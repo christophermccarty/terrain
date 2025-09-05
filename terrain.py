@@ -11,10 +11,41 @@ import numpy as np
 from opensimplex import OpenSimplex
 import cProfile
 import pstats
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 _ELEV_TEX = None
 _ELEV_SHAPE = (0, 0)
+
+# Simple multiprocessing tuning
+_MP_ENABLED = True
+_MP_WORKERS = None  # None → os.cpu_count()
+_MP_CHUNK_ROWS = 32
+
+
+def _compute_elevation_block(r0: int, r1: int, tex_w: int, tex_h: int, seed: int) -> tuple[int, np.ndarray]:
+    """Worker: compute elevation rows [r0:r1) as float32 block."""
+    noise = OpenSimplex(seed=seed)
+
+    # Longitudes φ ∈ [-π, π), latitudes θ ∈ [-π/2, π/2]
+    phi = np.linspace(-np.pi, np.pi, tex_w, endpoint=False)
+    the = np.linspace(-np.pi / 2.0, np.pi / 2.0, tex_h)
+    the_slice = the[r0:r1]
+    PHI, THE = np.meshgrid(phi, the_slice)
+    cp, sp = np.cos(PHI), np.sin(PHI)
+    ct, st = np.cos(THE), np.sin(THE)
+    vx, vy, vz = (ct * cp).ravel(), st.ravel(), (ct * sp).ravel()
+
+    def fbm(a, b, c, octaves=4, freq=1.2, lac=2.0, gain=0.5):
+        a = float(a); b = float(b); c = float(c)
+        amp = 1.0; f = freq; s = 0.0
+        for _ in range(octaves): s += amp * noise.noise3(a * f, b * f, c * f); f *= lac; amp *= gain
+        return 0.5 * (s + 1.0)
+
+    total = vx.size
+    block = np.fromiter((fbm(vx[i], vy[i], vz[i]) for i in range(total)), dtype=np.float32, count=total)
+    return r0, block.reshape(r1 - r0, tex_w)
 
 def _ensure_elevation(size: int, seed: int = 42) -> np.ndarray:
     """Build and cache an equirectangular elevation map once. Returns float in [0,1].
@@ -27,26 +58,40 @@ def _ensure_elevation(size: int, seed: int = 42) -> np.ndarray:
     if _ELEV_TEX is not None and _ELEV_SHAPE == (tex_h, tex_w):
         return _ELEV_TEX
 
-    noise = OpenSimplex(seed=seed)
-    # Longitudes φ ∈ [-π, π), latitudes θ ∈ [-π/2, π/2]
-    phi = np.linspace(-np.pi, np.pi, tex_w, endpoint=False)
-    the = np.linspace(-np.pi / 2.0, np.pi / 2.0, tex_h)
-    PHI, THE = np.meshgrid(phi, the)
-    cp, sp = np.cos(PHI), np.sin(PHI)
-    ct, st = np.cos(THE), np.sin(THE)
-    # Unit direction vectors for each (φ, θ)
-    vx, vy, vz = (ct * cp).ravel(), st.ravel(), (ct * sp).ravel()
+    # Parallel path: split rows across processes
+    workers = (_MP_WORKERS or os.cpu_count() or 1) if _MP_ENABLED else 1
+    if workers > 1:
+        elev = np.empty((tex_h, tex_w), dtype=np.float32)
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = []
+            for r0 in range(0, tex_h, _MP_CHUNK_ROWS):
+                r1 = min(r0 + _MP_CHUNK_ROWS, tex_h)
+                futures.append(pool.submit(_compute_elevation_block, r0, r1, tex_w, tex_h, seed))
+            for fut in as_completed(futures):
+                r0, block = fut.result()
+                elev[r0:r0 + block.shape[0], :] = block
+        _ELEV_TEX = elev
+    else:
+        noise = OpenSimplex(seed=seed)
+        # Longitudes φ ∈ [-π, π), latitudes θ ∈ [-π/2, π/2]
+        phi = np.linspace(-np.pi, np.pi, tex_w, endpoint=False)
+        the = np.linspace(-np.pi / 2.0, np.pi / 2.0, tex_h)
+        PHI, THE = np.meshgrid(phi, the)
+        cp, sp = np.cos(PHI), np.sin(PHI)
+        ct, st = np.cos(THE), np.sin(THE)
+        # Unit direction vectors for each (φ, θ)
+        vx, vy, vz = (ct * cp).ravel(), st.ravel(), (ct * sp).ravel()
 
-    # Small fBM helper for soft multi-scale features; output in [0,1]
-    def fbm(a, b, c, octaves=4, freq=1.2, lac=2.0, gain=0.5):
-        a = float(a); b = float(b); c = float(c)
-        amp = 1.0; f = freq; s = 0.0
-        for _ in range(octaves): s += amp * noise.noise3(a * f, b * f, c * f); f *= lac; amp *= gain
-        return 0.5 * (s + 1.0)
+        # Small fBM helper for soft multi-scale features; output in [0,1]
+        def fbm(a, b, c, octaves=4, freq=1.2, lac=2.0, gain=0.5):
+            a = float(a); b = float(b); c = float(c)
+            amp = 1.0; f = freq; s = 0.0
+            for _ in range(octaves): s += amp * noise.noise3(a * f, b * f, c * f); f *= lac; amp *= gain
+            return 0.5 * (s + 1.0)
 
-    total = vx.size
-    elev = np.fromiter((fbm(vx[i], vy[i], vz[i]) for i in range(total)), dtype=np.float32, count=total)
-    _ELEV_TEX = elev.reshape(tex_h, tex_w)
+        total = vx.size
+        elev = np.fromiter((fbm(vx[i], vy[i], vz[i]) for i in range(total)), dtype=np.float32, count=total)
+        _ELEV_TEX = elev.reshape(tex_h, tex_w)
     _ELEV_SHAPE = (tex_h, tex_w)
     return _ELEV_TEX
 
