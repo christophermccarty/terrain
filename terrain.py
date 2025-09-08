@@ -153,12 +153,12 @@ def _colorize(elev: np.ndarray) -> np.ndarray:
     return c0 + (c1 - c0) * t[..., None]
 
 
-def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5) -> Image.Image:
+def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, view: str = "Terrain", seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5) -> Image.Image:
     """Render a fully lit sphere by sampling the cached terrain. radius<1 zooms out.
 
     - Build a canvas-space unit disk and reconstruct Z for the sphere surface.
     - Rotate normals by yaw/pitch/roll, map to (φ, θ), then sample the texture.
-    - No shading; colors come solely from elevation.
+    - No shading; colors come solely from elevation, with optional temperature overlay.
     """
     lin = np.linspace(-1.0, 1.0, size)
     u, v = np.meshgrid(lin, -lin)  # invert Y so lighting feels natural
@@ -186,7 +186,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
     R = Rz @ Ry @ Rx
     n = n0 @ R.T
 
-    # Fully lit: sample cached elevation and map to color, no shading
+    # Fully lit: sample cached elevation and map to color; optionally blend temperature
     tex = _ensure_elevation(size, seed=seed, octaves=octaves, freq=freq, lac=lac, gain=gain)
     tex_h, tex_w = tex.shape
     # normal → spherical → texture coords (equirectangular mapping)
@@ -200,6 +200,12 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
     idx = np.where(mask)
     elev_img[idx] = tex[iy[idx], ix[idx]]
     rgbf = _colorize(elev_img)
+    if view == "Temperature":
+        overlay_tex = generate_temperature_overlay(tex_h, tex_w)
+        overlay_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
+        overlay_img[idx] = overlay_tex[iy[idx], ix[idx], :]
+        alpha = 0.7
+        rgbf = (1.0 - alpha) * rgbf + alpha * overlay_img
     rgb = (np.clip(rgbf, 0.0, 1.0) * 255).astype(np.uint8)
     rgb[~mask] = 0
 
@@ -264,7 +270,7 @@ def main() -> None:
             "gain": float(gain_var.get()),
         }
         if mode_var.get() == "globe":
-            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), **p)
+            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), **p)
             canvas.config(width=size, height=size)
         else:
             tex = _ensure_elevation(size, **p)
@@ -299,7 +305,7 @@ def main() -> None:
     def render():
         nonlocal tk_img
         if mode_var.get() == "globe":
-            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
             canvas.config(width=size, height=size)
         else:
             tex = _ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
