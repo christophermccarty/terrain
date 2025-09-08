@@ -15,6 +15,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
+from atmosphere import generate_wind_field, render_wind_arrows
 
 
 _ELEV_TEX = None
@@ -34,6 +35,8 @@ _DEFAULT_SETTINGS = {
     "freq": 1.2,
     "lac": 2.0,
     "gain": 0.5,
+    "wind_arrows": 250,
+    "wind_scale": 0.9,
 }
 
 def _load_settings() -> dict:
@@ -158,7 +161,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
 
     - Build a canvas-space unit disk and reconstruct Z for the sphere surface.
     - Rotate normals by yaw/pitch/roll, map to (φ, θ), then sample the texture.
-    - No shading; colors come solely from elevation, with optional temperature overlay.
+    - No shading; colors come solely from elevation, with optional overlays.
     """
     lin = np.linspace(-1.0, 1.0, size)
     u, v = np.meshgrid(lin, -lin)  # invert Y so lighting feels natural
@@ -206,6 +209,14 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
         overlay_img[idx] = overlay_tex[iy[idx], ix[idx], :]
         alpha = 0.7
         rgbf = (1.0 - alpha) * rgbf + alpha * overlay_img
+    elif view == "Wind":
+        # Overlay wind arrows (project equirectangular arrows via sampling)
+        from atmosphere import generate_wind_field, render_wind_arrows
+        u, v = generate_wind_field(tex_h, tex_w)
+        arrows = render_wind_arrows(tex_h, tex_w, u, v, target_arrows=250)
+        arr_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
+        arr_img[idx] = arrows[iy[idx], ix[idx], :]
+        rgbf = np.clip(rgbf + arr_img, 0.0, 1.0)
     rgb = (np.clip(rgbf, 0.0, 1.0) * 255).astype(np.uint8)
     rgb[~mask] = 0
 
@@ -235,7 +246,20 @@ def main() -> None:
     tk.Radiobutton(controls, text="Globe", variable=mode_var, value="globe").pack(side="left")
     tk.Radiobutton(controls, text="Map", variable=mode_var, value="map").pack(side="left")
     tk.Label(controls, text="View").pack(side="left", padx=(8,0))
-    tk.OptionMenu(controls, view_var, "Terrain", "Temperature").pack(side="left")
+    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind").pack(side="left")
+
+    # Wind controls
+    wind_arrows_var = tk.IntVar(value=int(settings.get("wind_arrows", _DEFAULT_SETTINGS["wind_arrows"])) )
+    wind_scale_var = tk.DoubleVar(value=float(settings.get("wind_scale", _DEFAULT_SETTINGS["wind_scale"])) )
+    def add_wind_controls():
+        frm = tk.Frame(root)
+        frm.pack(fill="x")
+        def add(parent, label, var, width=6):
+            f = tk.Frame(parent); f.pack(side="left", padx=4); tk.Label(f, text=label).pack(side="left"); tk.Entry(f, textvariable=var, width=width).pack(side="left")
+        add(frm, "Arrows", wind_arrows_var)
+        add(frm, "Scale", wind_scale_var)
+        return frm
+    wind_controls = add_wind_controls()
 
     # Terrain parameter inputs
     seed_var = tk.IntVar(value=int(settings["seed"]))
@@ -274,8 +298,15 @@ def main() -> None:
             canvas.config(width=size, height=size)
         else:
             tex = _ensure_elevation(size, **p)
-            rgbf = _colorize(tex)
-            arr = (np.clip(rgbf, 0.0, 1.0) * 255).astype(np.uint8)
+            if view_var.get() == "Wind":
+                base_rgb = _colorize(tex)
+                u, v = generate_wind_field(*tex.shape)
+                arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
+                comb = np.clip(base_rgb + arrows, 0.0, 1.0)
+                arr = (comb * 255).astype(np.uint8)
+            else:
+                rgbf = _colorize(tex)
+                arr = (np.clip(rgbf, 0.0, 1.0) * 255).astype(np.uint8)
             new_img = Image.fromarray(arr)
             h, w = tex.shape
             canvas.config(width=w, height=h)
@@ -316,6 +347,10 @@ def main() -> None:
                 alpha = 0.7 # Sets temperature map opacity
                 comb = (1.0 - alpha) * base_rgb + alpha * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+            elif view_var.get() == "Wind":
+                u, v = generate_wind_field(*tex.shape)
+                arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
+                arr = (np.clip(base_rgb + arrows, 0.0, 1.0) * 255).astype(np.uint8)
             else:
                 arr = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
             new_img = Image.fromarray(arr)
@@ -338,9 +373,14 @@ def main() -> None:
             # Equirectangular: x∈[0,w) -> φ∈[-π,π), y∈[0,h) -> θ∈[-π/2,π/2]
             lon = (x / w) * 360.0 - 180.0
             lat = 90.0 - (y / h) * 180.0
-            # Compute temperature at this latitude
-            T = temperature_kelvin_for_lat(np.deg2rad(lat))
-            latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°, T {T:.1f} K")
+            if view_var.get() == "Wind":
+                u, v = generate_wind_field(h, w)
+                speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
+                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°, wind {speed:.1f} m/s")
+            else:
+                # Compute temperature at this latitude
+                T = temperature_kelvin_for_lat(np.deg2rad(lat))
+                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°, T {T:.1f} K")
         else:
             latlon_var.set("")
 
@@ -377,6 +417,8 @@ def main() -> None:
             "freq": float(freq_var.get()),
             "lac": float(lac_var.get()),
             "gain": float(gain_var.get()),
+            "wind_arrows": int(wind_arrows_var.get()),
+            "wind_scale": float(wind_scale_var.get()),
         }
         _save_settings(s)
         root.destroy()
