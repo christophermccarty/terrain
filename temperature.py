@@ -30,7 +30,20 @@ def _daily_mean_insolation_Q(lat_rad: np.ndarray, day_of_year: int, S0: float = 
     return (S0 / np.pi) * (H0 * np.sin(lat) * np.sin(delta) + np.cos(lat) * np.cos(delta) * np.sin(H0))
 
 
-def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80, epsilon_atm: float = EPSILON_ATM) -> np.ndarray:
+def _coarse_shape(H: int, W: int, block_size: int) -> tuple[int, int]:
+    bs = max(1, int(block_size))
+    Hc = max(1, (H + bs - 1) // bs)
+    Wc = max(1, (W + bs - 1) // bs)
+    return Hc, Wc
+
+
+def _upsample_repeat(field: np.ndarray, H: int, W: int, block_size: int) -> np.ndarray:
+    bs = max(1, int(block_size))
+    up = np.repeat(np.repeat(field, bs, axis=0), bs, axis=1)
+    return up[:H, :W]
+
+
+def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80, epsilon_atm: float = EPSILON_ATM, block_size: int = 3) -> np.ndarray:
     """Return an (H,W,3) float32 RGB overlay in [0,1] for given map size.
 
     - Insolation: daily-mean TOA Q(φ, δ) with S0=1361 W/m^2; albedo A=0.3.
@@ -39,9 +52,11 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80,
     """
     h = int(height)
     w = int(width)
+    bs = max(1, int(block_size))
+    hc, wc = _coarse_shape(h, w, bs)
 
     # Latitude centers per row in radians: +π/2 (north) → -π/2 (south)
-    lat = (0.5 - (np.arange(h, dtype=np.float32) + 0.5) / h) * np.pi
+    lat = (0.5 - (np.arange(hc, dtype=np.float32) + 0.5) / hc) * np.pi
 
     # Blackbody equilibrium from daily-mean absorbed flux
     A = 0.3
@@ -54,7 +69,7 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80,
     # Normalize to a broad 150–320 K range for coloring
     tmin, tmax = 150.0, 320.0
     v = np.clip((T_lat - tmin) / (tmax - tmin), 0.0, 1.0).astype(np.float32)
-    v2d = np.repeat(v[:, None], w, axis=1)
+    v2d = np.repeat(v[:, None], wc, axis=1)
 
     # Piecewise-linear color map: Blue→Cyan→Yellow→Red
     color_stops = np.array(
@@ -66,7 +81,8 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80,
     c0 = color_stops[idx]
     c1 = color_stops[idx + 1]
     t = (v2d - breakpoints[idx]) / (breakpoints[idx + 1] - breakpoints[idx] + 1e-9)
-    return (c0 + (c1 - c0) * t[..., None]).astype(np.float32)
+    coarse = (c0 + (c1 - c0) * t[..., None]).astype(np.float32)
+    return _upsample_repeat(coarse, h, w, bs)
 
 
 def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 80, epsilon_atm: float = EPSILON_ATM) -> np.ndarray | float:

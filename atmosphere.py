@@ -19,7 +19,20 @@ def _latitudes_h(height: int) -> np.ndarray:
     return (0.5 - (np.arange(int(height), dtype=np.float32) + 0.5) / float(height)) * np.pi
 
 
-def generate_wind_field(height: int, width: int, *, day_of_year: int = 80) -> tuple[np.ndarray, np.ndarray]:
+def _coarse_shape(H: int, W: int, block_size: int) -> tuple[int, int]:
+    bs = max(1, int(block_size))
+    Hc = max(1, (H + bs - 1) // bs)
+    Wc = max(1, (W + bs - 1) // bs)
+    return Hc, Wc
+
+
+def _upsample_repeat(field: np.ndarray, H: int, W: int, block_size: int) -> np.ndarray:
+    bs = max(1, int(block_size))
+    up = np.repeat(np.repeat(field, bs, axis=0), bs, axis=1)
+    return up[:H, :W]
+
+
+def generate_wind_field(height: int, width: int, *, day_of_year: int = 80, block_size: int = 3) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v) winds at surface on equirectangular grid (H,W).
 
     u: eastward (m/s), v: northward (m/s). Positive u is to the right in map.
@@ -32,7 +45,8 @@ def generate_wind_field(height: int, width: int, *, day_of_year: int = 80) -> tu
     - Reverse sign across equator for symmetry.
     """
     H = int(height); W = int(width)
-    lat = _latitudes_h(H)
+    Hc, Wc = _coarse_shape(H, W, block_size)
+    lat = _latitudes_h(Hc)
     abs_deg = np.rad2deg(np.abs(lat))
 
     # Meridional temperature gradient magnitude as simple driver (Hadley strength)
@@ -70,9 +84,9 @@ def generate_wind_field(height: int, width: int, *, day_of_year: int = 80) -> tu
     v_lat = (v_hadley + v_ferrel + v_polar) * (0.8 + 0.4 * (grad_norm / gmax))
 
     # Broadcast to full field (assume longitude-uniform mean winds)
-    u = np.repeat(u_lat[:, None], W, axis=1).astype(np.float32)
-    v = np.repeat(v_lat[:, None], W, axis=1).astype(np.float32)
-    return u, v
+    uc = np.repeat(u_lat[:, None], Wc, axis=1).astype(np.float32)
+    vc = np.repeat(v_lat[:, None], Wc, axis=1).astype(np.float32)
+    return _upsample_repeat(uc, H, W, block_size), _upsample_repeat(vc, H, W, block_size)
 
 
 def _cos_window(x_deg: np.ndarray, a: float, b: float) -> np.ndarray:
@@ -150,5 +164,55 @@ def _speed_color(t: float) -> np.ndarray:
     c0 = np.array([0.05, 0.40, 1.00], dtype=np.float32)
     c1 = np.array([1.00, 0.20, 0.05], dtype=np.float32)
     return (1.0 - t) * c0 + t * c1
+
+
+def generate_precipitation(height: int, width: int, elevation: np.ndarray, *, day_of_year: int = 80, evap_coeff: float = 1.0, uplift_coeff: float = 1.0, rain_efficiency: float = 0.7, iterations: int = 24, wind_ref: float = 12.0, seed: int | None = None, block_size: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    """Return (precip_mm_day, humidity) using simple moisture budget.
+
+    - Sea mask from median elevation.
+    - q_sat from temperature; evaporation over ocean; condensation with convergence
+      and orographic uplift; advection via simple upwind relaxation against winds.
+    """
+    H = int(height); W = int(width)
+    bs = max(1, int(block_size))
+    Hc, Wc = _coarse_shape(H, W, bs)
+    # Downsample elevation by block mean
+    elev_pad = np.pad(elevation.astype(np.float32), ((0, Hc*bs - H), (0, Wc*bs - W)), mode="edge")
+    elev_c = elev_pad.reshape(Hc, bs, Wc, bs).mean(axis=(1, 3))
+    sea_c = elev_c <= float(np.median(elev_c))
+    lat_c = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
+    T_c = np.repeat(temperature_kelvin_for_lat(lat_c, day_of_year=day_of_year)[:, None], Wc, axis=1).astype(np.float32)
+    Tc = T_c - 273.15
+    es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))  # hPa
+    qsat = np.clip(0.622 * es / 1013.25, 0.0, 0.03).astype(np.float32)
+    u, v = generate_wind_field(Hc, Wc, day_of_year=day_of_year, block_size=1)
+    mag = np.sqrt(u * u + v * v) + 1e-6
+    q = (sea_c.astype(np.float32) * 0.5 * qsat).astype(np.float32)
+    P = np.zeros((Hc, Wc), dtype=np.float32)
+    dt = 1.0 / max(1, int(iterations))
+    ufac = np.clip(mag / max(wind_ref, 1e-3), 0.0, 1.0)
+    gx, gy = np.gradient(elev_c)
+    for _ in range(int(iterations)):
+        E = evap_coeff * sea_c.astype(np.float32) * np.clip(qsat - q, 0.0, None) * (0.6 + 0.4 * ufac)
+        dudx = np.gradient(u, axis=1); dvdy = np.gradient(v, axis=0)
+        conv = np.clip(-(dudx + dvdy), 0.0, None)
+        conv /= (np.percentile(conv, 95.0) + 1e-6)
+        orog = np.clip(gx * u + gy * v, 0.0, None)
+        orog /= (np.percentile(orog, 95.0) + 1e-6)
+        widx = uplift_coeff * (conv + 0.5 * orog)
+        widx = np.clip(widx, 0.0, 2.0)
+        r = rain_efficiency * widx * q
+        r = np.minimum(r, q / dt)
+        P += (1000.0 * r) * dt  # scale factor so max q(~0.02) -> ~20 mm/day
+        q = q + E * dt - r * dt
+        # crude upwind advection relaxation
+        qx = np.where(u >= 0, np.roll(q, 1, axis=1), np.roll(q, -1, axis=1))
+        qy = np.where(v >= 0, np.roll(q, 1, axis=0), np.roll(q, -1, axis=0))
+        q += 0.5 * (np.abs(u) / (wind_ref + 1e-6)) * (qx - q) * dt
+        q += 0.5 * (np.abs(v) / (wind_ref + 1e-6)) * (qy - q) * dt
+        q = np.clip(q, 0.0, qsat)
+    P_full = _upsample_repeat(P.astype(np.float32), H, W, bs)
+    q_full = _upsample_repeat(q.astype(np.float32), H, W, bs)
+    return P_full, q_full
 
 
