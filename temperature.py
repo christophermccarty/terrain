@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import numpy as np
 
+# Simple one-layer gray-atmosphere greenhouse tuned for Earth
+# ε≈0.77 gives global-mean ~288 K from ~255 K effective temperature
+EPSILON_ATM = 0.77
+
 
 def _daily_mean_insolation_Q(lat_rad: np.ndarray, day_of_year: int, S0: float = 1361.0) -> np.ndarray:
     """Daily-mean TOA insolation Q(φ, δ) in W/m^2.
@@ -26,7 +30,7 @@ def _daily_mean_insolation_Q(lat_rad: np.ndarray, day_of_year: int, S0: float = 
     return (S0 / np.pi) * (H0 * np.sin(lat) * np.sin(delta) + np.cos(lat) * np.cos(delta) * np.sin(H0))
 
 
-def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80) -> np.ndarray:
+def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80, epsilon_atm: float = EPSILON_ATM) -> np.ndarray:
     """Return an (H,W,3) float32 RGB overlay in [0,1] for given map size.
 
     - Insolation: daily-mean TOA Q(φ, δ) with S0=1361 W/m^2; albedo A=0.3.
@@ -44,7 +48,8 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80)
     sigma = 5.670374419e-8
     Q = _daily_mean_insolation_Q(lat, day_of_year)
     F_abs = (1.0 - A) * np.maximum(Q, 0.0)
-    T_lat = np.power(np.clip(F_abs, 1e-9, None) / sigma, 0.25)
+    gh_denom = np.maximum(1.0 - 0.5 * float(epsilon_atm), 1e-6)
+    T_lat = np.power(np.clip(F_abs, 1e-9, None) / (sigma * gh_denom), 0.25)
 
     # Normalize to a broad 150–320 K range for coloring
     tmin, tmax = 150.0, 320.0
@@ -64,7 +69,7 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80)
     return (c0 + (c1 - c0) * t[..., None]).astype(np.float32)
 
 
-def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 80) -> np.ndarray | float:
+def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 80, epsilon_atm: float = EPSILON_ATM) -> np.ndarray | float:
     """Return blackbody-equilibrium temperature (K) for latitude(s).
 
     Uses daily-mean TOA insolation by latitude and day-of-year (handles
@@ -75,7 +80,8 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 8
     sigma = 5.670374419e-8
     Q = _daily_mean_insolation_Q(lat, day_of_year)
     F_abs = (1.0 - A) * np.maximum(Q, 0.0)
-    T = np.power(np.clip(F_abs, 1e-9, None) / sigma, 0.25)
+    gh_denom = np.maximum(1.0 - 0.5 * float(epsilon_atm), 1e-6)
+    T = np.power(np.clip(F_abs, 1e-9, None) / (sigma * gh_denom), 0.25)
     if np.isscalar(lat_rad):
         return float(T)
     return T
