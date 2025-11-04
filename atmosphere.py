@@ -166,7 +166,25 @@ def _speed_color(t: float) -> np.ndarray:
     return (1.0 - t) * c0 + t * c1
 
 
-def generate_precipitation(height: int, width: int, elevation: np.ndarray, *, day_of_year: int = 80, evap_coeff: float = 1.0, uplift_coeff: float = 1.0, rain_efficiency: float = 0.7, iterations: int = 24, wind_ref: float = 12.0, seed: int | None = None, block_size: int = 3) -> tuple[np.ndarray, np.ndarray]:
+def generate_precipitation(
+    height: int,
+    width: int,
+    elevation: np.ndarray,
+    *,
+    day_of_year: int = 80,
+    evap_coeff: float = 1.0,
+    uplift_coeff: float = 1.0,
+    rain_efficiency: float = 0.7,
+    iterations: int = 48,
+    wind_ref: float = 12.0,
+    seed: int | None = None,
+    block_size: int = 2,
+    evap_land_coeff: float = 0.2,
+    recycle_coeff: float = 0.2,
+    conv_eff: float = 0.4,
+    conv_rh0: float = 0.8,
+    kdiff: float = 0.02,
+) -> tuple[np.ndarray, np.ndarray]:
     """Return (precip_mm_day, humidity) using simple moisture budget.
 
     - Sea mask from median elevation.
@@ -180,9 +198,10 @@ def generate_precipitation(height: int, width: int, elevation: np.ndarray, *, da
     elev_pad = np.pad(elevation.astype(np.float32), ((0, Hc*bs - H), (0, Wc*bs - W)), mode="edge")
     elev_c = elev_pad.reshape(Hc, bs, Wc, bs).mean(axis=(1, 3))
     sea_c = elev_c <= float(np.median(elev_c))
+    land_c = ~sea_c
     lat_c = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
     T_c = np.repeat(temperature_kelvin_for_lat(lat_c, day_of_year=day_of_year)[:, None], Wc, axis=1).astype(np.float32)
-    Tc = T_c - 273.15
+    Tc = np.clip(T_c - 273.15, -100.0, 100.0)  # Clip to prevent overflow in exp
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))  # hPa
     qsat = np.clip(0.622 * es / 1013.25, 0.0, 0.03).astype(np.float32)
     u, v = generate_wind_field(Hc, Wc, day_of_year=day_of_year, block_size=1)
@@ -192,19 +211,36 @@ def generate_precipitation(height: int, width: int, elevation: np.ndarray, *, da
     dt = 1.0 / max(1, int(iterations))
     ufac = np.clip(mag / max(wind_ref, 1e-3), 0.0, 1.0)
     gx, gy = np.gradient(elev_c)
+    # Latitude weighting for deep convection (ITCZ-like)
+    lat_w = (np.cos(lat_c) ** 2)[:, None].astype(np.float32)
+
+    def _lap(a: np.ndarray) -> np.ndarray:
+        ap = np.pad(a, 1, mode="edge")
+        return ap[0:-2,1:-1] + ap[2:,1:-1] + ap[1:-1,0:-2] + ap[1:-1,2:] - 4.0 * a
+
     for _ in range(int(iterations)):
-        E = evap_coeff * sea_c.astype(np.float32) * np.clip(qsat - q, 0.0, None) * (0.6 + 0.4 * ufac)
-        dudx = np.gradient(u, axis=1); dvdy = np.gradient(v, axis=0)
-        conv = np.clip(-(dudx + dvdy), 0.0, None)
+        # Ocean + small land evap
+        mask = sea_c.astype(np.float32) + float(evap_land_coeff) * land_c.astype(np.float32)
+        E = evap_coeff * mask * np.clip(qsat - q, 0.0, None) * (0.6 + 0.4 * ufac)
+        # Moisture-flux convergence (adds longitudinal variability)
+        mx = q * u; my = q * v
+        dmxdx = np.gradient(mx, axis=1); dmydy = np.gradient(my, axis=0)
+        conv = np.clip(-(dmxdx + dmydy), 0.0, None)
         conv /= (np.percentile(conv, 95.0) + 1e-6)
         orog = np.clip(gx * u + gy * v, 0.0, None)
         orog /= (np.percentile(orog, 95.0) + 1e-6)
         widx = uplift_coeff * (conv + 0.5 * orog)
         widx = np.clip(widx, 0.0, 2.0)
-        r = rain_efficiency * widx * q
+        # Large-scale + convective rain
+        r_ls = rain_efficiency * widx * q
+        rh = q / (qsat + 1e-6)
+        r_cv = conv_eff * lat_w * np.clip(rh - conv_rh0, 0.0, None) * q
+        r = r_ls + r_cv
         r = np.minimum(r, q / dt)
         P += (1000.0 * r) * dt  # scale factor so max q(~0.02) -> ~20 mm/day
-        q = q + E * dt - r * dt
+        # Moisture budget with recycling and small diffusion
+        q = q + E * dt - (1.0 - recycle_coeff) * r * dt
+        q += kdiff * _lap(q) * dt
         # crude upwind advection relaxation
         qx = np.where(u >= 0, np.roll(q, 1, axis=1), np.roll(q, -1, axis=1))
         qy = np.where(v >= 0, np.roll(q, 1, axis=0), np.roll(q, -1, axis=0))
