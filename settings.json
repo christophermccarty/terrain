@@ -4,8 +4,8 @@
   "freq": 1.2,
   "lac": 2.0,
   "gain": 0.5,
-  "wind_arrows": 500,
-  "wind_scale": 0.9,
+  "wind_arrows": 250,
+  "wind_scale": 1.0,
   "precip_evap_coeff": 1.0,
   "precip_uplift_coeff": 1.0,
   "precip_efficiency": 0.7
