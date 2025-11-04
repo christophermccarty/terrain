@@ -137,7 +137,8 @@ def main() -> None:
             "gain": float(gain_var.get()),
         }
         if mode_var.get() == "globe":
-            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), **p)
+            day = int(sim_state.day_of_year) if (sim_state is not None and sim_running) else 80
+            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), day_of_year=day, **p)
             canvas.config(width=size, height=size)
         else:
             tex = ensure_elevation(size, **p)
@@ -190,7 +191,8 @@ def main() -> None:
         
         if mode_var.get() == "globe":
             with log_time("Render globe"):
-                new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+                day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+                new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get(), day_of_year=day)
             canvas.config(width=size, height=size)
         else:
             # Get elevation from simulation or generate

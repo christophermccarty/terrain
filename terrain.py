@@ -179,7 +179,7 @@ def colorize(elev: np.ndarray) -> np.ndarray:
     return c0 + (c1 - c0) * t[..., None]
 
 
-def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, view: str = "Terrain", seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5) -> Image.Image:
+def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, view: str = "Terrain", seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5, day_of_year: int = 80) -> Image.Image:
     """Render a fully lit sphere by sampling the cached terrain. radius<1 zooms out.
 
     - Build a canvas-space unit disk and reconstruct Z for the sphere surface.
@@ -227,7 +227,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
     elev_img[idx] = tex[iy[idx], ix[idx]]
     rgbf = colorize(elev_img)
     if view == "Temperature":
-        overlay_tex = generate_temperature_overlay(tex_h, tex_w)
+        overlay_tex = generate_temperature_overlay(tex_h, tex_w, day_of_year=day_of_year)
         overlay_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
         overlay_img[idx] = overlay_tex[iy[idx], ix[idx], :]
         alpha = 0.7
