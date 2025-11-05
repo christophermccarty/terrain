@@ -235,7 +235,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
     elif view == "Wind":
         # Overlay wind arrows (project equirectangular arrows via sampling)
         from atmosphere import generate_wind_field, render_wind_arrows
-        u, v = generate_wind_field(tex_h, tex_w)
+        u, v = generate_wind_field(tex_h, tex_w, elevation=tex)
         arrows = render_wind_arrows(tex_h, tex_w, u, v, target_arrows=250)
         arr_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
         arr_img[idx] = arrows[iy[idx], ix[idx], :]
