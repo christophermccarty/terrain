@@ -32,7 +32,7 @@ def _upsample_repeat(field: np.ndarray, H: int, W: int, block_size: int) -> np.n
     return up[:H, :W]
 
 
-def generate_wind_field(height: int, width: int, *, day_of_year: int = 80, block_size: int = 3) -> tuple[np.ndarray, np.ndarray]:
+def generate_wind_field(height: int, width: int, *, day_of_year: int = 80, block_size: int = 3, elevation: np.ndarray | None = None, terrain_influence: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v) winds at surface on equirectangular grid (H,W).
 
     u: eastward (m/s), v: northward (m/s). Positive u is to the right in map.
@@ -43,6 +43,7 @@ def generate_wind_field(height: int, width: int, *, day_of_year: int = 80, block
         Polar easterlies ~ 6 m/s, Mid-lat westerlies ~ 12 m/s, Trade winds ~ 8 m/s.
     - Smooth with cos windows at band edges. Meridional component small return flow.
     - Reverse sign across equator for symmetry.
+    - Optional terrain effects: mountains block/channel winds, land-sea contrasts.
     """
     H = int(height); W = int(width)
     Hc, Wc = _coarse_shape(H, W, block_size)
@@ -86,6 +87,49 @@ def generate_wind_field(height: int, width: int, *, day_of_year: int = 80, block
     # Broadcast to full field (assume longitude-uniform mean winds)
     uc = np.repeat(u_lat[:, None], Wc, axis=1).astype(np.float32)
     vc = np.repeat(v_lat[:, None], Wc, axis=1).astype(np.float32)
+
+    # Apply terrain effects if elevation provided
+    if elevation is not None and terrain_influence > 0:
+        elev_shape = elevation.shape
+        if elev_shape == (Hc, Wc):
+            # Already at coarse resolution
+            elev_c = elevation.astype(np.float32)
+        else:
+            # Downsample from full resolution
+            elev_pad = np.pad(elevation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+            elev_c = elev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+        
+        # Land-sea mask (median split)
+        sea_mask = elev_c <= float(np.median(elev_c))
+        land_mask = ~sea_mask
+        
+        # Elevation gradients (for channeling/blocking)
+        gx, gy = np.gradient(elev_c)
+        elev_norm = np.clip(elev_c, 0.0, 1.0)
+        elev_grad_mag = np.hypot(gx, gy)
+        
+        # Mountain blocking: reduce wind speed over high terrain
+        block_factor = 1.0 - terrain_influence * 0.6 * elev_norm
+        block_factor = np.clip(block_factor, 0.3, 1.0)
+        
+        # Channeling: winds accelerate around terrain (perpendicular to gradient)
+        # For zonal winds, reduce if blocked by N-S mountains, channel if E-W valleys
+        channel_u = 1.0 + terrain_influence * 0.3 * (1.0 - np.clip(np.abs(gy) / (np.max(np.abs(gy)) + 1e-6), 0.0, 1.0))
+        
+        # Land-sea contrast: stronger winds over ocean, weaker over land
+        land_sea_factor = np.where(sea_mask, 1.15, 0.85)
+        
+        # Apply all terrain effects
+        uc *= block_factor * channel_u * land_sea_factor
+        vc *= block_factor * land_sea_factor
+        
+        # Add deflection around terrain (winds follow valleys)
+        defl_scale = terrain_influence * 0.4
+        u_deflect = -defl_scale * np.sign(uc) * np.clip(np.abs(gx) / (np.max(np.abs(gx)) + 1e-6), 0.0, 1.0)
+        v_deflect = -defl_scale * np.sign(vc) * np.clip(np.abs(gy) / (np.max(np.abs(gy)) + 1e-6), 0.0, 1.0)
+        uc += u_deflect * np.abs(uc)
+        vc += v_deflect * np.abs(vc)
+
     return _upsample_repeat(uc, H, W, block_size), _upsample_repeat(vc, H, W, block_size)
 
 
@@ -100,37 +144,50 @@ def _cos_window(x_deg: np.ndarray, a: float, b: float) -> np.ndarray:
 
 
 def render_wind_arrows(height: int, width: int, u: np.ndarray, v: np.ndarray, *, step: int | None = None, target_arrows: int | None = 250, scale: float = 0.8) -> np.ndarray:
-    """Rasterize sparse white arrows onto black background; returns (H,W,3) float.
+    """Rasterize sparse white triangles onto black background; returns (H,W,3) float.
 
-    - `step` controls arrow density; `scale` scales vector length relative to step.
-    - Uses simple Bresenham-like interpolation for the arrow shaft; small triangle head.
+    - `step` controls triangle density; `scale` scales triangle size relative to step.
+    - Triangles point in wind direction, size scales with wind speed.
     """
     H = int(height); W = int(width)
     img = np.zeros((H, W, 3), dtype=np.float32)
     mag = np.sqrt(u * u + v * v) + 1e-9
     umax = np.percentile(mag, 95.0) + 1e-6
     if step is None:
-        # Choose step so ~target_arrows arrows are drawn on equirectangular grid
+        # Choose step so ~target_arrows triangles are drawn on equirectangular grid
         n_target = max(50, int(target_arrows or 250))
         step_f = np.sqrt((H * W) / float(n_target))
         sx = sy = max(6, int(step_f))
     else:
         sx = sy = max(4, int(step))
     step_len = float(min(sx, sy))
+    white = np.array([1.0, 1.0, 1.0], dtype=np.float32)
     for y in range(sy // 2, H, sy):
         for x in range(sx // 2, W, sx):
             uu = float(u[y, x]); vv = float(v[y, x])
             m = np.sqrt(uu * uu + vv * vv)
             if m < 1e-3:
                 continue
-            L = scale * (m / umax) * 0.9 * step_len
-            dx = uu / m * L
-            dy = -vv / m * L  # screen y grows down
-            x0, y0 = x - dx * 0.5, y - dy * 0.5
-            x1, y1 = x + dx * 0.5, y + dy * 0.5
-            col = _speed_color(m / umax)
-            _draw_line(img, x0, y0, x1, y1, col)
-            _draw_head(img, x1, y1, dx, dy, col)
+            # Triangle size scales with wind speed
+            size = scale * (m / umax) * step_len * 0.5
+            size = max(2.0, min(size, step_len * 0.8))
+            # Direction vector (normalized)
+            dx = uu / m
+            dy = -vv / m  # screen y grows down
+            # Triangle points: tip in wind direction, base perpendicular
+            tip_x = x + dx * size * 0.6
+            tip_y = y + dy * size * 0.6
+            base_x = x - dx * size * 0.4
+            base_y = y - dy * size * 0.4
+            # Perpendicular direction for base
+            perp_x = -dy
+            perp_y = dx
+            base_w = size * 0.4
+            p1_x = base_x + perp_x * base_w
+            p1_y = base_y + perp_y * base_w
+            p2_x = base_x - perp_x * base_w
+            p2_y = base_y - perp_y * base_w
+            _draw_triangle(img, tip_x, tip_y, p1_x, p1_y, p2_x, p2_y, white)
     return img
 
 
@@ -145,17 +202,49 @@ def _draw_line(img: np.ndarray, x0: float, y0: float, x1: float, y1: float, col:
             img[yi, xi, :] = np.maximum(img[yi, xi, :], col)
 
 
-def _draw_head(img: np.ndarray, x1: float, y1: float, dx: float, dy: float, col: np.ndarray) -> None:
+def _draw_triangle(img: np.ndarray, x0: float, y0: float, x1: float, y1: float, x2: float, y2: float, col: np.ndarray) -> None:
+    """Draw filled triangle using scanline algorithm."""
     H, W, _ = img.shape
-    nx, ny = -dy, dx
-    nx, ny = nx / (np.hypot(nx, ny) + 1e-9), ny / (np.hypot(nx, ny) + 1e-9)
-    back_x = x1 - 0.25 * dx
-    back_y = y1 - 0.25 * dy
-    p0 = (int(round(x1)), int(round(y1)))
-    p1 = (int(round(back_x + 0.12 * dx + 0.18 * nx * np.hypot(dx, dy))), int(round(back_y + 0.12 * dy + 0.18 * ny * np.hypot(dx, dy))))
-    p2 = (int(round(back_x + 0.12 * dx - 0.18 * nx * np.hypot(dx, dy))), int(round(back_y + 0.12 * dy - 0.18 * ny * np.hypot(dx, dy))))
-    for (xa, ya), (xb, yb) in [(p0, p1), (p0, p2), (p1, p2)]:
-        _draw_line(img, xa, ya, xb, yb, col)
+    # Sort vertices by y
+    pts = [(x0, y0), (x1, y1), (x2, y2)]
+    pts.sort(key=lambda p: p[1])
+    x0, y0 = pts[0]; x1, y1 = pts[1]; x2, y2 = pts[2]
+    
+    # Bounding box
+    min_x = int(max(0, min(x0, x1, x2)))
+    max_x = int(min(W - 1, max(x0, x1, x2)))
+    min_y = int(max(0, min(y0, y1, y2)))
+    max_y = int(min(H - 1, max(y0, y1, y2)))
+    
+    if min_y >= max_y or min_x >= max_x:
+        return
+    
+    # Scanline fill
+    for y in range(min_y, max_y + 1):
+        # Find intersections with triangle edges
+        intersections = []
+        # Edge 0-1
+        if y0 != y1:
+            t = (y - y0) / (y1 - y0)
+            if 0 <= t <= 1:
+                intersections.append(x0 + t * (x1 - x0))
+        # Edge 0-2
+        if y0 != y2:
+            t = (y - y0) / (y2 - y0)
+            if 0 <= t <= 1:
+                intersections.append(x0 + t * (x2 - x0))
+        # Edge 1-2
+        if y1 != y2:
+            t = (y - y1) / (y2 - y1)
+            if 0 <= t <= 1:
+                intersections.append(x1 + t * (x2 - x1))
+        
+        if len(intersections) >= 2:
+            x_start = int(round(min(intersections)))
+            x_end = int(round(max(intersections)))
+            for x in range(max(min_x, x_start), min(max_x + 1, x_end + 1)):
+                if 0 <= x < W and 0 <= y < H:
+                    img[y, x, :] = np.maximum(img[y, x, :], col)
 
 
 def _speed_color(t: float) -> np.ndarray:
@@ -204,7 +293,7 @@ def generate_precipitation(
     Tc = np.clip(T_c - 273.15, -100.0, 100.0)  # Clip to prevent overflow in exp
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))  # hPa
     qsat = np.clip(0.622 * es / 1013.25, 0.0, 0.03).astype(np.float32)
-    u, v = generate_wind_field(Hc, Wc, day_of_year=day_of_year, block_size=1)
+    u, v = generate_wind_field(Hc, Wc, day_of_year=day_of_year, block_size=1, elevation=elev_c)
     mag = np.sqrt(u * u + v * v) + 1e-6
     q = (sea_c.astype(np.float32) * 0.5 * qsat).astype(np.float32)
     P = np.zeros((Hc, Wc), dtype=np.float32)
