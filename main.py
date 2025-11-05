@@ -147,7 +147,7 @@ def main() -> None:
                 wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()))
                 if _WIND_CACHE["key"] != wkey:
                     with log_time("Generate wind field+arrows"):
-                        u, v = generate_wind_field(*tex.shape)
+                        u, v = generate_wind_field(*tex.shape, elevation=tex)
                         _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
                 else:
                     u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
@@ -236,7 +236,7 @@ def main() -> None:
                     wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()))
                     if _WIND_CACHE["key"] != wkey:
                         with log_time("Generate wind field"):
-                            u, v = generate_wind_field(*tex.shape)
+                            u, v = generate_wind_field(*tex.shape, elevation=tex)
                             _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
                     else:
                         u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
@@ -333,7 +333,7 @@ def main() -> None:
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
                 elif _WIND_CACHE["u"] is None or _WIND_CACHE["u"].shape != (h, w):
-                    u, v = generate_wind_field(h, w)
+                    u, v = generate_wind_field(h, w, elevation=tex)
                     _WIND_CACHE.update({"key": (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get())), "u": u, "v": v})
                 else:
                     u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
