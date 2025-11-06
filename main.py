@@ -226,7 +226,7 @@ def main() -> None:
                     h, w = tex.shape
                     with log_time("Generate temperature overlay"):
                         overlay = generate_temperature_overlay(h, w)
-                alpha = 0.7
+                alpha = 0.5
                 comb = (1.0 - alpha) * base_rgb + alpha * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Wind":
@@ -249,7 +249,15 @@ def main() -> None:
                     pkey = (tex.shape, float(precip_evap_var.get()), float(precip_uplift_var.get()), float(precip_eff_var.get()))
                     if _PRECIP_CACHE["key"] != pkey:
                         with log_time("Generate precipitation"):
-                            P, _ = generate_precipitation(*tex.shape, tex, evap_coeff=float(precip_evap_var.get()), uplift_coeff=float(precip_uplift_var.get()), rain_efficiency=float(precip_eff_var.get()))
+                            day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+                            P, _, _ = generate_precipitation(
+                                *tex.shape,
+                                tex,
+                                day_of_year=day,
+                                evap_coeff=float(precip_evap_var.get()),
+                                uplift_coeff=float(precip_uplift_var.get()),
+                                rain_efficiency=float(precip_eff_var.get()),
+                            )
                         _PRECIP_CACHE.update({"key": pkey, "P": P})
                     else:
                         P = _PRECIP_CACHE["P"]
@@ -343,7 +351,16 @@ def main() -> None:
                 if use_sim_data and sim_state.precipitation is not None:
                     P = sim_state.precipitation
                 elif _PRECIP_CACHE["P"] is None or _PRECIP_CACHE["P"].shape != (h, w):
-                    P, _ = generate_precipitation(h, w, tex)
+                    day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+                    P, _, _ = generate_precipitation(
+                        h,
+                        w,
+                        tex,
+                        day_of_year=day,
+                        evap_coeff=float(precip_evap_var.get()),
+                        uplift_coeff=float(precip_uplift_var.get()),
+                        rain_efficiency=float(precip_eff_var.get()),
+                    )
                     _PRECIP_CACHE.update({"key": (tex.shape, float(precip_evap_var.get()), float(precip_uplift_var.get()), float(precip_eff_var.get())), "P": P})
                 else:
                     P = _PRECIP_CACHE["P"]

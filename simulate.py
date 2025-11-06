@@ -21,6 +21,7 @@ class PlanetState(NamedTuple):
     wind_v: np.ndarray | None = None  # (H, W) northward wind (m/s)
     precipitation: np.ndarray | None = None  # (H, W) precipitation (mm/day)
     humidity: np.ndarray | None = None  # (H, W) specific humidity
+    soil_moisture: np.ndarray | None = None  # (H, W) bucket soil moisture [0,1]
 
 
 def simulate_step(
@@ -145,18 +146,27 @@ def simulate_step(
         u_full, v_full = state.wind_u, state.wind_v
 
     # Update precipitation from wind, temperature, elevation (if requested)
+    humidity_prev = state.humidity
+    soil_prev = getattr(state, "soil_moisture", None)
+
     if update_precip:
-        P_full, q_full = generate_precipitation(
+        P_full, humidity_next, soil_next = generate_precipitation(
             H, W, state.elevation,
+            temperature=T_full,
+            wind_u=u_full,
+            wind_v=v_full,
+            humidity=humidity_prev,
+            soil_moisture=soil_prev,
             day_of_year=int(new_day),
+            dt_days=max(days, 1.0),
             evap_coeff=evap_coeff,
             uplift_coeff=uplift_coeff,
             rain_efficiency=rain_efficiency,
-            iterations=precip_iterations,
-            block_size=block_size,
         )
     else:
-        P_full, q_full = state.precipitation, state.humidity
+        P_full = state.precipitation
+        humidity_next = humidity_prev
+        soil_next = soil_prev
 
     return PlanetState(
         day_of_year=new_day,
@@ -165,7 +175,8 @@ def simulate_step(
         wind_u=u_full,
         wind_v=v_full,
         precipitation=P_full,
-        humidity=q_full,
+        humidity=humidity_next,
+        soil_moisture=soil_next,
     )
 
 
