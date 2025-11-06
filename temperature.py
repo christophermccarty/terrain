@@ -113,7 +113,7 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 80,
 def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 80) -> np.ndarray:
     """Return latitude-dependent albedo accounting for ice/snow at poles.
     
-    Ice/snow has high albedo (0.7-0.85) at poles, typical Earth surface (0.2-0.3)
+    Ice/snow has high albedo (0.8-0.9) at poles, typical Earth surface (0.2-0.3)
     at mid/low latitudes. Smooth transition between zones. Albedo slightly lower
     during summer at poles due to partial ice melt.
     """
@@ -127,13 +127,13 @@ def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 80) -> np.ndarr
     transition_start = 60.0  # degrees
     
     # Seasonal variation: reduce ice albedo slightly during summer due to partial melt
-    # Winter: A_ice = 0.85 (full ice cover), Summer: A_ice = 0.75 (partial melt)
+    # Winter: A_ice = 0.90 (full ice cover), Summer: A_ice = 0.80 (partial melt)
     obliq = np.deg2rad(23.44)
     gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / 365.2422
     delta = np.arcsin(np.sin(obliq) * np.sin(gamma))
     # Summer: |delta| > 15°, reduce albedo; Winter: |delta| < 15°, full albedo
     season_factor = np.clip(1.0 - 0.5 * (np.abs(delta) / np.deg2rad(15.0)), 0.5, 1.0)
-    A_ice = 0.75 + 0.10 * season_factor  # Range: 0.75-0.85
+    A_ice = 0.80 + 0.10 * season_factor  # Range: 0.80-0.90
     
     # Linear transition from transition_start to 90°
     transition_range = 90.0 - transition_start

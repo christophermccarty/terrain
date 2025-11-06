@@ -230,7 +230,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
         overlay_tex = generate_temperature_overlay(tex_h, tex_w, day_of_year=day_of_year)
         overlay_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
         overlay_img[idx] = overlay_tex[iy[idx], ix[idx], :]
-        alpha = 0.7
+        alpha = 0.5
         rgbf = (1.0 - alpha) * rgbf + alpha * overlay_img
     elif view == "Wind":
         # Overlay wind arrows (project equirectangular arrows via sampling)

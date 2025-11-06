@@ -226,7 +226,7 @@ def main() -> None:
                     h, w = tex.shape
                     with log_time("Generate temperature overlay"):
                         overlay = generate_temperature_overlay(h, w)
-                alpha = 0.7
+                alpha = 0.5
                 comb = (1.0 - alpha) * base_rgb + alpha * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Wind":
