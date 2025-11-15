@@ -112,6 +112,13 @@ def ensure_elevation(size: int, seed: int = 42, octaves: int = 4, freq: float = 
     - Each texel samples 3D fBM at the unit sphere direction for that lon/lat.
     """
     global _ELEV_TEX, _ELEV_SHAPE, _ELEV_KEY
+    
+    # If a loaded heightmap is in the cache, use it (don't regenerate)
+    if _ELEV_TEX is not None and _ELEV_KEY is not None and isinstance(_ELEV_KEY, tuple) and len(_ELEV_KEY) >= 1:
+        if _ELEV_KEY[0] == "loaded":
+            # Loaded heightmap is cached, return it
+            return _ELEV_TEX
+    
     tex_w, tex_h = size * 2, size  # equirectangular: W=360°, H=180°
     key = (size, int(seed), int(octaves), float(freq), float(lac), float(gain))
     if _ELEV_TEX is not None and _ELEV_KEY == key:
@@ -162,24 +169,71 @@ def colorize(elev: np.ndarray) -> np.ndarray:
     """Map elevation in [0,1] to RGB using a piecewise-linear palette.
 
     Breakpoints span ocean→beach→land→snow; linear interpolation between stops.
+    Raven Maps style: muted earth tones, dense breakpoints for subtle gradients.
     """
-    bp = np.array([0.0, 0.35, 0.48, 0.55, 0.7, 0.85, 1.0], dtype=np.float32)
-    col = np.array([
-        [0.02, 0.08, 0.20],   # deep ocean
-        [0.00, 0.40, 0.70],   # shallow ocean
-        [0.94, 0.86, 0.62],   # beach
-        [0.10, 0.60, 0.20],   # lowland
-        [0.45, 0.34, 0.22],   # highland
-        [0.80, 0.80, 0.80],   # snow line
-        [1.00, 1.00, 1.00],   # peaks
+    # Raven Maps inspired gradient: 20 breakpoints optimized for terrain detail
+    # After normalization: 0.0 = ocean, 0.0-0.03 = low (0-100m), 0.03-1.0 = higher (100-8848m)
+    bp = np.array([
+        0.0,      # Ocean
+        0.000001, # Immediate coast
+        0.006,    # ~20m: deltas, tidal flats
+        0.012,    # ~40m: river valleys
+        0.018,    # ~60m: coastal plains
+        0.025,    # ~80m: low plains
+        0.035,    # ~120m: plains
+        0.055,    # ~230m: interior lowlands
+        0.085,    # ~350m: rolling plains
+        0.125,    # ~470m: elevated plains
+        0.175,    # ~770m: low hills
+        0.240,    # ~1200m: hills
+        0.320,    # ~1700m: high hills
+        0.420,    # ~2400m: foothills
+        0.530,    # ~3300m: low mountains
+        0.640,    # ~4400m: mountains
+        0.740,    # ~5500m: high mountains
+        0.850,    # ~7000m: alpine peaks
+        0.950,    # ~8200m: snow peaks
+        1.000,    # ~8848m: highest peaks
     ], dtype=np.float32)
+    
+    # Muted, desaturated earth tones for natural appearance
+    col = np.array([
+        [0.02, 0.08, 0.22],   # Ocean: deep blue
+        [0.68, 0.72, 0.58],   # Coast: sandy tan
+        [0.64, 0.69, 0.54],   # Deltas: light tan-green
+        [0.60, 0.66, 0.50],   # River valleys: tan-green
+        [0.56, 0.63, 0.47],   # Coastal plains: muted green-tan
+        [0.53, 0.60, 0.45],   # Low plains: olive-tan
+        [0.51, 0.58, 0.43],   # Plains: olive
+        [0.52, 0.57, 0.43],   # Interior lowlands: yellow-olive
+        [0.54, 0.58, 0.44],   # Rolling plains: light olive
+        [0.56, 0.58, 0.45],   # Elevated plains: tan-olive
+        [0.58, 0.58, 0.46],   # Low hills: yellow-tan
+        [0.61, 0.58, 0.47],   # Hills: tan
+        [0.63, 0.57, 0.47],   # High hills: tan-brown
+        [0.66, 0.56, 0.46],   # Foothills: brown-tan
+        [0.68, 0.54, 0.45],   # Low mountains: brown
+        [0.71, 0.54, 0.44],   # Mountains: darker brown
+        [0.74, 0.57, 0.47],   # High mountains: brown-gray
+        [0.80, 0.70, 0.62],   # Alpine peaks: tan-gray
+        [0.90, 0.88, 0.86],   # Snow peaks: light gray
+        [1.00, 1.00, 1.00],   # Highest peaks: pure white
+    ], dtype=np.float32)
+    
+    # Calculate interpolated colors
     i = np.clip(np.searchsorted(bp, elev, side="right") - 1, 0, len(bp) - 2)
     c0, c1 = col[i], col[i + 1]
     t = (elev - bp[i]) / (bp[i + 1] - bp[i] + 1e-9)
-    return c0 + (c1 - c0) * t[..., None]
+    result = c0 + (c1 - c0) * t[..., None]
+    
+    # Force pixels at exactly 0.0 to be pure ocean color (no interpolation)
+    ocean_mask = (elev == 0.0)
+    result[ocean_mask] = col[0]
+    
+    return result
 
 
-def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, view: str = "Terrain", seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5, day_of_year: int = 80) -> Image.Image:
+def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, view: str = "Terrain", seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5, day_of_year: int = 1) -> Image.Image:
     """Render a fully lit sphere by sampling the cached terrain. radius<1 zooms out.
 
     - Build a canvas-space unit disk and reconstruct Z for the sphere surface.
@@ -214,6 +268,13 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
 
     # Fully lit: sample cached elevation and map to color; optionally blend temperature
     tex = ensure_elevation(size, seed=seed, octaves=octaves, freq=freq, lac=lac, gain=gain)
+    
+    # Check if we have a loaded heightmap and flip it for correct globe orientation
+    _, elev_key = get_elevation_cache()
+    if elev_key is not None and isinstance(elev_key, tuple) and len(elev_key) >= 1 and elev_key[0] == "loaded":
+        # Flip loaded heightmap horizontally for globe view only
+        tex = np.fliplr(tex)
+    
     tex_h, tex_w = tex.shape
     # normal → spherical → texture coords (equirectangular mapping)
     phi = np.arctan2(n[..., 2], n[..., 0])
@@ -227,7 +288,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
     elev_img[idx] = tex[iy[idx], ix[idx]]
     rgbf = colorize(elev_img)
     if view == "Temperature":
-        overlay_tex = generate_temperature_overlay(tex_h, tex_w, day_of_year=day_of_year)
+        overlay_tex = generate_temperature_overlay(tex_h, tex_w, day_of_year=day_of_year, elevation=tex)
         overlay_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
         overlay_img[idx] = overlay_tex[iy[idx], ix[idx], :]
         alpha = 0.5
@@ -257,5 +318,18 @@ def clear_elevation_cache() -> None:
     _ELEV_TEX = None
     _ELEV_SHAPE = (0, 0)
     _ELEV_KEY = None
+
+
+def set_elevation_cache(elevation: np.ndarray, key: tuple | None = None) -> None:
+    """Set elevation cache with custom data (e.g., loaded heightmap).
+    
+    Args:
+        elevation: (H, W) elevation array in [0, 1]
+        key: Optional cache key (use special key for loaded data)
+    """
+    global _ELEV_TEX, _ELEV_SHAPE, _ELEV_KEY
+    _ELEV_TEX = elevation.astype(np.float32)
+    _ELEV_SHAPE = elevation.shape
+    _ELEV_KEY = key if key is not None else ("loaded", elevation.shape)
 
 
