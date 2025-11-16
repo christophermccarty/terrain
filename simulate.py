@@ -167,7 +167,7 @@ def simulate_step(
             elev_pad = np.pad(state.elevation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
             elev_coarse = elev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
         u_coarse, v_coarse = generate_wind_field(
-            Hc, Wc, day_of_year=int(new_day), block_size=1, elevation=elev_coarse
+            Hc, Wc, day_of_year=int(new_day), block_size=1, elevation=elev_coarse, debug_log=debug_log
         )
         if block_size > 1:
             u_full = np.repeat(np.repeat(u_coarse, block_size, axis=0), block_size, axis=1)[:H, :W]
