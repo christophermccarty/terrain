@@ -147,6 +147,7 @@ def generate_wind_field(
     block_size: int = 3,
     elevation: np.ndarray | None = None,
     terrain_influence: float = 1.0,
+    debug_log: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v) near-surface winds derived from pressure gradients.
 
@@ -245,7 +246,7 @@ def generate_wind_field(
     # Scale by Coriolis parameter f = 2Ω sin(φ)
     f_coriolis = 2.0 * 7.2921e-5 * np.sin(lat)  # Earth's rotation rate
     # Avoid division by zero at equator: enforce minimum magnitude while preserving sign
-    f_min = 1e-5
+    f_min = 3e-5  # Increased from 1e-5 for stronger damping near equator
     mask_pos = f_coriolis >= 0
     f_coriolis = np.where(mask_pos, np.maximum(f_coriolis, f_min), np.minimum(f_coriolis, -f_min))
     
@@ -257,17 +258,52 @@ def generate_wind_field(
     u_geo = -(1.0 / (rho * f_coriolis[:, None])) * dp_dy
     v_geo = (1.0 / (rho * f_coriolis[:, None])) * dp_dx
     
-    # Scale to realistic speeds (geostrophic approximation overestimates near surface)
-    u_geo = np.clip(u_geo * 0.6, -25.0, 25.0)
-    v_geo = np.clip(v_geo * 0.6, -15.0, 15.0)
+    # Add tropical wind model (trade winds/Walker circulation)
+    # Geostrophic approximation breaks down near equator; use direct tropical circulation
+    abs_lat = np.abs(lat)
+    tropical_mask = abs_lat < np.deg2rad(25.0)  # ±25° tropical zone
+    
+    # Tropical easterlies (trade winds): -1.6 to -2.6 m/s with Walker circulation
+    u_tropical = -2.1 + -0.4 * np.sin(lon[None, :] * 1.4)  # (Hc, Wc)
+    # Weak meridional component (ITCZ convergence)
+    v_tropical = 0.05 * np.sin(lat[:, None] * 3.0)  # (Hc, Wc)
+    
+    # Blend: tropical model in tropics, geostrophic elsewhere
+    # Tropical zones use primarily tropical model with small geostrophic component
+    geo_scale_mid = 0.08
+    geo_scale_trop = 0.02
+    u_geo = np.where(tropical_mask[:, None], 
+                     u_tropical + geo_scale_trop * u_geo,  # Small geostrophic contribution
+                     geo_scale_mid * u_geo)  # Mid/high latitudes use geostrophic
+    v_geo = np.where(tropical_mask[:, None],
+                     v_tropical + geo_scale_trop * v_geo,
+                     geo_scale_mid * v_geo)
+    
+    # Latitude-dependent clipping for realistic wind speeds
+    tropical_limit_u = 12.0  # Weaker tropical winds
+    midlat_limit_u = 22.0    # Stronger mid-latitude storm tracks
+    tropical_limit_v = 8.0
+    midlat_limit_v = 15.0
+    
+    # Scale limits linearly from equator (0) to 60° (1); equator keeps tropical caps
+    lat_factor = np.clip(np.abs(lat) / np.deg2rad(60.0), 0.0, 1.0)
+    u_limit = tropical_limit_u + (midlat_limit_u - tropical_limit_u) * lat_factor
+    v_limit = tropical_limit_v + (midlat_limit_v - tropical_limit_v) * lat_factor
+    
+    u_geo = np.clip(u_geo, -u_limit[:, None], u_limit[:, None])
+    v_geo = np.clip(v_geo, -v_limit[:, None], v_limit[:, None])
     
     # Add ageostrophic component (cross-isobar flow toward low pressure)
-    ageo_frac = 0.15
-    u_ageo = -ageo_frac * dp_dx / (np.abs(dp_dx) + 1e-3) * np.abs(u_geo) * 0.3
-    v_ageo = -ageo_frac * dp_dy / (np.abs(dp_dy) + 1e-3) * np.abs(v_geo) * 0.3
+    ageo_frac = 0.03
+    u_ageo = -ageo_frac * dp_dx / (np.abs(dp_dx) + 1e-3) * np.abs(u_geo) * 0.10
+    v_ageo = -ageo_frac * dp_dy / (np.abs(dp_dy) + 1e-3) * np.abs(v_geo) * 0.10
     
     uc = u_geo + u_ageo
     vc = v_geo + v_ageo
+    lat_amp = 0.06 + 0.60 * (lat_factor ** 1.6)
+    global_amp = 0.30
+    uc = uc * lat_amp[:, None] * global_amp
+    vc = vc * lat_amp[:, None] * global_amp
     
     # Convert to vorticity and solve via streamfunction to ensure divergence-free
     dvc_dx = np.gradient(vc, axis=1)
@@ -290,9 +326,9 @@ def generate_wind_field(
         # Mountain blocking
         block_factor = np.clip(1.0 - terrain_influence * 0.5 * elev_norm, 0.4, 1.0)
         
-        # Terrain channeling (flow follows valleys)
+        # Terrain channeling (flow follows valleys) - reduced from 0.25 to 0.15
         slope_mag = np.hypot(gx, gy)
-        channel_factor = 1.0 + terrain_influence * 0.25 * slope_mag
+        channel_factor = 1.0 + terrain_influence * 0.15 * slope_mag
         
         # Deflection around obstacles
         deflect_u = -terrain_influence * 0.3 * gx * slope_mag
@@ -301,8 +337,8 @@ def generate_wind_field(
         uc = (uc * block_factor + deflect_u) * channel_factor
         vc = (vc * block_factor + deflect_v) * channel_factor
         
-        # Land-sea friction contrast
-        friction_factor = np.where(sea_mask, 1.15, 0.85)
+        # Land-sea friction contrast - reduced from 1.15/0.85 to 1.08/0.92
+        friction_factor = np.where(sea_mask, 1.08, 0.92)
         uc *= friction_factor
         vc *= friction_factor
     
@@ -310,8 +346,36 @@ def generate_wind_field(
     uc = uc + 0.10 * _laplacian(uc)
     vc = vc + 0.10 * _laplacian(vc)
     
-    uc = np.clip(uc, -30.0, 30.0).astype(np.float32)
-    vc = np.clip(vc, -20.0, 20.0).astype(np.float32)
+    uc = np.clip(uc, -u_limit[:, None], u_limit[:, None]).astype(np.float32)
+    vc = np.clip(vc, -v_limit[:, None], v_limit[:, None]).astype(np.float32)
+    
+    # Debug logging for wind diagnostics
+    if debug_log:
+        from terrain import LOG
+        wind_mag = np.sqrt(uc*uc + vc*vc)
+        LOG.info(f"[Wind Debug Day {day_of_year}]")
+        LOG.info(f"  Pressure: min={float(np.min(pressure)):.1f}, mean={float(np.mean(pressure)):.1f}, max={float(np.max(pressure)):.1f} hPa")
+        LOG.info(f"  Pressure gradients: dp_dx mean={float(np.mean(np.abs(dp_dx))):.4f}, dp_dy mean={float(np.mean(np.abs(dp_dy))):.4f}")
+        LOG.info(f"  f_coriolis: min={float(np.min(np.abs(f_coriolis))):.2e}, max={float(np.max(np.abs(f_coriolis))):.2e}")
+        LOG.info(f"  u_final: min={float(np.min(uc)):.1f}, mean={float(np.mean(uc)):.1f}, max={float(np.max(uc)):.1f} m/s")
+        LOG.info(f"  v_final: min={float(np.min(vc)):.1f}, mean={float(np.mean(vc)):.1f}, max={float(np.max(vc)):.1f} m/s")
+        LOG.info(f"  Wind magnitude: min={float(np.min(wind_mag)):.1f}, mean={float(np.mean(wind_mag)):.1f}, max={float(np.max(wind_mag)):.1f} m/s")
+        LOG.info(f"  Wind percentiles: p10={float(np.percentile(wind_mag, 10)):.1f}, p50={float(np.percentile(wind_mag, 50)):.1f}, p90={float(np.percentile(wind_mag, 90)):.1f} m/s")
+        
+        # Latitude band breakdown
+        eq_band = np.abs(lat) < np.deg2rad(10)
+        trop_band = (np.abs(lat) >= np.deg2rad(10)) & (np.abs(lat) < np.deg2rad(30))
+        mid_band = (np.abs(lat) >= np.deg2rad(30)) & (np.abs(lat) < np.deg2rad(60))
+        
+        LOG.info(f"  By latitude - Equatorial (0-10°): mean={float(np.mean(wind_mag[eq_band[:, None].repeat(Wc, 1)])):.1f} m/s")
+        LOG.info(f"  By latitude - Tropical (10-30°): mean={float(np.mean(wind_mag[trop_band[:, None].repeat(Wc, 1)])):.1f} m/s")
+        LOG.info(f"  By latitude - Mid-lat (30-60°): mean={float(np.mean(wind_mag[mid_band[:, None].repeat(Wc, 1)])):.1f} m/s")
+        
+        # Clipping statistics
+        u_clipped = np.sum((uc == 30.0) | (uc == -30.0))
+        v_clipped = np.sum((vc == 20.0) | (vc == -20.0))
+        total_cells = uc.size
+        LOG.info(f"  Clipping: u_clipped={u_clipped}/{total_cells} ({100.0*u_clipped/total_cells:.1f}%), v_clipped={v_clipped}/{total_cells} ({100.0*v_clipped/total_cells:.1f}%)")
 
     return _upsample_repeat(uc, H, W, block_size), _upsample_repeat(vc, H, W, block_size)
 
@@ -486,6 +550,7 @@ def generate_precipitation(
             day_of_year=day_of_year,
             block_size=1,
             elevation=elev,
+            debug_log=False,
         )
     else:
         u = wind_u.astype(np.float32)
