@@ -25,7 +25,7 @@ from terrain import (
     set_elevation_cache,
     LOG,
 )
-from atmosphere import generate_wind_field, render_wind_arrows, generate_precipitation
+from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb, generate_precipitation
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
 from diagnostics import ClimateDiagnostics
@@ -136,9 +136,12 @@ def main() -> None:
     sim_controls = tk.Frame(root)
     sim_controls.pack(fill="x")
     sim_status_var = tk.StringVar(value="Stopped")
+    sim_cycle_var = tk.StringVar(value="Year: 1")
     tk.Label(sim_controls, text="Simulation:").pack(side="left", padx=(4,0))
     sim_status_label = tk.Label(sim_controls, textvariable=sim_status_var)
     sim_status_label.pack(side="left", padx=4)
+    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var)
+    sim_cycle_label.pack(side="left", padx=8)
     tk.Button(sim_controls, text="Start", command=lambda: start_simulation()).pack(side="left", padx=2)
     tk.Button(sim_controls, text="Stop", command=lambda: stop_simulation()).pack(side="left", padx=2)
     tk.Button(sim_controls, text="Pause", command=lambda: pause_simulation()).pack(side="left", padx=2)
@@ -321,14 +324,15 @@ def main() -> None:
         else:
             tex = ensure_elevation(size, **p)
             if view_var.get() == "Wind":
-                base_rgb = colorize(tex)
-                wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()))
+                wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
                 if _WIND_CACHE["key"] != wkey:
                     with log_time("Generate wind field+arrows"):
-                        u, v = generate_wind_field(*tex.shape, elevation=tex, debug_log=False)
+                        u, v = generate_wind_field(*tex.shape, elevation=tex, upsample="bilinear", weather_amp=0.35, debug_log=False)
                         _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
                 else:
                     u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
+                speed = np.hypot(u, v).astype(np.float32)
+                base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 comb = np.clip(base_rgb + arrows, 0.0, 1.0)
                 arr = (comb * 255).astype(np.uint8)
@@ -500,13 +504,15 @@ def main() -> None:
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
                 else:
-                    wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()))
+                    wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
                     if _WIND_CACHE["key"] != wkey:
                         with log_time("Generate wind field"):
-                            u, v = generate_wind_field(*tex.shape, elevation=tex, debug_log=False)
+                            u, v = generate_wind_field(*tex.shape, elevation=tex, upsample="bilinear", weather_amp=0.35, debug_log=False)
                             _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
                     else:
                         u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
+                speed = np.hypot(u, v).astype(np.float32)
+                base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 arr = (np.clip(base_rgb + arrows, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Precipitation":
@@ -547,7 +553,7 @@ def main() -> None:
         canvas.itemconfig(img_id, image=tk_img)
         # Update status with simulation day (only if not paused)
         if use_sim_data and not sim_paused:
-            sim_status_var.set(f"Running: Day {sim_state.day_of_year:.1f}")
+            sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
         # Clear lat/lon when switching out of map
         if mode_var.get() != "map":
             latlon_var.set("")
@@ -567,6 +573,8 @@ def main() -> None:
         sim_running = True
         sim_paused = False
         sim_status_var.set("Running")
+        # Diagnostics tracks total time; use it to display cycle count (years).
+        sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
         update_simulation()
     
     def stop_simulation():
@@ -587,6 +595,11 @@ def main() -> None:
         sim_running = False
         sim_paused = False
         sim_status_var.set("Stopped")
+        # Reset diagnostics time so cycle counter restarts.
+        diagnostics.history.clear()
+        diagnostics.component_history.clear()
+        diagnostics.total_days = 0.0
+        sim_cycle_var.set("Year: 1")
         render()
     
     def update_cursor_display(x: int, y: int):
@@ -634,8 +647,8 @@ def main() -> None:
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
                 elif _WIND_CACHE["u"] is None or _WIND_CACHE["u"].shape != (h, w):
-                    u, v = generate_wind_field(h, w, elevation=tex, debug_log=False)
-                    _WIND_CACHE.update({"key": (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get())), "u": u, "v": v})
+                    u, v = generate_wind_field(h, w, elevation=tex, upsample="bilinear", weather_amp=0.35, debug_log=False)
+                    _WIND_CACHE.update({"key": (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear"), "u": u, "v": v})
                 else:
                     u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
@@ -695,6 +708,7 @@ def main() -> None:
                     days_elapsed=sim_speed,
                     component_contributions=temp_components
                 )
+                sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
             # Update display
             render()
             # Update cursor display at last known mouse position

@@ -17,6 +17,7 @@ class PlanetState(NamedTuple):
     """Current planet state snapshot."""
     day_of_year: float  # Fractional day (0-365.2422)
     elevation: np.ndarray  # (H, W) terrain elevation [0,1]
+    total_days: float = 0.0  # Unwrapped simulation time (days since start)
     temperature: np.ndarray | None = None  # (H, W) surface temperature (K)
     air_temperature: np.ndarray | None = None  # (H, W) troposphere temperature (K)
     wind_u: np.ndarray | None = None  # (H, W) eastward wind (m/s)
@@ -41,6 +42,7 @@ def simulate_step(
     precip_iterations: int = 48,
     update_wind: bool = True,
     update_precip: bool = True,
+    wind_relax: float = 0.35,
     debug_log: bool = False,
     track_components: bool = False,
 ) -> tuple[PlanetState, dict]:
@@ -73,6 +75,7 @@ def simulate_step(
         New state with updated day_of_year and atmospheric fields
     """
     new_day = (state.day_of_year + days) % 365.2422
+    new_total_days = float(state.total_days) + float(days)
     H, W = state.elevation.shape
     Hc, Wc = (max(1, (H + block_size - 1) // block_size),
               max(1, (W + block_size - 1) // block_size))
@@ -147,6 +150,26 @@ def simulate_step(
             elevation=elev_c,
             dt_days=days
         )
+
+        # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
+        # (generate_wind_field injects synoptic-scale "weather systems" seeded by day_of_year).
+        if wind_relax > 0.0:
+            u_diag, v_diag = generate_wind_field(
+                Hc,
+                Wc,
+                day_of_year=int(new_day),
+                block_size=1,
+                temperature=T_for_wind,
+                elevation=elev_c,
+                weather_amp=0.80,
+                zonal_pressure=1.0,
+                terrain_pressure_amp=0.25,
+                terrain_flow_amp=0.25,
+                time_days=new_total_days,
+            )
+            a = float(np.clip(wind_relax, 0.0, 1.0))
+            u_coarse_evol = (1.0 - a) * u_coarse_evol + a * u_diag
+            v_coarse_evol = (1.0 - a) * v_coarse_evol + a * v_diag
         
         # Upsample back to full resolution using bilinear interpolation
         from atmosphere import _upsample_bilinear
@@ -164,6 +187,24 @@ def simulate_step(
             elevation=state.elevation,
             dt_days=days
         )
+        if wind_relax > 0.0:
+            T_for_wind = state.temperature if state.temperature is not None else T_base
+            u_diag, v_diag = generate_wind_field(
+                H,
+                W,
+                day_of_year=int(new_day),
+                block_size=1,
+                temperature=T_for_wind,
+                elevation=state.elevation,
+                weather_amp=0.80,
+                zonal_pressure=1.0,
+                terrain_pressure_amp=0.25,
+                terrain_flow_amp=0.25,
+                time_days=new_total_days,
+            )
+            a = float(np.clip(wind_relax, 0.0, 1.0))
+            u_full = (1.0 - a) * u_full + a * u_diag
+            v_full = (1.0 - a) * v_full + a * v_diag
         u_coarse = u_full
         v_coarse = v_full
 
@@ -290,8 +331,13 @@ def simulate_step(
                 if P_prev.shape == P_full.shape:
                     P_full = 0.7 * P_full + 0.3 * P_prev
                 # Additional spatial smoothing to reduce extreme values
-                P_pad = np.pad(P_full, 1, mode="edge")
-                P_lap = P_pad[0:-2, 1:-1] + P_pad[2:, 1:-1] + P_pad[1:-1, 0:-2] + P_pad[1:-1, 2:] - 4.0 * P_full
+                P_pad = np.pad(P_full, ((1, 1), (0, 0)), mode="edge")
+                c = P_pad[1:-1, :]
+                n = P_pad[0:-2, :]
+                s = P_pad[2:, :]
+                e = np.roll(c, -1, axis=1)
+                w = np.roll(c, 1, axis=1)
+                P_lap = n + s + e + w - 4.0 * c
                 P_full = P_full + 0.1 * P_lap  # Light smoothing
                 P_full = np.maximum(P_full, 0.0)  # Ensure non-negative
             
@@ -327,8 +373,13 @@ def simulate_step(
                 if P_prev.shape == P_full.shape:
                     P_full = 0.7 * P_full + 0.3 * P_prev
                 # Additional spatial smoothing to reduce extreme values
-                P_pad = np.pad(P_full, 1, mode="edge")
-                P_lap = P_pad[0:-2, 1:-1] + P_pad[2:, 1:-1] + P_pad[1:-1, 0:-2] + P_pad[1:-1, 2:] - 4.0 * P_full
+                P_pad = np.pad(P_full, ((1, 1), (0, 0)), mode="edge")
+                c = P_pad[1:-1, :]
+                n = P_pad[0:-2, :]
+                s = P_pad[2:, :]
+                e = np.roll(c, -1, axis=1)
+                w = np.roll(c, 1, axis=1)
+                P_lap = n + s + e + w - 4.0 * c
                 P_full = P_full + 0.1 * P_lap  # Light smoothing
                 P_full = np.maximum(P_full, 0.0)  # Ensure non-negative
     else:
@@ -376,6 +427,7 @@ def simulate_step(
     
     new_state = PlanetState(
         day_of_year=new_day,
+        total_days=new_total_days,
         elevation=state.elevation,
         temperature=T_full,
         wind_u=u_full,
@@ -439,6 +491,7 @@ def create_initial_state(
     """
     state = PlanetState(
         day_of_year=day_of_year,
+        total_days=0.0,
         elevation=elevation,
         temperature=None,
         wind_u=None,
@@ -534,8 +587,14 @@ def _evolve_temperature(
     # Increased diffusion to reduce regional hot spots and improve stability
     # More iterations and higher coefficient to smooth out asymmetries
     for _ in range(3):  # Increased from 2 to 3 iterations
-        T_pad = np.pad(T, 1, mode="edge")
-        T_lap = T_pad[0:-2, 1:-1] + T_pad[2:, 1:-1] + T_pad[1:-1, 0:-2] + T_pad[1:-1, 2:] - 4.0 * T
+        # Periodic longitude (axis=1), clamped poles (axis=0)
+        T_pad = np.pad(T, ((1, 1), (0, 0)), mode="edge")
+        c = T_pad[1:-1, :]
+        n = T_pad[0:-2, :]
+        s = T_pad[2:, :]
+        e = np.roll(c, -1, axis=1)
+        w = np.roll(c, 1, axis=1)
+        T_lap = n + s + e + w - 4.0 * c
         # Clamp laplacian to prevent extreme smoothing
         T_lap = np.clip(T_lap, -30.0, 30.0)  # Max ±30K smoothing per iteration
         T = T + thermal_diffusion * 1.2 * T_lap * days  # Increased effective diffusion by 20%
@@ -694,8 +753,13 @@ def _evolve_temperature(
         
         T_after_diffusion = T_after_advection.copy()
         for _ in range(2):
-            T_pad = np.pad(T_after_diffusion, 1, mode="edge")
-            T_lap = T_pad[0:-2, 1:-1] + T_pad[2:, 1:-1] + T_pad[1:-1, 0:-2] + T_pad[1:-1, 2:] - 4.0 * T_after_diffusion
+            T_pad = np.pad(T_after_diffusion, ((1, 1), (0, 0)), mode="edge")
+            c = T_pad[1:-1, :]
+            n = T_pad[0:-2, :]
+            s = T_pad[2:, :]
+            e = np.roll(c, -1, axis=1)
+            w = np.roll(c, 1, axis=1)
+            T_lap = n + s + e + w - 4.0 * c
             T_lap = np.clip(T_lap, -30.0, 30.0)
             T_after_diffusion = T_after_diffusion + thermal_diffusion * T_lap * days
         components['diffusion'] = T_after_diffusion - T_after_advection
