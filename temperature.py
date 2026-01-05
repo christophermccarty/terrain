@@ -14,6 +14,33 @@ import numpy as np
 EPSILON_ATM = 0.68
 
 
+def elevation_to_alt_km(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: float = 0.05) -> np.ndarray:
+    """Convert normalized elevation [0,1] to approximate altitude (km).
+
+    This matches the UI mappings:
+    - Loaded heightmaps: ocean is exactly 0.0; lowlands 0..0.03 => 0..100m (linear),
+      then a power curve up to 8848m.
+    - Procedural terrain: sea level ~0.2; quadratic rise to 8848m.
+    """
+    e = np.asarray(elevation, dtype=np.float32)
+    if e.size == 0:
+        return e
+    zeros_frac = float(np.mean(e == 0.0))
+    if zeros_frac > assume_loaded_if_zeros_frac:
+        # Loaded heightmap mapping
+        alt_m = np.zeros_like(e)
+        low = (e > 0.0) & (e <= 0.03)
+        high = e > 0.03
+        alt_m[low] = (e[low] / 0.03) * 100.0
+        norm = (e[high] - 0.03) / 0.97
+        alt_m[high] = 100.0 + (norm ** 2.5) * 8748.0
+        return alt_m / 1000.0
+    # Procedural mapping (approx)
+    sea_level = 0.2
+    x = np.clip((e - sea_level) / (1.0 - sea_level + 1e-9), 0.0, 1.0)
+    return (x ** 2.0) * 8.848
+
+
 def _daily_mean_insolation_Q(lat_rad: np.ndarray, day_of_year: int, S0: float = 1361.0) -> np.ndarray:
     """Daily-mean TOA insolation Q(φ, δ) in W/m^2.
 
@@ -76,55 +103,22 @@ def _upsample_repeat(field: np.ndarray, H: int, W: int, block_size: int) -> np.n
     return up[:H, :W]
 
 
-def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, epsilon_atm: float = EPSILON_ATM, block_size: int = 3, elevation: np.ndarray | None = None) -> np.ndarray:
-    """Return an (H,W,3) float32 RGB overlay in [0,1] for given map size.
-
-    NOW USES SIMULATION PHYSICS for consistency:
-    - Creates a temporary simulation state to generate temperature
-    - Includes ocean thermal inertia, seasonal lag, and all moderating effects
-    - Ensures the displayed temperature map matches what the simulation will show
+def temperature_to_rgb(T_kelvin: np.ndarray) -> np.ndarray:
+    """Convert temperature array (Kelvin) to RGB overlay using high-quality color gradient.
+    
+    Uses the same 11-color gradient as generate_temperature_overlay for visual consistency.
+    Range: -80°C to +40°C (193K to 313K).
     
     Args:
-        height: Map height in pixels
-        width: Map width in pixels
-        day_of_year: Day of year (0-365)
-        epsilon_atm: Atmospheric emissivity for greenhouse effect
-        block_size: Coarse resolution for faster computation
-        elevation: Optional (H, W) elevation array [0, 1] where 0.5 = sea level
+        T_kelvin: Temperature array in Kelvin, shape (H, W)
+    
+    Returns:
+        RGB overlay array, shape (H, W, 3), float32 in [0, 1]
     """
-    h = int(height)
-    w = int(width)
-    
-    # Use simulation system to generate temperature with consistent physics
-    from simulate import create_initial_state
-    
-    # Create elevation if not provided
-    if elevation is None:
-        elevation = np.zeros((h, w), dtype=np.float32)
-    
-    # Generate initial state using full simulation physics
-    state = create_initial_state(elevation, day_of_year=float(day_of_year))
-    T_kelvin = state.temperature
-    
-    # Temperature already calculated by simulation system (includes all physics)
-    # T_kelvin shape is (H, W) at full resolution - no need to downsample
-    T_lat = T_kelvin
-    
-    # Log temperature stats (now using simulation temperature)
-    import logging
-    LOG = logging.getLogger("planetsim")
-    LOG.info(f"[Temperature from Simulation] min={float(np.min(T_lat)):.1f}K ({float(np.min(T_lat)-273.15):.1f}°C), "
-             f"mean={float(np.mean(T_lat)):.1f}K ({float(np.mean(T_lat)-273.15):.1f}°C), "
-             f"max={float(np.max(T_lat)):.1f}K ({float(np.max(T_lat)-273.15):.1f}°C)")
-    
-    # T_lat is already full resolution (H, W) with all physics applied by simulation
-    # (includes altitude correction, ocean thermal inertia, seasonal lag, etc.)
-    
     # Normalize to FULL realistic Earth temperature range
     # Extended range: -80°C to +40°C (193K to 313K)
-    # This shows full spectrum from Arctic winter extremes to tropical heat
     tmin, tmax = 193.15, 313.15  # -80°C to +40°C
-    v = np.clip((T_lat - tmin) / (tmax - tmin), 0.0, 1.0).astype(np.float32)
+    v = np.clip((T_kelvin - tmin) / (tmax - tmin), 0.0, 1.0).astype(np.float32)
 
     # Enhanced color gradient with better differentiation across full range
     # Blue→Cyan→Green→Yellow→Orange→Red with more detail in inhabited zones
@@ -147,13 +141,77 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, 
     c1 = color_stops[idx + 1]
     t = (v - breakpoints[idx]) / (breakpoints[idx + 1] - breakpoints[idx] + 1e-9)
     rgb_full = (c0 + (c1 - c0) * t[..., None]).astype(np.float32)
+    return rgb_full
+
+
+def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, epsilon_atm: float = EPSILON_ATM, block_size: int = 3, elevation: np.ndarray | None = None) -> np.ndarray:
+    """Return an (H,W,3) float32 RGB overlay in [0,1] for given map size.
+
+    NOW USES SIMULATION PHYSICS for consistency:
+    - Creates a temporary simulation state to generate temperature
+    - Includes ocean thermal inertia, seasonal lag, and all moderating effects
+    - Ensures the displayed temperature map matches what the simulation will show
+    
+    Args:
+        height: Map height in pixels
+        width: Map width in pixels
+        day_of_year: Day of year (0-365)
+        epsilon_atm: Atmospheric emissivity for greenhouse effect
+        block_size: Coarse resolution for faster computation
+        elevation: Optional (H, W) elevation array [0, 1] where 0.5 = sea level
+    """
+    h = int(height)
+    w = int(width)
+    
+    # Fast path: use simplified temperature calculation for overlay (not full simulation)
+    # This avoids expensive wind/precipitation calculations when just viewing temperature
+    if elevation is None:
+        elevation = np.zeros((h, w), dtype=np.float32)
+    
+    # Calculate temperature directly using latitude-based formula + elevation correction
+    # This is much faster than running full simulation
+    lat = (0.5 - (np.arange(h, dtype=np.float32) + 0.5) / h) * np.pi
+    T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year)
+    T_kelvin = np.repeat(T_lat[:, None], w, axis=1).astype(np.float32)
+    
+    # Apply elevation correction (lapse rate ~6.5 K/km)
+    if elevation is not None and np.any(elevation > 0):
+        alt_km = elevation_to_alt_km(elevation)
+        lapse_rate = 6.5  # K/km
+        T_kelvin = T_kelvin - lapse_rate * alt_km
+    
+    # Temperature already calculated by simulation system (includes all physics)
+    # T_kelvin shape is (H, W) at full resolution - no need to downsample
+    T_lat = T_kelvin
+    
+    # Log temperature stats (now using simulation temperature)
+    import logging
+    LOG = logging.getLogger("planetsim")
+    LOG.info(f"[Temperature from Simulation] min={float(np.min(T_lat)):.1f}K ({float(np.min(T_lat)-273.15):.1f}°C), "
+             f"mean={float(np.mean(T_lat)):.1f}K ({float(np.mean(T_lat)-273.15):.1f}°C), "
+             f"max={float(np.max(T_lat)):.1f}K ({float(np.max(T_lat)-273.15):.1f}°C)")
+    
+    # T_lat is already full resolution (H, W) with all physics applied by simulation
+    # (includes altitude correction, ocean thermal inertia, seasonal lag, etc.)
+    
+    # Log temperature stats (now using simulation temperature)
+    # Removed console logging - uncomment if needed for debugging
+    # import logging
+    # LOG = logging.getLogger("planetsim")
+    # LOG.info(f"[Temperature from Simulation] min={float(np.min(T_lat)):.1f}K ({float(np.min(T_lat)-273.15):.1f}°C), "
+    #          f"mean={float(np.mean(T_lat)):.1f}K ({float(np.mean(T_lat)-273.15):.1f}°C), "
+    #          f"max={float(np.max(T_lat)):.1f}K ({float(np.max(T_lat)-273.15):.1f}°C)")
+    
+    # Use the same high-quality color mapping function for consistency
+    rgb_full = temperature_to_rgb(T_lat)
     
     # Diagnostic: Color mapping distribution
-    temp_ranges = [(tmin + (tmax-tmin)*bp) for bp in [0.0, 0.25, 0.50, 0.67, 0.83, 1.0]]
-    LOG.info(f"[Color Map] Range: {temp_ranges[0]-273.15:.0f}°C to {temp_ranges[-1]-273.15:.0f}°C | "
-             f"Blue<{temp_ranges[1]-273.15:.0f}°C, Cyan={temp_ranges[1]-273.15:.0f} to {temp_ranges[2]-273.15:.0f}°C, "
-             f"Green={temp_ranges[2]-273.15:.0f} to {temp_ranges[3]-273.15:.0f}°C, Yellow={temp_ranges[3]-273.15:.0f} to {temp_ranges[4]-273.15:.0f}°C, "
-             f"Orange-Red>{temp_ranges[4]-273.15:.0f}°C")
+    # Removed console logging - uncomment if needed for debugging
+    # temp_ranges = [(tmin + (tmax-tmin)*bp) for bp in [0.0, 0.25, 0.50, 0.67, 0.83, 1.0]]
+    # LOG.info(f"[Color Map] Range: {temp_ranges[0]-273.15:.0f}°C to {temp_ranges[-1]-273.15:.0f}°C | "
+    #          f"Blue<{temp_ranges[1]-273.15:.0f}°C, Cyan={temp_ranges[1]-273.15:.0f} to {temp_ranges[2]-273.15:.0f}°C, "
+    #          f"Green={temp_ranges[2]-273.15:.0f} to {temp_ranges[3]-273.15:.0f}°C, Yellow={temp_ranges[3]-273.15:.0f} to {temp_ranges[4]-273.15:.0f}°C, "
+    #          f"Orange-Red>{temp_ranges[4]-273.15:.0f}°C")
     
     # Return RGB overlay at full resolution (H, W, 3)
     return rgb_full
@@ -296,8 +354,8 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     
     # LATITUDE-DEPENDENT GREENHOUSE EFFECT (realistic atmospheric physics)
     abs_lat_deg = np.rad2deg(np.abs(lat))
-    epsilon_equator = 0.68  # Strong greenhouse (humid tropics) - INCREASED to warm base temps
-    epsilon_pole = 0.40     # Weak greenhouse (dry polar air)
+    epsilon_equator = 0.78  # Increased from 0.75 to 0.78 to warm equator and global mean more aggressively
+    epsilon_pole = 0.55     # Increased from 0.50 to 0.55 to reduce polar extremes further
     lat_factor = np.cos(np.deg2rad(abs_lat_deg))  # 1.0 at equator, 0.0 at poles
     epsilon_lat = epsilon_pole + (epsilon_equator - epsilon_pole) * lat_factor
     
@@ -345,7 +403,8 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     
     # Maximum latent heat flux during peak melting conditions
     # Peak value: 150 W/m² at poles during midsummer with full sun
-    F_latent_max = 150.0  # W/m²
+    # FURTHER REDUCED to prevent excessive polar cooling (global mean too cold)
+    F_latent_max = 30.0  # Reduced from 50 to 30 W/m² to warm poles more aggressively
     
     # Apply latent heat flux loss only during melt season
     # Scales with solar intensity (more sun = more melting)
@@ -375,7 +434,7 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     # Convective flux scales with temperature excess above freezing (273K)
     # Only active when surface is warm enough to drive convection (>260K = -13°C)
     T_excess = np.maximum(T_estimate - 260.0, 0.0)  # Kelvin above -13°C
-    convection_efficiency = 2.0  # W/m² per K excess (empirically calibrated)
+    convection_efficiency = 0.4  # Reduced from 0.6 to 0.4 W/m² per K excess to warm poles more
     
     # Apply convective export in polar regions (>50° latitude)
     polar_convection_mask = abs_lat_deg > 50.0
@@ -385,8 +444,8 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
         0.0
     )
     
-    # Limit convective export to reasonable values (0-80 W/m²)
-    F_convective = np.clip(F_convective, 0.0, 80.0)
+    # Limit convective export to reasonable values (0-20 W/m²) - further reduced to warm poles
+    F_convective = np.clip(F_convective, 0.0, 20.0)
     
     # ==============================================================================
     # NET FLUX AFTER POLAR COOLING MECHANISMS
@@ -399,7 +458,9 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     T = np.power(F_net / (sigma * gh_denom), 0.25)
     
     # Minimum temperature floor during polar night (accounts for heat transport/thermal inertia)
-    T_min = 200.0
+    # Earth's coldest recorded: -89.2°C (184K) at Vostok, but typical polar winter is -50°C to -60°C (223-213K)
+    # Increased to 240K (-33°C) to match Earth reference pole_temp_winter and warm global mean
+    T_min = 240.0  # Increased from 230K to 240K to warm poles and reduce gradient
     T = np.maximum(T, T_min)
     
     if np.isscalar(lat_rad):

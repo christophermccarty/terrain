@@ -27,7 +27,8 @@ from terrain import (
 )
 from atmosphere import generate_wind_field, render_wind_arrows, generate_precipitation
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
-from simulate import PlanetState, create_initial_state, simulate_step
+from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
+from diagnostics import ClimateDiagnostics
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
@@ -63,7 +64,6 @@ def main() -> None:
     sim_paused = False
     sim_speed = 1.0  # days per step
     last_mouse_pos = (0, 0)  # Track last mouse position for cursor updates
-    last_debug_day = 0.0  # Track last day we logged debug info
     
     # Terrain mode: "procedural" or "loaded"
     terrain_mode = "procedural"
@@ -78,7 +78,59 @@ def main() -> None:
     tk.Radiobutton(controls, text="Globe", variable=mode_var, value="globe").pack(side="left")
     tk.Radiobutton(controls, text="Map", variable=mode_var, value="map").pack(side="left")
     tk.Label(controls, text="View").pack(side="left", padx=(8,0))
-    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind", "Precipitation").pack(side="left")
+    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind", "Precipitation", "Cloud Cover", "Snow Cover").pack(side="left")
+    
+    # Diagnostics
+    diagnostics = ClimateDiagnostics(track_history=True)
+    
+    def export_data():
+        """Export simulation time series data."""
+        if not diagnostics.history:
+            messagebox.showinfo("Info", "No simulation data to export. Please run the simulation first.")
+            return
+        
+        try:
+            filename = filedialog.asksaveasfilename(
+                title="Export Simulation Data",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("JSON files", "*.json"), ("All files", "*.*")]
+            )
+            if filename:
+                if filename.endswith('.json'):
+                    filepath = diagnostics.export_time_series(filename, format='json')
+                else:
+                    filepath = diagnostics.export_time_series(filename, format='csv')
+                messagebox.showinfo("Export Complete", f"Data exported to:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export data:\n{str(e)}")
+    
+    def run_benchmark():
+        if sim_state is None:
+            messagebox.showinfo("Info", "Please start or initialize simulation first.")
+            return
+        
+        sim_running = False
+        sim_status_var.set("Benchmarking...")
+        root.update()
+        
+        LOG.info("Starting 1-year benchmark...")
+        # Run for 365 days
+        states = simulate_multiple_steps(sim_state, total_days=365.0, step_days=1.0)
+        
+        # Analyze final state
+        final_state = states[-1]
+        stats = diagnostics.analyze_snapshot(final_state)
+        diagnostics.print_report(stats)
+        
+        messagebox.showinfo("Benchmark Complete", 
+            f"Global Mean Temp: {stats['global_mean_temp']:.1f} K\n"
+            f"Equator-Pole Gradient: {stats['gradient_north']:.1f} K\n"
+            "Check console for full report.")
+        
+        sim_status_var.set("Stopped")
+
+    tk.Button(controls, text="Export Data", command=export_data).pack(side="right", padx=10)
+    tk.Button(controls, text="Benchmark", command=run_benchmark).pack(side="right", padx=10)
     
     # Simulation controls
     sim_controls = tk.Frame(root)
@@ -413,18 +465,10 @@ def main() -> None:
             
             if view_var.get() == "Temperature":
                 if use_sim_data and sim_state.temperature is not None:
-                    # Use simulation temperature, convert to overlay RGB
+                    # Use simulation temperature, convert to overlay RGB using same high-quality mapping
+                    from temperature import temperature_to_rgb
                     T = sim_state.temperature
-                    h, w = T.shape
-                    T_norm = (T - 200.0) / 100.0  # Normalize roughly [200K, 300K] -> [0, 1]
-                    T_norm = np.clip(T_norm, 0.0, 1.0)
-                    # Blue→Green→Yellow→Red gradient
-                    cstops = np.array([[0.0,0.2,0.8],[0.0,0.8,0.0],[0.9,0.9,0.0],[0.9,0.1,0.0]], dtype=np.float32)
-                    bp = np.array([0.0, 0.33, 0.66, 1.0], dtype=np.float32)
-                    i = np.clip(np.searchsorted(bp, T_norm, side="right") - 1, 0, len(bp) - 2)
-                    c0 = cstops[i]; c1 = cstops[i+1]
-                    t = (T_norm - bp[i]) / (bp[i+1] - bp[i] + 1e-9)
-                    overlay = c0 + (c1 - c0) * t[..., None]
+                    overlay = temperature_to_rgb(T)
                 else:
                     h, w = tex.shape
                     with log_time("Generate temperature overlay"):
@@ -432,6 +476,26 @@ def main() -> None:
                 alpha = 0.5
                 comb = (1.0 - alpha) * base_rgb + alpha * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+            elif view_var.get() == "Cloud Cover":
+                if use_sim_data and sim_state.cloud_cover is not None:
+                    C = sim_state.cloud_cover
+                    # White clouds
+                    overlay = np.stack([C, C, C], axis=-1)
+                    alpha = C * 0.8
+                    comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
+                    arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+                else:
+                    arr = (base_rgb * 255).astype(np.uint8)
+            elif view_var.get() == "Snow Cover":
+                if use_sim_data and sim_state.snow_depth is not None:
+                    S = np.clip(sim_state.snow_depth, 0.0, 1.0)
+                    # White snow (slightly blueish)
+                    overlay = np.array([0.9, 0.9, 1.0], dtype=np.float32)
+                    alpha = S * 0.9
+                    comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
+                    arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+                else:
+                    arr = (base_rgb * 255).astype(np.uint8)
             elif view_var.get() == "Wind":
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
@@ -466,7 +530,6 @@ def main() -> None:
                         P = _PRECIP_CACHE["P"]
                 # Fixed color scale: 0..20 mm/day
                 v = np.clip(P / 20.0, 0.0, 1.0).astype(np.float32)
-                LOG.info(f"Precip stats: min {float(np.min(P)):.2f}, mean {float(np.mean(P)):.2f}, max {float(np.max(P)):.2f} mm/day")
                 # Blue→Green→Yellow→Red
                 cstops = np.array([[0.0,0.2,0.8],[0.0,0.8,0.0],[0.9,0.9,0.0],[0.9,0.1,0.0]], dtype=np.float32)
                 bp = np.array([0.0, 0.33, 0.66, 1.0], dtype=np.float32)
@@ -490,18 +553,17 @@ def main() -> None:
             latlon_var.set("")
 
     def start_simulation():
-        nonlocal sim_state, sim_running, sim_paused, last_debug_day
+        nonlocal sim_state, sim_running, sim_paused
         if sim_state is None:
             # Initialize simulation from current elevation
             tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
             sim_state = create_initial_state(
                 tex,
-                day_of_year=1.0,
+                day_of_year=80.0,
                 evap_coeff=float(precip_evap_var.get()),
                 uplift_coeff=float(precip_uplift_var.get()),
                 rain_efficiency=float(precip_eff_var.get()),
             )
-            last_debug_day = sim_state.day_of_year  # Initialize debug tracking
         sim_running = True
         sim_paused = False
         sim_status_var.set("Running")
@@ -612,22 +674,27 @@ def main() -> None:
             latlon_var.set("")
     
     def update_simulation():
-        nonlocal sim_state, last_debug_day
+        nonlocal sim_state
         if sim_running and not sim_paused and sim_state is not None:
-            # Check if we should log debug info (every 10 days)
-            should_log = (sim_state.day_of_year - last_debug_day) >= 10.0
-            if should_log:
-                last_debug_day = sim_state.day_of_year
-            
             # Advance simulation
-            sim_state = simulate_step(
+            sim_state, temp_components = simulate_step(
                 sim_state,
                 days=sim_speed,
                 evap_coeff=float(precip_evap_var.get()),
                 uplift_coeff=float(precip_uplift_var.get()),
                 rain_efficiency=float(precip_eff_var.get()),
-                debug_log=should_log,
+                debug_log=False,  # Disabled - use export data for analysis instead
+                track_components=True,  # Always track components for diagnostics
             )
+            
+            # Record diagnostics with component tracking
+            if sim_state is not None:
+                diagnostics.record_step(
+                    sim_state, 
+                    sim_state.day_of_year, 
+                    days_elapsed=sim_speed,
+                    component_contributions=temp_components
+                )
             # Update display
             render()
             # Update cursor display at last known mouse position
