@@ -12,6 +12,21 @@ atmospheric transport. This is critical for moderating high-latitude climates.
 import numpy as np
 
 
+def _ocean_mask_from_elevation(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: float = 0.05) -> np.ndarray:
+    """Return boolean ocean mask from normalized elevation.
+
+    - Loaded DEMs in this project encode ocean as exactly 0.0.
+    - Procedural terrain does not, so we fall back to a median sea level split
+      (matching the rest of the simulation).
+    """
+    elev = np.asarray(elevation, dtype=np.float32)
+    zeros_frac = float(np.mean(elev == 0.0)) if elev.size else 0.0
+    if zeros_frac > assume_loaded_if_zeros_frac:
+        return elev == 0.0
+    elev_median = float(np.median(elev))
+    return elev <= elev_median
+
+
 def calculate_ocean_heat_transport(
     T: np.ndarray,
     elevation: np.ndarray,
@@ -47,10 +62,9 @@ def calculate_ocean_heat_transport(
     - Eastern boundary currents (California, Canary) carry cold water south
     - Heat released in high latitudes warms atmosphere
     """
-    # Identify ocean vs land from elevation
-    # Using median as sea level (similar to simulate.py)
-    elev_median = float(np.median(elevation))
-    is_ocean = elevation <= elev_median
+    # Identify ocean vs land from elevation.
+    # NOTE: use a stable mask for loaded DEMs (ocean=0) to avoid latitudinal ringing/stripes.
+    is_ocean = _ocean_mask_from_elevation(elevation)
     
     # Calculate latitude for each row
     lat_rows = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * 180.0  # degrees, -90 to +90
@@ -67,14 +81,20 @@ def calculate_ocean_heat_transport(
     # atmosphere in mid-high latitudes. This warms high-latitude air.
     
     # Calculate zonal (east-west) average temperature in ocean
-    T_ocean = np.where(is_ocean, T, np.nan)
-    with np.errstate(invalid='ignore', divide='ignore'):  # Suppress NaN/divide warnings
-        T_ocean_zonal = np.nanmean(T_ocean, axis=1)  # (Hc,) - zonal average
+    # Avoid np.nanmean (which can warn on all-NaN rows) by doing explicit sum/count.
+    ocean_count = np.sum(is_ocean, axis=1).astype(np.float32)  # (Hc,)
+    ocean_sum = np.sum(T * is_ocean.astype(np.float32), axis=1)  # (Hc,)
+    global_mean = float(np.mean(T))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        T_ocean_zonal = ocean_sum / np.maximum(ocean_count, 1.0)
+    # Replace "no ocean in this latitude row" with a neutral fallback to prevent sharp jumps
+    T_ocean_zonal = np.where(ocean_count > 0.0, T_ocean_zonal, global_mean).astype(np.float32)
     
-    # Replace NaN with global mean (for rows with no ocean)
-    # Use full temperature field mean as fallback
-    global_mean = np.mean(T)
-    T_ocean_zonal = np.where(np.isnan(T_ocean_zonal), global_mean, T_ocean_zonal)
+    # Light latitudinal smoothing before taking derivatives (reduces banding/ringing).
+    # This is intentionally minimal (3-pt filter, 2 passes) to keep the climatology similar.
+    for _ in range(2):
+        z = np.pad(T_ocean_zonal, 1, mode="edge")
+        T_ocean_zonal = (0.25 * z[:-2] + 0.50 * z[1:-1] + 0.25 * z[2:]).astype(np.float32)
     
     # Calculate poleward heat flux
     # Peak at mid-latitudes (30-60°) where major currents (Gulf Stream) exist
@@ -98,6 +118,9 @@ def calculate_ocean_heat_transport(
     flux_divergence[1:-1] = (poleward_flux[2:] - poleward_flux[:-2]) / 2.0
     flux_divergence[0] = poleward_flux[1] - poleward_flux[0]
     flux_divergence[-1] = poleward_flux[-1] - poleward_flux[-2]
+    
+    # Clamp flux divergence to prevent extreme adjustments
+    flux_divergence = np.clip(flux_divergence, -5.0, 5.0)  # Max ±5K per day
     
     # Apply to ocean cells only
     T_adjustment = -flux_divergence[:, np.newaxis] * is_ocean.astype(np.float32)
@@ -138,10 +161,15 @@ def calculate_ocean_heat_transport(
     # Ocean releases/absorbs heat based on temperature excess
     T_excess = T - T_equator
     heat_exchange = -exchange_coefficient * exchange_strength[:, np.newaxis] * T_excess * dt_days
+    # Clamp heat exchange to prevent extreme adjustments
+    heat_exchange = np.clip(heat_exchange, -3.0, 3.0)  # Max ±3K per day
     heat_exchange = heat_exchange * is_ocean.astype(np.float32)
     
     # Add heat exchange to adjustment
     T_adjustment = T_adjustment + heat_exchange
+    
+    # Final clamp on total ocean adjustment
+    T_adjustment = np.clip(T_adjustment, -10.0, 10.0)  # Max ±10K total per day
     
     return T_adjustment
 
