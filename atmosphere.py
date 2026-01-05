@@ -91,22 +91,35 @@ def _majority_filter(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
 
 def _derive_land_sea_masks(elevation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     elev = elevation.astype(np.float32)
-    thresh = float(np.median(elev))
-    land = elev > thresh
+    # If elevation contains a meaningful ocean mask (common in loaded DEM workflow),
+    # treat near-zero as ocean instead of using a median split.
+    ocean_eps = 1e-6
+    zeros_frac = float(np.mean(elev <= ocean_eps))
+    if zeros_frac > 0.02:
+        sea = elev <= ocean_eps
+        land = ~sea
+    else:
+        thresh = float(np.median(elev))
+        land = elev > thresh
     land = _majority_filter(land, iterations=2)
     sea = ~land
     return land, sea
 
 
 def _laplacian(field: np.ndarray) -> np.ndarray:
-    pad = np.pad(field, 1, mode="edge")
-    return (
-        pad[0:-2, 1:-1]
-        + pad[2:, 1:-1]
-        + pad[1:-1, 0:-2]
-        + pad[1:-1, 2:]
-        - 4.0 * field
-    )
+    # Periodic in longitude (axis=1), clamped at poles (axis=0).
+    pad_y = np.pad(field, ((1, 1), (0, 0)), mode="edge")
+    c = pad_y[1:-1, :]
+    n = pad_y[0:-2, :]
+    s = pad_y[2:, :]
+    e = np.roll(c, -1, axis=1)
+    w = np.roll(c, 1, axis=1)
+    return n + s + e + w - 4.0 * c
+
+
+def _ddx_periodic(field: np.ndarray) -> np.ndarray:
+    """Central difference in x with periodic wrap (axis=1). Returns derivative per grid index."""
+    return 0.5 * (np.roll(field, -1, axis=1) - np.roll(field, 1, axis=1))
 
 
 def _advect_scalar(
@@ -146,7 +159,7 @@ def evolve_wind(
     pressure: np.ndarray | None,
     elevation: np.ndarray,
     dt_days: float = 1.0,
-    damping: float = 0.1,
+    damping: float = 0.25,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -193,14 +206,16 @@ def evolve_wind(
     # Pre-calculate PGF (constant over the day)
     if pressure is None:
         # P ~ P0 * exp(-z/H) * (T0/T)^g/R... simplified:
-        p_anom = -150.0 * ((temperature - 273.15) / 30.0)  # Pa anomaly
+        # NOTE: Keep this in Pa (not hPa). Scale is intentionally "synoptic-ish":
+        # order ~5-10 hPa swings across large temperature gradients.
+        p_anom = -450.0 * ((temperature - 273.15) / 30.0)  # Pa anomaly
         if elevation is not None:
              # Terrain effect: flow around obstacles, high pressure wedge
-             p_anom += 500.0 * elevation 
+             p_anom += 900.0 * elevation 
     else:
         p_anom = pressure
         
-    dp_dx = np.gradient(p_anom, axis=1) / (dx + 1e-3)
+    dp_dx = _ddx_periodic(p_anom) / (dx + 1e-3)
     dp_dy = np.gradient(p_anom, axis=0) / dy
     
     pgf_u = -1.0/rho * dp_dx
@@ -213,10 +228,10 @@ def evolve_wind(
         u_adv = _advect_scalar(u_curr, u_curr, v_curr, u_scale, v_scale)
         v_adv = _advect_scalar(v_curr, u_curr, v_curr, u_scale, v_scale)
         
-        # Friction
-        drag = 2.0e-5 
+        # Friction (quadratic surface drag). Keep small; dt_sub is in seconds.
+        drag = 2.0e-7
         if elevation is not None:
-            drag += 5.0e-5 * elevation
+            drag += 6.0e-7 * elevation
         friction_u = -drag * u_curr * np.abs(u_curr)
         friction_v = -drag * v_curr * np.abs(v_curr)
         
@@ -243,8 +258,15 @@ def generate_wind_field(
     *,
     day_of_year: int = 80,
     block_size: int = 3,
+    upsample: str = "repeat",
+    temperature: np.ndarray | None = None,
     elevation: np.ndarray | None = None,
     terrain_influence: float = 1.0,
+    weather_amp: float = 1.0,
+    zonal_pressure: float = 0.85,
+    terrain_pressure_amp: float = 1.0,
+    terrain_flow_amp: float = 1.0,
+    time_days: float | None = None,
     debug_log: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v) near-surface winds derived from pressure gradients.
@@ -285,55 +307,105 @@ def generate_wind_field(
         gx = np.zeros((Hc, Wc), dtype=np.float32)
         gy = np.zeros((Hc, Wc), dtype=np.float32)
 
-    # Build 2D temperature field with land-sea contrast and longitudinal variation
-    T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year).astype(np.float32)
-    T = np.repeat(T_lat[:, None], Wc, axis=1).astype(np.float32)
-    
-    # Land-sea temperature contrast (land warmer in summer, cooler in winter)
-    land_f = land_mask.astype(np.float32)
-    sea_f = sea_mask.astype(np.float32)
-    season_phase = 2.0 * np.pi * (day_of_year - 80) / 365.2422
-    seasonal_contrast = 8.0 * np.sin(season_phase) * np.cos(lat[:, None])  # NH summer = positive
-    T += seasonal_contrast * land_f
-    
-    # Coastal gradients (sharp temperature transitions)
-    coastal_grad = _laplacian(land_f)
-    T += 3.5 * coastal_grad * (T / 280.0)
-    
-    # Add longitudinal temperature waves (continentality, monsoon drivers)
-    T_wave = 6.0 * np.sin(lon[None, :] * 2.5 + season_phase) * land_f
-    T_wave += 3.5 * np.sin(lon[None, :] * 4.0 - 0.8) * land_f
-    T_wave *= np.exp(-((abs_deg[:, None] - 35.0) / 25.0) ** 2)  # Peak at mid-latitudes
-    T += T_wave
-    
-    # Smooth temperature to avoid numerical instabilities
-    T = T + 0.15 * _laplacian(T)
-    T = np.clip(T, 200.0, 320.0)
+    # Temperature field:
+    # - If provided, use it (it should come from the simulation state).
+    # - Otherwise fall back to a lightweight climatology.
+    if temperature is not None:
+        temp = temperature.astype(np.float32)
+        if temp.shape == (H, W):
+            temp_pad = np.pad(
+                temp,
+                ((0, Hc * block_size - H), (0, Wc * block_size - W)),
+                mode="edge",
+            )
+            T = temp_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+        elif temp.shape == (Hc, Wc):
+            T = temp
+        else:
+            raise ValueError(f"temperature must be shape {(H, W)} or {(Hc, Wc)}; got {temp.shape}")
+        # Mild smoothing only (keep gradients that actually drive winds).
+        T = np.clip(T + 0.05 * _laplacian(T), 200.0, 330.0)
+        season_phase = 2.0 * np.pi * (day_of_year - 80) / 365.2422
+        land_f = land_mask.astype(np.float32)
+    else:
+        # Build 2D temperature field with land-sea contrast and longitudinal variation
+        T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year).astype(np.float32)
+        T = np.repeat(T_lat[:, None], Wc, axis=1).astype(np.float32)
+        
+        # Land-sea temperature contrast (land warmer in summer, cooler in winter)
+        land_f = land_mask.astype(np.float32)
+        season_phase = 2.0 * np.pi * (day_of_year - 80) / 365.2422
+        seasonal_contrast = 8.0 * np.sin(season_phase) * np.cos(lat[:, None])  # NH summer = positive
+        T += seasonal_contrast * land_f
+        
+        # Coastal gradients (sharp temperature transitions)
+        coastal_grad = _laplacian(land_f)
+        T += 3.5 * coastal_grad * (T / 280.0)
+        
+        # Add longitudinal temperature waves (continentality, monsoon drivers)
+        T_wave = 6.0 * np.sin(lon[None, :] * 2.5 + season_phase) * land_f
+        T_wave += 3.5 * np.sin(lon[None, :] * 4.0 - 0.8) * land_f
+        T_wave *= np.exp(-((abs_deg[:, None] - 35.0) / 25.0) ** 2)  # Peak at mid-latitudes
+        T += T_wave
+        
+        # Smooth temperature to avoid numerical instabilities
+        T = np.clip(T + 0.15 * _laplacian(T), 200.0, 320.0)
     
     # Convert temperature to surface pressure (ideal gas law approximation)
-    # Warmer = lower pressure (thermal low), colder = higher pressure (thermal high)
+    # For sim-driven winds we keep it mostly zonal to avoid stationary continent-scale blobs.
     T_ref = 273.15
-    p_thermal = 1013.25 * (T_ref / T) ** 3.5  # hPa, exaggerated for stronger gradients
+    zp = float(np.clip(zonal_pressure, 0.0, 1.0))
+    if temperature is not None and zp > 0.0:
+        T_zonal = np.mean(T, axis=1, keepdims=True)
+        T_used = zp * T_zonal + (1.0 - zp) * T
+    else:
+        T_used = T
+    # Warmer = lower pressure (thermal low), colder = higher pressure (thermal high)
+    p_thermal = 1013.25 * (T_ref / (T_used + 1e-6)) ** 2.2  # hPa
     
     # Add terrain pressure anomalies (mountains create blocking highs)
-    p_terrain = 25.0 * terrain_influence * np.clip(elev_c, 0.0, 1.0)
+    tp = float(np.clip(terrain_pressure_amp, 0.0, 1.0))
+    p_terrain = 25.0 * tp * terrain_influence * np.clip(elev_c, 0.0, 1.0)
     
-    # Inject weather system perturbations (quasi-stationary cyclones/anticyclones)
-    rng = np.random.default_rng(int(day_of_year) + 9001)
-    n_systems = 8
-    for _ in range(n_systems):
-        sys_lon = rng.uniform(-np.pi, np.pi)
-        sys_lat = rng.uniform(-0.6 * np.pi, 0.6 * np.pi)
-        sys_strength = rng.uniform(-18.0, 18.0)
-        sys_scale = rng.uniform(0.15, 0.35)
-        
-        dist_lon = np.abs(lon[None, :] - sys_lon)
-        dist_lon = np.minimum(dist_lon, 2.0 * np.pi - dist_lon)
-        dist_lat = np.abs(lat[:, None] - sys_lat)
-        dist = np.sqrt(dist_lon ** 2 + dist_lat ** 2)
-        
-        p_system = sys_strength * np.exp(-(dist / sys_scale) ** 2)
-        p_thermal += p_system
+    # Optional: inject weak synoptic-scale perturbations.
+    wamp = float(np.clip(weather_amp, 0.0, 1.0))
+    if wamp > 0.0:
+        # If simulation time is provided, use traveling-wave perturbations (moving eddies)
+        # instead of stationary, day-seeded blobs.
+        t_days = float(time_days) if time_days is not None else float(day_of_year)
+        if temperature is not None:
+            # Mid-latitude storm-track window
+            storm_window = np.exp(-((abs_deg[:, None] - 45.0) / 18.0) ** 2).astype(np.float32)
+            equ_window = np.exp(-((abs_deg[:, None]) / 12.0) ** 2).astype(np.float32)
+            # A small set of deterministic planetary waves
+            ks = np.array([3.0, 5.0, 7.0, 9.0], dtype=np.float32)
+            periods = np.array([6.0, 9.0, 14.0, 20.0], dtype=np.float32)  # days
+            phases = np.array([0.3, 1.1, -0.7, 2.2], dtype=np.float32)
+            amps = np.array([6.0, 4.5, 3.0, 2.5], dtype=np.float32) * wamp  # hPa
+            wave = np.zeros((Hc, Wc), dtype=np.float32)
+            for k, per, ph, a in zip(ks, periods, phases, amps):
+                wave += a * np.cos(k * lon[None, :] + (2.0 * np.pi * t_days / per) + ph)
+            p_thermal += storm_window * wave
+
+            # Add a weak equatorial traveling wave (Walker / MJO-ish), to avoid overly static tropics.
+            p_thermal += equ_window * (2.0 * wamp) * np.cos(2.0 * lon[None, :] - (2.0 * np.pi * t_days / 7.0) + 0.4)
+        else:
+            # Fallback (static view): small stationary systems
+            rng = np.random.default_rng(int(day_of_year) + 9001)
+            n_systems = 6
+            for _ in range(n_systems):
+                sys_lon = rng.uniform(-np.pi, np.pi)
+                sys_lat = rng.uniform(-0.6 * np.pi, 0.6 * np.pi)
+                sys_strength = rng.uniform(-12.0, 12.0) * wamp
+                sys_scale = rng.uniform(0.18, 0.40)
+                
+                dist_lon = np.abs(lon[None, :] - sys_lon)
+                dist_lon = np.minimum(dist_lon, 2.0 * np.pi - dist_lon)
+                dist_lat = np.abs(lat[:, None] - sys_lat)
+                dist = np.sqrt(dist_lon ** 2 + dist_lat ** 2)
+                
+                p_system = sys_strength * np.exp(-(dist / sys_scale) ** 2)
+                p_thermal += p_system
     
     # Total pressure field
     pressure = p_thermal + p_terrain
@@ -349,7 +421,7 @@ def generate_wind_field(
     f_coriolis = np.where(mask_pos, np.maximum(f_coriolis, f_min), np.minimum(f_coriolis, -f_min))
     
     dp_dy = np.gradient(pressure, axis=0) / (111320.0 / Hc)  # Pa/m (approximate)
-    dp_dx = np.gradient(pressure, axis=1) / (111320.0 * np.cos(lat[:, None]) / Wc)  # Pa/m
+    dp_dx = _ddx_periodic(pressure) / (111320.0 * np.cos(lat[:, None]) / Wc)  # Pa/m
     
     # Geostrophic wind (m/s)
     rho = 1.2  # kg/m³ air density
@@ -398,20 +470,30 @@ def generate_wind_field(
     
     uc = u_geo + u_ageo
     vc = v_geo + v_ageo
+
+    # --- Tiny 2-layer jet correction (thermal-wind inspired) ---
+    # Real jets strengthen where meridional temperature gradients are strong (mid-lats).
+    # We approximate an upper-level westerly anomaly from |dT/dy| and mix a fraction down.
+    dT_dy = np.gradient(T, axis=0) / (111320.0 / Hc)  # K/m (approx)
+    jet_window = np.exp(-((abs_deg[:, None] - 45.0) / 18.0) ** 2).astype(np.float32)
+    thermal_wind_coeff = 2.0e6  # tuned: |dT/dy|~1e-5 K/m -> ~20 m/s aloft
+    u_aloft = thermal_wind_coeff * jet_window * np.abs(dT_dy)
+    surface_mix = 0.20
+    uc = uc + surface_mix * u_aloft
     lat_amp = 0.06 + 0.60 * (lat_factor ** 1.6)
     global_amp = 0.30
     uc = uc * lat_amp[:, None] * global_amp
     vc = vc * lat_amp[:, None] * global_amp
     
     # Convert to vorticity and solve via streamfunction to ensure divergence-free
-    dvc_dx = np.gradient(vc, axis=1)
+    dvc_dx = _ddx_periodic(vc)
     duc_dy = np.gradient(uc, axis=0)
     omega = dvc_dx - duc_dy
     
     # Solve for streamfunction
     psi = _streamfunction_from_vorticity(omega)
     u_stream = np.gradient(psi, axis=0) * (Hc / (np.pi))
-    v_stream = -np.gradient(psi, axis=1) * (Wc / (2.0 * np.pi))
+    v_stream = -_ddx_periodic(psi) * (Wc / (2.0 * np.pi))
     
     # Blend: mostly from pressure gradients, streamfunction ensures consistency
     uc = 0.75 * uc + 0.25 * u_stream
@@ -420,23 +502,24 @@ def generate_wind_field(
     # Apply terrain effects: blocking, channeling, deflection
     if terrain_influence > 0:
         elev_norm = np.clip(elev_c, 0.0, 1.0)
+        tf = float(np.clip(terrain_flow_amp, 0.0, 1.0))
         
         # Mountain blocking
-        block_factor = np.clip(1.0 - terrain_influence * 0.5 * elev_norm, 0.4, 1.0)
+        block_factor = np.clip(1.0 - tf * terrain_influence * 0.5 * elev_norm, 0.6, 1.0)
         
         # Terrain channeling (flow follows valleys) - reduced from 0.25 to 0.15
         slope_mag = np.hypot(gx, gy)
-        channel_factor = 1.0 + terrain_influence * 0.15 * slope_mag
+        channel_factor = 1.0 + tf * terrain_influence * 0.08 * slope_mag
         
         # Deflection around obstacles
-        deflect_u = -terrain_influence * 0.3 * gx * slope_mag
-        deflect_v = -terrain_influence * 0.3 * gy * slope_mag
+        deflect_u = -tf * terrain_influence * 0.12 * gx * slope_mag
+        deflect_v = -tf * terrain_influence * 0.12 * gy * slope_mag
         
         uc = (uc * block_factor + deflect_u) * channel_factor
         vc = (vc * block_factor + deflect_v) * channel_factor
         
-        # Land-sea friction contrast - reduced from 1.15/0.85 to 1.08/0.92
-        friction_factor = np.where(sea_mask, 1.08, 0.92)
+        # Land-sea friction contrast (keep subtle; strong contrast creates stationary speed blobs)
+        friction_factor = np.where(sea_mask, 1.03, 0.97)
         uc *= friction_factor
         vc *= friction_factor
     
@@ -475,7 +558,8 @@ def generate_wind_field(
         total_cells = uc.size
         LOG.info(f"  Clipping: u_clipped={u_clipped}/{total_cells} ({100.0*u_clipped/total_cells:.1f}%), v_clipped={v_clipped}/{total_cells} ({100.0*v_clipped/total_cells:.1f}%)")
 
-    return _upsample_repeat(uc, H, W, block_size), _upsample_repeat(vc, H, W, block_size)
+    up = _upsample_bilinear if str(upsample).lower() == "bilinear" else _upsample_repeat
+    return up(uc, H, W, block_size), up(vc, H, W, block_size)
 
 
 def _cos_window(x_deg: np.ndarray, a: float, b: float) -> np.ndarray:
@@ -489,10 +573,10 @@ def _cos_window(x_deg: np.ndarray, a: float, b: float) -> np.ndarray:
 
 
 def render_wind_arrows(height: int, width: int, u: np.ndarray, v: np.ndarray, *, step: int | None = None, target_arrows: int | None = 250, scale: float = 0.8) -> np.ndarray:
-    """Rasterize sparse white triangles onto black background; returns (H,W,3) float.
+    """Rasterize sparse white arrows onto black background; returns (H,W,3) float.
 
-    - `step` controls triangle density; `scale` scales triangle size relative to step.
-    - Triangles point in wind direction, size scales with wind speed.
+    - `step` controls arrow density; `scale` scales arrow length relative to step.
+    - Arrows point in wind direction; length varies slightly with wind speed for readability.
     """
     H = int(height); W = int(width)
     img = np.zeros((H, W, 3), dtype=np.float32)
@@ -513,27 +597,71 @@ def render_wind_arrows(height: int, width: int, u: np.ndarray, v: np.ndarray, *,
             m = np.sqrt(uu * uu + vv * vv)
             if m < 1e-3:
                 continue
-            # Triangle size scales with wind speed
-            size = scale * (m / umax) * step_len * 0.5
-            size = max(2.0, min(size, step_len * 0.8))
-            # Direction vector (normalized)
+            # Direction vector (normalized). Note: screen y grows downward, so flip v.
             dx = uu / m
             dy = -vv / m  # screen y grows down
-            # Triangle points: tip in wind direction, base perpendicular
-            tip_x = x + dx * size * 0.6
-            tip_y = y + dy * size * 0.6
-            base_x = x - dx * size * 0.4
-            base_y = y - dy * size * 0.4
-            # Perpendicular direction for base
+
+            # Mostly-constant arrow size (matches "quiver"-like look); small speed modulation.
+            t = min(1.0, m / umax)
+            arrow_len = scale * step_len * (0.42 + 0.22 * t)
+            arrow_len = max(3.0, min(arrow_len, step_len * 0.85))
+
+            # Shaft from tail -> just before head.
+            head_len = max(2.0, arrow_len * 0.45)
+            shaft_len = max(1.0, arrow_len - head_len)
+
+            tail_x = x - dx * (shaft_len * 0.55)
+            tail_y = y - dy * (shaft_len * 0.55)
+            head_base_x = x + dx * (shaft_len * 0.45)
+            head_base_y = y + dy * (shaft_len * 0.45)
+            tip_x = head_base_x + dx * head_len
+            tip_y = head_base_y + dy * head_len
+
+            _draw_line(img, tail_x, tail_y, head_base_x, head_base_y, white)
+
+            # Arrow head: narrow filled triangle.
             perp_x = -dy
             perp_y = dx
-            base_w = size * 0.4
-            p1_x = base_x + perp_x * base_w
-            p1_y = base_y + perp_y * base_w
-            p2_x = base_x - perp_x * base_w
-            p2_y = base_y - perp_y * base_w
+            head_w = max(1.0, head_len * 0.55)
+            p1_x = head_base_x + perp_x * head_w
+            p1_y = head_base_y + perp_y * head_w
+            p2_x = head_base_x - perp_x * head_w
+            p2_y = head_base_y - perp_y * head_w
             _draw_triangle(img, tip_x, tip_y, p1_x, p1_y, p2_x, p2_y, white)
     return img
+
+
+def wind_speed_to_rgb(
+    speed: np.ndarray,
+    *,
+    vmax: float = 25.0,
+    gamma: float = 0.75,
+) -> np.ndarray:
+    """Map wind speed (m/s) -> RGB float image (H,W,3).
+
+    Uses absolute scaling (0..vmax) for consistent colors across time.
+    """
+    s = speed.astype(np.float32)
+    vm = max(1e-6, float(vmax))
+    t = np.clip(s / vm, 0.0, 1.0)
+    t = t ** float(gamma)
+
+    # Slow → fast: blue → green → yellow → red.
+    cstops = np.array(
+        [
+            [0.06, 0.25, 0.92],  # blue (slow)
+            [0.10, 0.78, 0.55],  # green
+            [0.95, 0.88, 0.20],  # yellow
+            [0.92, 0.18, 0.10],  # red (fast)
+        ],
+        dtype=np.float32,
+    )
+    bp = np.array([0.0, 0.50, 0.80, 1.0], dtype=np.float32)
+    i = np.clip(np.searchsorted(bp, t, side="right") - 1, 0, len(bp) - 2)
+    c0 = cstops[i]
+    c1 = cstops[i + 1]
+    tt = (t - bp[i]) / (bp[i + 1] - bp[i] + 1e-6)
+    return c0 + (c1 - c0) * tt[..., None]
 
 
 def _draw_line(img: np.ndarray, x0: float, y0: float, x1: float, y1: float, col: np.ndarray) -> None:
@@ -697,12 +825,13 @@ def generate_precipitation(
     # Moisture-flux convergence driver
     flux_x = q * u
     flux_y = q * v
-    conv = np.clip(-(np.gradient(flux_x, axis=1) + np.gradient(flux_y, axis=0)), 0.0, None)
+    conv = np.clip(-(_ddx_periodic(flux_x) + np.gradient(flux_y, axis=0)), 0.0, None)
     conv = conv / (np.mean(conv) + 1e-6)
     conv = np.clip(conv + 0.15 * _laplacian(conv), 0.0, 3.0)
 
     # Orographic uplift signal
-    gx, gy = np.gradient(elev)
+    gx = _ddx_periodic(elev)
+    gy = np.gradient(elev, axis=0)
     slope = np.hypot(gx, gy)
     orog = np.clip(gx * u + gy * v, 0.0, None) + 0.25 * slope
     orog = land_f * orog
