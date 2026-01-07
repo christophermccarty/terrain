@@ -160,6 +160,13 @@ def evolve_wind(
     elevation: np.ndarray,
     dt_days: float = 1.0,
     damping: float = 0.25,
+    pgf_temp_scale: float = 450.0,
+    pgf_terrain_scale: float = 900.0,
+    drag_base: float = 2.0e-7,
+    drag_elev_scale: float = 6.0e-7,
+    vmax_clip: float = 150.0,
+    baroclinic_jet_amp: float = 0.0,
+    baroclinic_mix: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -177,27 +184,32 @@ def evolve_wind(
     H, W = u.shape
     dt_total = dt_days * 86400.0  # seconds
     
-    # Sub-stepping for stability (CFL condition)
-    # Grid scale ~ 40000km / 512 ~ 80km.
-    # Max wind ~ 100 m/s. CFL time ~ 800s.
-    # Use adaptive substep sizing: larger steps when wind is slower
-    # For 1 day, use 24 hourly steps (3600s) instead of 144 steps - much faster
-    substep_sec = 3600.0  # 1 hour substeps (was 600s = 10 min)
-    n_steps = max(1, int(dt_total / substep_sec))
-    dt_sub = dt_total / n_steps
-
-    # Grid parameters
+    # Sub-stepping for stability (CFL-like). Full-res winds have smaller dx than coarse winds,
+    # so a fixed 1-hour substep can violate CFL and force the vmax clamp.
+    # Use a conservative estimate based on grid spacing and vmax_clip.
+    # (dx→0 near poles; use a low-percentile to avoid dt→0.)
+    # Target CFL ~ 0.4
     R_earth = 6.371e6
     lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
     lat_2d = np.repeat(lat[:, None], W, axis=1)
-    
+    dx = R_earth * (2 * np.pi / W) * np.cos(lat_2d)
+    dy = R_earth * (np.pi / H)
+    dx_eff = dx[np.isfinite(dx)]
+    dx_min = float(np.nanpercentile(dx_eff, 5.0)) if dx_eff.size else float(dy)
+    dx_min = max(1.0e3, dx_min)
+    dy_min = float(dy)
+    dt_cfl = 0.4 * min(dx_min, dy_min) / max(1.0, float(vmax_clip))
+    substep_sec = float(np.clip(dt_cfl, 120.0, 3600.0))
+    n_steps = max(1, int(np.ceil(dt_total / substep_sec)))
+    dt_sub = dt_total / n_steps
+
+    # Grid parameters
     # Coriolis parameter f = 2*Omega*sin(lat)
     Omega = 7.2921e-5
     f = 2.0 * Omega * np.sin(lat_2d)
     
     # Gradients dx, dy
-    dx = R_earth * (2 * np.pi / W) * np.cos(lat_2d)
-    dy = R_earth * (np.pi / H)
+    # (dx,dy already computed above)
     
     rho = 1.225 # kg/m3
     
@@ -208,18 +220,36 @@ def evolve_wind(
         # P ~ P0 * exp(-z/H) * (T0/T)^g/R... simplified:
         # NOTE: Keep this in Pa (not hPa). Scale is intentionally "synoptic-ish":
         # order ~5-10 hPa swings across large temperature gradients.
-        p_anom = -450.0 * ((temperature - 273.15) / 30.0)  # Pa anomaly
+        p_anom = -float(pgf_temp_scale) * ((temperature - 273.15) / 30.0)  # Pa anomaly
         if elevation is not None:
              # Terrain effect: flow around obstacles, high pressure wedge
-             p_anom += 900.0 * elevation 
+             p_anom += float(pgf_terrain_scale) * elevation 
     else:
         p_anom = pressure
         
     dp_dx = _ddx_periodic(p_anom) / (dx + 1e-3)
-    dp_dy = np.gradient(p_anom, axis=0) / dy
+    # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
+    dp_dy = -np.gradient(p_anom, axis=0) / dy
     
     pgf_u = -1.0/rho * dp_dx
     pgf_v = -1.0/rho * dp_dy
+
+    # --- Baroclinic / eddy-driven mid-lat westerly tendency (parameterized) ---
+    # In the real atmosphere, mid-lat westerlies are maintained by baroclinic eddies and
+    # their momentum flux convergence. We approximate the net effect by mixing a
+    # thermal-wind-like westerly target down toward the surface, based on |dT/dy|.
+    b_amp = float(baroclinic_jet_amp)
+    b_mix = float(baroclinic_mix)
+    if b_amp != 0.0 and b_mix > 0.0:
+        # Use zonal-mean temperature gradient so the tendency acts on the zonal-mean jet,
+        # matching the climatological effect of baroclinic eddies.
+        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
+        w_mid_1d = np.exp(-((abs_deg_1d - 45.0) / 12.0) ** 2).astype(np.float32)  # (H,)
+        ztemp = np.mean(temperature.astype(np.float32), axis=1, keepdims=True)  # (H,1)
+        dT_dy = -np.gradient(ztemp, axis=0) / dy  # (H,1) physical K/m; negate for north→south axis
+        u_jet = (b_amp * w_mid_1d[:, None] * np.abs(dT_dy)).astype(np.float32)  # (H,1)
+        # Safety clamp: keep the parameterization from generating unrealistic surface jets.
+        u_jet = np.clip(u_jet, 0.0, 70.0).astype(np.float32)
     
     for _ in range(n_steps):
         # Advection
@@ -229,23 +259,31 @@ def evolve_wind(
         v_adv = _advect_scalar(v_curr, u_curr, v_curr, u_scale, v_scale)
         
         # Friction (quadratic surface drag). Keep small; dt_sub is in seconds.
-        drag = 2.0e-7
+        drag = float(drag_base)
         if elevation is not None:
-            drag += 6.0e-7 * elevation
+            drag += float(drag_elev_scale) * elevation
         friction_u = -drag * u_curr * np.abs(u_curr)
         friction_v = -drag * v_curr * np.abs(v_curr)
         
         # Integration
         du = (pgf_u + f * v_curr + friction_u) * dt_sub
         dv = (pgf_v - f * u_curr + friction_v) * dt_sub
+
+        # Mix toward baroclinic jet target (eddy momentum flux convergence proxy)
+        if b_amp != 0.0 and b_mix > 0.0:
+            # relaxation rate (1/s)
+            k = 1.0 / (b_mix * 86400.0)
+            u_zm = np.mean(u_curr, axis=1, keepdims=True)  # (H,1)
+            du = du + (u_jet - u_zm) * k * dt_sub
         
         u_curr = u_adv + du * damping
         v_curr = v_adv + dv * damping
         
         # Soft clamp to prevent explosion
         total_v = np.hypot(u_curr, v_curr)
-        mask_high = total_v > 150.0
-        scale = 150.0 / (total_v + 1e-6)
+        vmax = float(vmax_clip)
+        mask_high = total_v > vmax
+        scale = vmax / (total_v + 1e-6)
         u_curr[mask_high] *= scale[mask_high]
         v_curr[mask_high] *= scale[mask_high]
     
@@ -420,7 +458,8 @@ def generate_wind_field(
     mask_pos = f_coriolis >= 0
     f_coriolis = np.where(mask_pos, np.maximum(f_coriolis, f_min), np.minimum(f_coriolis, -f_min))
     
-    dp_dy = np.gradient(pressure, axis=0) / (111320.0 / Hc)  # Pa/m (approximate)
+    # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
+    dp_dy = -np.gradient(pressure, axis=0) / (111320.0 / Hc)  # Pa/m (approximate)
     dp_dx = _ddx_periodic(pressure) / (111320.0 * np.cos(lat[:, None]) / Wc)  # Pa/m
     
     # Geostrophic wind (m/s)
@@ -433,10 +472,14 @@ def generate_wind_field(
     abs_lat = np.abs(lat)
     tropical_mask = abs_lat < np.deg2rad(25.0)  # ±25° tropical zone
     
-    # Tropical easterlies (trade winds): -1.6 to -2.6 m/s with Walker circulation
-    u_tropical = -2.1 + -0.4 * np.sin(lon[None, :] * 1.4)  # (Hc, Wc)
-    # Weak meridional component (ITCZ convergence)
-    v_tropical = 0.05 * np.sin(lat[:, None] * 3.0)  # (Hc, Wc)
+    # Tropical winds (Hadley-cell-like):
+    # - Doldrums near the equator (weak surface winds)
+    # - Trades peak off-equator (~10-20°) and converge toward ITCZ.
+    lat0 = np.deg2rad(25.0)
+    absn = np.clip(abs_lat / lat0, 0.0, 1.0)
+    trade_profile = np.sin(np.pi * absn)  # 0 at equator and 25°, peak near 12.5°
+    u_tropical = -(2.8 * trade_profile[:, None]) * (1.0 + 0.12 * np.sin(lon[None, :] * 1.4))  # easterlies
+    v_tropical = -0.6 * np.tanh(lat[:, None] / np.deg2rad(10.0)) * (1.0 - absn[:, None])  # toward equator
     
     # Blend: tropical model in tropics, geostrophic elsewhere
     # Tropical zones use primarily tropical model with small geostrophic component
@@ -487,12 +530,12 @@ def generate_wind_field(
     
     # Convert to vorticity and solve via streamfunction to ensure divergence-free
     dvc_dx = _ddx_periodic(vc)
-    duc_dy = np.gradient(uc, axis=0)
+    duc_dy = -np.gradient(uc, axis=0)
     omega = dvc_dx - duc_dy
     
     # Solve for streamfunction
     psi = _streamfunction_from_vorticity(omega)
-    u_stream = np.gradient(psi, axis=0) * (Hc / (np.pi))
+    u_stream = -np.gradient(psi, axis=0) * (Hc / (np.pi))
     v_stream = -_ddx_periodic(psi) * (Wc / (2.0 * np.pi))
     
     # Blend: mostly from pressure gradients, streamfunction ensures consistency
@@ -634,15 +677,22 @@ def render_wind_arrows(height: int, width: int, u: np.ndarray, v: np.ndarray, *,
 def wind_speed_to_rgb(
     speed: np.ndarray,
     *,
-    vmax: float = 25.0,
+    vmax: float | None = None,
     gamma: float = 0.75,
 ) -> np.ndarray:
     """Map wind speed (m/s) -> RGB float image (H,W,3).
 
-    Uses absolute scaling (0..vmax) for consistent colors across time.
+    If `vmax` is None, choose a robust per-frame scale from the data
+    (99.5th percentile). This avoids fixed ceilings and lets the colormap
+    adapt to whatever range the simulation produces.
     """
     s = speed.astype(np.float32)
-    vm = max(1e-6, float(vmax))
+    if vmax is None:
+        # Robust scale: ignore rare extremes so the map doesn't saturate.
+        vm = float(np.nanpercentile(s, 99.5))
+    else:
+        vm = float(vmax)
+    vm = max(1e-6, vm)
     t = np.clip(s / vm, 0.0, 1.0)
     t = t ** float(gamma)
 

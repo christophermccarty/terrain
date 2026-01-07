@@ -11,6 +11,7 @@ import numpy as np
 import cProfile
 import pstats
 import logging
+import time
 
 from terrain import (
     generate_sphere_image,
@@ -25,14 +26,13 @@ from terrain import (
     set_elevation_cache,
     LOG,
 )
-from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb, generate_precipitation
+from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
 from diagnostics import ClimateDiagnostics
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
-_PRECIP_CACHE = {"key": None, "P": None}
 
 
 def main() -> None:
@@ -52,6 +52,9 @@ def main() -> None:
         "gain": 0.5,
         "wind_arrows": 250,
         "wind_scale": 0.9,
+        # Wind model resolution decoupled from temp/precip resolution.
+        # Larger => fewer wind cells => faster, but more approximate.
+        "wind_block_size": 8,
     }
 
     root = tk.Tk()
@@ -78,10 +81,162 @@ def main() -> None:
     tk.Radiobutton(controls, text="Globe", variable=mode_var, value="globe").pack(side="left")
     tk.Radiobutton(controls, text="Map", variable=mode_var, value="map").pack(side="left")
     tk.Label(controls, text="View").pack(side="left", padx=(8,0))
-    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind", "Precipitation", "Cloud Cover", "Snow Cover").pack(side="left")
+    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind Arrows", "Wind Particles", "Cloud Cover", "Snow Cover").pack(side="left")
     
     # Diagnostics
     diagnostics = ClimateDiagnostics(track_history=True)
+
+    # --- Wind particle visualization state (map mode) ---
+    particle_xy: np.ndarray | None = None  # (N,2) float32, x/y in pixel space
+    particle_age: np.ndarray | None = None  # (N,) int32
+    trail: np.ndarray | None = None  # (H,W) float32 intensity
+    base_wind_rgb_u8: np.ndarray | None = None  # (H,W,3) uint8
+    last_wind_key = None
+    last_anim_t = 0.0
+    particle_anim_running = False
+
+    def _init_particles(h: int, w: int, n: int) -> None:
+        """Initialize particles and trail buffer for wind particle animation."""
+        nonlocal particle_xy, particle_age, trail, base_wind_rgb_u8, last_anim_t
+        rng = np.random.default_rng(1337)
+        n = int(max(500, min(int(n), 60000)))
+        particle_xy = np.empty((n, 2), dtype=np.float32)
+        particle_xy[:, 0] = rng.uniform(0, w - 1, size=n).astype(np.float32)
+        particle_xy[:, 1] = rng.uniform(0, h - 1, size=n).astype(np.float32)
+        particle_age = rng.integers(0, 80, size=n, dtype=np.int32)
+        trail = np.zeros((h, w), dtype=np.float32)
+        base_wind_rgb_u8 = None
+        last_anim_t = time.perf_counter()
+
+    def _wind_uv_for_display() -> tuple[np.ndarray, np.ndarray] | None:
+        """Get (u,v) from sim_state for wind particle animation."""
+        nonlocal sim_state
+        if sim_state is None or sim_state.wind_u is None or sim_state.wind_v is None:
+            return None
+        return sim_state.wind_u, sim_state.wind_v
+
+    def _update_wind_particles() -> None:
+        """Animate wind particles in map mode using a fading trail buffer."""
+        nonlocal tk_img, particle_xy, particle_age, trail, base_wind_rgb_u8, last_wind_key, last_anim_t, particle_anim_running
+        if mode_var.get() != "map" or view_var.get() != "Wind Particles":
+            particle_anim_running = False
+            return
+        # Only animate while the simulation is running (Start). Otherwise, show a static frame.
+        if not sim_running or sim_paused:
+            uv = _wind_uv_for_display()
+            if uv is None:
+                return
+            u, v = uv
+            speed = np.hypot(u, v).astype(np.float32)
+            base_rgb = wind_speed_to_rgb(speed)
+            out = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
+            new_img = Image.fromarray(out)
+            tk_img = ImageTk.PhotoImage(new_img)
+            canvas.itemconfig(img_id, image=tk_img)
+            canvas.config(width=out.shape[1], height=out.shape[0])
+            particle_anim_running = False
+            return
+
+        # Use simulation elevation for dimensions (required for consistent indexing).
+        if sim_state is None or sim_state.elevation is None:
+            return
+        tex = sim_state.elevation
+        h, w = tex.shape
+        if trail is None or trail.shape != (h, w) or particle_xy is None or particle_age is None:
+            # Particle count: tie to "Arrows" control, but scale up for particles
+            _init_particles(h, w, n=int(wind_arrows_var.get()) * 8)
+
+        uv = _wind_uv_for_display()
+        if uv is None:
+            return
+        u, v = uv
+        # Cache base wind speed colormap, recompute only if u/v identity changes
+        uv_key = (id(u), id(v), h, w)
+        if base_wind_rgb_u8 is None or last_wind_key != uv_key:
+            speed = np.hypot(u, v).astype(np.float32)
+            base_rgb = wind_speed_to_rgb(speed)  # absolute scaling now
+            base_wind_rgb_u8 = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
+            last_wind_key = uv_key
+
+        # Time step (seconds) -> normalize to a stable "frames" unit
+        now = time.perf_counter()
+        dt_wall = now - last_anim_t
+        if dt_wall < 0.05:
+            root.after(50, _update_wind_particles)
+            return
+        dt = max(1e-3, min(0.08, dt_wall))
+        last_anim_t = now
+
+        # Fade trail
+        trail *= 0.90
+
+        # Advect particles (vectorized)
+        xy = particle_xy
+        x = xy[:, 0]
+        y = xy[:, 1]
+        xi = np.clip(x.astype(np.int32), 0, w - 1)
+        yi = np.clip(y.astype(np.int32), 0, h - 1)
+        uu = u[yi, xi].astype(np.float32)
+        vv = v[yi, xi].astype(np.float32)
+        sp = np.hypot(uu, vv) + 1e-6
+
+        # Convert wind speed to pixels per tick (heuristic). Scale control acts like a multiplier.
+        vmax = 25.0
+        px_step = (float(wind_scale_var.get()) * 6.0) * (sp / vmax)
+        dx = (uu / sp) * px_step
+        dy = (-vv / sp) * px_step
+        x1 = (x + dx).astype(np.float32)
+        y1 = (y + dy).astype(np.float32)
+
+        # Wrap in longitude, respawn if off-map in latitude
+        x1 = np.mod(x1, float(w))
+        alive = (y1 >= 0.0) & (y1 < float(h))
+
+        # Intensity by speed; brighten fast flow
+        inten = np.clip(sp / vmax, 0.0, 1.0) ** 0.6
+        inten = inten.astype(np.float32) * 0.9
+
+        # Deposit a short streak along motion (4 samples), additive then clamp
+        samples = np.array([0.0, 0.33, 0.66, 1.0], dtype=np.float32)
+        xs = x[:, None] + (x1 - x)[:, None] * samples[None, :]
+        ys = y[:, None] + (y1 - y)[:, None] * samples[None, :]
+        xs = np.mod(xs, float(w))
+        # only deposit for in-bounds y samples
+        ys_clip = np.clip(ys, 0.0, float(h - 1))
+        xi_s = xs.astype(np.int32).ravel()
+        yi_s = ys_clip.astype(np.int32).ravel()
+        w_s = np.repeat(inten, samples.size)
+        # Add with clip (fast, avoids Python loops)
+        trail[yi_s, xi_s] = np.clip(trail[yi_s, xi_s] + w_s * 0.35, 0.0, 1.0)
+
+        # Update particle positions and ages
+        particle_xy[:, 0] = x1
+        particle_xy[:, 1] = np.where(alive, y1, y)  # keep y for dead until respawn
+        particle_age -= 1
+
+        # Respawn: dead age or out-of-bounds
+        dead = (particle_age <= 0) | (~alive)
+        if np.any(dead):
+            rng = np.random.default_rng(int(now * 1000) & 0xFFFFFFFF)
+            particle_xy[dead, 0] = rng.uniform(0, w - 1, size=int(np.sum(dead))).astype(np.float32)
+            particle_xy[dead, 1] = rng.uniform(0, h - 1, size=int(np.sum(dead))).astype(np.float32)
+            particle_age[dead] = rng.integers(40, 120, size=int(np.sum(dead)), dtype=np.int32)
+
+        # Composite: base wind + white trails (brightness indicates speed)
+        out = base_wind_rgb_u8.copy()
+        streak = (np.clip(trail, 0.0, 1.0) * 255.0).astype(np.uint8)
+        # Additive blend into RGB
+        out[..., 0] = np.clip(out[..., 0].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
+        out[..., 1] = np.clip(out[..., 1].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
+        out[..., 2] = np.clip(out[..., 2].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
+
+        new_img = Image.fromarray(out)
+        tk_img = ImageTk.PhotoImage(new_img)
+        canvas.itemconfig(img_id, image=tk_img)
+        canvas.config(width=w, height=h)
+
+        # Schedule next frame
+        root.after(50, _update_wind_particles)
     
     def export_data():
         """Export simulation time series data."""
@@ -131,6 +286,22 @@ def main() -> None:
 
     tk.Button(controls, text="Export Data", command=export_data).pack(side="right", padx=10)
     tk.Button(controls, text="Benchmark", command=run_benchmark).pack(side="right", padx=10)
+
+    def _init_sim_state_from_elevation(elev: np.ndarray) -> None:
+        """Initialize sim_state immediately (but do not start stepping)."""
+        nonlocal sim_state, sim_running, sim_paused
+        sim_state = create_initial_state(
+            elev,
+            day_of_year=80.0,
+            wind_block_size=int(wind_block_size_var.get()),
+        )
+        sim_running = False
+        sim_paused = False
+        sim_status_var.set("Stopped")
+        diagnostics.history.clear()
+        diagnostics.component_history.clear()
+        diagnostics.total_days = 0.0
+        sim_cycle_var.set("Year: 1")
     
     # Simulation controls
     sim_controls = tk.Frame(root)
@@ -150,9 +321,8 @@ def main() -> None:
     # Wind controls
     wind_arrows_var = tk.IntVar(value=int(settings.get("wind_arrows", default_settings["wind_arrows"])))
     wind_scale_var = tk.DoubleVar(value=float(settings.get("wind_scale", default_settings["wind_scale"])))
-    precip_evap_var = tk.DoubleVar(value=float(settings.get("precip_evap_coeff", 1.0)))
-    precip_uplift_var = tk.DoubleVar(value=float(settings.get("precip_uplift_coeff", 1.0)))
-    precip_eff_var = tk.DoubleVar(value=float(settings.get("precip_efficiency", 0.7)))
+    wind_block_size_var = tk.IntVar(value=int(settings.get("wind_block_size", default_settings["wind_block_size"])))
+    # Precipitation simulation removed.
     def add_wind_controls():
         frm = tk.Frame(root)
         frm.pack(fill="x")
@@ -160,9 +330,7 @@ def main() -> None:
             f = tk.Frame(parent); f.pack(side="left", padx=4); tk.Label(f, text=label).pack(side="left"); tk.Entry(f, textvariable=var, width=width).pack(side="left")
         add(frm, "Arrows", wind_arrows_var)
         add(frm, "Scale", wind_scale_var)
-        add(frm, "Evap", precip_evap_var)
-        add(frm, "Uplift", precip_uplift_var)
-        add(frm, "Eff", precip_eff_var)
+        add(frm, "WindBS", wind_block_size_var, width=4)
         return frm
     wind_controls = add_wind_controls()
 
@@ -246,11 +414,8 @@ def main() -> None:
                 lac_entry.config(state="disabled")
                 gain_entry.config(state="disabled")
                 
-                # Reset simulation
-                sim_state = None
-                sim_running = False
-                sim_paused = False
-                sim_status_var.set("Stopped")
+                # Reset simulation (initialize immediately, but not running)
+                _init_sim_state_from_elevation(arr)
                 
                 # Update title
                 root.title(f"Sphere {size}x{size} - Loaded Heightmap")
@@ -282,11 +447,9 @@ def main() -> None:
         lac_entry.config(state="normal")
         gain_entry.config(state="normal")
         
-        # Reset simulation
-        sim_state = None
-        sim_running = False
-        sim_paused = False
-        sim_status_var.set("Stopped")
+        # Reset simulation (initialize immediately, but not running)
+        tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+        _init_sim_state_from_elevation(tex)
         
         # Update title
         root.title(f"Sphere {size}x{size} (262,144 cells)")
@@ -319,11 +482,21 @@ def main() -> None:
         }
         if mode_var.get() == "globe":
             day = int(sim_state.day_of_year) if (sim_state is not None and sim_running) else 80
-            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), day_of_year=day, **p)
+            view_name = view_var.get()
+            if view_name == "Wind Arrows" or view_name == "Wind Particles":
+                view_name = "Wind"
+            new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_name, day_of_year=day, **p)
             canvas.config(width=size, height=size)
         else:
             tex = ensure_elevation(size, **p)
-            if view_var.get() == "Wind":
+            if view_var.get() == "Wind Particles":
+                # Start animation loop; render() will keep it going.
+                nonlocal particle_anim_running
+                if not particle_anim_running:
+                    particle_anim_running = True
+                    _update_wind_particles()
+                return
+            if view_var.get() == "Wind Arrows":
                 wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
                 if _WIND_CACHE["key"] != wkey:
                     with log_time("Generate wind field+arrows"):
@@ -413,6 +586,9 @@ def main() -> None:
     except Exception as e:
         LOG.warning(f"Could not load default heightmap: {e}, using procedural")
         tex0 = ensure_elevation(size, seed=settings["seed"], octaves=settings["octaves"], freq=settings["freq"], lac=settings["lac"], gain=settings["gain"])
+
+    # Initialize sim_state immediately (stopped) so wind particles can use sim winds even before Start.
+    _init_sim_state_from_elevation(tex0)
     
     rgbf0 = colorize(tex0)
     arr0 = (np.clip(rgbf0, 0.0, 1.0) * 255).astype(np.uint8)
@@ -434,13 +610,16 @@ def main() -> None:
         if mode_var.get() == "globe":
             with log_time("Render globe"):
                 day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+                view_name = view_var.get()
+                if view_name == "Wind Arrows" or view_name == "Wind Particles":
+                    view_name = "Wind"
                 # In loaded mode, ensure elevation is cached before generating sphere
                 if terrain_mode == "loaded":
                     elev_tex, _ = get_elevation_cache()
                     if elev_tex is None:
                         # Cache was cleared, shouldn't happen but fallback to procedural
                         terrain_mode = "procedural"
-                new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_var.get(), seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get(), day_of_year=day)
+                new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_name, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get(), day_of_year=day)
             canvas.config(width=size, height=size)
         else:
             # Get elevation from simulation or generate
@@ -465,6 +644,12 @@ def main() -> None:
                             tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
                     else:
                         tex = elev_tex
+            if view_var.get() == "Wind Particles":
+                nonlocal particle_anim_running
+                if not particle_anim_running:
+                    particle_anim_running = True
+                    _update_wind_particles()
+                return
             base_rgb = colorize(tex)
             
             if view_var.get() == "Temperature":
@@ -500,7 +685,7 @@ def main() -> None:
                     arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
                 else:
                     arr = (base_rgb * 255).astype(np.uint8)
-            elif view_var.get() == "Wind":
+            elif view_var.get() == "Wind Arrows":
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
                 else:
@@ -515,35 +700,6 @@ def main() -> None:
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 arr = (np.clip(base_rgb + arrows, 0.0, 1.0) * 255).astype(np.uint8)
-            elif view_var.get() == "Precipitation":
-                if use_sim_data and sim_state.precipitation is not None:
-                    P = sim_state.precipitation
-                else:
-                    pkey = (tex.shape, float(precip_evap_var.get()), float(precip_uplift_var.get()), float(precip_eff_var.get()))
-                    if _PRECIP_CACHE["key"] != pkey:
-                        with log_time("Generate precipitation"):
-                            day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
-                            P, _, _ = generate_precipitation(
-                                *tex.shape,
-                                tex,
-                                day_of_year=day,
-                                evap_coeff=float(precip_evap_var.get()),
-                                uplift_coeff=float(precip_uplift_var.get()),
-                                rain_efficiency=float(precip_eff_var.get()),
-                            )
-                        _PRECIP_CACHE.update({"key": pkey, "P": P})
-                    else:
-                        P = _PRECIP_CACHE["P"]
-                # Fixed color scale: 0..20 mm/day
-                v = np.clip(P / 20.0, 0.0, 1.0).astype(np.float32)
-                # Blue→Green→Yellow→Red
-                cstops = np.array([[0.0,0.2,0.8],[0.0,0.8,0.0],[0.9,0.9,0.0],[0.9,0.1,0.0]], dtype=np.float32)
-                bp = np.array([0.0, 0.33, 0.66, 1.0], dtype=np.float32)
-                i = np.clip(np.searchsorted(bp, v, side="right") - 1, 0, len(bp) - 2)
-                c0 = cstops[i]; c1 = cstops[i+1]
-                t = (v - bp[i]) / (bp[i+1] - bp[i] + 1e-9)
-                rgb = c0 + (c1 - c0) * t[..., None]
-                arr = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
             else:
                 arr = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
             new_img = Image.fromarray(arr)
@@ -563,18 +719,17 @@ def main() -> None:
         if sim_state is None:
             # Initialize simulation from current elevation
             tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
-            sim_state = create_initial_state(
-                tex,
-                day_of_year=80.0,
-                evap_coeff=float(precip_evap_var.get()),
-                uplift_coeff=float(precip_uplift_var.get()),
-                rain_efficiency=float(precip_eff_var.get()),
-            )
+            _init_sim_state_from_elevation(tex)
         sim_running = True
         sim_paused = False
         sim_status_var.set("Running")
         # Diagnostics tracks total time; use it to display cycle count (years).
         sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
+        # If particle view is selected, start animation loop.
+        nonlocal particle_anim_running
+        if mode_var.get() == "map" and view_var.get() == "Wind Particles" and not particle_anim_running:
+            particle_anim_running = True
+            _update_wind_particles()
         update_simulation()
     
     def stop_simulation():
@@ -591,15 +746,13 @@ def main() -> None:
     
     def reset_simulation():
         nonlocal sim_state, sim_running, sim_paused
-        sim_state = None
-        sim_running = False
-        sim_paused = False
-        sim_status_var.set("Stopped")
-        # Reset diagnostics time so cycle counter restarts.
-        diagnostics.history.clear()
-        diagnostics.component_history.clear()
-        diagnostics.total_days = 0.0
-        sim_cycle_var.set("Year: 1")
+        # Reset to a freshly initialized (stopped) state from current elevation.
+        use_sim_data = sim_state is not None and sim_running
+        if use_sim_data and sim_state is not None and sim_state.elevation is not None:
+            tex = sim_state.elevation
+        else:
+            tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+        _init_sim_state_from_elevation(tex)
         render()
     
     def update_cursor_display(x: int, y: int):
@@ -643,7 +796,7 @@ def main() -> None:
                 else:
                     elevation_above_sea = elev_raw - sea_level
                     alt_m = (elevation_above_sea / (1.0 - sea_level)) ** 2.0 * 8848.0
-            if view_var.get() == "Wind":
+            if view_var.get() == "Wind Arrows" or view_var.get() == "Wind Particles":
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
                 elif _WIND_CACHE["u"] is None or _WIND_CACHE["u"].shape != (h, w):
@@ -654,25 +807,6 @@ def main() -> None:
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
                 px_str = f", {pixel_display}" if pixel_display else ""
                 latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, wind {speed:.1f} m/s")
-            elif view_var.get() == "Precipitation":
-                if use_sim_data and sim_state.precipitation is not None:
-                    P = sim_state.precipitation
-                elif _PRECIP_CACHE["P"] is None or _PRECIP_CACHE["P"].shape != (h, w):
-                    day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
-                    P, _, _ = generate_precipitation(
-                        h,
-                        w,
-                        tex,
-                        day_of_year=day,
-                        evap_coeff=float(precip_evap_var.get()),
-                        uplift_coeff=float(precip_uplift_var.get()),
-                        rain_efficiency=float(precip_eff_var.get()),
-                    )
-                    _PRECIP_CACHE.update({"key": (tex.shape, float(precip_evap_var.get()), float(precip_uplift_var.get()), float(precip_eff_var.get())), "P": P})
-                else:
-                    P = _PRECIP_CACHE["P"]
-                px_str = f", {pixel_display}" if pixel_display else ""
-                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, precip {float(P[int(y), int(x)]):.2f} mm/day")
             else:
                 # Use simulation temperature if available
                 if use_sim_data and sim_state.temperature is not None:
@@ -693,9 +827,7 @@ def main() -> None:
             sim_state, temp_components = simulate_step(
                 sim_state,
                 days=sim_speed,
-                evap_coeff=float(precip_evap_var.get()),
-                uplift_coeff=float(precip_uplift_var.get()),
-                rain_efficiency=float(precip_eff_var.get()),
+                wind_block_size=int(wind_block_size_var.get()),
                 debug_log=False,  # Disabled - use export data for analysis instead
                 track_components=True,  # Always track components for diagnostics
             )
@@ -709,6 +841,8 @@ def main() -> None:
                     component_contributions=temp_components
                 )
                 sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
+                # Always update day label here (Wind Particles render path can return early).
+                sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
             # Update display
             render()
             # Update cursor display at last known mouse position
@@ -757,9 +891,7 @@ def main() -> None:
             "gain": float(gain_var.get()),
             "wind_arrows": int(wind_arrows_var.get()),
             "wind_scale": float(wind_scale_var.get()),
-            "precip_evap_coeff": float(precip_evap_var.get()),
-            "precip_uplift_coeff": float(precip_uplift_var.get()),
-            "precip_efficiency": float(precip_eff_var.get()),
+            "wind_block_size": int(wind_block_size_var.get()),
         }
         save_settings(s)
         root.destroy()
