@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import numpy as np
 from typing import NamedTuple
-from atmosphere import generate_wind_field, generate_precipitation
+from atmosphere import generate_wind_field
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
 from ocean import calculate_ocean_heat_transport
+
+# Cache for diagnostic/relaxation wind to avoid recomputing every step.
+_RELAX_CACHE = {"key": None, "u": None, "v": None}
 
 
 class PlanetState(NamedTuple):
@@ -36,13 +39,22 @@ def simulate_step(
     days: float = 1.0,
     *,
     block_size: int = 3,
-    evap_coeff: float = 1.0,
-    uplift_coeff: float = 1.0,
-    rain_efficiency: float = 0.7,
-    precip_iterations: int = 48,
+    wind_block_size: int | None = None,
     update_wind: bool = True,
-    update_precip: bool = True,
-    wind_relax: float = 0.35,
+    wind_relax: float = 0.0,
+    wind_target_weather_amp: float = 0.0,
+    wind_target_zonal_pressure: float = 1.0,
+    wind_target_terrain_pressure_amp: float = 0.25,
+    wind_target_terrain_flow_amp: float = 0.25,
+    wind_pgf_temp_scale: float = 450.0,
+    wind_pgf_terrain_scale: float = 900.0,
+    wind_drag_base: float = 2.0e-7,
+    wind_drag_elev_scale: float = 6.0e-7,
+    wind_damping: float = 0.25,
+    # Baroclinic eddy / thermal-wind proxy. The previous default (3e7) tends to produce
+    # unrealistically strong, planet-wide surface jets. Keep conservative by default.
+    wind_baroclinic_jet_amp: float = 0.0,
+    wind_baroclinic_mix: float = 2.0,
     debug_log: bool = False,
     track_components: bool = False,
 ) -> tuple[PlanetState, dict]:
@@ -64,12 +76,8 @@ def simulate_step(
         state: Current planet state
         days: Time step in days (default 1.0)
         block_size: Coarse resolution for simulation (larger = faster, less accurate)
-        evap_coeff: Evaporation coefficient
-        uplift_coeff: Orographic uplift coefficient
-        rain_efficiency: Rain efficiency
-        precip_iterations: Precipitation solver iterations
+        wind_block_size: Coarse resolution used for wind evolution. If None, uses `block_size`.
         update_wind: Whether to recompute wind field
-        update_precip: Whether to recompute precipitation
 
     Returns:
         New state with updated day_of_year and atmospheric fields
@@ -79,6 +87,9 @@ def simulate_step(
     H, W = state.elevation.shape
     Hc, Wc = (max(1, (H + block_size - 1) // block_size),
               max(1, (W + block_size - 1) // block_size))
+    wind_bs = max(1, int(block_size if wind_block_size is None else wind_block_size))
+    Hcw, Wcw = (max(1, (H + wind_bs - 1) // wind_bs),
+                max(1, (W + wind_bs - 1) // wind_bs))
 
     # Get base insolation temperature (latitude-dependent)
     # Ocean: seasonal lag of ~50 days (1.5 months) due to high heat capacity
@@ -94,6 +105,11 @@ def simulate_step(
     lagged_day = (new_day - lag_days) % 365.2422
     T_lat_ocean = temperature_kelvin_for_lat(lat, day_of_year=int(lagged_day))
     T_base_ocean = np.repeat(T_lat_ocean[:, None], Wc, axis=1).astype(np.float32)
+    # Full-resolution fallback base temperature (used when wind evolves at full resolution
+    # before `state.temperature` is initialized).
+    lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
+    T_lat_ocean_full = temperature_kelvin_for_lat(lat_full, day_of_year=int(lagged_day))
+    T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32)
     
     # Blend based on land fraction (will be calculated in _evolve_temperature)
     # Use ocean-lagged temperature as base; _evolve_temperature will handle land/ocean mixing
@@ -117,94 +133,140 @@ def simulate_step(
     # ------------------------------------------------------
     # NEW: Prognostic Wind Evolution (Physics Items 16-33)
     # ------------------------------------------------------
-    # If wind is None, initialize it at coarse resolution for speed
+    # If wind is None, initialize it near-rest (small noise) so circulation spins up
+    # from pressure gradients (Hadley-like overturning) rather than a synthetic target.
     if state.wind_u is None or state.wind_v is None:
-        if block_size > 1:
-            # Generate at coarse resolution, then upsample
-            u_coarse_init, v_coarse_init = generate_wind_field(Hc, Wc, day_of_year=int(new_day), block_size=1, elevation=elev_c)
-            from atmosphere import _upsample_bilinear
-            u_full = _upsample_bilinear(u_coarse_init, H, W, block_size)
-            v_full = _upsample_bilinear(v_coarse_init, H, W, block_size)
-        else:
-            u_full, v_full = generate_wind_field(H, W, day_of_year=int(new_day), block_size=1, elevation=state.elevation)
+        rng = np.random.default_rng(12345)
+        u_full = rng.normal(0.0, 0.15, size=(H, W)).astype(np.float32)
+        v_full = rng.normal(0.0, 0.15, size=(H, W)).astype(np.float32)
     else:
         u_full, v_full = state.wind_u, state.wind_v
         
-    # Evolve wind at coarse resolution for speed (6x faster for block_size=3)
+    # Evolve wind at `wind_block_size` resolution (can differ from temperature/precip `block_size`)
     # Then upsample to full resolution for precipitation
     from atmosphere import evolve_wind
-    if block_size > 1:
-        # Downsample wind and temperature for evolution
-        u_pad = np.pad(u_full, ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        v_pad = np.pad(v_full, ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        u_coarse_evol = u_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-        v_coarse_evol = v_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-        
-        T_for_wind = T_prev_coarse if state.temperature is not None else T_base
-        
-        # Evolve at coarse resolution (much faster)
+    # Cached diagnostic wind for relaxation (once per day/shape/params).
+    def _diag_wind_cached(h: int, w: int, temp_field: np.ndarray, elev_field: np.ndarray):
+        key = (
+            h,
+            w,
+            int(new_day),  # only vary daily
+            float(wind_target_weather_amp),
+            float(wind_target_zonal_pressure),
+            float(wind_target_terrain_pressure_amp),
+            float(wind_target_terrain_flow_amp),
+        )
+        cache = _RELAX_CACHE
+        if cache["key"] == key and cache["u"] is not None and cache["v"] is not None:
+            return cache["u"], cache["v"]
+        u_diag, v_diag = generate_wind_field(
+            h,
+            w,
+            day_of_year=int(new_day),
+            block_size=1,
+            temperature=temp_field,
+            elevation=elev_field,
+            weather_amp=float(wind_target_weather_amp),
+            zonal_pressure=float(wind_target_zonal_pressure),
+            terrain_pressure_amp=float(wind_target_terrain_pressure_amp),
+            terrain_flow_amp=float(wind_target_terrain_flow_amp),
+            time_days=new_total_days,
+        )
+        cache.update({"key": key, "u": u_diag, "v": v_diag})
+        return u_diag, v_diag
+
+    if wind_bs > 1:
+        # Downsample wind/temperature/elevation for evolution on the wind grid.
+        u_pad = np.pad(u_full.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
+        v_pad = np.pad(v_full.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
+        u_coarse_evol = u_pad.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
+        v_coarse_evol = v_pad.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
+
+        elev_pad_w = np.pad(state.elevation.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
+        elev_c_w = elev_pad_w.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
+
+        if state.temperature is not None:
+            T_pad_w = np.pad(state.temperature.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
+            T_for_wind = T_pad_w.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
+        else:
+            # When temperature is not yet initialized, use the same lagged-ocean base but on the wind grid.
+            lat_w = (0.5 - (np.arange(Hcw, dtype=np.float32) + 0.5) / Hcw) * np.pi
+            T_lat_ocean_w = temperature_kelvin_for_lat(lat_w, day_of_year=int(lagged_day))
+            T_for_wind = np.repeat(T_lat_ocean_w[:, None], Wcw, axis=1).astype(np.float32)
+
+        # Evolve at wind-grid resolution.
         u_coarse_evol, v_coarse_evol = evolve_wind(
             u_coarse_evol, v_coarse_evol,
             temperature=T_for_wind,
             pressure=None,
-            elevation=elev_c,
-            dt_days=days
+            elevation=elev_c_w,
+            dt_days=days,
+            damping=float(wind_damping),
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            pgf_terrain_scale=float(wind_pgf_terrain_scale),
+            drag_base=float(wind_drag_base),
+            drag_elev_scale=float(wind_drag_elev_scale),
+            baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
+            baroclinic_mix=float(wind_baroclinic_mix),
         )
 
         # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
         # (generate_wind_field injects synoptic-scale "weather systems" seeded by day_of_year).
         if wind_relax > 0.0:
-            u_diag, v_diag = generate_wind_field(
-                Hc,
-                Wc,
-                day_of_year=int(new_day),
-                block_size=1,
-                temperature=T_for_wind,
-                elevation=elev_c,
-                weather_amp=0.80,
-                zonal_pressure=1.0,
-                terrain_pressure_amp=0.25,
-                terrain_flow_amp=0.25,
-                time_days=new_total_days,
-            )
+            u_diag, v_diag = _diag_wind_cached(Hcw, Wcw, T_for_wind, elev_c_w)
             a = float(np.clip(wind_relax, 0.0, 1.0))
             u_coarse_evol = (1.0 - a) * u_coarse_evol + a * u_diag
             v_coarse_evol = (1.0 - a) * v_coarse_evol + a * v_diag
         
         # Upsample back to full resolution using bilinear interpolation
         from atmosphere import _upsample_bilinear
-        u_full = _upsample_bilinear(u_coarse_evol, H, W, block_size)
-        v_full = _upsample_bilinear(v_coarse_evol, H, W, block_size)
-        
-        u_coarse = u_coarse_evol
-        v_coarse = v_coarse_evol
+        u_full = _upsample_bilinear(u_coarse_evol, H, W, wind_bs)
+        v_full = _upsample_bilinear(v_coarse_evol, H, W, wind_bs)
     else:
-        # Full resolution evolution (block_size=1)
+        # Full resolution evolution
+        # If wind evolves at higher resolution than the temperature solver, drive it with the
+        # coarse temperature field upsampled to full resolution. This avoids injecting
+        # grid-scale temperature noise into the wind solver (which can blow up speeds),
+        # while still allowing the wind numerics to run on the fine grid.
+        T_wind_full = state.temperature if state.temperature is not None else T_base_ocean_full
+        elev_wind_full = state.elevation
+        if wind_bs < block_size and block_size > 1:
+            from atmosphere import _upsample_bilinear
+            if state.temperature is not None:
+                T_wind_full = _upsample_bilinear(T_prev_coarse, H, W, block_size)
+            else:
+                T_wind_full = _upsample_bilinear(T_base, H, W, block_size)
+            if elev_c is not None:
+                elev_wind_full = _upsample_bilinear(elev_c, H, W, block_size)
+
         u_full, v_full = evolve_wind(
             u_full, v_full, 
-            temperature=state.temperature if state.temperature is not None else T_base,
+            temperature=T_wind_full,
             pressure=None,
-            elevation=state.elevation,
-            dt_days=days
+            elevation=elev_wind_full,
+            dt_days=days,
+            damping=float(wind_damping),
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            pgf_terrain_scale=float(wind_pgf_terrain_scale),
+            drag_base=float(wind_drag_base),
+            drag_elev_scale=float(wind_drag_elev_scale),
+            baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
+            baroclinic_mix=float(wind_baroclinic_mix),
         )
         if wind_relax > 0.0:
-            T_for_wind = state.temperature if state.temperature is not None else T_base
-            u_diag, v_diag = generate_wind_field(
-                H,
-                W,
-                day_of_year=int(new_day),
-                block_size=1,
-                temperature=T_for_wind,
-                elevation=state.elevation,
-                weather_amp=0.80,
-                zonal_pressure=1.0,
-                terrain_pressure_amp=0.25,
-                terrain_flow_amp=0.25,
-                time_days=new_total_days,
-            )
+            T_for_wind = T_wind_full
+            u_diag, v_diag = _diag_wind_cached(H, W, T_for_wind, elev_wind_full)
             a = float(np.clip(wind_relax, 0.0, 1.0))
             u_full = (1.0 - a) * u_full + a * u_diag
             v_full = (1.0 - a) * v_full + a * v_diag
+
+    # Winds to couple into temperature evolution operate on the temperature grid (Hc,Wc).
+    if block_size > 1:
+        u_pad_t = np.pad(u_full.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        v_pad_t = np.pad(v_full.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        u_coarse = u_pad_t.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+        v_coarse = v_pad_t.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+    else:
         u_coarse = u_full
         v_coarse = v_full
 
@@ -268,124 +330,14 @@ def simulate_step(
         cloud_full = cloud_c
         snow_full = snow_c
 
-    # Update wind from temperature gradients (if requested or needed for precipitation)
+    # Update wind from temperature gradients (if requested)
     # Already evolved above
     # if update_wind... removed legacy block
     
-    # Update precipitation from wind, temperature, elevation (if requested)
-    humidity_prev = state.humidity
-    soil_prev = getattr(state, "soil_moisture", None)
-
-    if update_precip:
-        if block_size > 1:
-            # Run precipitation at coarse resolution for speed (9x faster)
-            # Downsample inputs
-            elev_pad = np.pad(state.elevation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-            elev_coarse = elev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-            
-            T_pad = np.pad(T_full.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-            T_coarse_precip = T_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-            
-            u_pad = np.pad(u_full, ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-            v_pad = np.pad(v_full, ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-            u_coarse_precip = u_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-            v_coarse_precip = v_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-            
-            # Downsample humidity and soil moisture if they exist
-            if humidity_prev is not None:
-                h_pad = np.pad(humidity_prev.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-                humidity_coarse = h_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-            else:
-                humidity_coarse = None
-            
-            if soil_prev is not None:
-                s_pad = np.pad(soil_prev.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-                soil_coarse = s_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-            else:
-                soil_coarse = None
-            
-            # Run precipitation at coarse resolution
-            P_coarse, humidity_coarse_next, soil_coarse_next = generate_precipitation(
-                Hc, Wc, elev_coarse,
-                temperature=T_coarse_precip,
-                wind_u=u_coarse_precip,
-                wind_v=v_coarse_precip,
-                humidity=humidity_coarse,
-                soil_moisture=soil_coarse,
-                day_of_year=int(new_day),
-                dt_days=max(days, 1.0),
-                evap_coeff=evap_coeff,
-                uplift_coeff=uplift_coeff,
-                rain_efficiency=rain_efficiency,
-            )
-            
-            # Upsample results to full resolution
-            from atmosphere import _upsample_bilinear
-            P_full = _upsample_bilinear(P_coarse, H, W, block_size)
-            
-            # Apply temporal damping to precipitation to reduce variability
-            # Blend with previous precipitation (70% new, 30% old) to smooth out fluctuations
-            if state.precipitation is not None:
-                P_prev = state.precipitation
-                # Match shapes if needed (e.g., after resolution change)
-                if P_prev.shape == P_full.shape:
-                    P_full = 0.7 * P_full + 0.3 * P_prev
-                # Additional spatial smoothing to reduce extreme values
-                P_pad = np.pad(P_full, ((1, 1), (0, 0)), mode="edge")
-                c = P_pad[1:-1, :]
-                n = P_pad[0:-2, :]
-                s = P_pad[2:, :]
-                e = np.roll(c, -1, axis=1)
-                w = np.roll(c, 1, axis=1)
-                P_lap = n + s + e + w - 4.0 * c
-                P_full = P_full + 0.1 * P_lap  # Light smoothing
-                P_full = np.maximum(P_full, 0.0)  # Ensure non-negative
-            
-            if humidity_coarse_next is not None:
-                humidity_next = _upsample_bilinear(humidity_coarse_next, H, W, block_size)
-            else:
-                humidity_next = None
-            if soil_coarse_next is not None:
-                soil_next = _upsample_bilinear(soil_coarse_next, H, W, block_size)
-            else:
-                soil_next = None
-        else:
-            # Full resolution (block_size=1)
-            P_full, humidity_next, soil_next = generate_precipitation(
-                H, W, state.elevation,
-                temperature=T_full,
-                wind_u=u_full,
-                wind_v=v_full,
-                humidity=humidity_prev,
-                soil_moisture=soil_prev,
-                day_of_year=int(new_day),
-                dt_days=max(days, 1.0),
-                evap_coeff=evap_coeff,
-                uplift_coeff=uplift_coeff,
-                rain_efficiency=rain_efficiency,
-            )
-            
-            # Apply temporal damping to precipitation to reduce variability
-            # Blend with previous precipitation (70% new, 30% old) to smooth out fluctuations
-            if state.precipitation is not None:
-                P_prev = state.precipitation
-                # Match shapes if needed
-                if P_prev.shape == P_full.shape:
-                    P_full = 0.7 * P_full + 0.3 * P_prev
-                # Additional spatial smoothing to reduce extreme values
-                P_pad = np.pad(P_full, ((1, 1), (0, 0)), mode="edge")
-                c = P_pad[1:-1, :]
-                n = P_pad[0:-2, :]
-                s = P_pad[2:, :]
-                e = np.roll(c, -1, axis=1)
-                w = np.roll(c, 1, axis=1)
-                P_lap = n + s + e + w - 4.0 * c
-                P_full = P_full + 0.1 * P_lap  # Light smoothing
-                P_full = np.maximum(P_full, 0.0)  # Ensure non-negative
-    else:
-        P_full = state.precipitation
-        humidity_next = humidity_prev
-        soil_next = soil_prev
+    # Precipitation simulation removed (for performance / simplicity).
+    P_full = None
+    humidity_next = None
+    soil_next = None
 
     # Debug logging if requested
     if debug_log:
