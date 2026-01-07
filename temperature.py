@@ -13,6 +13,15 @@ import numpy as np
 # Combined with mild evaporative cooling and improved color gradient
 EPSILON_ATM = 0.68
 
+# Cache for base temperature calculations (optimization 2.6)
+_TEMP_BASE_CACHE = {}
+
+# Color lookup table for temperature-to-RGB conversion (optimization 2.5)
+_TEMP_LUT = None
+_TEMP_LUT_TMIN = 193.15
+_TEMP_LUT_TMAX = 313.15
+_TEMP_LUT_SIZE = 256
+
 
 def elevation_to_alt_km(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: float = 0.05) -> np.ndarray:
     """Convert normalized elevation [0,1] to approximate altitude (km).
@@ -103,10 +112,30 @@ def _upsample_repeat(field: np.ndarray, H: int, W: int, block_size: int) -> np.n
     return up[:H, :W]
 
 
+def _temperature_to_rgb_slow(T_kelvin: np.ndarray) -> np.ndarray:
+    """Slow reference implementation of temperature-to-RGB conversion.
+    
+    Used for building the lookup table.
+    """
+    tmin, tmax = 193.15, 313.15
+    v = np.clip((T_kelvin - tmin) / (tmax - tmin), 0.0, 1.0).astype(np.float32)
+    color_stops = np.array([
+        [0.05, 0.0, 0.4],   [0.0, 0.2, 0.7],    [0.0, 0.5, 0.9],    [0.0, 0.7, 0.8],
+        [0.2, 0.8, 0.6],   [0.4, 0.85, 0.4],   [0.65, 0.9, 0.3],   [0.85, 0.95, 0.2],
+        [0.95, 0.8, 0.15], [0.98, 0.5, 0.05],  [0.85, 0.15, 0.0],
+    ], dtype=np.float32)
+    breakpoints = np.array([0.0, 0.12, 0.25, 0.38, 0.50, 0.58, 0.67, 0.75, 0.83, 0.92, 1.0], dtype=np.float32)
+    idx = np.clip(np.searchsorted(breakpoints, v, side="right") - 1, 0, len(breakpoints) - 2)
+    c0 = color_stops[idx]
+    c1 = color_stops[idx + 1]
+    t = (v - breakpoints[idx]) / (breakpoints[idx + 1] - breakpoints[idx] + 1e-9)
+    return (c0 + (c1 - c0) * t[..., None]).astype(np.float32)
+
+
 def temperature_to_rgb(T_kelvin: np.ndarray) -> np.ndarray:
     """Convert temperature array (Kelvin) to RGB overlay using high-quality color gradient.
     
-    Uses the same 11-color gradient as generate_temperature_overlay for visual consistency.
+    Uses optimized lookup table for fast conversion (optimization 2.5).
     Range: -80°C to +40°C (193K to 313K).
     
     Args:
@@ -115,33 +144,56 @@ def temperature_to_rgb(T_kelvin: np.ndarray) -> np.ndarray:
     Returns:
         RGB overlay array, shape (H, W, 3), float32 in [0, 1]
     """
-    # Normalize to FULL realistic Earth temperature range
-    # Extended range: -80°C to +40°C (193K to 313K)
-    tmin, tmax = 193.15, 313.15  # -80°C to +40°C
-    v = np.clip((T_kelvin - tmin) / (tmax - tmin), 0.0, 1.0).astype(np.float32)
-
-    # Enhanced color gradient with better differentiation across full range
-    # Blue→Cyan→Green→Yellow→Orange→Red with more detail in inhabited zones
-    color_stops = np.array([
-        [0.05, 0.0, 0.4],   # 0.00: Deep purple-blue (-80°C) - extreme Arctic winter
-        [0.0, 0.2, 0.7],    # 0.12: Dark blue (-65°C) - Arctic winter
-        [0.0, 0.5, 0.9],    # 0.25: Blue (-50°C) - severe cold
-        [0.0, 0.7, 0.8],    # 0.38: Cyan (-35°C) - very cold
-        [0.2, 0.8, 0.6],    # 0.50: Cyan-green (-20°C) - cold temperate
-        [0.4, 0.85, 0.4],   # 0.58: Green (-5°C) - cool temperate
-        [0.65, 0.9, 0.3],   # 0.67: Yellow-green (+5°C) - mild temperate
-        [0.85, 0.95, 0.2],  # 0.75: Yellow (+10°C) - warm temperate
-        [0.95, 0.8, 0.15],  # 0.83: Yellow-orange (+20°C) - warm/subtropical
-        [0.98, 0.5, 0.05],  # 0.92: Orange (+30°C) - hot tropical
-        [0.85, 0.15, 0.0],  # 1.00: Deep red (+40°C) - extreme heat
-    ], dtype=np.float32)
-    breakpoints = np.array([0.0, 0.12, 0.25, 0.38, 0.50, 0.58, 0.67, 0.75, 0.83, 0.92, 1.0], dtype=np.float32)
-    idx = np.clip(np.searchsorted(breakpoints, v, side="right") - 1, 0, len(breakpoints) - 2)
-    c0 = color_stops[idx]
-    c1 = color_stops[idx + 1]
-    t = (v - breakpoints[idx]) / (breakpoints[idx + 1] - breakpoints[idx] + 1e-9)
-    rgb_full = (c0 + (c1 - c0) * t[..., None]).astype(np.float32)
-    return rgb_full
+    global _TEMP_LUT
+    
+    # Initialize lookup table on first call
+    # IMPORTANT: the LUT must be exactly shape (256, 3). If it is (256, 1, 3),
+    # then c0/c1 become (N, 1, 3) and multiplying by t shaped (N, 1) broadcasts to
+    # (N, N, 3) -> the 3.00 TiB ArrayMemoryError you’re seeing.
+    if (
+        _TEMP_LUT is None
+        or not isinstance(_TEMP_LUT, np.ndarray)
+        or _TEMP_LUT.shape != (_TEMP_LUT_SIZE, 3)
+    ):
+        T_range = np.linspace(_TEMP_LUT_TMIN, _TEMP_LUT_TMAX, _TEMP_LUT_SIZE, dtype=np.float32)
+        _TEMP_LUT = _temperature_to_rgb_slow(T_range)  # (256, 3)
+        _TEMP_LUT = np.ascontiguousarray(_TEMP_LUT, dtype=np.float32)
+    
+    # Use LUT with linear interpolation
+    # IMPORTANT: force ndarray + 1D vectors to prevent accidental (N,N,3) broadcasts.
+    # If an upstream caller passes an np.matrix (or other 2D vector-like type),
+    # methods like `.flatten()` can return (1,N) instead of (N,), which combined with
+    # (N,1) interpolation weights explodes into an outer-product (N,N,3) allocation.
+    T_arr = np.asarray(T_kelvin, dtype=np.float32)
+    original_shape = T_arr.shape
+    T_flat = T_arr.ravel()  # guaranteed shape (N,)
+    n_pixels = int(T_flat.size)
+    
+    # Normalize temperatures to [0, 1] range
+    v = np.clip((T_flat - _TEMP_LUT_TMIN) / (_TEMP_LUT_TMAX - _TEMP_LUT_TMIN), 0.0, 1.0)
+    
+    # Convert to LUT indices (0 to 255)
+    idx_f = v * (_TEMP_LUT_SIZE - 1)
+    idx_lo = np.clip(np.floor(idx_f).astype(np.int32), 0, _TEMP_LUT_SIZE - 2)
+    idx_hi = idx_lo + 1
+    
+    # Interpolation factor [0, 1)
+    t = (idx_f - idx_lo).astype(np.float32)
+    
+    # Force true 1D ndarrays (works even if something upstream produced matrix-like arrays)
+    idx_lo = np.asarray(idx_lo, dtype=np.int32).ravel()
+    idx_hi = np.asarray(idx_hi, dtype=np.int32).ravel()
+    t = np.asarray(t, dtype=np.float32).ravel()
+    
+    # Get colors from LUT using direct indexing
+    c0 = _TEMP_LUT[idx_lo, :]  # (N, 3)
+    c1 = _TEMP_LUT[idx_hi, :]  # (N, 3)
+    
+    # Linear interpolation: ensure t is (n_pixels, 1) for broadcasting
+    t = t.reshape(n_pixels, 1)  # (N, 1)
+    rgb_flat = c0 + (c1 - c0) * t  # (N, 3)
+    
+    return rgb_flat.reshape(original_shape + (3,)).astype(np.float32)
 
 
 def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, epsilon_atm: float = EPSILON_ATM, block_size: int = 3, elevation: np.ndarray | None = None) -> np.ndarray:
@@ -184,23 +236,14 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, 
     # T_kelvin shape is (H, W) at full resolution - no need to downsample
     T_lat = T_kelvin
     
-    # Log temperature stats (now using simulation temperature)
+    # Log temperature stats only if debug logging enabled (optimization 2.4)
     import logging
     LOG = logging.getLogger("planetsim")
-    LOG.info(f"[Temperature from Simulation] min={float(np.min(T_lat)):.1f}K ({float(np.min(T_lat)-273.15):.1f}°C), "
-             f"mean={float(np.mean(T_lat)):.1f}K ({float(np.mean(T_lat)-273.15):.1f}°C), "
-             f"max={float(np.max(T_lat)):.1f}K ({float(np.max(T_lat)-273.15):.1f}°C)")
-    
-    # T_lat is already full resolution (H, W) with all physics applied by simulation
-    # (includes altitude correction, ocean thermal inertia, seasonal lag, etc.)
-    
-    # Log temperature stats (now using simulation temperature)
-    # Removed console logging - uncomment if needed for debugging
-    # import logging
-    # LOG = logging.getLogger("planetsim")
-    # LOG.info(f"[Temperature from Simulation] min={float(np.min(T_lat)):.1f}K ({float(np.min(T_lat)-273.15):.1f}°C), "
-    #          f"mean={float(np.mean(T_lat)):.1f}K ({float(np.mean(T_lat)-273.15):.1f}°C), "
-    #          f"max={float(np.max(T_lat)):.1f}K ({float(np.max(T_lat)-273.15):.1f}°C)")
+    if LOG.isEnabledFor(logging.DEBUG) or (not hasattr(generate_temperature_overlay, '_logged_once')):
+        LOG.info(f"[Temperature from Simulation] min={float(np.min(T_lat)):.1f}K ({float(np.min(T_lat)-273.15):.1f}°C), "
+                 f"mean={float(np.mean(T_lat)):.1f}K ({float(np.mean(T_lat)-273.15):.1f}°C), "
+                 f"max={float(np.max(T_lat)):.1f}K ({float(np.max(T_lat)-273.15):.1f}°C)")
+        generate_temperature_overlay._logged_once = True
     
     # Use the same high-quality color mapping function for consistency
     rgb_full = temperature_to_rgb(T_lat)
@@ -271,27 +314,31 @@ def _apply_heat_diffusion(T_lat: np.ndarray, lat_rad: np.ndarray, diffusion_coef
         
         T = T_new
         
-        # Debug: log every 25 iterations
+        # Debug: log only if debug logging enabled (optimization 2.4)
         if (iteration + 1) % 25 == 0 or iteration == 0:
+            import logging
             from logging import getLogger
             LOG = getLogger(__name__)
-            pole_idx_n = 0
-            pole_idx_s = n - 1
-            mid_idx = len(T) // 4
-            LOG.info(f"  [Transport Iter {iteration+1}/{iterations}] "
-                     f"Equator={float(T[eq_idx]):.1f}K, "
-                     f"Mid(45°)={float(T[mid_idx]):.1f}K, "
-                     f"N-Pole={float(T[pole_idx_n]):.1f}K, "
-                     f"S-Pole={float(T[pole_idx_s]):.1f}K, "
-                     f"ΔT(eq-Npole)={float(T[eq_idx]-T[pole_idx_n]):.1f}K")
+            if LOG.isEnabledFor(logging.DEBUG):
+                pole_idx_n = 0
+                pole_idx_s = n - 1
+                mid_idx = len(T) // 4
+                LOG.debug(f"  [Transport Iter {iteration+1}/{iterations}] "
+                         f"Equator={float(T[eq_idx]):.1f}K, "
+                         f"Mid(45°)={float(T[mid_idx]):.1f}K, "
+                         f"N-Pole={float(T[pole_idx_n]):.1f}K, "
+                         f"S-Pole={float(T[pole_idx_s]):.1f}K, "
+                         f"ΔT(eq-Npole)={float(T[eq_idx]-T[pole_idx_n]):.1f}K")
     
-    # Verify heat conservation
+    # Verify heat conservation (only log if debug enabled)
     final_total_heat = float(np.sum(T))
     heat_change_percent = 100.0 * abs(final_total_heat - initial_total_heat) / initial_total_heat
+    import logging
     from logging import getLogger
     LOG = getLogger(__name__)
-    LOG.info(f"  [Heat Conservation] {heat_change_percent:.3f}% change "
-             f"(initial={initial_total_heat:.1f}, final={final_total_heat:.1f})")
+    if LOG.isEnabledFor(logging.DEBUG):
+        LOG.debug(f"  [Heat Conservation] {heat_change_percent:.3f}% change "
+                 f"(initial={initial_total_heat:.1f}, final={final_total_heat:.1f})")
     
     return T.astype(np.float32)
 
@@ -334,7 +381,7 @@ def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 1) -> np.ndarra
     return A.astype(np.float32)
 
 
-def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1, epsilon_atm: float = EPSILON_ATM) -> np.ndarray | float:
+def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1, epsilon_atm: float = EPSILON_ATM, cache: bool = True) -> np.ndarray | float:
     """Return blackbody-equilibrium temperature (K) for latitude(s).
 
     Uses daily-mean TOA insolation by latitude and day-of-year (handles
@@ -345,8 +392,36 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     - Latent heat flux: Energy goes to melting ice/snow (100-150 W/m²)
     - Convective export: Warm air rises and loses heat to space (30-80 W/m²)
     Both applied to FLUX before temperature calculation (more physically accurate).
+    
+    Args:
+        lat_rad: Latitude(s) in radians
+        day_of_year: Day of year (0-365)
+        epsilon_atm: Atmospheric emissivity
+        cache: Whether to use caching (optimization 2.6)
     """
+    # Check cache if enabled (optimization 2.6)
     lat = np.asarray(lat_rad, dtype=np.float32)
+    cache_key = None
+    if cache:
+        day_int = int(day_of_year) % 365
+        # Create cache key from latitude array shape and hash of values
+        if np.isscalar(lat_rad):
+            cache_key = (day_int, 'scalar', float(lat_rad), epsilon_atm)
+        else:
+            # Use hash of first, middle, and last values for efficiency (sufficient for typical use)
+            n = len(lat)
+            if n > 0:
+                lat_hash = (float(lat[0]), float(lat[n//2]) if n > 1 else 0.0, float(lat[-1]) if n > 1 else 0.0, n)
+            else:
+                lat_hash = (0.0, 0.0, 0.0, 0)
+            cache_key = (day_int, lat_hash, epsilon_atm)
+        
+        if cache_key in _TEMP_BASE_CACHE:
+            cached_result = _TEMP_BASE_CACHE[cache_key]
+            # Return same type as input
+            if np.isscalar(lat_rad):
+                return float(cached_result)
+            return cached_result.copy()
     A = _albedo_for_latitude(lat, day_of_year)
     sigma = 5.670374419e-8
     Q = _daily_mean_insolation_Q(lat, day_of_year)
@@ -462,6 +537,16 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     # Increased to 240K (-33°C) to match Earth reference pole_temp_winter and warm global mean
     T_min = 240.0  # Increased from 230K to 240K to warm poles and reduce gradient
     T = np.maximum(T, T_min)
+    
+    # Store in cache if enabled
+    if cache:
+        _TEMP_BASE_CACHE[cache_key] = T.copy() if not np.isscalar(lat_rad) else T
+        # Limit cache size to prevent memory growth (keep last 1000 entries)
+        if len(_TEMP_BASE_CACHE) > 1000:
+            # Remove oldest 200 entries (simple FIFO approximation)
+            keys_to_remove = list(_TEMP_BASE_CACHE.keys())[:200]
+            for k in keys_to_remove:
+                _TEMP_BASE_CACHE.pop(k, None)
     
     if np.isscalar(lat_rad):
         return float(T)

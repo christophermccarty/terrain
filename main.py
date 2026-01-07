@@ -270,12 +270,15 @@ def main() -> None:
         
         LOG.info("Starting 1-year benchmark...")
         # Run for 365 days
-        states = simulate_multiple_steps(sim_state, total_days=365.0, step_days=1.0)
+        states, _ = simulate_multiple_steps(sim_state, total_days=365.0, step_days=1.0)
         
         # Analyze final state
         final_state = states[-1]
         stats = diagnostics.analyze_snapshot(final_state)
         diagnostics.print_report(stats)
+        # Circulation validation (surface 3-cell proxies)
+        circ = diagnostics.analyze_circulation(stats)
+        diagnostics.print_circulation_report(circ)
         
         messagebox.showinfo("Benchmark Complete", 
             f"Global Mean Temp: {stats['global_mean_temp']:.1f} K\n"

@@ -167,6 +167,8 @@ def evolve_wind(
     vmax_clip: float = 150.0,
     baroclinic_jet_amp: float = 0.0,
     baroclinic_mix: float = 0.0,
+    cell_relax_days: float = 0.0,
+    time_days: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -207,6 +209,10 @@ def evolve_wind(
     # Coriolis parameter f = 2*Omega*sin(lat)
     Omega = 7.2921e-5
     f = 2.0 * Omega * np.sin(lat_2d)
+    abs_lat_deg_2d = np.abs(np.rad2deg(lat_2d)).astype(np.float32)
+    # Equatorial damping: in a single-layer model, PGF can over-accelerate winds where f≈0.
+    # Boost drag within ~±12° to recover calmer doldrums and prevent equatorial jets.
+    eq_window = np.exp(-((abs_lat_deg_2d / 12.0) ** 2)).astype(np.float32)
     
     # Gradients dx, dy
     # (dx,dy already computed above)
@@ -226,6 +232,19 @@ def evolve_wind(
              p_anom += float(pgf_terrain_scale) * elevation 
     else:
         p_anom = pressure
+
+    # Add weak, time-varying mid-latitude planetary waves to break perfectly zonal bands.
+    # This produces storm-track-like meanders instead of uniform stripes.
+    if time_days is not None:
+        lon = np.linspace(-np.pi, np.pi, W, endpoint=False, dtype=np.float32)
+        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
+        storm_w = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32)  # (H,)
+        t = float(time_days)
+        wave = np.zeros((H, W), dtype=np.float32)
+        # hPa-scale perturbations -> Pa
+        for k, per, ph, amp_hpa in ((3.0, 6.0, 0.3, 1.2), (5.0, 9.0, 1.1, 0.9), (7.0, 14.0, -0.7, 0.6)):
+            wave += (amp_hpa * 100.0) * np.cos(k * lon[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32)
+        p_anom = p_anom + storm_w[:, None] * wave
         
     dp_dx = _ddx_periodic(p_anom) / (dx + 1e-3)
     # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
@@ -250,6 +269,27 @@ def evolve_wind(
         u_jet = (b_amp * w_mid_1d[:, None] * np.abs(dT_dy)).astype(np.float32)  # (H,1)
         # Safety clamp: keep the parameterization from generating unrealistic surface jets.
         u_jet = np.clip(u_jet, 0.0, 70.0).astype(np.float32)
+
+    # --- 3-cell surface tendency (Hadley/Ferrel/Polar) ---
+    # A single-layer model won't spontaneously generate the full overturning circulation.
+    # This optional, weak relaxation nudges zonal-mean (u,v) toward an Earth-like 3-cell
+    # surface signature: trades (easterly), mid-lat westerlies, polar easterlies; plus
+    # equatorward/poleward v bands by hemisphere.
+    tau_cell = float(cell_relax_days)
+    if tau_cell > 0.0:
+        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
+        sign_lat = np.sign(lat_2d[:, 0]).astype(np.float32)  # +N, -S
+        # Broaden the windows + reduce amplitudes to avoid razor-thin zonal bands.
+        w_trade = np.exp(-((abs_deg_1d - 15.0) / 12.0) ** 2).astype(np.float32)
+        w_mid = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32)
+        w_polar = np.exp(-((abs_deg_1d - 75.0) / 14.0) ** 2).astype(np.float32)
+        # Keep polar surface easterlies: ensure the polar term dominates at high latitudes.
+        u_target = (-2.0 * w_trade + 3.0 * w_mid - 5.0 * w_polar).astype(np.float32)  # m/s
+        # v_target: Hadley (equatorward), Ferrel (poleward), Polar (equatorward), by hemisphere.
+        v_target = (-1.6 * w_trade + 5.0 * w_mid - 3.0 * w_polar).astype(np.float32) * sign_lat  # m/s
+        # Remove the equator sign ambiguity (sign(0)=0) so the equator stays calm.
+        v_target = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target).astype(np.float32)
+        k_cell = 1.0 / (tau_cell * 86400.0)
     
     for _ in range(n_steps):
         # Advection
@@ -262,6 +302,7 @@ def evolve_wind(
         drag = float(drag_base)
         if elevation is not None:
             drag += float(drag_elev_scale) * elevation
+        drag = drag + (2.0e-6 * eq_window)
         friction_u = -drag * u_curr * np.abs(u_curr)
         friction_v = -drag * v_curr * np.abs(v_curr)
         
@@ -275,9 +316,24 @@ def evolve_wind(
             k = 1.0 / (b_mix * 86400.0)
             u_zm = np.mean(u_curr, axis=1, keepdims=True)  # (H,1)
             du = du + (u_jet - u_zm) * k * dt_sub
-        
+
         u_curr = u_adv + du * damping
         v_curr = v_adv + dv * damping
+
+        # Relax zonal-mean toward 3-cell surface targets (apply directly so it isn't
+        # weakened by the global `damping` factor above).
+        if tau_cell > 0.0:
+            a = float(np.clip(dt_sub * k_cell, 0.0, 1.0))
+            u_zm = np.mean(u_curr, axis=1, keepdims=True)  # (H,1)
+            v_zm = np.mean(v_curr, axis=1, keepdims=True)  # (H,1)
+            # Pull u toward the target in mid-lats + polar regions to avoid razor-thin, overly-fast jets.
+            u_t = np.clip(u_target, -10.0, 10.0).astype(np.float32)
+            a_u_row = np.clip(a * (1.0 + 20.0 * w_mid[:, None] + 30.0 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
+            u_curr = u_curr + (u_t[:, None] - u_zm) * a_u_row
+            # Relax v more strongly in mid-lats, but keep it modest so bands can meander.
+            # (Ferrel surface flow is otherwise easily flipped by Coriolis coupling from strong u.)
+            a_v_row = np.clip(a * (3.0 + 90.0 * w_mid[:, None] + 150.0 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
+            v_curr = v_curr + (v_target[:, None] - v_zm) * a_v_row
         
         # Soft clamp to prevent explosion
         total_v = np.hypot(u_curr, v_curr)
@@ -459,8 +515,14 @@ def generate_wind_field(
     f_coriolis = np.where(mask_pos, np.maximum(f_coriolis, f_min), np.minimum(f_coriolis, -f_min))
     
     # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
-    dp_dy = -np.gradient(pressure, axis=0) / (111320.0 / Hc)  # Pa/m (approximate)
-    dp_dx = _ddx_periodic(pressure) / (111320.0 * np.cos(lat[:, None]) / Wc)  # Pa/m
+    # Use proper metric terms (meters), consistent with `evolve_wind`.
+    R_earth = 6.371e6
+    lat_2d = np.repeat(lat[:, None], Wc, axis=1)
+    dx = R_earth * (2 * np.pi / Wc) * np.cos(lat_2d)
+    dy = R_earth * (np.pi / Hc)
+    p_pa = (pressure * 100.0).astype(np.float32)  # hPa -> Pa
+    dp_dy = -np.gradient(p_pa, axis=0) / dy
+    dp_dx = _ddx_periodic(p_pa) / (dx + 1e-3)
     
     # Geostrophic wind (m/s)
     rho = 1.2  # kg/m³ air density
@@ -517,7 +579,8 @@ def generate_wind_field(
     # --- Tiny 2-layer jet correction (thermal-wind inspired) ---
     # Real jets strengthen where meridional temperature gradients are strong (mid-lats).
     # We approximate an upper-level westerly anomaly from |dT/dy| and mix a fraction down.
-    dT_dy = np.gradient(T, axis=0) / (111320.0 / Hc)  # K/m (approx)
+    # Use the same metric as the pressure-gradient step above (meters per latitude row).
+    dT_dy = np.gradient(T, axis=0) / dy
     jet_window = np.exp(-((abs_deg[:, None] - 45.0) / 18.0) ** 2).astype(np.float32)
     thermal_wind_coeff = 2.0e6  # tuned: |dT/dy|~1e-5 K/m -> ~20 m/s aloft
     u_aloft = thermal_wind_coeff * jet_window * np.abs(dT_dy)

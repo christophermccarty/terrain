@@ -41,9 +41,11 @@ def simulate_step(
     block_size: int = 3,
     wind_block_size: int | None = None,
     update_wind: bool = True,
+    # Small relaxation toward a diagnostic wind (includes tropical trades + mid-lat storm-track structure).
+    # This helps recover easterly trades, westerly mid-lats, and calmer doldrums in a single-layer model.
     wind_relax: float = 0.0,
-    wind_target_weather_amp: float = 0.0,
-    wind_target_zonal_pressure: float = 1.0,
+    wind_target_weather_amp: float = 0.35,
+    wind_target_zonal_pressure: float = 0.85,
     wind_target_terrain_pressure_amp: float = 0.25,
     wind_target_terrain_flow_amp: float = 0.25,
     wind_pgf_temp_scale: float = 450.0,
@@ -53,8 +55,11 @@ def simulate_step(
     wind_damping: float = 0.25,
     # Baroclinic eddy / thermal-wind proxy. The previous default (3e7) tends to produce
     # unrealistically strong, planet-wide surface jets. Keep conservative by default.
-    wind_baroclinic_jet_amp: float = 0.0,
+    # Lower default to avoid razor-thin zonal jets at the surface.
+    wind_baroclinic_jet_amp: float = 1.0e6,
     wind_baroclinic_mix: float = 2.0,
+    # Weaken the zonal-mean 3-cell nudging so eddies can deform the bands.
+    wind_cell_relax_days: float = 6.0,
     debug_log: bool = False,
     track_components: bool = False,
 ) -> tuple[PlanetState, dict]:
@@ -208,6 +213,8 @@ def simulate_step(
             drag_elev_scale=float(wind_drag_elev_scale),
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
+            cell_relax_days=float(wind_cell_relax_days),
+            time_days=float(new_total_days),
         )
 
         # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
@@ -252,6 +259,8 @@ def simulate_step(
             drag_elev_scale=float(wind_drag_elev_scale),
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
+            cell_relax_days=float(wind_cell_relax_days),
+            time_days=float(new_total_days),
         )
         if wind_relax > 0.0:
             T_for_wind = T_wind_full
