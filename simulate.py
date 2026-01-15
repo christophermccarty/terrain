@@ -226,9 +226,9 @@ def simulate_step(
             v_coarse_evol = (1.0 - a) * v_coarse_evol + a * v_diag
         
         # Upsample back to full resolution using bilinear interpolation
-        from atmosphere import _upsample_bilinear
-        u_full = _upsample_bilinear(u_coarse_evol, H, W, wind_bs)
-        v_full = _upsample_bilinear(v_coarse_evol, H, W, wind_bs)
+        from atmosphere import _upsample_bilinear_many
+        uv = _upsample_bilinear_many({"u": u_coarse_evol, "v": v_coarse_evol}, H, W, wind_bs)
+        u_full, v_full = uv["u"], uv["v"]
     else:
         # Full resolution evolution
         # If wind evolves at higher resolution than the temperature solver, drive it with the
@@ -238,13 +238,15 @@ def simulate_step(
         T_wind_full = state.temperature if state.temperature is not None else T_base_ocean_full
         elev_wind_full = state.elevation
         if wind_bs < block_size and block_size > 1:
-            from atmosphere import _upsample_bilinear
-            if state.temperature is not None:
-                T_wind_full = _upsample_bilinear(T_prev_coarse, H, W, block_size)
-            else:
-                T_wind_full = _upsample_bilinear(T_base, H, W, block_size)
+            from atmosphere import _upsample_bilinear_many
+            to_up = {}
+            to_up["T"] = T_prev_coarse if state.temperature is not None else T_base
             if elev_c is not None:
-                elev_wind_full = _upsample_bilinear(elev_c, H, W, block_size)
+                to_up["elev"] = elev_c
+            up = _upsample_bilinear_many(to_up, H, W, block_size)
+            T_wind_full = up["T"]
+            if "elev" in up:
+                elev_wind_full = up["elev"]
 
         u_full, v_full = evolve_wind(
             u_full, v_full, 
@@ -291,53 +293,25 @@ def simulate_step(
     
     # Upsample components to full resolution if needed
     if block_size > 1 and temp_components:
-        from atmosphere import _upsample_bilinear
         temp_components_full = {}
+        to_up = {k: v for k, v in temp_components.items() if isinstance(v, np.ndarray) and v.shape == (Hc, Wc)}
+        if to_up:
+            from atmosphere import _upsample_bilinear_many
+            up = _upsample_bilinear_many(to_up, H, W, block_size)
+            temp_components_full.update(up)
         for name, field in temp_components.items():
-            if isinstance(field, np.ndarray) and field.shape == (Hc, Wc):
-                temp_components_full[name] = _upsample_bilinear(field, H, W, block_size)
-            else:
+            if name not in temp_components_full:
                 # Scalar or already full resolution
                 temp_components_full[name] = field
         temp_components = temp_components_full
     
     if block_size > 1:
-        # Use bilinear interpolation for smooth upsampling (eliminates blocky artifacts)
-        # Create coordinate arrays for interpolation
-        y_coarse = np.arange(Hc, dtype=np.float32)
-        x_coarse = np.arange(Wc, dtype=np.float32)
-        y_fine = np.linspace(0, Hc - 1, H, dtype=np.float32)
-        x_fine = np.linspace(0, Wc - 1, W, dtype=np.float32)
-        
-        # Create meshgrid for fine coordinates
-        Y_fine, X_fine = np.meshgrid(y_fine, x_fine, indexing='ij')
-        
-        # Find integer indices and fractional parts for bilinear interpolation
-        y_idx = np.floor(Y_fine).astype(np.int32)
-        x_idx = np.floor(X_fine).astype(np.int32)
-        y_frac = Y_fine - y_idx
-        x_frac = X_fine - x_idx
-        
-        # Clamp indices to valid range
-        y_idx = np.clip(y_idx, 0, Hc - 1)
-        x_idx = np.clip(x_idx, 0, Wc - 1)
-        y_idx_next = np.clip(y_idx + 1, 0, Hc - 1)
-        x_idx_next = np.clip(x_idx + 1, 0, Wc - 1)
-        
-        # Bilinear interpolation helper
-        def interp(f):
-            top = f[y_idx, x_idx] * (1.0 - x_frac) + f[y_idx, x_idx_next] * x_frac
-            bot = f[y_idx_next, x_idx] * (1.0 - x_frac) + f[y_idx_next, x_idx_next] * x_frac
-            return top * (1.0 - y_frac) + bot * y_frac
-
-        T_full = interp(T_coarse).astype(np.float32)
-        # Interpolate diagnostics
-        cloud_full = interp(cloud_c).astype(np.float32)
-        snow_full = interp(snow_c).astype(np.float32)
+        from atmosphere import _upsample_bilinear_many
+        up = _upsample_bilinear_many({"T": T_coarse, "cloud": cloud_c}, H, W, block_size)
+        T_full, cloud_full = up["T"], up["cloud"]
     else:
         T_full = T_coarse
         cloud_full = cloud_c
-        snow_full = snow_c
 
     # Update wind from temperature gradients (if requested)
     # Already evolved above
@@ -397,7 +371,7 @@ def simulate_step(
         humidity=humidity_next,
         soil_moisture=soil_next,
         cloud_cover=cloud_full,
-        snow_depth=snow_full,
+        snow_depth=None,
     )
     
     # Return state and components (empty dict if not tracking)

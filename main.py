@@ -81,7 +81,7 @@ def main() -> None:
     tk.Radiobutton(controls, text="Globe", variable=mode_var, value="globe").pack(side="left")
     tk.Radiobutton(controls, text="Map", variable=mode_var, value="map").pack(side="left")
     tk.Label(controls, text="View").pack(side="left", padx=(8,0))
-    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind Arrows", "Wind Particles", "Cloud Cover", "Snow Cover").pack(side="left")
+    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind Arrows", "Wind Particles", "Cloud Cover").pack(side="left")
     
     # Diagnostics
     diagnostics = ClimateDiagnostics(track_history=True)
@@ -144,7 +144,7 @@ def main() -> None:
         h, w = tex.shape
         if trail is None or trail.shape != (h, w) or particle_xy is None or particle_age is None:
             # Particle count: tie to "Arrows" control, but scale up for particles
-            _init_particles(h, w, n=int(wind_arrows_var.get()) * 8)
+            _init_particles(h, w, n=int(wind_arrows_var.get()) * 2)
 
         uv = _wind_uv_for_display()
         if uv is None:
@@ -168,7 +168,7 @@ def main() -> None:
         last_anim_t = now
 
         # Fade trail
-        trail *= 0.90
+        trail *= 0.92
 
         # Advect particles (vectorized)
         xy = particle_xy
@@ -207,7 +207,7 @@ def main() -> None:
         yi_s = ys_clip.astype(np.int32).ravel()
         w_s = np.repeat(inten, samples.size)
         # Add with clip (fast, avoids Python loops)
-        trail[yi_s, xi_s] = np.clip(trail[yi_s, xi_s] + w_s * 0.35, 0.0, 1.0)
+        trail[yi_s, xi_s] = np.clip(trail[yi_s, xi_s] + w_s * 0.4, 0.0, 1.0)
 
         # Update particle positions and ages
         particle_xy[:, 0] = x1
@@ -674,16 +674,6 @@ def main() -> None:
                     # White clouds
                     overlay = np.stack([C, C, C], axis=-1)
                     alpha = C * 0.8
-                    comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
-                    arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
-                else:
-                    arr = (base_rgb * 255).astype(np.uint8)
-            elif view_var.get() == "Snow Cover":
-                if use_sim_data and sim_state.snow_depth is not None:
-                    S = np.clip(sim_state.snow_depth, 0.0, 1.0)
-                    # White snow (slightly blueish)
-                    overlay = np.array([0.9, 0.9, 1.0], dtype=np.float32)
-                    alpha = S * 0.9
                     comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                     arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
                 else:
