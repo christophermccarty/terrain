@@ -30,6 +30,7 @@ from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rg
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
 from diagnostics import ClimateDiagnostics
+import graphs
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
@@ -85,6 +86,15 @@ def main() -> None:
     
     # Diagnostics
     diagnostics = ClimateDiagnostics(track_history=True)
+    graphs_enabled_var = tk.BooleanVar(value=False)
+    graphs_controller = graphs.GraphsController(
+        root,
+        get_state=lambda: sim_state,
+        diagnostics=diagnostics,
+        history_seconds=300,
+        update_ms=1000,
+        toggle_var=graphs_enabled_var,
+    )
 
     # --- Wind particle visualization state (map mode) ---
     particle_xy: np.ndarray | None = None  # (N,2) float32, x/y in pixel space
@@ -305,6 +315,7 @@ def main() -> None:
         diagnostics.component_history.clear()
         diagnostics.total_days = 0.0
         sim_cycle_var.set("Year: 1")
+        graphs_controller.reset()
     
     # Simulation controls
     sim_controls = tk.Frame(root)
@@ -320,6 +331,9 @@ def main() -> None:
     tk.Button(sim_controls, text="Stop", command=lambda: stop_simulation()).pack(side="left", padx=2)
     tk.Button(sim_controls, text="Pause", command=lambda: pause_simulation()).pack(side="left", padx=2)
     tk.Button(sim_controls, text="Reset", command=lambda: reset_simulation()).pack(side="left", padx=2)
+    def on_graphs_toggle():
+        graphs_controller.set_enabled(graphs_enabled_var.get())
+    tk.Checkbutton(sim_controls, text="Graphs", variable=graphs_enabled_var, command=on_graphs_toggle).pack(side="left", padx=6)
 
     # Wind controls
     wind_arrows_var = tk.IntVar(value=int(settings.get("wind_arrows", default_settings["wind_arrows"])))
@@ -887,6 +901,7 @@ def main() -> None:
             "wind_block_size": int(wind_block_size_var.get()),
         }
         save_settings(s)
+        graphs_controller.close()
         root.destroy()
 
     root.bind("<Escape>", lambda e: on_close())
