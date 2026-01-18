@@ -10,7 +10,7 @@ import numpy as np
 from typing import NamedTuple
 from atmosphere import generate_wind_field
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
-from ocean import calculate_ocean_heat_transport
+from ocean import calculate_ocean_heat_transport, update_sea_ice
 
 # Cache for diagnostic/relaxation wind to avoid recomputing every step.
 _RELAX_CACHE = {"key": None, "u": None, "v": None}
@@ -60,6 +60,21 @@ def simulate_step(
     wind_baroclinic_mix: float = 2.0,
     # Weaken the zonal-mean 3-cell nudging so eddies can deform the bands.
     wind_cell_relax_days: float = 6.0,
+    ocean_transport_coeff: float = 0.3,
+    ocean_exchange_floor: float = 0.65,
+    ocean_exchange_span: float = 0.35,
+    ocean_exchange_coeff: float = 0.08,
+    ocean_exchange_inertia: float = 0.35,
+    epsilon_equator: float = 0.78,
+    epsilon_pole: float = 0.55,
+    polar_cooling_scale: float = 0.6,
+    ice_freeze_temp: float = 269.5,
+    ice_melt_temp: float = 273.35,
+    ice_freeze_rate: float = 0.06,
+    ice_melt_rate: float = 0.16,
+    ice_albedo_strength: float = 1.0,
+    heat_transport_coeff: float = 0.8,
+    thermal_diffusion: float = 0.04,
     debug_log: bool = False,
     track_components: bool = False,
 ) -> tuple[PlanetState, dict]:
@@ -102,18 +117,30 @@ def simulate_step(
     lat = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
     
     # Calculate temperature for current day (land response)
-    T_lat_land = temperature_kelvin_for_lat(lat, day_of_year=int(new_day))
+    T_lat_land = temperature_kelvin_for_lat(
+        lat,
+        day_of_year=int(new_day),
+        polar_cooling_scale=polar_cooling_scale,
+    )
     T_base_land = np.repeat(T_lat_land[:, None], Wc, axis=1).astype(np.float32)
     
     # Calculate temperature for lagged day (ocean response with 1.5 month delay)
     lag_days = 50.0  # ~1.5 months thermal lag for deep ocean mixed layer
     lagged_day = (new_day - lag_days) % 365.2422
-    T_lat_ocean = temperature_kelvin_for_lat(lat, day_of_year=int(lagged_day))
+    T_lat_ocean = temperature_kelvin_for_lat(
+        lat,
+        day_of_year=int(lagged_day),
+        polar_cooling_scale=polar_cooling_scale,
+    )
     T_base_ocean = np.repeat(T_lat_ocean[:, None], Wc, axis=1).astype(np.float32)
     # Full-resolution fallback base temperature (used when wind evolves at full resolution
     # before `state.temperature` is initialized).
     lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
-    T_lat_ocean_full = temperature_kelvin_for_lat(lat_full, day_of_year=int(lagged_day))
+    T_lat_ocean_full = temperature_kelvin_for_lat(
+        lat_full,
+        day_of_year=int(lagged_day),
+        polar_cooling_scale=polar_cooling_scale,
+    )
     T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32)
     
     # Blend based on land fraction (will be calculated in _evolve_temperature)
@@ -134,6 +161,11 @@ def simulate_step(
         T_prev_coarse = T_prev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
     else:
         T_prev_coarse = T_base.copy()
+    if state.ice_cover is not None:
+        ice_pad = np.pad(state.ice_cover.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        ice_prev_coarse = ice_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+    else:
+        ice_prev_coarse = None
     
     # ------------------------------------------------------
     # NEW: Prognostic Wind Evolution (Physics Items 16-33)
@@ -196,7 +228,11 @@ def simulate_step(
         else:
             # When temperature is not yet initialized, use the same lagged-ocean base but on the wind grid.
             lat_w = (0.5 - (np.arange(Hcw, dtype=np.float32) + 0.5) / Hcw) * np.pi
-            T_lat_ocean_w = temperature_kelvin_for_lat(lat_w, day_of_year=int(lagged_day))
+            T_lat_ocean_w = temperature_kelvin_for_lat(
+                lat_w,
+                day_of_year=int(lagged_day),
+                polar_cooling_scale=polar_cooling_scale,
+            )
             T_for_wind = np.repeat(T_lat_ocean_w[:, None], Wcw, axis=1).astype(np.float32)
 
         # Evolve at wind-grid resolution.
@@ -226,9 +262,9 @@ def simulate_step(
             v_coarse_evol = (1.0 - a) * v_coarse_evol + a * v_diag
         
         # Upsample back to full resolution using bilinear interpolation
-        from atmosphere import _upsample_bilinear
-        u_full = _upsample_bilinear(u_coarse_evol, H, W, wind_bs)
-        v_full = _upsample_bilinear(v_coarse_evol, H, W, wind_bs)
+        from atmosphere import _upsample_bilinear_many
+        uv = _upsample_bilinear_many({"u": u_coarse_evol, "v": v_coarse_evol}, H, W, wind_bs)
+        u_full, v_full = uv["u"], uv["v"]
     else:
         # Full resolution evolution
         # If wind evolves at higher resolution than the temperature solver, drive it with the
@@ -238,13 +274,15 @@ def simulate_step(
         T_wind_full = state.temperature if state.temperature is not None else T_base_ocean_full
         elev_wind_full = state.elevation
         if wind_bs < block_size and block_size > 1:
-            from atmosphere import _upsample_bilinear
-            if state.temperature is not None:
-                T_wind_full = _upsample_bilinear(T_prev_coarse, H, W, block_size)
-            else:
-                T_wind_full = _upsample_bilinear(T_base, H, W, block_size)
+            from atmosphere import _upsample_bilinear_many
+            to_up = {}
+            to_up["T"] = T_prev_coarse if state.temperature is not None else T_base
             if elev_c is not None:
-                elev_wind_full = _upsample_bilinear(elev_c, H, W, block_size)
+                to_up["elev"] = elev_c
+            up = _upsample_bilinear_many(to_up, H, W, block_size)
+            T_wind_full = up["T"]
+            if "elev" in up:
+                elev_wind_full = up["elev"]
 
         u_full, v_full = evolve_wind(
             u_full, v_full, 
@@ -286,58 +324,41 @@ def simulate_step(
         day_of_year=int(new_day), days=days,
         wind_u=u_coarse, wind_v=v_coarse, # Pass evolved wind
         T_base_land=T_base_land,  # Pass land temperature for seasonal lag correction
+        ice_cover=ice_prev_coarse,
+        heat_transport_coeff=heat_transport_coeff,
+        thermal_diffusion=thermal_diffusion,
+        ocean_transport_coeff=ocean_transport_coeff,
+        ocean_exchange_floor=ocean_exchange_floor,
+        ocean_exchange_span=ocean_exchange_span,
+        ocean_exchange_coeff=ocean_exchange_coeff,
+        ocean_exchange_inertia=ocean_exchange_inertia,
+        epsilon_equator=epsilon_equator,
+        epsilon_pole=epsilon_pole,
+        ice_albedo_strength=ice_albedo_strength,
         track_components=track_components  # Track components for diagnostics
     )
     
     # Upsample components to full resolution if needed
     if block_size > 1 and temp_components:
-        from atmosphere import _upsample_bilinear
         temp_components_full = {}
+        to_up = {k: v for k, v in temp_components.items() if isinstance(v, np.ndarray) and v.shape == (Hc, Wc)}
+        if to_up:
+            from atmosphere import _upsample_bilinear_many
+            up = _upsample_bilinear_many(to_up, H, W, block_size)
+            temp_components_full.update(up)
         for name, field in temp_components.items():
-            if isinstance(field, np.ndarray) and field.shape == (Hc, Wc):
-                temp_components_full[name] = _upsample_bilinear(field, H, W, block_size)
-            else:
+            if name not in temp_components_full:
                 # Scalar or already full resolution
                 temp_components_full[name] = field
         temp_components = temp_components_full
     
     if block_size > 1:
-        # Use bilinear interpolation for smooth upsampling (eliminates blocky artifacts)
-        # Create coordinate arrays for interpolation
-        y_coarse = np.arange(Hc, dtype=np.float32)
-        x_coarse = np.arange(Wc, dtype=np.float32)
-        y_fine = np.linspace(0, Hc - 1, H, dtype=np.float32)
-        x_fine = np.linspace(0, Wc - 1, W, dtype=np.float32)
-        
-        # Create meshgrid for fine coordinates
-        Y_fine, X_fine = np.meshgrid(y_fine, x_fine, indexing='ij')
-        
-        # Find integer indices and fractional parts for bilinear interpolation
-        y_idx = np.floor(Y_fine).astype(np.int32)
-        x_idx = np.floor(X_fine).astype(np.int32)
-        y_frac = Y_fine - y_idx
-        x_frac = X_fine - x_idx
-        
-        # Clamp indices to valid range
-        y_idx = np.clip(y_idx, 0, Hc - 1)
-        x_idx = np.clip(x_idx, 0, Wc - 1)
-        y_idx_next = np.clip(y_idx + 1, 0, Hc - 1)
-        x_idx_next = np.clip(x_idx + 1, 0, Wc - 1)
-        
-        # Bilinear interpolation helper
-        def interp(f):
-            top = f[y_idx, x_idx] * (1.0 - x_frac) + f[y_idx, x_idx_next] * x_frac
-            bot = f[y_idx_next, x_idx] * (1.0 - x_frac) + f[y_idx_next, x_idx_next] * x_frac
-            return top * (1.0 - y_frac) + bot * y_frac
-
-        T_full = interp(T_coarse).astype(np.float32)
-        # Interpolate diagnostics
-        cloud_full = interp(cloud_c).astype(np.float32)
-        snow_full = interp(snow_c).astype(np.float32)
+        from atmosphere import _upsample_bilinear_many
+        up = _upsample_bilinear_many({"T": T_coarse, "cloud": cloud_c}, H, W, block_size)
+        T_full, cloud_full = up["T"], up["cloud"]
     else:
         T_full = T_coarse
         cloud_full = cloud_c
-        snow_full = snow_c
 
     # Update wind from temperature gradients (if requested)
     # Already evolved above
@@ -347,6 +368,13 @@ def simulate_step(
     P_full = None
     humidity_next = None
     soil_next = None
+    ice_full = update_sea_ice(
+        T_full, state.elevation, state.ice_cover, days,
+        freeze_temp=ice_freeze_temp,
+        melt_temp=ice_melt_temp,
+        freeze_rate=ice_freeze_rate,
+        melt_rate=ice_melt_rate,
+    ) if T_full is not None else None
 
     # Debug logging if requested
     if debug_log:
@@ -397,7 +425,8 @@ def simulate_step(
         humidity=humidity_next,
         soil_moisture=soil_next,
         cloud_cover=cloud_full,
-        snow_depth=snow_full,
+        snow_depth=None,
+        ice_cover=ice_full,
     )
     
     # Return state and components (empty dict if not tracking)
@@ -482,6 +511,15 @@ def _evolve_temperature(
     land_sea_contrast: float = 0.0,
     thermal_diffusion: float = 0.04,    # CONSERVATIVE increase from 0.03 (1.3x) respects CFL
     T_base_land: np.ndarray | None = None,
+    ice_cover: np.ndarray | None = None,
+    ocean_transport_coeff: float = 0.5,
+    ocean_exchange_floor: float = 0.65,
+    ocean_exchange_span: float = 0.35,
+    ocean_exchange_coeff: float = 0.05,
+    ocean_exchange_inertia: float = 0.0,
+    epsilon_equator: float = 0.78,
+    epsilon_pole: float = 0.55,
+    ice_albedo_strength: float = 1.0,
     track_components: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
@@ -571,6 +609,10 @@ def _evolve_temperature(
     # Ice/Snow Cover approximation based on Temp
     # T < 271 K -> Snow/Ice likely
     snow_cover = np.clip((273.15 - T) / 10.0, 0.0, 1.0)
+    sea_ice = np.zeros_like(T, dtype=np.float32) if ice_cover is None else np.clip(ice_cover.astype(np.float32), 0.0, 1.0)
+    sea_ice = np.where(sea_mask, sea_ice, 0.0)
+    if ice_albedo_strength != 1.0:
+        sea_ice = np.clip(sea_ice * float(ice_albedo_strength), 0.0, 1.0)
     
     # Cloud Cover approximation (RH proxy)
     # Warmer air holds more water, but assume constant RH availability for now
@@ -578,9 +620,10 @@ def _evolve_temperature(
     cloud_fraction = 0.4 + 0.2 * np.sin(lat_2d * 3.0) # Base climatology
     
     # Albedo
-    # Ocean: 0.06, Land: 0.2, Snow: 0.8, Cloud: 0.5
-    albedo_sfc = np.where(sea_mask, 0.06, 0.2)
-    albedo_sfc = albedo_sfc * (1 - snow_cover) + 0.8 * snow_cover
+    # Ocean: 0.06, Land: 0.2, Sea Ice: 0.75, Snow: 0.8, Cloud: 0.5
+    albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.75 * sea_ice, 0.2)
+    snow_cover_land = snow_cover * land_mask.astype(np.float32)
+    albedo_sfc = np.where(land_mask, albedo_sfc * (1.0 - snow_cover_land) + 0.8 * snow_cover_land, albedo_sfc)
     albedo_total = albedo_sfc * (1 - cloud_fraction) + 0.5 * cloud_fraction
     
     # Insolation Q (Daily mean) - use proper astronomical calculation
@@ -604,8 +647,8 @@ def _evolve_temperature(
     # Outgoing Longwave (L_out) = sigma * T^4 * epsilon
     # Greenhouse effect reduces OLR - use latitude-dependent epsilon (like temperature.py)
     abs_lat_deg = np.rad2deg(np.abs(lat_2d))
-    epsilon_equator = 0.78  # Increased from 0.75 to match temperature.py and warm global mean
-    epsilon_pole = 0.55     # Increased from 0.50 to reduce polar extremes
+    epsilon_equator = float(epsilon_equator)  # Increased from 0.75 to match temperature.py and warm global mean
+    epsilon_pole = float(epsilon_pole)     # Increased from 0.50 to reduce polar extremes
     lat_factor = np.cos(np.deg2rad(abs_lat_deg))  # 1.0 at equator, 0.0 at poles
     epsilon = epsilon_pole + (epsilon_equator - epsilon_pole) * lat_factor
     
@@ -684,7 +727,13 @@ def _evolve_temperature(
 
     # --- Ocean Transport (Keep existing) ---
     T_ocean_adj = calculate_ocean_heat_transport(
-        T, elev_c, Hc, Wc, day_of_year, days, transport_coefficient=0.5
+        T, elev_c, Hc, Wc, day_of_year, days,
+        transport_coefficient=float(ocean_transport_coeff),
+        exchange_strength_floor=float(ocean_exchange_floor),
+        exchange_strength_span=float(ocean_exchange_span),
+        exchange_coefficient=float(ocean_exchange_coeff),
+        exchange_inertia=float(ocean_exchange_inertia),
+        prev_T=T_prev,
     )
     # Clamp ocean transport to prevent extreme adjustments
     T_ocean_adj = np.clip(T_ocean_adj, -10.0, 10.0)  # Max ±10K per day

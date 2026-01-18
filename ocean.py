@@ -27,6 +27,30 @@ def _ocean_mask_from_elevation(elevation: np.ndarray, *, assume_loaded_if_zeros_
     return elev <= elev_median
 
 
+def update_sea_ice(
+    T: np.ndarray,
+    elevation: np.ndarray,
+    prev_ice: np.ndarray | None,
+    dt_days: float,
+    *,
+    freeze_temp: float = 269.5,
+    melt_temp: float = 273.35,
+    freeze_rate: float = 0.06,
+    melt_rate: float = 0.16,
+) -> np.ndarray:
+    """Update sea ice fraction based on persistent cold ocean temperatures."""
+    is_ocean = _ocean_mask_from_elevation(elevation)
+    ice = np.zeros_like(T, dtype=np.float32) if prev_ice is None else np.asarray(prev_ice, dtype=np.float32)
+    T = np.asarray(T, dtype=np.float32)
+    freeze = (T <= freeze_temp) & is_ocean
+    melt = (T >= melt_temp) & is_ocean
+    if np.any(freeze):
+        ice = np.where(freeze, np.minimum(1.0, ice + freeze_rate * dt_days), ice)
+    if np.any(melt):
+        ice = np.where(melt, np.maximum(0.0, ice - melt_rate * dt_days), ice)
+    return np.where(is_ocean, ice, 0.0)
+
+
 def calculate_ocean_heat_transport(
     T: np.ndarray,
     elevation: np.ndarray,
@@ -35,6 +59,11 @@ def calculate_ocean_heat_transport(
     day_of_year: int,
     dt_days: float,
     transport_coefficient: float = 0.3,
+    exchange_strength_floor: float = 0.65,
+    exchange_strength_span: float = 0.35,
+    exchange_coefficient: float = 0.05,
+    exchange_inertia: float = 0.0,
+    prev_T: np.ndarray | None = None,
 ) -> np.ndarray:
     """Calculate ocean heat transport and return temperature adjustment.
     
@@ -152,14 +181,22 @@ def calculate_ocean_heat_transport(
     # Low latitudes: ocean cooler than air → heat absorption
     
     # Equatorial reference temperature (warm baseline)
-    T_equator = np.mean(T[abs_lat_rows < 10.0, :])
+    # Apply inertia by blending toward the previous ocean temperature.
+    if prev_T is not None and exchange_inertia > 0.0:
+        a = float(np.clip(exchange_inertia, 0.0, 1.0))
+        T_eff = (1.0 - a) * T + a * np.asarray(prev_T, dtype=np.float32)
+    else:
+        T_eff = T
+    T_equator = np.mean(T_eff[abs_lat_rows < 10.0, :])
     
     # Heat exchange scales with latitude (stronger at high latitudes)
+    # Reduce polar coupling to avoid excessive heat loss from ocean surface.
     exchange_strength = (abs_lat_rows / 90.0) ** 1.5  # 0 at equator, 1 at poles
-    exchange_coefficient = 0.05  # K per day (weak coupling)
+    exchange_strength = float(exchange_strength_floor) + float(exchange_strength_span) * exchange_strength
+    exchange_coefficient = float(exchange_coefficient)  # K per day (weak coupling)
     
     # Ocean releases/absorbs heat based on temperature excess
-    T_excess = T - T_equator
+    T_excess = T_eff - T_equator
     heat_exchange = -exchange_coefficient * exchange_strength[:, np.newaxis] * T_excess * dt_days
     # Clamp heat exchange to prevent extreme adjustments
     heat_exchange = np.clip(heat_exchange, -3.0, 3.0)  # Max ±3K per day
@@ -238,6 +275,56 @@ def get_major_ocean_currents(
     u += acc_mask * 0.5  # Strong eastward flow
     
     return u, v
+
+
+def generate_ocean_currents(
+    elevation: np.ndarray,
+    *,
+    wind_u: np.ndarray | None = None,
+    wind_v: np.ndarray | None = None,
+    day_of_year: int = 0,
+    time_days: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate a dynamic surface ocean current field for visualization.
+
+    Combines a climatological gyre pattern with wind-driven surface drift and
+    a light, deterministic mesoscale variability term.
+    """
+    H, W = elevation.shape
+    base_u, base_v = get_major_ocean_currents(H, W, day_of_year=int(day_of_year))
+    is_ocean = _ocean_mask_from_elevation(elevation)
+
+    # Seasonal modulation (small amplitude).
+    seasonal = 0.9 + 0.1 * np.sin(2.0 * np.pi * (float(day_of_year) / 365.2422))
+    u = base_u * seasonal
+    v = base_v * seasonal
+
+    # Wind-driven surface drift (Ekman-like, modest rotation).
+    if wind_u is not None and wind_v is not None:
+        lat_rows = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+        lat_grid = lat_rows[:, None].astype(np.float32)
+        sign = np.sign(lat_grid)
+        angle = np.deg2rad(20.0) * sign
+        ca = np.cos(angle)
+        sa = np.sin(angle)
+        u_rot = wind_u * ca - wind_v * sa
+        v_rot = wind_u * sa + wind_v * ca
+        wind_scale = 0.03
+        u = u + wind_scale * u_rot
+        v = v + wind_scale * v_rot
+
+    # Deterministic mesoscale variability for visual dynamics.
+    t = float(time_days if time_days is not None else day_of_year)
+    lon = ((np.arange(W, dtype=np.float32) + 0.5) / W) * 360.0 - 180.0
+    lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    phase = 0.6 * np.sin(np.deg2rad(lon_grid * 3.0) + t * 0.08) * np.cos(np.deg2rad(lat_grid * 2.0) - t * 0.06)
+    u = u + 0.04 * phase
+    v = v + 0.02 * phase
+
+    u = u * is_ocean.astype(np.float32)
+    v = v * is_ocean.astype(np.float32)
+    return u.astype(np.float32), v.astype(np.float32)
 
 
 def apply_ocean_transport(
