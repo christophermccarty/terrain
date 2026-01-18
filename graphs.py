@@ -24,10 +24,10 @@ class LiveGraphsWindow:
         self,
         root: tk.Tk,
         *,
-        history_seconds: int = 300,
+        history_days: float = 365.0,
         on_close: Optional[Callable[[], None]] = None,
     ) -> None:
-        self.history_seconds = int(history_seconds)
+        self.history_days = float(history_days)
         self._on_close_cb = on_close
         self._last_total_days: Optional[float] = None
 
@@ -180,8 +180,7 @@ class LiveGraphsWindow:
             return
         self._last_total_days = total_days
 
-        now = time.monotonic()
-        self._times.append(now)
+        self._times.append(total_days)
 
         avg_temp = float(stats.get("global_mean_temp", np.mean(state.temperature)))
         avg_ocean_temp = self._ocean_mean_temp(state)
@@ -221,11 +220,11 @@ class LiveGraphsWindow:
         self._series["wind_trade_mean"].append(wind_trade_mean)
         self._series["wind_midlat_mean"].append(wind_midlat_mean)
 
-        self._trim_history(now)
+        self._trim_history(total_days)
         self._redraw()
 
-    def _trim_history(self, now: float) -> None:
-        cutoff = now - float(self.history_seconds)
+    def _trim_history(self, now_days: float) -> None:
+        cutoff = now_days - float(self.history_days)
         while self._times and self._times[0] < cutoff:
             self._times.popleft()
             for series in self._series.values():
@@ -235,9 +234,9 @@ class LiveGraphsWindow:
         if not self._times:
             return
         t0 = self._times[0]
-        xs = [(t - t0) / 60.0 for t in self._times]
+        xs = [(t - t0) for t in self._times]
         max_x = max(xs[-1], 1e-3)
-        xlim = (max(0.0, max_x - (self.history_seconds / 60.0)), max_x)
+        xlim = (max(0.0, max_x - float(self.history_days)), max_x)
 
         for key, line in self._lines.items():
             ys = list(self._series[key])
@@ -286,14 +285,14 @@ class GraphsController:
         *,
         get_state: Callable[[], object],
         diagnostics: object,
-        history_seconds: int = 300,
+        history_days: float = 365.0,
         update_ms: int = 1000,
         toggle_var: Optional[tk.BooleanVar] = None,
     ) -> None:
         self.root = root
         self.get_state = get_state
         self.diagnostics = diagnostics
-        self.history_seconds = int(history_seconds)
+        self.history_days = float(history_days)
         self.update_ms = int(update_ms)
         self.toggle_var = toggle_var
         self.window: Optional[LiveGraphsWindow] = None
@@ -307,7 +306,7 @@ class GraphsController:
             if self.window is None:
                 self.window = LiveGraphsWindow(
                     self.root,
-                    history_seconds=self.history_seconds,
+                    history_days=self.history_days,
                     on_close=self._handle_window_close,
                 )
             self._schedule()
