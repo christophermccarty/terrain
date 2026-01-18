@@ -28,12 +28,14 @@ from terrain import (
 )
 from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
+from ocean import _ocean_mask_from_elevation, generate_ocean_currents
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
 from diagnostics import ClimateDiagnostics
 import graphs
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
+_OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None}
 
 
 def main() -> None:
@@ -82,7 +84,17 @@ def main() -> None:
     tk.Radiobutton(controls, text="Globe", variable=mode_var, value="globe").pack(side="left")
     tk.Radiobutton(controls, text="Map", variable=mode_var, value="map").pack(side="left")
     tk.Label(controls, text="View").pack(side="left", padx=(8,0))
-    tk.OptionMenu(controls, view_var, "Terrain", "Temperature", "Wind Arrows", "Wind Particles", "Cloud Cover").pack(side="left")
+    tk.OptionMenu(
+        controls,
+        view_var,
+        "Terrain",
+        "Temperature",
+        "Ocean Temperature",
+        "Wind Arrows",
+        "Ocean Currents",
+        "Wind Particles",
+        "Cloud Cover",
+    ).pack(side="left")
     
     # Diagnostics
     diagnostics = ClimateDiagnostics(track_history=True)
@@ -91,7 +103,7 @@ def main() -> None:
         root,
         get_state=lambda: sim_state,
         diagnostics=diagnostics,
-        history_seconds=300,
+        history_days=365.0,
         update_ms=1000,
         toggle_var=graphs_enabled_var,
     )
@@ -526,6 +538,20 @@ def main() -> None:
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 comb = np.clip(base_rgb + arrows, 0.0, 1.0)
                 arr = (comb * 255).astype(np.uint8)
+            elif view_var.get() == "Ocean Currents":
+                ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents")
+                if _OCEAN_CURRENT_CACHE["key"] != ckey:
+                    u, v = generate_ocean_currents(tex, day_of_year=day, time_days=float(day))
+                    _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
+                else:
+                    u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
+                speed = np.hypot(u, v).astype(np.float32)
+                base_rgb = wind_speed_to_rgb(speed)
+                arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
+                ocean_mask = _ocean_mask_from_elevation(tex)
+                mask3 = ocean_mask[..., None].astype(np.float32)
+                comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
+                arr = (comb * 255).astype(np.uint8)
             else:
                 rgbf = colorize(tex)
                 arr = (np.clip(rgbf, 0.0, 1.0) * 255).astype(np.uint8)
@@ -630,6 +656,8 @@ def main() -> None:
                 view_name = view_var.get()
                 if view_name == "Wind Arrows" or view_name == "Wind Particles":
                     view_name = "Wind"
+                if view_name == "Ocean Temperature":
+                    view_name = "Temperature"
                 # In loaded mode, ensure elevation is cached before generating sphere
                 if terrain_mode == "loaded":
                     elev_tex, _ = get_elevation_cache()
@@ -682,6 +710,23 @@ def main() -> None:
                 alpha = 0.5
                 comb = (1.0 - alpha) * base_rgb + alpha * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+            elif view_var.get() == "Ocean Temperature":
+                if use_sim_data and sim_state.temperature is not None:
+                    from temperature import temperature_to_rgb
+                    T = sim_state.temperature
+                    ocean_rgb = temperature_to_rgb(T)
+                else:
+                    h, w = tex.shape
+                    with log_time("Generate temperature overlay"):
+                        ocean_rgb = generate_temperature_overlay(h, w, elevation=tex)
+                ocean_mask = _ocean_mask_from_elevation(tex)
+                base = np.zeros_like(ocean_rgb, dtype=np.float32)
+                base[ocean_mask] = ocean_rgb[ocean_mask]
+                if use_sim_data and sim_state.ice_cover is not None:
+                    ice = np.clip(sim_state.ice_cover.astype(np.float32), 0.0, 1.0)
+                    ice_mask = ocean_mask & (ice > 0.01)
+                    base[ice_mask] = 1.0
+                arr = (np.clip(base, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Cloud Cover":
                 if use_sim_data and sim_state.cloud_cover is not None:
                     C = sim_state.cloud_cover
@@ -707,6 +752,24 @@ def main() -> None:
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 arr = (np.clip(base_rgb + arrows, 0.0, 1.0) * 255).astype(np.uint8)
+            elif view_var.get() == "Ocean Currents":
+                day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+                tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
+                ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents", int(tdays))
+                if _OCEAN_CURRENT_CACHE["key"] != ckey:
+                    wu = sim_state.wind_u if (use_sim_data and sim_state is not None) else None
+                    wv = sim_state.wind_v if (use_sim_data and sim_state is not None) else None
+                    u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
+                    _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
+                else:
+                    u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
+                speed = np.hypot(u, v).astype(np.float32)
+                base_rgb = wind_speed_to_rgb(speed)
+                arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
+                ocean_mask = _ocean_mask_from_elevation(tex)
+                mask3 = ocean_mask[..., None].astype(np.float32)
+                comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
+                arr = (comb * 255).astype(np.uint8)
             else:
                 arr = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
             new_img = Image.fromarray(arr)
@@ -814,6 +877,20 @@ def main() -> None:
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
                 px_str = f", {pixel_display}" if pixel_display else ""
                 latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, wind {speed:.1f} m/s")
+            elif view_var.get() == "Ocean Currents":
+                day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+                tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
+                ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents", int(tdays))
+                if _OCEAN_CURRENT_CACHE["key"] != ckey:
+                    wu = sim_state.wind_u if (use_sim_data and sim_state is not None) else None
+                    wv = sim_state.wind_v if (use_sim_data and sim_state is not None) else None
+                    u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
+                    _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
+                else:
+                    u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
+                speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
+                px_str = f", {pixel_display}" if pixel_display else ""
+                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, current {speed:.2f} m/s")
             else:
                 # Use simulation temperature if available
                 if use_sim_data and sim_state.temperature is not None:
