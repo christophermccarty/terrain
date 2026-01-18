@@ -362,7 +362,7 @@ def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 1) -> np.ndarra
     A_base = 0.25 + cloud_contribution  # Range: 0.25 (mid-latitude) to 0.29 (equator)
     
     # High albedo at poles - transition starts around 60°
-    transition_start = 60.0  # degrees
+    transition_start = 65.0  # degrees
     
     # Seasonal variation: reduce ice albedo slightly during summer due to partial melt
     # Winter: A_ice = 0.90 (full ice cover), Summer: A_ice = 0.80 (partial melt)
@@ -371,7 +371,7 @@ def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 1) -> np.ndarra
     delta = np.arcsin(np.sin(obliq) * np.sin(gamma))
     # Summer: |delta| > 15°, reduce albedo; Winter: |delta| < 15°, full albedo
     season_factor = np.clip(1.0 - 0.5 * (np.abs(delta) / np.deg2rad(15.0)), 0.5, 1.0)
-    A_ice = 0.80 + 0.10 * season_factor  # Range: 0.80-0.90
+    A_ice = 0.75 + 0.08 * season_factor  # Range: 0.75-0.83
     
     # Linear transition from transition_start to 90°
     transition_range = 90.0 - transition_start
@@ -381,7 +381,14 @@ def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 1) -> np.ndarra
     return A.astype(np.float32)
 
 
-def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1, epsilon_atm: float = EPSILON_ATM, cache: bool = True) -> np.ndarray | float:
+def temperature_kelvin_for_lat(
+    lat_rad: np.ndarray | float,
+    day_of_year: int = 1,
+    epsilon_atm: float = EPSILON_ATM,
+    *,
+    polar_cooling_scale: float = 0.8,
+    cache: bool = True,
+) -> np.ndarray | float:
     """Return blackbody-equilibrium temperature (K) for latitude(s).
 
     Uses daily-mean TOA insolation by latitude and day-of-year (handles
@@ -406,7 +413,7 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
         day_int = int(day_of_year) % 365
         # Create cache key from latitude array shape and hash of values
         if np.isscalar(lat_rad):
-            cache_key = (day_int, 'scalar', float(lat_rad), epsilon_atm)
+            cache_key = (day_int, 'scalar', float(lat_rad), epsilon_atm, float(polar_cooling_scale))
         else:
             # Use hash of first, middle, and last values for efficiency (sufficient for typical use)
             n = len(lat)
@@ -414,7 +421,7 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
                 lat_hash = (float(lat[0]), float(lat[n//2]) if n > 1 else 0.0, float(lat[-1]) if n > 1 else 0.0, n)
             else:
                 lat_hash = (0.0, 0.0, 0.0, 0)
-            cache_key = (day_int, lat_hash, epsilon_atm)
+            cache_key = (day_int, lat_hash, epsilon_atm, float(polar_cooling_scale))
         
         if cache_key in _TEMP_BASE_CACHE:
             cached_result = _TEMP_BASE_CACHE[cache_key]
@@ -479,7 +486,7 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     # Maximum latent heat flux during peak melting conditions
     # Peak value: 150 W/m² at poles during midsummer with full sun
     # FURTHER REDUCED to prevent excessive polar cooling (global mean too cold)
-    F_latent_max = 30.0  # Reduced from 50 to 30 W/m² to warm poles more aggressively
+    F_latent_max = 30.0 * float(polar_cooling_scale)  # Reduced from 50 to 30 W/m² to warm poles more aggressively
     
     # Apply latent heat flux loss only during melt season
     # Scales with solar intensity (more sun = more melting)
@@ -509,7 +516,7 @@ def temperature_kelvin_for_lat(lat_rad: np.ndarray | float, day_of_year: int = 1
     # Convective flux scales with temperature excess above freezing (273K)
     # Only active when surface is warm enough to drive convection (>260K = -13°C)
     T_excess = np.maximum(T_estimate - 260.0, 0.0)  # Kelvin above -13°C
-    convection_efficiency = 0.4  # Reduced from 0.6 to 0.4 W/m² per K excess to warm poles more
+    convection_efficiency = 0.4 * float(polar_cooling_scale)  # Reduced from 0.6 to 0.4 W/m² per K excess to warm poles more
     
     # Apply convective export in polar regions (>50° latitude)
     polar_convection_mask = abs_lat_deg > 50.0

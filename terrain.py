@@ -12,7 +12,8 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
-from atmosphere import generate_wind_field, render_wind_arrows, generate_precipitation
+from atmosphere import generate_wind_field, render_wind_arrows, generate_precipitation, wind_speed_to_rgb
+from ocean import generate_ocean_currents, _ocean_mask_from_elevation
 import logging
 import time
 from contextlib import contextmanager
@@ -37,10 +38,12 @@ def log_time(action: str):
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
+_OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None}
 _PRECIP_CACHE = {"key": None, "P": None}
 
 def invalidate_view_caches():
     _WIND_CACHE.update({"key": None, "u": None, "v": None})
+    _OCEAN_CURRENT_CACHE.update({"key": None, "u": None, "v": None})
     _PRECIP_CACHE.update({"key": None, "P": None})
 
 # Simple multiprocessing tuning
@@ -295,11 +298,27 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
         rgbf = (1.0 - alpha) * rgbf + alpha * overlay_img
     elif view == "Wind":
         # Overlay wind arrows (project equirectangular arrows via sampling)
-        from atmosphere import generate_wind_field, render_wind_arrows
         u, v = generate_wind_field(tex_h, tex_w, elevation=tex)
         arrows = render_wind_arrows(tex_h, tex_w, u, v, target_arrows=250)
         arr_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
         arr_img[idx] = arrows[iy[idx], ix[idx], :]
+        rgbf = np.clip(rgbf + arr_img, 0.0, 1.0)
+    elif view == "Ocean Currents":
+        oc_key = (tex.shape, int(day_of_year), "ocean_currents")
+        if _OCEAN_CURRENT_CACHE["key"] != oc_key:
+            u, v = generate_ocean_currents(tex, day_of_year=int(day_of_year))
+            _OCEAN_CURRENT_CACHE.update({"key": oc_key, "u": u, "v": v})
+        else:
+            u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
+        speed = np.hypot(u, v).astype(np.float32)
+        base_rgb = wind_speed_to_rgb(speed)
+        arrows = render_wind_arrows(tex_h, tex_w, u, v, target_arrows=250)
+        ocean_mask = _ocean_mask_from_elevation(tex)
+        mask3 = ocean_mask[..., None].astype(np.float32)
+        base_rgb = base_rgb * mask3
+        arrows = arrows * mask3
+        arr_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
+        arr_img[idx] = (base_rgb + arrows)[iy[idx], ix[idx], :]
         rgbf = np.clip(rgbf + arr_img, 0.0, 1.0)
     rgb = (np.clip(rgbf, 0.0, 1.0) * 255).astype(np.uint8)
     rgb[~mask] = 0

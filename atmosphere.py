@@ -10,6 +10,7 @@ vector field and a pre-rendered arrow RGB overlay for display.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import numpy as np
 from temperature import temperature_kelvin_for_lat
 
@@ -38,42 +39,50 @@ def _upsample_bilinear(field: np.ndarray, H: int, W: int, block_size: int) -> np
     Hc, Wc = field.shape
     if bs == 1:
         return field[:H, :W]
-    
-    # Create coordinate arrays for interpolation
-    y_coarse = np.arange(Hc, dtype=np.float32)
-    x_coarse = np.arange(Wc, dtype=np.float32)
-    y_fine = np.linspace(0, Hc - 1, H, dtype=np.float32)
-    x_fine = np.linspace(0, Wc - 1, W, dtype=np.float32)
-    
-    # Create meshgrid for fine coordinates
-    Y_fine, X_fine = np.meshgrid(y_fine, x_fine, indexing='ij')
-    
-    # Find integer indices and fractional parts for bilinear interpolation
-    y_idx = np.floor(Y_fine).astype(np.int32)
-    x_idx = np.floor(X_fine).astype(np.int32)
-    y_frac = Y_fine - y_idx
-    x_frac = X_fine - x_idx
-    
-    # Clamp indices to valid range
-    y_idx = np.clip(y_idx, 0, Hc - 1)
-    x_idx = np.clip(x_idx, 0, Wc - 1)
-    y_idx_next = np.clip(y_idx + 1, 0, Hc - 1)
-    x_idx_next = np.clip(x_idx + 1, 0, Wc - 1)
-    
-    # Bilinear interpolation: interpolate in x first, then y
-    # Top edge
-    f_top_left = field[y_idx, x_idx]
-    f_top_right = field[y_idx, x_idx_next]
-    f_top = f_top_left * (1.0 - x_frac) + f_top_right * x_frac
-    
-    # Bottom edge
-    f_bot_left = field[y_idx_next, x_idx]
-    f_bot_right = field[y_idx_next, x_idx_next]
-    f_bot = f_bot_left * (1.0 - x_frac) + f_bot_right * x_frac
-    
-    # Interpolate in y
-    result = (f_top * (1.0 - y_frac) + f_bot * y_frac).astype(np.float32)
-    return result
+
+    y0, y1, wy, x0, x1, wx = _bilinear_plan(int(H), int(W), int(Hc), int(Wc))
+    f0 = field[y0, :].astype(np.float32, copy=False)
+    f1 = field[y1, :].astype(np.float32, copy=False)
+    top = f0[:, x0] * (1.0 - wx)[None, :] + f0[:, x1] * wx[None, :]
+    bot = f1[:, x0] * (1.0 - wx)[None, :] + f1[:, x1] * wx[None, :]
+    return (top * (1.0 - wy)[:, None] + bot * wy[:, None]).astype(np.float32)
+
+
+@lru_cache(maxsize=64)
+def _bilinear_plan(H: int, W: int, Hc: int, Wc: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    # 1D sampling plan; avoids per-call 2D meshgrid/indices allocations.
+    y = np.linspace(0, Hc - 1, int(H), dtype=np.float32)
+    x = np.linspace(0, Wc - 1, int(W), dtype=np.float32)
+    y0 = np.floor(y).astype(np.int32)
+    x0 = np.floor(x).astype(np.int32)
+    wy = (y - y0).astype(np.float32)
+    wx = (x - x0).astype(np.float32)
+    y0 = np.clip(y0, 0, Hc - 1)
+    x0 = np.clip(x0, 0, Wc - 1)
+    y1 = np.clip(y0 + 1, 0, Hc - 1)
+    x1 = np.clip(x0 + 1, 0, Wc - 1)
+    return y0, y1, wy, x0, x1, wx
+
+
+def _upsample_bilinear_many(fields: dict[str, np.ndarray], H: int, W: int, block_size: int) -> dict[str, np.ndarray]:
+    """Upsample multiple (Hc,Wc) fields sharing the same sampling plan."""
+    if not fields:
+        return {}
+    bs = max(1, int(block_size))
+    first = next(iter(fields.values()))
+    Hc, Wc = first.shape
+    if bs == 1:
+        return {k: v[:H, :W] for k, v in fields.items()}
+
+    keys = list(fields.keys())
+    stack = np.stack([fields[k].astype(np.float32, copy=False) for k in keys], axis=0)
+    y0, y1, wy, x0, x1, wx = _bilinear_plan(int(H), int(W), int(Hc), int(Wc))
+    f0 = stack[:, y0, :]
+    f1 = stack[:, y1, :]
+    top = f0[:, :, x0] * (1.0 - wx)[None, None, :] + f0[:, :, x1] * wx[None, None, :]
+    bot = f1[:, :, x0] * (1.0 - wx)[None, None, :] + f1[:, :, x1] * wx[None, None, :]
+    out = (top * (1.0 - wy)[None, :, None] + bot * wy[None, :, None]).astype(np.float32)
+    return {k: out[i] for i, k in enumerate(keys)}
 
 
 def _majority_filter(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
