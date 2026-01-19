@@ -288,11 +288,14 @@ def generate_ocean_currents(
     """Generate a dynamic surface ocean current field for visualization.
 
     Combines a climatological gyre pattern with wind-driven surface drift and
-    a light, deterministic mesoscale variability term.
+    a light, deterministic mesoscale variability term. Land boundaries block
+    and redirect flow for realistic coastal current patterns.
     """
     H, W = elevation.shape
-    base_u, base_v = get_major_ocean_currents(H, W, day_of_year=int(day_of_year))
     is_ocean = _ocean_mask_from_elevation(elevation)
+    is_land = ~is_ocean
+
+    base_u, base_v = get_major_ocean_currents(H, W, day_of_year=int(day_of_year))
 
     # Seasonal modulation (small amplitude).
     seasonal = 0.9 + 0.1 * np.sin(2.0 * np.pi * (float(day_of_year) / 365.2422))
@@ -322,9 +325,40 @@ def generate_ocean_currents(
     u = u + 0.04 * phase
     v = v + 0.02 * phase
 
-    u = u * is_ocean.astype(np.float32)
-    v = v * is_ocean.astype(np.float32)
-    return u.astype(np.float32), v.astype(np.float32)
+    # Apply land boundary conditions: block flow into land, enhance coastal currents.
+    # Meridional (north-south) flow blocked at land boundaries.
+    v_blocked = v.copy()
+    v_blocked[is_land] = 0.0
+    # Reduce meridional flow near land (coastal friction).
+    land_north = np.roll(is_land, -1, axis=0)
+    land_south = np.roll(is_land, 1, axis=0)
+    coastal_mask = (land_north | land_south) & is_ocean
+    v_blocked = np.where(coastal_mask, v_blocked * 0.7, v_blocked)
+
+    # Zonal (east-west) flow blocked at land boundaries.
+    u_blocked = u.copy()
+    u_blocked[is_land] = 0.0
+    # Reduce zonal flow near land.
+    land_east = np.roll(is_land, -1, axis=1)
+    land_west = np.roll(is_land, 1, axis=1)
+    coastal_mask_z = (land_east | land_west) & is_ocean
+    u_blocked = np.where(coastal_mask_z, u_blocked * 0.7, u_blocked)
+
+    # Western boundary current enhancement at actual western coastlines.
+    # Detect western ocean boundaries (ocean cells with land to the west).
+    western_coast = is_ocean & land_west
+    if np.any(western_coast):
+        lat_rows = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+        lat_grid = lat_rows[:, None].astype(np.float32)
+        abs_lat = np.abs(lat_grid)
+        midlat_mask = (abs_lat >= 20.0) & (abs_lat <= 60.0)
+        enhancement = western_coast & midlat_mask
+        v_blocked = np.where(enhancement, v_blocked * 1.4, v_blocked)
+
+    # Final mask: zero on land.
+    u_final = u_blocked * is_ocean.astype(np.float32)
+    v_final = v_blocked * is_ocean.astype(np.float32)
+    return u_final.astype(np.float32), v_final.astype(np.float32)
 
 
 def apply_ocean_transport(
