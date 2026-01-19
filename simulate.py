@@ -65,8 +65,8 @@ def simulate_step(
     ocean_exchange_span: float = 0.35,
     ocean_exchange_coeff: float = 0.08,
     ocean_exchange_inertia: float = 0.35,
-    epsilon_equator: float = 0.78,
-    epsilon_pole: float = 0.55,
+    epsilon_equator: float = 0.72,
+    epsilon_pole: float = 0.50,
     polar_cooling_scale: float = 0.6,
     ice_freeze_temp: float = 269.5,
     ice_melt_temp: float = 273.35,
@@ -517,8 +517,8 @@ def _evolve_temperature(
     ocean_exchange_span: float = 0.35,
     ocean_exchange_coeff: float = 0.05,
     ocean_exchange_inertia: float = 0.0,
-    epsilon_equator: float = 0.78,
-    epsilon_pole: float = 0.55,
+    epsilon_equator: float = 0.72,
+    epsilon_pole: float = 0.50,
     ice_albedo_strength: float = 1.0,
     track_components: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
@@ -617,7 +617,8 @@ def _evolve_temperature(
     # Cloud Cover approximation (RH proxy)
     # Warmer air holds more water, but assume constant RH availability for now
     # Cloud fraction increases with uplift/convergence (simplified)
-    cloud_fraction = 0.4 + 0.2 * np.sin(lat_2d * 3.0) # Base climatology
+    cloud_fraction = 0.25 + 0.1 * np.sin(lat_2d * 3.0) # Base climatology
+    cloud_fraction = np.clip(cloud_fraction, 0.0, 1.0)
     
     # Albedo
     # Ocean: 0.06, Land: 0.2, Sea Ice: 0.75, Snow: 0.8, Cloud: 0.5
@@ -786,6 +787,20 @@ def _evolve_temperature(
         components['subsidence'] = subsidence
         components['equilibrium_temp'] = T_eq
         components['net_radiation'] = R_net
+        def _summ(field: np.ndarray) -> dict:
+            return {
+                "mean": float(np.mean(field)),
+                "min": float(np.min(field)),
+                "max": float(np.max(field)),
+            }
+        components["toa"] = {
+            "S_absorbed": _summ(S_absorbed),
+            "L_out": _summ(L_out),
+            "R_net": _summ(R_net),
+            "albedo_mean": float(np.mean(albedo_total)),
+            "cloud_mean": float(np.mean(cloud_fraction)),
+            "epsilon_mean": float(np.mean(epsilon)),
+        }
 
     return T.astype(np.float32), cloud_fraction.astype(np.float32), snow_cover.astype(np.float32), components
 
