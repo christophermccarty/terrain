@@ -209,6 +209,113 @@ def _coriolis_kernel_numba(u: np.ndarray, v: np.ndarray, f: np.ndarray,
     return du, dv
 
 
+# ============================================================================
+# Numba-accelerated compute kernels for precipitation
+# These accelerate humidity advection, moisture convergence, and precipitation
+# ============================================================================
+
+@jit(nopython=True, parallel=True, cache=True)
+def _advect_humidity_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray,
+                           u_scale: np.ndarray, v_scale: np.ndarray) -> np.ndarray:
+    """Advect humidity field with upwind scheme (semi-Lagrangian).
+
+    Returns advected humidity field.
+    """
+    H, W = q.shape
+    q_out = np.zeros_like(q)
+
+    for i in prange(H):
+        for j in range(W):
+            # Zonal advection (periodic boundary)
+            j_east = (j + 1) % W
+            j_west = (j - 1 + W) % W
+
+            if u[i, j] >= 0:
+                q_x = q[i, j_west]
+            else:
+                q_x = q[i, j_east]
+
+            q_adv_x = q[i, j] + u_scale[i, j] * (q_x - q[i, j])
+
+            # Meridional advection (edge boundary)
+            if i == 0:
+                q_out[i, j] = q_adv_x  # North pole edge
+            elif i == H - 1:
+                q_out[i, j] = q_adv_x  # South pole edge
+            else:
+                if v[i, j] >= 0:
+                    q_y = q[i + 1, j]  # Southward
+                else:
+                    q_y = q[i - 1, j]  # Northward
+
+                q_out[i, j] = q_adv_x + v_scale[i, j] * (q_y - q_adv_x)
+
+    return q_out
+
+
+@jit(nopython=True, parallel=True, cache=True)
+def _laplacian_numba(field: np.ndarray) -> np.ndarray:
+    """Compute Laplacian (5-point stencil) with periodic x, edge y boundaries.
+
+    Returns Laplacian of field (∇²f).
+    """
+    H, W = field.shape
+    lap = np.zeros_like(field)
+
+    for i in prange(1, H - 1):  # Skip poles
+        for j in range(W):
+            j_east = (j + 1) % W
+            j_west = (j - 1 + W) % W
+
+            # 5-point stencil
+            c = field[i, j]
+            n = field[i - 1, j]
+            s = field[i + 1, j]
+            e = field[i, j_east]
+            w = field[i, j_west]
+
+            lap[i, j] = n + s + e + w - 4.0 * c
+
+    # Handle poles separately (copy from neighbors)
+    for j in range(W):
+        lap[0, j] = lap[1, j]
+        lap[H - 1, j] = lap[H - 2, j]
+
+    return lap
+
+
+@jit(nopython=True, parallel=True, cache=True)
+def _moisture_convergence_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Compute moisture flux convergence: -∇·(q·V).
+
+    Returns convergence field (positive = moisture converging).
+    """
+    H, W = q.shape
+    conv = np.zeros_like(q)
+
+    for i in prange(1, H - 1):
+        for j in range(W):
+            j_east = (j + 1) % W
+            j_west = (j - 1 + W) % W
+
+            # Moisture flux
+            flux_x_here = q[i, j] * u[i, j]
+            flux_y_here = q[i, j] * v[i, j]
+
+            # Central differences
+            d_flux_x = 0.5 * (q[i, j_east] * u[i, j_east] - q[i, j_west] * u[i, j_west])
+            d_flux_y = 0.5 * (q[i + 1, j] * v[i + 1, j] - q[i - 1, j] * v[i - 1, j])
+
+            # Convergence (negative divergence)
+            conv[i, j] = -(d_flux_x + d_flux_y)
+
+            # Clip to positive (only interested in convergence)
+            if conv[i, j] < 0.0:
+                conv[i, j] = 0.0
+
+    return conv
+
+
 def _streamfunction_from_vorticity(omega: np.ndarray) -> np.ndarray:
     H, W = omega.shape
     ky = 2.0 * np.pi * np.fft.fftfreq(H)
@@ -1016,17 +1123,38 @@ def generate_precipitation(
     # Moisture advection/diffusion (semi-Lagrangian-ish)
     u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * 0.4
     v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * 0.4
-    for _ in range(3):
-        q = _advect_scalar(q, u, v, u_scale, v_scale)
-        q = q + 0.12 * _laplacian(q)
-        q = np.clip(q, 0.0, qsat)
+
+    if NUMBA_AVAILABLE:
+        # Fast path: Numba-accelerated advection with adaptive diffusion
+        for _ in range(3):
+            q = _advect_humidity_numba(q.astype(np.float32), u, v, u_scale, v_scale)
+            lap_q = _laplacian_numba(q)
+            # Adaptive diffusion: stronger in regions with sharp gradients
+            q_grad_strength = np.abs(lap_q) / (np.mean(np.abs(lap_q)) + 1e-9)
+            diffusion_coeff = 0.12 * (1.0 + 0.3 * np.clip(q_grad_strength, 0.0, 2.0))
+            q = q + diffusion_coeff * lap_q
+            q = np.clip(q, 0.0, qsat)
+    else:
+        # Fallback: original NumPy implementation
+        for _ in range(3):
+            q = _advect_scalar(q, u, v, u_scale, v_scale)
+            q = q + 0.12 * _laplacian(q)
+            q = np.clip(q, 0.0, qsat)
 
     # Moisture-flux convergence driver
-    flux_x = q * u
-    flux_y = q * v
-    conv = np.clip(-(_ddx_periodic(flux_x) + np.gradient(flux_y, axis=0)), 0.0, None)
-    conv = conv / (np.mean(conv) + 1e-6)
-    conv = np.clip(conv + 0.15 * _laplacian(conv), 0.0, 3.0)
+    if NUMBA_AVAILABLE:
+        # Fast path: Numba-accelerated convergence
+        conv = _moisture_convergence_numba(q.astype(np.float32), u, v)
+        conv = conv / (np.mean(conv) + 1e-6)
+        lap_conv = _laplacian_numba(conv)
+        conv = np.clip(conv + 0.15 * lap_conv, 0.0, 3.0)
+    else:
+        # Fallback: original NumPy implementation
+        flux_x = q * u
+        flux_y = q * v
+        conv = np.clip(-(_ddx_periodic(flux_x) + np.gradient(flux_y, axis=0)), 0.0, None)
+        conv = conv / (np.mean(conv) + 1e-6)
+        conv = np.clip(conv + 0.15 * _laplacian(conv), 0.0, 3.0)
 
     # Large-scale ascent proxy from wind convergence
     div = _ddx_periodic(u) + np.gradient(v, axis=0)
@@ -1056,8 +1184,16 @@ def generate_precipitation(
         0.15 * convective +
         0.15 * ascent
     )
-    for _ in range(3):
-        precip_potential = np.clip(precip_potential + 0.18 * _laplacian(precip_potential), 0.0, 3.0)
+
+    if NUMBA_AVAILABLE:
+        # Fast path: Numba-accelerated smoothing
+        for _ in range(3):
+            lap_p = _laplacian_numba(precip_potential.astype(np.float32))
+            precip_potential = np.clip(precip_potential + 0.18 * lap_p, 0.0, 3.0)
+    else:
+        # Fallback: original NumPy implementation
+        for _ in range(3):
+            precip_potential = np.clip(precip_potential + 0.18 * _laplacian(precip_potential), 0.0, 3.0)
 
     # Convert potential to precipitation (mm/day) with moisture conservation
     remove_frac = np.clip(rain_efficiency * precip_potential * dt, 0.0, 1.0)
