@@ -865,6 +865,8 @@ def generate_precipitation(
     evap_coeff: float = 1.0,
     uplift_coeff: float = 1.0,
     rain_efficiency: float = 0.7,
+    target_mean_mm_day: float = 2.7,
+    max_precip_mm_day: float = 120.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (precip_mm_day, humidity, soil_moisture).
 
@@ -951,6 +953,12 @@ def generate_precipitation(
     conv = conv / (np.mean(conv) + 1e-6)
     conv = np.clip(conv + 0.15 * _laplacian(conv), 0.0, 3.0)
 
+    # Large-scale ascent proxy from wind convergence
+    div = _ddx_periodic(u) + np.gradient(v, axis=0)
+    ascent = np.clip(-div, 0.0, None)
+    ascent = ascent / (np.mean(ascent) + 1e-6)
+    ascent = np.clip(ascent + 0.15 * _laplacian(ascent), 0.0, 3.0)
+
     # Orographic uplift signal
     gx = _ddx_periodic(elev)
     gy = np.gradient(elev, axis=0)
@@ -967,21 +975,32 @@ def generate_precipitation(
 
     # Blend drivers into precipitation potential
     precip_potential = uplift_coeff * (
-        0.45 * rh +
-        0.25 * conv +
+        0.40 * rh +
+        0.20 * conv +
         0.20 * orog +
-        0.20 * convective
+        0.15 * convective +
+        0.15 * ascent
     )
     for _ in range(3):
         precip_potential = np.clip(precip_potential + 0.18 * _laplacian(precip_potential), 0.0, 3.0)
 
-    # Convert potential to precipitation (mm/day)
-    precip_rate = rain_efficiency * precip_potential * q
-    P = np.clip(480.0 * precip_rate, 0.0, None)
+    # Convert potential to precipitation (mm/day) with moisture conservation
+    remove_frac = np.clip(rain_efficiency * precip_potential * dt, 0.0, 1.0)
+    dq = np.clip(remove_frac * q, 0.0, q)
+    column_mm_per_q = 2000.0  # ~20 mm PW for q=0.01
+    P = dq * (column_mm_per_q / dt)
+    if target_mean_mm_day > 0.0:
+        mean_p = float(np.mean(P))
+        scale = float(np.clip(target_mean_mm_day / (mean_p + 1e-6), 0.2, 3.0))
+        dq = np.clip(dq * scale, 0.0, q)
+        P = dq * (column_mm_per_q / dt)
+    if max_precip_mm_day > 0.0:
+        cap = np.minimum(1.0, max_precip_mm_day / (P + 1e-9))
+        dq = dq * cap
+        P = P * cap
 
     # Update humidity and soil moisture reservoirs
-    rain_sink = np.clip(P * 0.00004, 0.0, q)
-    humidity_next = np.clip(q - rain_sink, 0.0, qsat)
+    humidity_next = np.clip(q - dq, 0.0, qsat)
 
     soil += (P * land_f) * 0.0006 - (land_evap * dt) * 0.4
     soil = np.where(land_mask, np.clip(soil, 0.05, 1.0), 0.0)
