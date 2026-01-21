@@ -12,6 +12,8 @@ import cProfile
 import pstats
 import logging
 import time
+from threading import Thread, Event
+from queue import Queue, Empty
 
 from terrain import (
     generate_sphere_image,
@@ -38,6 +40,81 @@ import graphs
 _WIND_CACHE = {"key": None, "u": None, "v": None}
 _OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None}
 _PRECIP_VIEW_CACHE = {"key": None, "P": None}
+
+
+class SimulationThread(Thread):
+    """Background thread that runs physics simulation independently of UI."""
+
+    def __init__(self, initial_state, days_per_step=1.0, wind_block_size=8, diagnostics=None):
+        super().__init__(daemon=True)
+        self.state = initial_state
+        self.days_per_step = days_per_step
+        self.wind_block_size = wind_block_size
+        self.diagnostics = diagnostics
+        self.running = Event()
+        self.paused = Event()
+        self.paused.set()  # Start paused
+        self.state_queue = Queue(maxsize=1)  # Only keep latest state
+        self.component_queue = Queue(maxsize=1)  # Track temperature components
+
+    def run(self):
+        """Main simulation loop (runs in background thread)."""
+        self.running.set()
+        while self.running.is_set():
+            if self.paused.is_set():
+                time.sleep(0.05)  # Sleep when paused (50ms)
+                continue
+
+            try:
+                # Run one simulation step
+                new_state, temp_components = simulate_step(
+                    self.state,
+                    days=self.days_per_step,
+                    wind_block_size=self.wind_block_size,
+                    debug_log=False,
+                    track_components=True,
+                )
+                self.state = new_state
+
+                # Record diagnostics if available
+                if self.diagnostics is not None:
+                    self.diagnostics.record_step(
+                        new_state,
+                        new_state.day_of_year,
+                        days_elapsed=self.days_per_step,
+                        component_contributions=temp_components
+                    )
+
+                # Push to UI (non-blocking, drop if UI busy)
+                try:
+                    self.state_queue.put_nowait(new_state)
+                    self.component_queue.put_nowait(temp_components)
+                except:
+                    pass  # Drop frame if queue full
+
+            except Exception as e:
+                LOG.error(f"Simulation thread error: {e}")
+                self.paused.set()  # Auto-pause on error
+
+    def pause(self):
+        """Pause simulation."""
+        self.paused.set()
+
+    def resume(self):
+        """Resume simulation."""
+        self.paused.clear()
+
+    def stop(self):
+        """Stop simulation thread."""
+        self.running.clear()
+
+    def update_days_per_step(self, days):
+        """Update simulation speed."""
+        self.days_per_step = days
+
+    def update_wind_block_size(self, block_size):
+        """Update wind resolution."""
+        self.wind_block_size = block_size
 
 
 def main() -> None:
@@ -68,6 +145,7 @@ def main() -> None:
 
     # Simulation state
     sim_state: PlanetState | None = None
+    sim_thread: SimulationThread | None = None
     sim_running = False
     sim_paused = False
     sim_speed = 1.0  # days per step
@@ -817,11 +895,23 @@ def main() -> None:
             latlon_var.set("")
 
     def start_simulation():
-        nonlocal sim_state, sim_running, sim_paused
+        nonlocal sim_state, sim_thread, sim_running, sim_paused
         if sim_state is None:
             # Initialize simulation from current elevation
             tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
             _init_sim_state_from_elevation(tex)
+
+        # Start or resume simulation thread
+        if sim_thread is None or not sim_thread.is_alive():
+            sim_thread = SimulationThread(
+                sim_state,
+                days_per_step=sim_speed,
+                wind_block_size=int(wind_block_size_var.get()),
+                diagnostics=diagnostics
+            )
+            sim_thread.start()
+
+        sim_thread.resume()
         sim_running = True
         sim_paused = False
         sim_status_var.set("Running")
@@ -832,22 +922,34 @@ def main() -> None:
         if mode_var.get() == "map" and view_var.get() == "Wind Particles" and not particle_anim_running:
             particle_anim_running = True
             _update_wind_particles()
-        update_simulation()
+        # Start UI update loop
+        update_from_simulation()
     
     def stop_simulation():
-        nonlocal sim_running, sim_paused
+        nonlocal sim_thread, sim_running, sim_paused
+        if sim_thread:
+            sim_thread.pause()
         sim_running = False
         sim_paused = False
         sim_status_var.set("Stopped")
     
     def pause_simulation():
-        nonlocal sim_paused
+        nonlocal sim_thread, sim_paused
         if sim_running:
             sim_paused = not sim_paused
+            if sim_thread:
+                if sim_paused:
+                    sim_thread.pause()
+                else:
+                    sim_thread.resume()
             sim_status_var.set("Paused" if sim_paused else "Running")
     
     def reset_simulation():
-        nonlocal sim_state, sim_running, sim_paused
+        nonlocal sim_state, sim_thread, sim_running, sim_paused
+        # Stop the simulation thread if running
+        if sim_thread:
+            sim_thread.stop()
+            sim_thread = None
         # Reset to a freshly initialized (stopped) state from current elevation.
         use_sim_data = sim_state is not None and sim_running
         if use_sim_data and sim_state is not None and sim_state.elevation is not None:
@@ -936,36 +1038,41 @@ def main() -> None:
         else:
             latlon_var.set("")
     
-    def update_simulation():
-        nonlocal sim_state
-        if sim_running and not sim_paused and sim_state is not None:
-            # Advance simulation
-            sim_state, temp_components = simulate_step(
-                sim_state,
-                days=sim_speed,
-                wind_block_size=int(wind_block_size_var.get()),
-                debug_log=False,  # Disabled - use export data for analysis instead
-                track_components=True,  # Always track components for diagnostics
-            )
-            
-            # Record diagnostics with component tracking
-            if sim_state is not None:
-                diagnostics.record_step(
-                    sim_state, 
-                    sim_state.day_of_year, 
-                    days_elapsed=sim_speed,
-                    component_contributions=temp_components
-                )
+    def update_from_simulation():
+        """Pull latest state from simulation thread and update UI (called by timer)."""
+        nonlocal sim_state, sim_thread
+
+        if sim_thread:
+            try:
+                # Non-blocking get - pull latest state if available
+                new_state = sim_thread.state_queue.get_nowait()
+                sim_state = new_state
+
+                # Also try to get temperature components (for diagnostics)
+                try:
+                    temp_components = sim_thread.component_queue.get_nowait()
+                except Empty:
+                    temp_components = None
+
+                # Update UI with new state
                 sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
-                # Always update day label here (Wind Particles render path can return early).
-                sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
-            # Update display
-            render()
-            # Update cursor display at last known mouse position
-            if mode_var.get() == "map":
-                update_cursor_display(last_mouse_pos[0], last_mouse_pos[1])
-            # Schedule next update (100ms = ~10 FPS)
-            root.after(100, update_simulation)
+                if not sim_paused:
+                    sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
+
+                # Update display
+                render()
+
+                # Update cursor display at last known mouse position
+                if mode_var.get() == "map":
+                    update_cursor_display(last_mouse_pos[0], last_mouse_pos[1])
+
+            except Empty:
+                # No new state available - that's okay, just skip this update
+                pass
+
+        # Schedule next UI update (50ms = ~20 FPS for UI responsiveness)
+        if sim_running or sim_thread:
+            root.after(50, update_from_simulation)
     
     def on_motion(e):
         nonlocal last_mouse_pos
@@ -998,6 +1105,11 @@ def main() -> None:
     mode_var.trace_add("write", lambda *_: render())
     view_var.trace_add("write", lambda *_: render())
     def on_close():
+        nonlocal sim_thread
+        # Stop simulation thread if running
+        if sim_thread:
+            sim_thread.stop()
+            sim_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
         # Persist current UI parameters to settings.json
         s = {
             "seed": int(seed_var.get()),
