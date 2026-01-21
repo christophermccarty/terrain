@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 from typing import NamedTuple
-from atmosphere import generate_wind_field
+from atmosphere import generate_wind_field, generate_precipitation
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
 from ocean import calculate_ocean_heat_transport, update_sea_ice
 
@@ -75,6 +75,7 @@ def simulate_step(
     ice_albedo_strength: float = 1.0,
     heat_transport_coeff: float = 0.8,
     thermal_diffusion: float = 0.04,
+    latent_cooling_coeff: float = 0.015,
     debug_log: bool = False,
     track_components: bool = False,
 ) -> tuple[PlanetState, dict]:
@@ -318,6 +319,11 @@ def simulate_step(
         v_coarse = v_full
 
     # Apply temperature evolution with advection and radiation
+    if state.humidity is not None:
+        hum_pad = np.pad(state.humidity.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        humidity_coarse = hum_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+    else:
+        humidity_coarse = None
     # Always track components for diagnostics (minimal overhead)
     T_coarse, cloud_c, snow_c, temp_components = _evolve_temperature(
         T_prev_coarse, T_base, state.elevation, Hc, Wc, block_size, H, W,
@@ -335,6 +341,7 @@ def simulate_step(
         epsilon_equator=epsilon_equator,
         epsilon_pole=epsilon_pole,
         ice_albedo_strength=ice_albedo_strength,
+        humidity=humidity_coarse,
         track_components=track_components  # Track components for diagnostics
     )
     
@@ -364,10 +371,26 @@ def simulate_step(
     # Already evolved above
     # if update_wind... removed legacy block
     
-    # Precipitation simulation removed (for performance / simplicity).
-    P_full = None
-    humidity_next = None
-    soil_next = None
+    if state.elevation is not None:
+        P_full, humidity_next, soil_next = generate_precipitation(
+            H,
+            W,
+            state.elevation,
+            temperature=T_full,
+            wind_u=u_full,
+            wind_v=v_full,
+            humidity=state.humidity,
+            soil_moisture=state.soil_moisture,
+            day_of_year=int(new_day),
+            dt_days=float(days),
+        )
+    else:
+        P_full = None
+        humidity_next = None
+        soil_next = None
+    if P_full is not None and T_full is not None:
+        T_full = T_full - (latent_cooling_coeff * P_full * float(days))
+        T_full = np.clip(T_full, 150.0, 330.0)
     ice_full = update_sea_ice(
         T_full, state.elevation, state.ice_cover, days,
         freeze_temp=ice_freeze_temp,
@@ -520,6 +543,7 @@ def _evolve_temperature(
     epsilon_equator: float = 0.72,
     epsilon_pole: float = 0.50,
     ice_albedo_strength: float = 1.0,
+    humidity: np.ndarray | None = None,
     track_components: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
@@ -614,11 +638,32 @@ def _evolve_temperature(
     if ice_albedo_strength != 1.0:
         sea_ice = np.clip(sea_ice * float(ice_albedo_strength), 0.0, 1.0)
     
-    # Cloud Cover approximation (RH proxy)
-    # Warmer air holds more water, but assume constant RH availability for now
-    # Cloud fraction increases with uplift/convergence (simplified)
-    cloud_fraction = 0.25 + 0.1 * np.sin(lat_2d * 3.0) # Base climatology
-    cloud_fraction = np.clip(cloud_fraction, 0.0, 1.0)
+    # Cloud Cover approximation (physics-based, no artificial floor)
+    # Use humidity when available, plus ascent, orographic lift, and subsidence clearing.
+    Tc = np.clip(T - 273.15, -60.0, 60.0)
+    es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
+    qsat = np.clip(0.622 * es / 1013.25, 1e-6, 0.035).astype(np.float32)
+    if humidity is not None:
+        q = np.clip(humidity.astype(np.float32), 0.0, qsat)
+    else:
+        temp_norm = np.clip((T - 255.0) / 45.0, 0.0, 1.0)
+        base_q = np.where(sea_mask, 0.012, 0.008).astype(np.float32)
+        q = base_q * (0.5 + 0.7 * temp_norm)
+    rh = np.clip(q / qsat, 0.0, 1.5)
+    div = 0.5 * (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1)) + np.gradient(v, axis=0)
+    ascent = np.clip(-div, 0.0, None)
+    subsidence = np.clip(div, 0.0, None)
+    ascent = ascent / (np.mean(ascent) + 1e-6)
+    subsidence = subsidence / (np.mean(subsidence) + 1e-6)
+    gx = 0.5 * (np.roll(elev_c, -1, axis=1) - np.roll(elev_c, 1, axis=1))
+    gy = np.gradient(elev_c, axis=0)
+    orog = np.clip(gx * u + gy * v, 0.0, None)
+    orog = orog / (np.mean(orog) + 1e-6)
+    rh_core = np.clip((rh - 0.65) * 2.0, 0.0, 1.0)
+    ascent_term = np.clip(0.6 + 0.6 * ascent, 0.0, 1.4)
+    cloud_fraction = rh_core * ascent_term
+    cloud_fraction = np.clip(cloud_fraction + 0.25 * rh_core * orog, 0.0, 1.0)
+    cloud_fraction = np.clip(cloud_fraction * (1.0 - 0.6 * np.clip(subsidence, 0.0, 1.0)), 0.0, 1.0)
     
     # Albedo
     # Ocean: 0.06, Land: 0.2, Sea Ice: 0.75, Snow: 0.8, Cloud: 0.5

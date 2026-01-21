@@ -26,9 +26,10 @@ from terrain import (
     set_elevation_cache,
     LOG,
 )
-from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb
+from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb, generate_precipitation
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from ocean import _ocean_mask_from_elevation, generate_ocean_currents
+from terrain import precipitation_to_rgb
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
 from diagnostics import ClimateDiagnostics
 import graphs
@@ -36,6 +37,7 @@ import graphs
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
 _OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None}
+_PRECIP_VIEW_CACHE = {"key": None, "P": None}
 
 
 def main() -> None:
@@ -90,6 +92,7 @@ def main() -> None:
         "Terrain",
         "Temperature",
         "Ocean Temperature",
+        "Precipitation",
         "Wind Arrows",
         "Ocean Currents",
         "Wind Particles",
@@ -501,6 +504,7 @@ def main() -> None:
         # Only clear cache if using procedural terrain
         if terrain_mode == "procedural":
             clear_elevation_cache()
+        _PRECIP_VIEW_CACHE.update({"key": None, "P": None})
         invalidate_view_caches()
         p = {
             "seed": int(seed_var.get()),
@@ -727,12 +731,40 @@ def main() -> None:
                     ice_mask = ocean_mask & (ice > 0.01)
                     base[ice_mask] = 1.0
                 arr = (np.clip(base, 0.0, 1.0) * 255).astype(np.uint8)
+            elif view_var.get() == "Precipitation":
+                h, w = tex.shape
+                day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+                if use_sim_data and sim_state.precipitation is not None:
+                    P = sim_state.precipitation.astype(np.float32)
+                else:
+                    T = sim_state.temperature if (use_sim_data and sim_state is not None) else None
+                    u = sim_state.wind_u if (use_sim_data and sim_state is not None) else None
+                    v = sim_state.wind_v if (use_sim_data and sim_state is not None) else None
+                    pkey = (tex.shape, int(day), id(T), id(u), id(v))
+                    if _PRECIP_VIEW_CACHE["key"] != pkey:
+                        P, _, _ = generate_precipitation(
+                            h,
+                            w,
+                            tex,
+                            temperature=T,
+                            wind_u=u,
+                            wind_v=v,
+                            day_of_year=int(day),
+                        )
+                        _PRECIP_VIEW_CACHE.update({"key": pkey, "P": P})
+                    else:
+                        P = _PRECIP_VIEW_CACHE["P"]
+                overlay, alpha = precipitation_to_rgb(P)
+                comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
+                arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Cloud Cover":
                 if use_sim_data and sim_state.cloud_cover is not None:
                     C = sim_state.cloud_cover
-                    # White clouds
-                    overlay = np.stack([C, C, C], axis=-1)
-                    alpha = C * 0.8
+                    # Grayscale cloud opacity: dark gray (thin) → white (dense)
+                    C = np.clip(C.astype(np.float32), 0.0, 1.0)
+                    gray = 0.25 + 0.75 * C
+                    overlay = np.stack([gray, gray, gray], axis=-1)
+                    alpha = C
                     comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                     arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
                 else:
