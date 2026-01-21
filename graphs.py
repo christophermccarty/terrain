@@ -35,8 +35,8 @@ class LiveGraphsWindow:
         self.top.title("Simulation Graphs")
         self.top.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.fig = Figure(figsize=(18, 7), dpi=100)
-        axes = self.fig.subplots(3, 4)
+        self.fig = Figure(figsize=(20, 9), dpi=100)
+        axes = self.fig.subplots(4, 4)
         self.axes = axes
 
         for ax in axes.ravel():
@@ -63,6 +63,18 @@ class LiveGraphsWindow:
             "temp_pole_south": deque(),
             "wind_trade_mean": deque(),
             "wind_midlat_mean": deque(),
+            "precip_mean": deque(),
+            "precip_min": deque(),
+            "precip_max": deque(),
+            "precip_equator": deque(),
+            "precip_pole_north": deque(),
+            "precip_pole_south": deque(),
+            "humidity_mean": deque(),
+            "humidity_min": deque(),
+            "humidity_max": deque(),
+            "soil_mean": deque(),
+            "soil_min": deque(),
+            "soil_max": deque(),
         }
 
         self._lines: dict[str, any] = {}
@@ -87,6 +99,10 @@ class LiveGraphsWindow:
         ax21 = axes[9]
         ax22 = axes[10]
         ax23 = axes[11]
+        ax30 = axes[12]
+        ax31 = axes[13]
+        ax32 = axes[14]
+        ax33 = axes[15]
 
         ax00.set_title("Avg Temperature (K)")
         self._lines["avg_temp"] = ax00.plot([], [], color="tab:red")[0]
@@ -135,6 +151,30 @@ class LiveGraphsWindow:
         self._lines["wind_trade_mean"] = ax23.plot([], [], color="tab:green", label="Trades")[0]
         self._lines["wind_midlat_mean"] = ax23.plot([], [], color="tab:olive", label="Mid-lat")[0]
         ax23.legend(loc="upper right", fontsize=8)
+
+        ax30.set_title("Precipitation Mean/Range (mm/day)")
+        self._lines["precip_mean"] = ax30.plot([], [], color="tab:blue", label="Mean")[0]
+        self._lines["precip_min"] = ax30.plot([], [], color="tab:gray", label="Min")[0]
+        self._lines["precip_max"] = ax30.plot([], [], color="tab:purple", label="Max")[0]
+        ax30.legend(loc="upper right", fontsize=8)
+
+        ax31.set_title("Precipitation by Latitude (mm/day)")
+        self._lines["precip_equator"] = ax31.plot([], [], color="tab:red", label="Equator")[0]
+        self._lines["precip_pole_north"] = ax31.plot([], [], color="tab:blue", label="Pole N")[0]
+        self._lines["precip_pole_south"] = ax31.plot([], [], color="tab:cyan", label="Pole S")[0]
+        ax31.legend(loc="upper right", fontsize=8)
+
+        ax32.set_title("Humidity Mean/Range (kg/kg)")
+        self._lines["humidity_mean"] = ax32.plot([], [], color="tab:blue", label="Mean")[0]
+        self._lines["humidity_min"] = ax32.plot([], [], color="tab:gray", label="Min")[0]
+        self._lines["humidity_max"] = ax32.plot([], [], color="tab:purple", label="Max")[0]
+        ax32.legend(loc="upper right", fontsize=8)
+
+        ax33.set_title("Soil Moisture Mean/Range")
+        self._lines["soil_mean"] = ax33.plot([], [], color="tab:green", label="Mean")[0]
+        self._lines["soil_min"] = ax33.plot([], [], color="tab:gray", label="Min")[0]
+        self._lines["soil_max"] = ax33.plot([], [], color="tab:olive", label="Max")[0]
+        ax33.legend(loc="upper right", fontsize=8)
 
     def reset(self) -> None:
         self._times.clear()
@@ -199,6 +239,18 @@ class LiveGraphsWindow:
         temp_pole_south = float(stats.get("T_pole_south", 0.0))
         wind_trade_mean = float(stats.get("wind_trade_mean", 0.0))
         wind_midlat_mean = float(stats.get("wind_midlat_mean", 0.0))
+        precip_mean = float(stats.get("mean_precip", 0.0))
+        precip_min = float(stats.get("precip_min", 0.0))
+        precip_max = float(stats.get("precip_max", 0.0))
+        precip_equator = float(stats.get("precip_equator", 0.0))
+        precip_pole_north = float(stats.get("precip_pole_north", 0.0))
+        precip_pole_south = float(stats.get("precip_pole_south", 0.0))
+        humidity_mean = float(stats.get("humidity_mean", 0.0))
+        humidity_min = float(stats.get("humidity_min", 0.0))
+        humidity_max = float(stats.get("humidity_max", 0.0))
+        soil_mean = float(stats.get("soil_mean", 0.0))
+        soil_min = float(stats.get("soil_min", 0.0))
+        soil_max = float(stats.get("soil_max", 0.0))
 
         self._series["avg_temp"].append(avg_temp)
         self._series["avg_ocean_temp"].append(avg_ocean_temp)
@@ -219,6 +271,18 @@ class LiveGraphsWindow:
         self._series["temp_pole_south"].append(temp_pole_south)
         self._series["wind_trade_mean"].append(wind_trade_mean)
         self._series["wind_midlat_mean"].append(wind_midlat_mean)
+        self._series["precip_mean"].append(precip_mean)
+        self._series["precip_min"].append(precip_min)
+        self._series["precip_max"].append(precip_max)
+        self._series["precip_equator"].append(precip_equator)
+        self._series["precip_pole_north"].append(precip_pole_north)
+        self._series["precip_pole_south"].append(precip_pole_south)
+        self._series["humidity_mean"].append(humidity_mean)
+        self._series["humidity_min"].append(humidity_min)
+        self._series["humidity_max"].append(humidity_max)
+        self._series["soil_mean"].append(soil_mean)
+        self._series["soil_min"].append(soil_min)
+        self._series["soil_max"].append(soil_max)
 
         self._trim_history(total_days)
         self._redraw()

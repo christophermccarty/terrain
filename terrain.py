@@ -236,6 +236,27 @@ def colorize(elev: np.ndarray) -> np.ndarray:
     return result
 
 
+def precipitation_to_rgb(precip_mm_day: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (rgb, alpha) precipitation overlay from mm/day."""
+    p = np.clip(precip_mm_day.astype(np.float32), 0.0, 120.0)
+    norm = np.log1p(p) / np.log1p(120.0)
+    stops = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+    colors = np.array([
+        [0.85, 0.90, 1.00],
+        [0.35, 0.65, 0.95],
+        [0.20, 0.80, 0.55],
+        [0.95, 0.85, 0.25],
+        [0.85, 0.20, 0.20],
+    ], dtype=np.float32)
+    idx = np.clip(np.searchsorted(stops, norm, side="right") - 1, 0, len(stops) - 2)
+    t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx] + 1e-9)
+    c0 = colors[idx]
+    c1 = colors[idx + 1]
+    rgb = c0 + (c1 - c0) * t[..., None]
+    alpha = np.clip(norm ** 0.6 * 0.9, 0.0, 0.9)
+    return rgb, alpha
+
+
 def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, view: str = "Terrain", seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5, day_of_year: int = 1) -> Image.Image:
     """Render a fully lit sphere by sampling the cached terrain. radius<1 zooms out.
 
@@ -296,6 +317,19 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
         overlay_img[idx] = overlay_tex[iy[idx], ix[idx], :]
         alpha = 0.5
         rgbf = (1.0 - alpha) * rgbf + alpha * overlay_img
+    elif view == "Precipitation":
+        pkey = (tex.shape, int(day_of_year), "precip")
+        if _PRECIP_CACHE["key"] != pkey:
+            P, _, _ = generate_precipitation(tex_h, tex_w, tex, day_of_year=int(day_of_year))
+            _PRECIP_CACHE.update({"key": pkey, "P": P})
+        else:
+            P = _PRECIP_CACHE["P"]
+        overlay_tex, alpha_tex = precipitation_to_rgb(P)
+        overlay_img = np.zeros((*elev_img.shape, 3), dtype=np.float32)
+        overlay_img[idx] = overlay_tex[iy[idx], ix[idx], :]
+        alpha_img = np.zeros_like(elev_img, dtype=np.float32)
+        alpha_img[idx] = alpha_tex[iy[idx], ix[idx]]
+        rgbf = (1.0 - alpha_img[..., None]) * rgbf + alpha_img[..., None] * overlay_img
     elif view == "Wind":
         # Overlay wind arrows (project equirectangular arrows via sampling)
         u, v = generate_wind_field(tex_h, tex_w, elevation=tex)
