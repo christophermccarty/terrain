@@ -171,6 +171,7 @@ def main() -> None:
         "Temperature",
         "Ocean Temperature",
         "Precipitation",
+        "Biomes",
         "Wind Arrows",
         "Ocean Currents",
         "Wind Particles",
@@ -835,6 +836,36 @@ def main() -> None:
                 overlay, alpha = precipitation_to_rgb(P)
                 comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+            elif view_var.get() == "Biomes":
+                # Biome visualization (Phase 4: Biosphere)
+                if use_sim_data and sim_state.temperature is not None and sim_state.precipitation is not None:
+                    from carbon_cycle import compute_biome_type
+                    land_mask = (tex > 0.02).astype(np.float32)
+                    biome = compute_biome_type(sim_state.temperature, sim_state.precipitation, land_mask)
+
+                    # Biome colors (RGB)
+                    # 0 = Ocean/Ice (keep terrain color)
+                    # 1 = Desert (sandy yellow)
+                    # 2 = Grassland (green)
+                    # 3 = Forest (dark green)
+                    # 4 = Tundra (light gray-blue)
+                    biome_colors = np.array([
+                        [0.0, 0.0, 0.0],    # Ocean (will use base terrain)
+                        [0.9, 0.8, 0.5],    # Desert (sandy)
+                        [0.6, 0.8, 0.3],    # Grassland (light green)
+                        [0.1, 0.5, 0.1],    # Forest (dark green)
+                        [0.7, 0.75, 0.8],   # Tundra (gray-blue)
+                    ], dtype=np.float32)
+
+                    # Create RGB image from biomes
+                    biome_rgb = biome_colors[biome]
+
+                    # Blend with terrain (ocean uses base, land uses biome color)
+                    alpha = (biome > 0).astype(np.float32)  # 0 = ocean, 1 = land biomes
+                    comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * biome_rgb
+                    arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+                else:
+                    arr = (base_rgb * 255).astype(np.uint8)
             elif view_var.get() == "Cloud Cover":
                 if use_sim_data and sim_state.cloud_cover is not None:
                     C = sim_state.cloud_cover
@@ -1010,7 +1041,7 @@ def main() -> None:
                     u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
                 px_str = f", {pixel_display}" if pixel_display else ""
-                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, wind {speed:.1f} m/s")
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, wind {speed:5.1f} m/s")
             elif view_var.get() == "Ocean Currents":
                 day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
                 tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
@@ -1024,7 +1055,7 @@ def main() -> None:
                     u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
                 px_str = f", {pixel_display}" if pixel_display else ""
-                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, current {speed:.2f} m/s")
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, current {speed:5.2f} m/s")
             else:
                 # Use simulation temperature if available
                 if use_sim_data and sim_state.temperature is not None:
@@ -1034,7 +1065,7 @@ def main() -> None:
                 # Convert Kelvin to Celsius
                 T_celsius = T_kelvin - 273.15
                 px_str = f", {pixel_display}" if pixel_display else ""
-                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, T {T_celsius:.1f}°C")
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, T {T_celsius:6.1f}°C")
         else:
             latlon_var.set("")
     
