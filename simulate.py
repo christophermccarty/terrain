@@ -14,6 +14,7 @@ import pickle
 from atmosphere import generate_wind_field, generate_precipitation
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
 from ocean import calculate_ocean_heat_transport, update_sea_ice
+from carbon_cycle import carbon_cycle_step, co2_temperature_response, CO2_PREINDUSTRIAL
 
 # Numba JIT compilation for performance
 try:
@@ -161,6 +162,10 @@ class PlanetState(NamedTuple):
     cloud_water: np.ndarray | None = None  # (H, W) cloud liquid water [kg/kg]
     snow_depth: np.ndarray | None = None  # (H, W) snow depth [m]
     ice_cover: np.ndarray | None = None  # (H, W) sea ice fraction [0,1]
+    # Carbon cycle fields (Phase 3)
+    co2_atmosphere: float = 400.0  # Atmospheric CO2 concentration [ppm] (global mean)
+    co2_ocean: np.ndarray | None = None  # (H, W) dissolved CO2 in ocean [ppm equivalent]
+    vegetation_biomass: np.ndarray | None = None  # (H, W) carbon in vegetation [kg C/m²]
 
 
 def simulate_step(
@@ -205,6 +210,8 @@ def simulate_step(
     heat_transport_coeff: float = 0.8,
     thermal_diffusion: float = 0.04,
     latent_cooling_coeff: float = 0.015,
+    enable_carbon_cycle: bool = True,
+    co2_climate_feedback: float = 0.8,
     debug_log: bool = False,
     track_components: bool = False,
 ) -> tuple[PlanetState, dict]:
@@ -241,19 +248,33 @@ def simulate_step(
     Hcw, Wcw = (max(1, (H + wind_bs - 1) // wind_bs),
                 max(1, (W + wind_bs - 1) // wind_bs))
 
-    # Get base insolation temperature (latitude-dependent)
+    # ------------------------------------------------------
+    # CO2 Greenhouse Forcing (if carbon cycle enabled)
+    # ------------------------------------------------------
+    # CRITICAL FIX: CO2 forcing must be applied to BASE TEMPERATURE before temperature evolution,
+    # not added to final temperature afterward (which would cause runaway warming).
+    # The forcing represents the equilibrium temperature offset that the simulation should relax toward.
+    co2_temp_offset = 0.0
+    if enable_carbon_cycle:
+        from carbon_cycle import co2_radiative_forcing, co2_temperature_response
+        co2_forcing = co2_radiative_forcing(state.co2_atmosphere, CO2_PREINDUSTRIAL)
+        co2_temp_offset = co2_temperature_response(co2_forcing, co2_climate_feedback)
+        if debug_log:
+            LOG.info(f"CO2={state.co2_atmosphere:.1f} ppm, forcing={co2_forcing:.2f} W/m², T_offset={co2_temp_offset:.2f}K")
+
+    # Get base insolation temperature (latitude-dependent) + CO2 offset
     # Ocean: seasonal lag of ~50 days (1.5 months) due to high heat capacity
     # Land: immediate response to current insolation
     lat = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
-    
+
     # Calculate temperature for current day (land response)
     T_lat_land = temperature_kelvin_for_lat(
         lat,
         day_of_year=int(new_day),
         polar_cooling_scale=polar_cooling_scale,
     )
-    T_base_land = np.repeat(T_lat_land[:, None], Wc, axis=1).astype(np.float32)
-    
+    T_base_land = np.repeat(T_lat_land[:, None], Wc, axis=1).astype(np.float32) + co2_temp_offset
+
     # Calculate temperature for lagged day (ocean response with 1.5 month delay)
     lag_days = 50.0  # ~1.5 months thermal lag for deep ocean mixed layer
     lagged_day = (new_day - lag_days) % 365.2422
@@ -262,7 +283,7 @@ def simulate_step(
         day_of_year=int(lagged_day),
         polar_cooling_scale=polar_cooling_scale,
     )
-    T_base_ocean = np.repeat(T_lat_ocean[:, None], Wc, axis=1).astype(np.float32)
+    T_base_ocean = np.repeat(T_lat_ocean[:, None], Wc, axis=1).astype(np.float32) + co2_temp_offset
     # Full-resolution fallback base temperature (used when wind evolves at full resolution
     # before `state.temperature` is initialized).
     lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
@@ -271,7 +292,7 @@ def simulate_step(
         day_of_year=int(lagged_day),
         polar_cooling_scale=polar_cooling_scale,
     )
-    T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32)
+    T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32) + co2_temp_offset
     
     # Blend based on land fraction (will be calculated in _evolve_temperature)
     # Use ocean-lagged temperature as base; _evolve_temperature will handle land/ocean mixing
@@ -453,6 +474,20 @@ def simulate_step(
         humidity_coarse = hum_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
     else:
         humidity_coarse = None
+
+    # Downsample precipitation and vegetation biomass for vegetation albedo (Phase 4)
+    if state.precipitation is not None:
+        P_pad = np.pad(state.precipitation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        precipitation_coarse = P_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+    else:
+        precipitation_coarse = None
+
+    if state.vegetation_biomass is not None:
+        biomass_pad = np.pad(state.vegetation_biomass.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        biomass_coarse = biomass_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+    else:
+        biomass_coarse = None
+
     # Always track components for diagnostics (minimal overhead)
     T_coarse, cloud_c, snow_c, temp_components = _evolve_temperature(
         T_prev_coarse, T_base, state.elevation, Hc, Wc, block_size, H, W,
@@ -471,7 +506,9 @@ def simulate_step(
         epsilon_pole=epsilon_pole,
         ice_albedo_strength=ice_albedo_strength,
         humidity=humidity_coarse,
-        track_components=track_components  # Track components for diagnostics
+        track_components=track_components,  # Track components for diagnostics
+        precipitation=precipitation_coarse,  # For vegetation albedo (Phase 4)
+        vegetation_biomass=biomass_coarse,   # For vegetation albedo (Phase 4)
     )
     
     # Upsample components to full resolution if needed
@@ -565,7 +602,40 @@ def simulate_step(
                     T_high_elev = T_full[high_elev_mask]
                     LOG.info(f"  High altitude (>0.4 elev): T_mean={float(np.mean(T_high_elev)):.1f}K ({float(np.mean(T_high_elev)-273.15):.1f}°C), "
                              f"T_max={float(np.max(T_high_elev)):.1f}K ({float(np.max(T_high_elev)-273.15):.1f}°C)")
-    
+
+    # ------------------------------------------------------
+    # Carbon Cycle (Phase 3)
+    # ------------------------------------------------------
+    if enable_carbon_cycle:
+        # Create temporary state for carbon cycle computation
+        temp_state_for_carbon = PlanetState(
+            day_of_year=new_day,
+            total_days=new_total_days,
+            elevation=state.elevation,
+            temperature=T_full,
+            wind_u=u_full,
+            wind_v=v_full,
+            precipitation=P_full,
+            co2_atmosphere=state.co2_atmosphere,
+            co2_ocean=state.co2_ocean,
+            vegetation_biomass=state.vegetation_biomass,
+        )
+
+        # Evolve carbon cycle
+        co2_atm_new, co2_ocean_new, biomass_new, co2_forcing_result = carbon_cycle_step(
+            temp_state_for_carbon, days
+        )
+
+        # CO2 greenhouse feedback is now applied to T_base (equilibrium temperature) above,
+        # not added to final temperature here. This prevents runaway warming.
+
+        if debug_log:
+            LOG.info(f"Carbon cycle: CO2={co2_atm_new:.1f} ppm, forcing={co2_forcing_result:.2f} W/m²")
+    else:
+        co2_atm_new = state.co2_atmosphere
+        co2_ocean_new = state.co2_ocean
+        biomass_new = state.vegetation_biomass
+
     new_state = PlanetState(
         day_of_year=new_day,
         total_days=new_total_days,
@@ -579,6 +649,9 @@ def simulate_step(
         cloud_cover=cloud_full,
         snow_depth=None,
         ice_cover=ice_full,
+        co2_atmosphere=co2_atm_new,
+        co2_ocean=co2_ocean_new,
+        vegetation_biomass=biomass_new,
     )
     
     # Return state and components (empty dict if not tracking)
@@ -674,6 +747,8 @@ def _evolve_temperature(
     ice_albedo_strength: float = 1.0,
     humidity: np.ndarray | None = None,
     track_components: bool = False,
+    precipitation: np.ndarray | None = None,
+    vegetation_biomass: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -807,11 +882,27 @@ def _evolve_temperature(
     cloud_fraction = np.clip(cloud_fraction + 0.25 * rh_core * orog, 0.0, 1.0)
     cloud_fraction = np.clip(cloud_fraction * (1.0 - 0.6 * np.clip(subsidence, 0.0, 1.0)), 0.0, 1.0)
     
-    # Albedo
-    # Ocean: 0.06, Land: 0.2, Sea Ice: 0.75, Snow: 0.8, Cloud: 0.5
-    albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.75 * sea_ice, 0.2)
+    # Albedo (with vegetation feedback - Phase 4)
+    # Ocean: 0.06, Sea Ice: 0.75, Snow: 0.8, Cloud: 0.5
+    # Land albedo now depends on vegetation/biome type
+
+    # Compute biome-based vegetation albedo (if biomass field exists)
+    if vegetation_biomass is not None and precipitation is not None:
+        from carbon_cycle import compute_biome_type, vegetation_albedo
+        land_mask_float = land_mask.astype(np.float32)
+        biome = compute_biome_type(T, precipitation, land_mask_float)
+        albedo_veg = vegetation_albedo(biome, base_land_albedo=0.2)
+        # Use vegetation albedo for land, ocean base albedo for sea
+        albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.75 * sea_ice, albedo_veg)
+    else:
+        # Fallback: uniform land albedo
+        albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.75 * sea_ice, 0.2)
+
+    # Snow albedo overrides vegetation (snow is brighter)
     snow_cover_land = snow_cover * land_mask.astype(np.float32)
     albedo_sfc = np.where(land_mask, albedo_sfc * (1.0 - snow_cover_land) + 0.8 * snow_cover_land, albedo_sfc)
+
+    # Total albedo including clouds
     albedo_total = albedo_sfc * (1 - cloud_fraction) + 0.5 * cloud_fraction
     
     # Insolation Q (Daily mean) - use proper astronomical calculation
