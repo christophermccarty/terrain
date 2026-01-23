@@ -179,28 +179,43 @@ def ocean_co2_flux(
 # Vegetation Carbon Dynamics
 # ==============================================================================
 
-def vegetation_albedo(biome: np.ndarray, base_land_albedo: float = 0.2) -> np.ndarray:
+def vegetation_albedo(biome: np.ndarray, base_land_albedo: float = 0.2,
+                      koppen_type: np.ndarray | None = None) -> np.ndarray:
     """Compute surface albedo based on vegetation/biome type.
 
     Parameters:
     -----------
     biome : np.ndarray (H, W)
-        Biome type index (from compute_biome_type)
+        Legacy biome type index (0-4) for backward compatibility
     base_land_albedo : float
         Base albedo for bare land (default: 0.2)
+    koppen_type : np.ndarray (H, W), optional
+        Köppen climate classification (0-19). If provided, uses Köppen-based
+        albedo values which are more detailed than legacy biomes.
 
     Returns:
     --------
     albedo : np.ndarray (H, W)
         Surface albedo [0-1]
 
-    Biome-specific albedo values:
-    ------------------------------
+    Legacy biome albedo values (used when koppen_type is None):
+    -----------------------------------------------------------
     - Ocean/Ice (0): 0.06 (handled separately with ice fraction)
     - Desert (1): 0.30 (bright sand/rock)
     - Grassland (2): 0.20 (moderate)
     - Forest (3): 0.12 (dark canopy absorbs more solar)
     - Tundra (4): 0.25 (lichens, sparse vegetation)
+
+    Köppen albedo values (used when koppen_type is provided):
+    ---------------------------------------------------------
+    - Af/Am (Tropical rainforest/monsoon): 0.12-0.14 (dark canopy)
+    - Aw (Tropical savanna): 0.18 (mixed)
+    - BWh/BWk (Desert): 0.30-0.35 (bright sand/rock)
+    - BSh/BSk (Steppe): 0.25-0.28 (sparse vegetation)
+    - Cfa-Cwa (Temperate): 0.15-0.22 (forest/shrub)
+    - Dfa-Dfc (Continental): 0.14-0.18 (boreal forest)
+    - ET (Tundra): 0.25
+    - EF (Ice Cap): 0.80
 
     Physics:
     --------
@@ -212,6 +227,12 @@ def vegetation_albedo(biome: np.ndarray, base_land_albedo: float = 0.2) -> np.nd
     This creates a positive feedback: forests warm their environment
     (lower albedo → more absorbed solar → warmer).
     """
+    # Use Köppen-based albedo if available
+    if koppen_type is not None:
+        from climate_averages import get_koppen_albedo
+        return get_koppen_albedo(koppen_type)
+
+    # Legacy biome-based albedo
     albedo = np.full_like(biome, base_land_albedo, dtype=np.float32)
 
     # Biome-specific albedo

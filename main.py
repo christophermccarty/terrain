@@ -417,9 +417,9 @@ def main() -> None:
     sim_status_var = tk.StringVar(value="Stopped")
     sim_cycle_var = tk.StringVar(value="Year: 1")
     tk.Label(sim_controls, text="Simulation:").pack(side="left", padx=(4,0))
-    sim_status_label = tk.Label(sim_controls, textvariable=sim_status_var)
+    sim_status_label = tk.Label(sim_controls, textvariable=sim_status_var, width=12, anchor="w")
     sim_status_label.pack(side="left", padx=4)
-    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var)
+    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var, width=10, anchor="w")
     sim_cycle_label.pack(side="left", padx=8)
     tk.Button(sim_controls, text="Start", command=lambda: start_simulation()).pack(side="left", padx=2)
     tk.Button(sim_controls, text="Stop", command=lambda: stop_simulation()).pack(side="left", padx=2)
@@ -652,7 +652,7 @@ def main() -> None:
         canvas.itemconfig(img_id, image=tk_img)
 
     tk.Button(controls, text="Regenerate", command=do_regen).pack(side="left", padx=6)
-    latlon_label = tk.Label(controls, textvariable=latlon_var)
+    latlon_label = tk.Label(controls, textvariable=latlon_var, width=70, anchor="e")
     latlon_label.pack(side="right")
 
     # Profile initial generation once at startup
@@ -844,39 +844,44 @@ def main() -> None:
                 comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Biomes":
-                # Biome visualization (Phase 1: Stable biomes from long-term climate)
-                if use_sim_data and sim_state.biome_type is not None:
-                    # Use cached stable biomes (updated every 3 years from 10-year climate averages)
+                # Biome visualization - prefer Köppen classification for detailed climate zones
+                from climate_averages import KOPPEN_COLORS
+
+                # Use Köppen if available, fall back to legacy biomes
+                if use_sim_data and sim_state.koppen_type is not None:
+                    # Köppen classification (20 climate types, updated every 30 days)
+                    koppen = sim_state.koppen_type
+                    biome_rgb = KOPPEN_COLORS[koppen]
+                    alpha = (koppen > 0).astype(np.float32)  # 0 = ocean
+                elif use_sim_data and sim_state.biome_type is not None:
+                    # Legacy biome classification (5 types)
                     biome = sim_state.biome_type
+                    biome_colors = np.array([
+                        [0.0, 0.0, 0.0],    # Ocean
+                        [0.9, 0.8, 0.5],    # Desert
+                        [0.6, 0.8, 0.3],    # Grassland
+                        [0.1, 0.5, 0.1],    # Forest
+                        [0.7, 0.75, 0.8],   # Tundra
+                    ], dtype=np.float32)
+                    biome_rgb = biome_colors[biome]
+                    alpha = (biome > 0).astype(np.float32)
                 elif use_sim_data and sim_state.temperature is not None and sim_state.precipitation is not None:
-                    # Fallback: compute from instantaneous values (simulation paused or no biomes yet)
+                    # Fallback: compute from instantaneous values
                     from carbon_cycle import compute_biome_type
                     land_mask = (tex > 0.02).astype(np.float32)
                     biome = compute_biome_type(sim_state.temperature, sim_state.precipitation, land_mask)
-                else:
-                    biome = None
-
-                if biome is not None:
-
-                    # Biome colors (RGB)
-                    # 0 = Ocean/Ice (keep terrain color)
-                    # 1 = Desert (sandy yellow)
-                    # 2 = Grassland (green)
-                    # 3 = Forest (dark green)
-                    # 4 = Tundra (light gray-blue)
                     biome_colors = np.array([
-                        [0.0, 0.0, 0.0],    # Ocean (will use base terrain)
-                        [0.9, 0.8, 0.5],    # Desert (sandy)
-                        [0.6, 0.8, 0.3],    # Grassland (light green)
-                        [0.1, 0.5, 0.1],    # Forest (dark green)
-                        [0.7, 0.75, 0.8],   # Tundra (gray-blue)
+                        [0.0, 0.0, 0.0], [0.9, 0.8, 0.5], [0.6, 0.8, 0.3],
+                        [0.1, 0.5, 0.1], [0.7, 0.75, 0.8],
                     ], dtype=np.float32)
-
-                    # Create RGB image from biomes
                     biome_rgb = biome_colors[biome]
+                    alpha = (biome > 0).astype(np.float32)
+                else:
+                    biome_rgb = None
+                    alpha = None
 
-                    # Blend with terrain (ocean uses base, land uses biome color)
-                    alpha = (biome > 0).astype(np.float32)  # 0 = ocean, 1 = land biomes
+                if biome_rgb is not None:
+                    # Blend with terrain (ocean uses base, land uses biome/Köppen color)
                     comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * biome_rgb
                     arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
                 else:
