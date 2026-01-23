@@ -172,6 +172,11 @@ class PlanetState(NamedTuple):
     climate_sample_days: float = 0.0  # Days accumulated in climate average
     biome_type: np.ndarray | None = None  # (H, W) stable biome classification (0-4: ocean, desert, grass, forest, tundra)
     biome_last_update_day: float = 0.0  # Total days when biomes were last reclassified
+    # Monthly climate statistics for Köppen classification
+    monthly_temp: np.ndarray | None = None  # (12, H, W) monthly mean temperature [K]
+    monthly_precip: np.ndarray | None = None  # (12, H, W) monthly mean precipitation [mm/day]
+    monthly_sample_count: np.ndarray | None = None  # (12,) sample count per month
+    koppen_type: np.ndarray | None = None  # (H, W) Köppen climate classification (0-19)
 
 
 def simulate_step(
@@ -256,45 +261,57 @@ def simulate_step(
                 max(1, (W + wind_bs - 1) // wind_bs))
 
     # ------------------------------------------------------
-    # Climate Averaging and Stable Biome Classification (Phase 1)
+    # Climate Averaging and Köppen Classification
     # ------------------------------------------------------
-    # Update 10-year rolling climate averages and reclassify biomes every 3 years
-    # This prevents daily biome oscillations due to seasonal weather fluctuations
-    from climate_averages import update_climate_averages, compute_stable_biomes
+    # Update 10-year rolling climate averages for general smoothing
+    # Update monthly statistics for Köppen seasonality detection
+    # Reclassify Köppen climate zones every 30 days
+    from climate_averages import (
+        update_climate_averages, compute_stable_biomes,
+        update_monthly_statistics, classify_koppen, koppen_to_legacy_biome
+    )
 
     # Update climate averages (exponential moving average)
     temp_avg, precip_avg, sample_days = update_climate_averages(
         state, days, window_days=10.0 * 365.2422  # 10-year averaging window
     )
 
-    # Initialize biome variables (will be updated if conditions are met)
+    # Update monthly statistics for Köppen classification
+    monthly_temp, monthly_precip, monthly_sample_count = update_monthly_statistics(
+        state, days, window_years=1.0  # 1-year rolling average per month
+    )
+
+    # Initialize biome/Köppen variables
     biome_new = state.biome_type
+    koppen_new = state.koppen_type
     biome_last_update = state.biome_last_update_day
 
-    # Reclassify biomes every 3 simulated years (not every day)
-    BIOME_UPDATE_INTERVAL = 3.0 * 365.2422  # 3 years
+    # Reclassify Köppen climate zones every 30 days
+    BIOME_UPDATE_INTERVAL = 30.0  # 30 days (was 3 years)
     days_since_biome_update = new_total_days - state.biome_last_update_day
 
-    # Only compute biomes if climate averages are available
-    if temp_avg is not None and precip_avg is not None:
-        if days_since_biome_update >= BIOME_UPDATE_INTERVAL or state.biome_type is None:
-            # Time to update biomes based on long-term climate averages
+    # Compute Köppen classification if monthly data is available
+    if monthly_temp is not None and monthly_precip is not None:
+        if days_since_biome_update >= BIOME_UPDATE_INTERVAL or state.koppen_type is None:
+            # Time to update Köppen classification
             land_mask_for_biomes = (state.elevation > 0.02).astype(np.float32)
-            biome_new = compute_stable_biomes(
-                temp_avg, precip_avg, land_mask_for_biomes,
-                prev_biome=state.biome_type,
-                hysteresis_temp=2.0,      # ±2K temperature buffer
-                hysteresis_precip=100.0,  # ±100 mm/yr precipitation buffer
+            koppen_new = classify_koppen(
+                monthly_temp, monthly_precip, land_mask_for_biomes
             )
+            # Convert Köppen to legacy biome for backward compatibility
+            biome_new = koppen_to_legacy_biome(koppen_new)
             biome_last_update = new_total_days
             if debug_log:
-                LOG.info(f"[Biome Update] Day {new_total_days:.0f} - Biomes reclassified from 10-year climate averages")
+                from terrain import LOG
+                LOG.info(f"[Köppen Update] Day {new_total_days:.0f} - Climate zones reclassified from monthly data")
         else:
-            # Keep existing stable biomes (updated every 3 years, not daily)
+            # Keep existing classification
+            koppen_new = state.koppen_type
             biome_new = state.biome_type
             biome_last_update = state.biome_last_update_day
     else:
-        # Climate averages not yet initialized - biomes will be computed on next step
+        # Monthly data not yet initialized - will be computed on next step
+        koppen_new = state.koppen_type
         biome_new = state.biome_type
         biome_last_update = state.biome_last_update_day
 
@@ -547,6 +564,13 @@ def simulate_step(
     else:
         biome_coarse = None
 
+    # Downsample Köppen classification to coarse resolution if available
+    if koppen_new is not None:
+        koppen_pad = np.pad(koppen_new.astype(np.int32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        koppen_coarse = koppen_pad.reshape(Hc, block_size, Wc, block_size)[:, 0, :, 0]
+    else:
+        koppen_coarse = None
+
     # Always track components for diagnostics (minimal overhead)
     T_coarse, cloud_c, snow_c, temp_components = _evolve_temperature(
         T_prev_coarse, T_base, state.elevation, Hc, Wc, block_size, H, W,
@@ -569,6 +593,7 @@ def simulate_step(
         precipitation=precipitation_coarse,  # For vegetation albedo (Phase 4)
         vegetation_biomass=biomass_coarse,   # For vegetation albedo (Phase 4)
         biome=biome_coarse,  # Phase 1: Stable biomes for albedo
+        koppen_type=koppen_coarse,  # Köppen classification for detailed albedo
     )
     
     # Upsample components to full resolution if needed
@@ -718,6 +743,11 @@ def simulate_step(
         climate_sample_days=sample_days,
         biome_type=biome_new,
         biome_last_update_day=biome_last_update,
+        # Monthly statistics and Köppen classification
+        monthly_temp=monthly_temp,
+        monthly_precip=monthly_precip,
+        monthly_sample_count=monthly_sample_count,
+        koppen_type=koppen_new,
     )
     
     # Return state and components (empty dict if not tracking)
@@ -816,6 +846,7 @@ def _evolve_temperature(
     precipitation: np.ndarray | None = None,
     vegetation_biomass: np.ndarray | None = None,
     biome: np.ndarray | None = None,  # Phase 1: Stable biome classification
+    koppen_type: np.ndarray | None = None,  # Köppen climate classification
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -957,9 +988,10 @@ def _evolve_temperature(
 
     # Compute biome-based vegetation albedo (if biomass field exists)
     # Phase 1 improvement: Use stable biomes from long-term climate averages (not daily weather)
+    # Köppen classification provides more detailed albedo values
     if vegetation_biomass is not None and biome is not None:
         from carbon_cycle import vegetation_albedo
-        albedo_veg = vegetation_albedo(biome, base_land_albedo=0.2)
+        albedo_veg = vegetation_albedo(biome, base_land_albedo=0.2, koppen_type=koppen_type)
         # Use vegetation albedo for land, ocean base albedo for sea
         albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.75 * sea_ice, albedo_veg)
     else:
