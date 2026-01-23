@@ -166,6 +166,12 @@ class PlanetState(NamedTuple):
     co2_atmosphere: float = 400.0  # Atmospheric CO2 concentration [ppm] (global mean)
     co2_ocean: np.ndarray | None = None  # (H, W) dissolved CO2 in ocean [ppm equivalent]
     vegetation_biomass: np.ndarray | None = None  # (H, W) carbon in vegetation [kg C/m²]
+    # Climate averaging fields (Phase 1 - Biome Stability)
+    climate_temp_avg: np.ndarray | None = None  # (H, W) 10-year rolling average temperature [K]
+    climate_precip_avg: np.ndarray | None = None  # (H, W) 10-year rolling average precip [mm/day]
+    climate_sample_days: float = 0.0  # Days accumulated in climate average
+    biome_type: np.ndarray | None = None  # (H, W) stable biome classification (0-4: ocean, desert, grass, forest, tundra)
+    biome_last_update_day: float = 0.0  # Total days when biomes were last reclassified
 
 
 def simulate_step(
@@ -186,14 +192,15 @@ def simulate_step(
     wind_pgf_terrain_scale: float = 900.0,
     wind_drag_base: float = 2.0e-7,
     wind_drag_elev_scale: float = 6.0e-7,
-    wind_damping: float = 0.25,
+    wind_damping: float = 0.25,  # TESTING: Revert to original damping to diagnose wind issues
+    wind_vmax_clip: float = 50.0,  # Phase 4 fix: Realistic maximum wind speed (strong jet stream)
     # Baroclinic eddy / thermal-wind proxy. The previous default (3e7) tends to produce
     # unrealistically strong, planet-wide surface jets. Keep conservative by default.
     # Lower default to avoid razor-thin zonal jets at the surface.
     wind_baroclinic_jet_amp: float = 1.0e6,
     wind_baroclinic_mix: float = 2.0,
-    # Weaken the zonal-mean 3-cell nudging so eddies can deform the bands.
-    wind_cell_relax_days: float = 6.0,
+    # Increased to 3.0 days to prevent oscillations from over-relaxation
+    wind_cell_relax_days: float = 3.0,
     ocean_transport_coeff: float = 0.3,
     ocean_exchange_floor: float = 0.65,
     ocean_exchange_span: float = 0.35,
@@ -247,6 +254,49 @@ def simulate_step(
     wind_bs = max(1, int(block_size if wind_block_size is None else wind_block_size))
     Hcw, Wcw = (max(1, (H + wind_bs - 1) // wind_bs),
                 max(1, (W + wind_bs - 1) // wind_bs))
+
+    # ------------------------------------------------------
+    # Climate Averaging and Stable Biome Classification (Phase 1)
+    # ------------------------------------------------------
+    # Update 10-year rolling climate averages and reclassify biomes every 3 years
+    # This prevents daily biome oscillations due to seasonal weather fluctuations
+    from climate_averages import update_climate_averages, compute_stable_biomes
+
+    # Update climate averages (exponential moving average)
+    temp_avg, precip_avg, sample_days = update_climate_averages(
+        state, days, window_days=10.0 * 365.2422  # 10-year averaging window
+    )
+
+    # Initialize biome variables (will be updated if conditions are met)
+    biome_new = state.biome_type
+    biome_last_update = state.biome_last_update_day
+
+    # Reclassify biomes every 3 simulated years (not every day)
+    BIOME_UPDATE_INTERVAL = 3.0 * 365.2422  # 3 years
+    days_since_biome_update = new_total_days - state.biome_last_update_day
+
+    # Only compute biomes if climate averages are available
+    if temp_avg is not None and precip_avg is not None:
+        if days_since_biome_update >= BIOME_UPDATE_INTERVAL or state.biome_type is None:
+            # Time to update biomes based on long-term climate averages
+            land_mask_for_biomes = (state.elevation > 0.02).astype(np.float32)
+            biome_new = compute_stable_biomes(
+                temp_avg, precip_avg, land_mask_for_biomes,
+                prev_biome=state.biome_type,
+                hysteresis_temp=2.0,      # ±2K temperature buffer
+                hysteresis_precip=100.0,  # ±100 mm/yr precipitation buffer
+            )
+            biome_last_update = new_total_days
+            if debug_log:
+                LOG.info(f"[Biome Update] Day {new_total_days:.0f} - Biomes reclassified from 10-year climate averages")
+        else:
+            # Keep existing stable biomes (updated every 3 years, not daily)
+            biome_new = state.biome_type
+            biome_last_update = state.biome_last_update_day
+    else:
+        # Climate averages not yet initialized - biomes will be computed on next step
+        biome_new = state.biome_type
+        biome_last_update = state.biome_last_update_day
 
     # ------------------------------------------------------
     # CO2 Greenhouse Forcing (if carbon cycle enabled)
@@ -398,6 +448,7 @@ def simulate_step(
             pgf_terrain_scale=float(wind_pgf_terrain_scale),
             drag_base=float(wind_drag_base),
             drag_elev_scale=float(wind_drag_elev_scale),
+            vmax_clip=float(wind_vmax_clip),
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
             cell_relax_days=float(wind_cell_relax_days),
@@ -436,7 +487,7 @@ def simulate_step(
                 elev_wind_full = up["elev"]
 
         u_full, v_full = evolve_wind(
-            u_full, v_full, 
+            u_full, v_full,
             temperature=T_wind_full,
             pressure=None,
             elevation=elev_wind_full,
@@ -446,6 +497,7 @@ def simulate_step(
             pgf_terrain_scale=float(wind_pgf_terrain_scale),
             drag_base=float(wind_drag_base),
             drag_elev_scale=float(wind_drag_elev_scale),
+            vmax_clip=float(wind_vmax_clip),
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
             cell_relax_days=float(wind_cell_relax_days),
@@ -488,6 +540,13 @@ def simulate_step(
     else:
         biomass_coarse = None
 
+    # Downsample biomes to coarse resolution if available
+    if biome_new is not None:
+        biome_pad = np.pad(biome_new.astype(np.int32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        biome_coarse = biome_pad.reshape(Hc, block_size, Wc, block_size)[:, 0, :, 0]  # Take first element (mode would be better but this is fast)
+    else:
+        biome_coarse = None
+
     # Always track components for diagnostics (minimal overhead)
     T_coarse, cloud_c, snow_c, temp_components = _evolve_temperature(
         T_prev_coarse, T_base, state.elevation, Hc, Wc, block_size, H, W,
@@ -509,6 +568,7 @@ def simulate_step(
         track_components=track_components,  # Track components for diagnostics
         precipitation=precipitation_coarse,  # For vegetation albedo (Phase 4)
         vegetation_biomass=biomass_coarse,   # For vegetation albedo (Phase 4)
+        biome=biome_coarse,  # Phase 1: Stable biomes for albedo
     )
     
     # Upsample components to full resolution if needed
@@ -652,6 +712,12 @@ def simulate_step(
         co2_atmosphere=co2_atm_new,
         co2_ocean=co2_ocean_new,
         vegetation_biomass=biomass_new,
+        # Phase 1: Climate averaging and stable biomes
+        climate_temp_avg=temp_avg,
+        climate_precip_avg=precip_avg,
+        climate_sample_days=sample_days,
+        biome_type=biome_new,
+        biome_last_update_day=biome_last_update,
     )
     
     # Return state and components (empty dict if not tracking)
@@ -749,6 +815,7 @@ def _evolve_temperature(
     track_components: bool = False,
     precipitation: np.ndarray | None = None,
     vegetation_biomass: np.ndarray | None = None,
+    biome: np.ndarray | None = None,  # Phase 1: Stable biome classification
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -824,11 +891,13 @@ def _evolve_temperature(
 
     if NUMBA_AVAILABLE:
         # Fast path: Numba-accelerated diffusion
+        # Phase 4: Reduced from iterations=3 to iterations=2 for ~10ms speedup
         T = _apply_diffusion_numba(T.astype(np.float32), float(thermal_diffusion),
-                                   float(days), iterations=3)
+                                   float(days), iterations=2)
     else:
         # Fallback: original NumPy implementation
-        for _ in range(3):
+        # Phase 4: Reduced from 3 to 2 iterations
+        for _ in range(2):
             T_pad = np.pad(T, ((1, 1), (0, 0)), mode="edge")
             c = T_pad[1:-1, :]
             n = T_pad[0:-2, :]
@@ -887,10 +956,9 @@ def _evolve_temperature(
     # Land albedo now depends on vegetation/biome type
 
     # Compute biome-based vegetation albedo (if biomass field exists)
-    if vegetation_biomass is not None and precipitation is not None:
-        from carbon_cycle import compute_biome_type, vegetation_albedo
-        land_mask_float = land_mask.astype(np.float32)
-        biome = compute_biome_type(T, precipitation, land_mask_float)
+    # Phase 1 improvement: Use stable biomes from long-term climate averages (not daily weather)
+    if vegetation_biomass is not None and biome is not None:
+        from carbon_cycle import vegetation_albedo
         albedo_veg = vegetation_albedo(biome, base_land_albedo=0.2)
         # Use vegetation albedo for land, ocean base albedo for sea
         albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.75 * sea_ice, albedo_veg)
@@ -983,15 +1051,37 @@ def _evolve_temperature(
     T_change = np.clip(T_change, -8.0, 8.0)  # Reduced from ±10K to ±8K per day to reduce oscillations
     T = T + T_change
     
-    # --- Latent & Sensible Heat (Physics Item 3, 11) ---
-    # Enhanced: Stronger cooling for very hot regions to prevent extreme temperatures
-    # Evap heat loss ~ proportional to T (Clausius-Clapeyron)
-    # Cooling = L * E
-    # Base cooling reduced, but enhanced for hot regions (>30°C = 303K)
-    base_evap = np.where(sea_mask, 0.01 * (T - 270.0), 0.0)
-    hot_evap = np.where((T > 303.0) & sea_mask, 0.03 * (T - 303.0), 0.0)  # Extra cooling for hot regions
-    evap_cooling = np.maximum(0.0, base_evap + hot_evap)
-    T = T - evap_cooling * days
+    # --- Phase 2: Wind-Dependent Evaporation (Bulk Aerodynamic Formula) ---
+    # E = C_D × wind_speed × (qsat - q)
+    # This makes evaporation realistic: stronger with high winds and dry air
+    if wind_u is not None and wind_v is not None and humidity is not None:
+        # Wind speed
+        wind_speed = np.sqrt(wind_u**2 + wind_v**2)
+
+        # Saturation humidity (Clausius-Clapeyron)
+        T_c = np.clip(T - 273.15, -60.0, 60.0)
+        es = 6.112 * np.exp(17.67 * T_c / (T_c + 243.5))  # Saturation vapor pressure [hPa]
+        qsat = np.clip(0.622 * es / 1013.25, 1e-6, 0.035)  # Saturation specific humidity [kg/kg]
+
+        # Humidity deficit (how much more moisture air can hold)
+        deficit = np.maximum(0.0, qsat - humidity)
+
+        # Drag coefficient (higher over rough ocean surface)
+        C_D = np.where(sea_mask, 1.5e-3, 0.5e-3)  # Ocean vs land
+
+        # Evaporation rate [mm/day equivalent]
+        E = C_D * wind_speed * deficit * 1000.0
+        E = np.clip(E, 0.0, 20.0)  # Cap at 20 mm/day (realistic maximum)
+
+        # Latent cooling: 2.5 K per mm/day evaporated
+        evap_cooling = E * 2.5 * days
+        T = T - evap_cooling
+    else:
+        # Fallback to simple temperature-dependent evaporation if wind/humidity not available
+        base_evap = np.where(sea_mask, 0.01 * (T - 270.0), 0.0)
+        hot_evap = np.where((T > 303.0) & sea_mask, 0.03 * (T - 303.0), 0.0)
+        evap_cooling = np.maximum(0.0, base_evap + hot_evap)
+        T = T - evap_cooling * days
     
     # --- Surface Physics (Items 5, 8, 9) ---
     # Blend land temperatures toward T_base_land (which has proper seasonal response)
@@ -1042,7 +1132,7 @@ def _evolve_temperature(
         # For other components, compute the change they would have caused
         # (these are already computed in the main simulation loop)
         components['radiation'] = k_relax * (T_eq - T) * days
-        components['evaporation'] = -evap_cooling * days
+        components['evaporation'] = -evap_cooling  # Phase 2: Now wind-dependent
         components['ocean_transport'] = T_ocean_adj
         components['subsidence'] = subsidence
         components['equilibrium_temp'] = T_eq

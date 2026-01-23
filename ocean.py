@@ -211,29 +211,96 @@ def calculate_ocean_heat_transport(
     return T_adjustment
 
 
+def compute_ekman_transport(
+    wind_u: np.ndarray,
+    wind_v: np.ndarray,
+    elevation: np.ndarray,
+    ekman_coefficient: float = 0.03,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute wind-driven Ekman transport (Phase 3: Ocean-Wind Coupling).
+
+    Ekman transport is the net transport of water due to wind stress, deflected
+    by Coriolis force. In the Northern Hemisphere, transport is 90° to the right
+    of the wind; in the Southern Hemisphere, 90° to the left.
+
+    Args:
+        wind_u: (H,W) Eastward wind speed [m/s]
+        wind_v: (H,W) Northward wind speed [m/s]
+        elevation: (H,W) Elevation map (to determine ocean mask)
+        ekman_coefficient: Wind-to-current scaling factor (default 0.03 = 3% of wind)
+
+    Returns:
+        (u_ekman, v_ekman): Ekman transport velocities [m/s]
+
+    Physics:
+    - Surface current ~ 3% of wind speed (observed ratio)
+    - Deflected 45° by Coriolis (simplified from 90° for surface layer)
+    - Right in NH, left in SH
+    """
+    H, W = wind_u.shape
+
+    # Ocean mask (where currents exist)
+    is_ocean = elevation <= 0.02
+
+    # Latitude grid for Coriolis deflection
+    lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi  # radians, -π/2 to +π/2
+    lat_2d = np.repeat(lat[:, None], W, axis=1)
+
+    # Coriolis deflection angle (45° to the right in NH, left in SH)
+    # Simplified from full 90° Ekman spiral to represent surface layer average
+    deflection = np.sign(lat_2d) * (np.pi / 4.0)  # ±45°
+
+    # Wind speed and direction
+    wind_speed = np.sqrt(wind_u**2 + wind_v**2)
+    wind_angle = np.arctan2(wind_v, wind_u)  # Angle from east
+
+    # Ekman current: scaled wind speed, deflected by Coriolis
+    current_speed = ekman_coefficient * wind_speed
+    current_angle = wind_angle + deflection
+
+    # Convert back to u, v components
+    u_ekman = current_speed * np.cos(current_angle)
+    v_ekman = current_speed * np.sin(current_angle)
+
+    # Mask to ocean only (no currents over land)
+    u_ekman = np.where(is_ocean, u_ekman, 0.0)
+    v_ekman = np.where(is_ocean, v_ekman, 0.0)
+
+    return u_ekman.astype(np.float32), v_ekman.astype(np.float32)
+
+
 def get_major_ocean_currents(
     Hc: int,
     Wc: int,
     day_of_year: int,
+    wind_u: np.ndarray | None = None,
+    wind_v: np.ndarray | None = None,
+    elevation: np.ndarray | None = None,
+    ekman_weight: float = 0.6,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate simplified ocean current velocity field.
-    
+    """Generate ocean current velocity field with wind coupling (Phase 3).
+
     Returns u (east-west) and v (north-south) velocity components for ocean currents.
-    This is a highly simplified model of major ocean gyres.
-    
+    Combines climatological gyre patterns with wind-driven Ekman transport.
+
     Args:
         Hc: Height of grid
         Wc: Width of grid
         day_of_year: Day of year (for seasonal variations)
-        
+        wind_u: Optional (H,W) wind field for Ekman transport
+        wind_v: Optional (H,W) wind field for Ekman transport
+        elevation: Optional (H,W) elevation for ocean mask
+        ekman_weight: Weight for Ekman transport (0.6 = 60% wind-driven, 40% climatology)
+
     Returns:
         (u, v): Velocity components in m/s, both shape (Hc, Wc)
-        
+
     Major ocean currents modeled:
-    - Subtropical gyres (clockwise NH, counterclockwise SH)
-    - Equatorial currents (eastward)
-    - Western boundary currents (Gulf Stream, Kuroshio)
-    - Antarctic Circumpolar Current
+    - Subtropical gyres (clockwise NH, counterclockwise SH) [climatology]
+    - Ekman transport (wind-driven, Coriolis-deflected) [dynamic]
+    - Equatorial currents (eastward) [climatology]
+    - Western boundary currents (Gulf Stream, Kuroshio) [climatology]
+    - Antarctic Circumpolar Current [climatology]
     """
     # Calculate latitude and longitude grids
     lat_rows = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * 180.0
@@ -269,11 +336,20 @@ def get_major_ocean_currents(
     # Equatorial currents (eastward near equator)
     equatorial_mask = np.exp(-(lat_grid / 10.0)**2)  # Gaussian at equator
     u += equatorial_mask * 0.3  # Eastward flow
-    
+
     # Antarctic Circumpolar Current (eastward flow around 50-60°S)
     acc_mask = np.exp(-((lat_grid + 55.0) / 10.0)**2)  # Centered at 55°S
     u += acc_mask * 0.5  # Strong eastward flow
-    
+
+    # Phase 3: Add wind-driven Ekman transport if wind fields provided
+    if wind_u is not None and wind_v is not None and elevation is not None:
+        u_ekman, v_ekman = compute_ekman_transport(wind_u, wind_v, elevation)
+
+        # Blend: ekman_weight% wind-driven, (1-ekman_weight)% climatological
+        # Default 60% wind, 40% climatology keeps some stability
+        u = (1.0 - ekman_weight) * u + ekman_weight * u_ekman
+        v = (1.0 - ekman_weight) * v + ekman_weight * v_ekman
+
     return u, v
 
 
@@ -295,7 +371,11 @@ def generate_ocean_currents(
     is_ocean = _ocean_mask_from_elevation(elevation)
     is_land = ~is_ocean
 
-    base_u, base_v = get_major_ocean_currents(H, W, day_of_year=int(day_of_year))
+    # Phase 3: Pass wind fields to enable Ekman transport coupling
+    base_u, base_v = get_major_ocean_currents(
+        H, W, day_of_year=int(day_of_year),
+        wind_u=wind_u, wind_v=wind_v, elevation=elevation
+    )
 
     # Seasonal modulation (small amplitude).
     seasonal = 0.9 + 0.1 * np.sin(2.0 * np.pi * (float(day_of_year) / 365.2422))
