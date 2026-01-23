@@ -609,13 +609,17 @@ def main() -> None:
                     _update_wind_particles()
                 return
             if view_var.get() == "Wind Arrows":
-                wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
-                if _WIND_CACHE["key"] != wkey:
-                    with log_time("Generate wind field+arrows"):
-                        u, v = generate_wind_field(*tex.shape, elevation=tex, upsample="bilinear", weather_amp=0.35, debug_log=False)
-                        _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
+                # Use simulated wind if available, otherwise generate synthetic wind
+                if sim_state is not None and sim_running and sim_state.wind_u is not None:
+                    u, v = sim_state.wind_u, sim_state.wind_v
                 else:
-                    u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
+                    wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
+                    if _WIND_CACHE["key"] != wkey:
+                        with log_time("Generate wind field+arrows"):
+                            u, v = generate_wind_field(*tex.shape, elevation=tex, upsample="bilinear", weather_amp=0.35, debug_log=False)
+                            _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
+                    else:
+                        u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
                 speed = np.hypot(u, v).astype(np.float32)
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
@@ -624,7 +628,10 @@ def main() -> None:
             elif view_var.get() == "Ocean Currents":
                 ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents")
                 if _OCEAN_CURRENT_CACHE["key"] != ckey:
-                    u, v = generate_ocean_currents(tex, day_of_year=day, time_days=float(day))
+                    # Phase 3: Pass wind fields for Ekman transport coupling
+                    wu = sim_state.wind_u if (sim_state is not None and sim_running) else None
+                    wv = sim_state.wind_v if (sim_state is not None and sim_running) else None
+                    u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=float(day))
                     _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
                 else:
                     u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
@@ -837,11 +844,19 @@ def main() -> None:
                 comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Biomes":
-                # Biome visualization (Phase 4: Biosphere)
-                if use_sim_data and sim_state.temperature is not None and sim_state.precipitation is not None:
+                # Biome visualization (Phase 1: Stable biomes from long-term climate)
+                if use_sim_data and sim_state.biome_type is not None:
+                    # Use cached stable biomes (updated every 3 years from 10-year climate averages)
+                    biome = sim_state.biome_type
+                elif use_sim_data and sim_state.temperature is not None and sim_state.precipitation is not None:
+                    # Fallback: compute from instantaneous values (simulation paused or no biomes yet)
                     from carbon_cycle import compute_biome_type
                     land_mask = (tex > 0.02).astype(np.float32)
                     biome = compute_biome_type(sim_state.temperature, sim_state.precipitation, land_mask)
+                else:
+                    biome = None
+
+                if biome is not None:
 
                     # Biome colors (RGB)
                     # 0 = Ocean/Ice (keep terrain color)
