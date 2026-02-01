@@ -246,10 +246,57 @@ def update_monthly_statistics(
     return monthly_temp, monthly_precip, monthly_sample_count
 
 
+def _compute_continentality(land_mask: np.ndarray, max_dist: int = 50) -> np.ndarray:
+    """Compute continentality index based on distance from ocean.
+
+    Returns a (H, W) array where 0 = coastal, 1 = deep interior.
+    Uses a simple distance transform approximation.
+    """
+    from scipy.ndimage import distance_transform_edt
+    land = land_mask > 0.5
+    # Distance from ocean (in grid cells)
+    dist = distance_transform_edt(land)
+    # Normalize: 0 at coast, 1 at max_dist cells inland
+    continentality = np.clip(dist / max_dist, 0.0, 1.0)
+    return continentality.astype(np.float32)
+
+
+def _deterministic_noise(H: int, W: int, scale: float = 8.0) -> np.ndarray:
+    """Generate deterministic pseudo-noise for boundary perturbation.
+
+    Uses a simple hash-based approach to create reproducible spatial noise
+    that breaks up the perfectly horizontal climate boundaries.
+    """
+    # Create coordinate grids
+    y_idx = np.arange(H)[:, None]
+    x_idx = np.arange(W)[None, :]
+
+    # Multiple frequency components for more natural variation
+    noise = np.zeros((H, W), dtype=np.float32)
+
+    # Low frequency component (large-scale variation)
+    freq1 = 2.0 * np.pi / (W / 3.0)
+    freq2 = 2.0 * np.pi / (H / 4.0)
+    noise += 0.5 * np.sin(x_idx * freq1 + 0.3) * np.cos(y_idx * freq2 * 1.3 + 0.7)
+
+    # Medium frequency component
+    freq3 = 2.0 * np.pi / (W / 8.0)
+    freq4 = 2.0 * np.pi / (H / 6.0)
+    noise += 0.3 * np.sin(x_idx * freq3 + y_idx * 0.1) * np.sin(y_idx * freq4 + x_idx * 0.05)
+
+    # Higher frequency detail
+    freq5 = 2.0 * np.pi / (W / 15.0)
+    freq6 = 2.0 * np.pi / (H / 12.0)
+    noise += 0.2 * np.cos(x_idx * freq5 + y_idx * freq6 * 0.7)
+
+    return (noise * scale).astype(np.float32)
+
+
 def classify_koppen(
     monthly_temp: np.ndarray,      # (12, H, W) monthly temps [K]
     monthly_precip: np.ndarray,    # (12, H, W) monthly precip [mm/day]
     land_mask: np.ndarray,         # (H, W) boolean or float
+    elevation: np.ndarray | None = None,  # (H, W) normalized elevation [0-1]
 ) -> np.ndarray:
     """Classify Köppen climate type for each grid cell.
 
@@ -257,10 +304,16 @@ def classify_koppen(
     5 main groups (A, B, C, D, E) and 20 subtypes based on temperature
     and precipitation seasonality.
 
+    Terrain effects applied when elevation is provided:
+    - Elevation lapse rate: ~6.5°C cooling per 1000m elevation
+    - Continentality: inland areas have more extreme temperature ranges
+    - Boundary perturbation: adds natural variation to climate boundaries
+
     Args:
         monthly_temp: (12, H, W) monthly mean temperatures [K]
         monthly_precip: (12, H, W) monthly mean precipitation [mm/day]
         land_mask: (H, W) land mask (1=land, 0=ocean)
+        elevation: (H, W) normalized elevation [0-1], optional
 
     Returns:
         (H, W) int32 array of Köppen codes (0-19)
@@ -272,16 +325,66 @@ def classify_koppen(
     T_celsius = monthly_temp - 273.15  # (12, H, W)
     P_monthly_mm = monthly_precip * 30.44  # mm/day -> mm/month
 
+    # ==========================================================================
+    # Terrain-based temperature adjustments
+    # ==========================================================================
+    if elevation is not None:
+        # Convert normalized elevation [0-1] to meters (assume max ~8848m)
+        elev_meters = elevation * 8848.0
+
+        # Lapse rate correction: -6.5°C per 1000m elevation
+        # Only apply to land (elevation > sea level threshold)
+        land = land_mask > 0.5
+        lapse_correction = np.where(land, -6.5 * elev_meters / 1000.0, 0.0)
+        lapse_correction = lapse_correction.astype(np.float32)
+
+        # Apply lapse rate to all months
+        T_celsius = T_celsius + lapse_correction[None, :, :]
+
+        # Continentality effect: inland areas have larger temperature swings
+        # (colder winters, warmer summers relative to coastal areas)
+        try:
+            continentality = _compute_continentality(land_mask, max_dist=30)
+            # Enhance seasonal amplitude for continental interiors
+            T_annual_mean_temp = T_celsius.mean(axis=0)
+            T_anomaly = T_celsius - T_annual_mean_temp[None, :, :]
+            # Amplify anomalies by up to 20% for deep continental interiors
+            continental_factor = 1.0 + 0.2 * continentality
+            T_celsius = T_annual_mean_temp[None, :, :] + T_anomaly * continental_factor[None, :, :]
+        except ImportError:
+            # scipy not available, skip continentality
+            pass
+
     # Key temperature metrics
     T_annual_mean = T_celsius.mean(axis=0)  # (H, W)
     T_warmest = T_celsius.max(axis=0)       # Hottest month (Thot)
     T_coldest = T_celsius.min(axis=0)       # Coldest month (Tcold)
     months_above_10 = (T_celsius > 10.0).sum(axis=0)  # Count of months > 10°C
 
+    # ==========================================================================
+    # Boundary perturbation - adds natural variation to climate boundaries
+    # ==========================================================================
+    # Add deterministic noise to temperature thresholds to break up horizontal bands
+    boundary_noise = _deterministic_noise(H, W, scale=2.5)  # ±2.5°C variation
+    T_warmest_perturbed = T_warmest + boundary_noise * 0.3
+    T_coldest_perturbed = T_coldest + boundary_noise * 0.4
+    T_annual_mean_perturbed = T_annual_mean + boundary_noise * 0.2
+
+    # Use perturbed values for threshold comparisons (creates irregular boundaries)
+    # but keep original values for the actual climate characterization
+    T_warmest_for_thresh = T_warmest_perturbed
+    T_coldest_for_thresh = T_coldest_perturbed
+    T_annual_for_thresh = T_annual_mean_perturbed
+
     # Key precipitation metrics
     P_annual = P_monthly_mm.sum(axis=0)     # Total annual precipitation [mm/year]
     P_driest = P_monthly_mm.min(axis=0)     # Driest month [mm]
     P_wettest = P_monthly_mm.max(axis=0)    # Wettest month [mm]
+
+    # Add precipitation noise for boundary variation
+    precip_noise = _deterministic_noise(H, W, scale=15.0)  # ±15mm variation
+    P_annual_perturbed = P_annual + precip_noise
+    P_driest_perturbed = np.maximum(0, P_driest + precip_noise * 0.3)
 
     # Determine summer/winter by hemisphere (latitude)
     # Row 0 = North Pole, Row H-1 = South Pole
@@ -331,64 +434,66 @@ def classify_koppen(
     # Threshold depends on precipitation seasonality
     pct_summer = P_summer / (P_annual + 1e-6)
 
-    # R = aridity threshold
+    # R = aridity threshold (use perturbed values for irregular boundaries)
     # If >=70% of rain in summer: R = 20*T + 280
     # If 30-70% in summer: R = 20*T + 140
     # If <30% in summer (winter dominant): R = 20*T
     P_threshold = np.where(
         pct_summer >= 0.7,
-        20.0 * T_annual_mean + 280.0,
+        20.0 * T_annual_for_thresh + 280.0,
         np.where(
             pct_summer >= 0.3,
-            20.0 * T_annual_mean + 140.0,
-            20.0 * T_annual_mean
+            20.0 * T_annual_for_thresh + 140.0,
+            20.0 * T_annual_for_thresh
         )
     )
 
     # ==========================================================================
     # Classification Logic (in priority order)
+    # Uses perturbed temperature/precipitation values for threshold comparisons
+    # to create more natural, irregular climate boundaries
     # ==========================================================================
 
     # Ocean cells (code 0)
     koppen[~land] = KOPPEN_OCEAN
 
     # ----- E Climates (Polar) - check first -----
-    # EF: Ice Cap - warmest month < 0°C
-    is_EF = land & (T_warmest < 0.0)
+    # EF: Ice Cap - warmest month < 0°C (use perturbed threshold)
+    is_EF = land & (T_warmest_for_thresh < 0.0)
     koppen[is_EF] = KOPPEN_EF
 
-    # ET: Tundra - warmest month 0-10°C
-    is_ET = land & (T_warmest >= 0.0) & (T_warmest < 10.0)
+    # ET: Tundra - warmest month 0-10°C (use perturbed threshold)
+    is_ET = land & (T_warmest_for_thresh >= 0.0) & (T_warmest_for_thresh < 10.0)
     koppen[is_ET] = KOPPEN_ET
 
     # ----- B Climates (Arid) - check second -----
     # Only for cells with warmest month >= 10°C (not polar)
-    is_warm_enough = (T_warmest >= 10.0)
+    is_warm_enough = (T_warmest_for_thresh >= 10.0)
 
-    # BW (Desert): P_annual < 0.5 * threshold
-    is_BW = land & is_warm_enough & (P_annual < 0.5 * P_threshold)
+    # BW (Desert): P_annual < 0.5 * threshold (use perturbed precipitation)
+    is_BW = land & is_warm_enough & (P_annual_perturbed < 0.5 * P_threshold)
     # BS (Steppe): 0.5 * threshold <= P_annual < threshold
-    is_BS = land & is_warm_enough & (P_annual >= 0.5 * P_threshold) & (P_annual < P_threshold)
+    is_BS = land & is_warm_enough & (P_annual_perturbed >= 0.5 * P_threshold) & (P_annual_perturbed < P_threshold)
 
     # Subdivide by temperature (h=hot, k=cold based on mean annual temp)
-    koppen[is_BW & (T_annual_mean >= 18.0)] = KOPPEN_BWH   # Hot Desert
-    koppen[is_BW & (T_annual_mean < 18.0)] = KOPPEN_BWK    # Cold Desert
-    koppen[is_BS & (T_annual_mean >= 18.0)] = KOPPEN_BSH   # Hot Steppe
-    koppen[is_BS & (T_annual_mean < 18.0)] = KOPPEN_BSK    # Cold Steppe
+    koppen[is_BW & (T_annual_for_thresh >= 18.0)] = KOPPEN_BWH   # Hot Desert
+    koppen[is_BW & (T_annual_for_thresh < 18.0)] = KOPPEN_BWK    # Cold Desert
+    koppen[is_BS & (T_annual_for_thresh >= 18.0)] = KOPPEN_BSH   # Hot Steppe
+    koppen[is_BS & (T_annual_for_thresh < 18.0)] = KOPPEN_BSK    # Cold Steppe
 
     is_B = is_BW | is_BS
 
     # ----- A Climates (Tropical) -----
-    # Coldest month >= 18°C, not arid
-    is_A = land & (T_coldest >= 18.0) & ~is_B & is_warm_enough
+    # Coldest month >= 18°C, not arid (use perturbed threshold)
+    is_A = land & (T_coldest_for_thresh >= 18.0) & ~is_B & is_warm_enough
 
-    # Af: Tropical Rainforest - driest month >= 60mm
-    is_Af = is_A & (P_driest >= 60.0)
+    # Af: Tropical Rainforest - driest month >= 60mm (use perturbed)
+    is_Af = is_A & (P_driest_perturbed >= 60.0)
     koppen[is_Af] = KOPPEN_AF
 
     # Am: Tropical Monsoon - driest month < 60mm but >= (100 - P_annual/25)
-    monsoon_threshold = 100.0 - P_annual / 25.0
-    is_Am = is_A & (P_driest < 60.0) & (P_driest >= monsoon_threshold)
+    monsoon_threshold = 100.0 - P_annual_perturbed / 25.0
+    is_Am = is_A & (P_driest_perturbed < 60.0) & (P_driest_perturbed >= monsoon_threshold)
     koppen[is_Am] = KOPPEN_AM
 
     # Aw: Tropical Savanna - driest month < monsoon threshold
@@ -396,8 +501,8 @@ def classify_koppen(
     koppen[is_Aw] = KOPPEN_AW
 
     # ----- C Climates (Temperate/Mesothermal) -----
-    # Coldest month > 0°C and < 18°C, warmest month >= 10°C, not arid
-    is_C = land & (T_coldest > 0.0) & (T_coldest < 18.0) & (T_warmest >= 10.0) & ~is_B
+    # Coldest month > 0°C and < 18°C, warmest month >= 10°C, not arid (perturbed)
+    is_C = land & (T_coldest_for_thresh > 0.0) & (T_coldest_for_thresh < 18.0) & (T_warmest_for_thresh >= 10.0) & ~is_B
 
     # Dry season classification (s=dry summer, w=dry winter, f=no dry season)
     # s: Driest summer month < 40mm AND < 1/3 of wettest winter month
@@ -412,45 +517,46 @@ def classify_koppen(
     # b: Warmest month < 22°C, but >= 4 months >= 10°C
     # c: 1-3 months >= 10°C
 
-    # Cfa, Cfb, Cfc
-    koppen[is_Cf & (T_warmest >= 22.0)] = KOPPEN_CFA
-    koppen[is_Cf & (T_warmest < 22.0) & (months_above_10 >= 4)] = KOPPEN_CFB
-    koppen[is_Cf & (T_warmest < 22.0) & (months_above_10 < 4)] = KOPPEN_CFC
+    # Cfa, Cfb, Cfc (use perturbed temps for subtype boundaries)
+    koppen[is_Cf & (T_warmest_for_thresh >= 22.0)] = KOPPEN_CFA
+    koppen[is_Cf & (T_warmest_for_thresh < 22.0) & (months_above_10 >= 4)] = KOPPEN_CFB
+    koppen[is_Cf & (T_warmest_for_thresh < 22.0) & (months_above_10 < 4)] = KOPPEN_CFC
 
     # Csa, Csb (Mediterranean)
-    koppen[is_Cs & (T_warmest >= 22.0)] = KOPPEN_CSA
-    koppen[is_Cs & (T_warmest < 22.0)] = KOPPEN_CSB
+    koppen[is_Cs & (T_warmest_for_thresh >= 22.0)] = KOPPEN_CSA
+    koppen[is_Cs & (T_warmest_for_thresh < 22.0)] = KOPPEN_CSB
 
     # Cwa (Subtropical Monsoon)
-    koppen[is_Cw & (T_warmest >= 22.0)] = KOPPEN_CWA
-    koppen[is_Cw & (T_warmest < 22.0)] = KOPPEN_CFB  # Treat as Cfb if not hot
+    koppen[is_Cw & (T_warmest_for_thresh >= 22.0)] = KOPPEN_CWA
+    koppen[is_Cw & (T_warmest_for_thresh < 22.0)] = KOPPEN_CFB  # Treat as Cfb if not hot
 
     # ----- D Climates (Continental/Microthermal) -----
     # Coldest month <= 0°C (or < -3°C in strict definition), warmest month >= 10°C, not arid
-    is_D = land & (T_coldest <= 0.0) & (T_warmest >= 10.0) & ~is_B & ~is_ET & ~is_EF
+    # Use perturbed thresholds for irregular boundaries
+    is_D = land & (T_coldest_for_thresh <= 0.0) & (T_warmest_for_thresh >= 10.0) & ~is_B & ~is_ET & ~is_EF
 
     # Dry season classification
     is_Ds = is_D & (P_summer_driest < 40.0) & (P_summer_driest < P_winter_wettest / 3.0)
     is_Dw = is_D & ~is_Ds & (P_winter_driest < P_summer_wettest / 10.0)
     is_Df = is_D & ~is_Ds & ~is_Dw
 
-    # Extreme cold (d): Coldest month < -38°C
-    is_extreme_cold = T_coldest < -38.0
+    # Extreme cold (d): Coldest month < -38°C (use perturbed)
+    is_extreme_cold = T_coldest_for_thresh < -38.0
 
-    # Dfa, Dfb, Dfc, Dfd
-    koppen[is_Df & (T_warmest >= 22.0)] = KOPPEN_DFA
-    koppen[is_Df & (T_warmest < 22.0) & (months_above_10 >= 4)] = KOPPEN_DFB
-    koppen[is_Df & (T_warmest < 22.0) & (months_above_10 < 4) & ~is_extreme_cold] = KOPPEN_DFC
+    # Dfa, Dfb, Dfc, Dfd (use perturbed for summer temp threshold)
+    koppen[is_Df & (T_warmest_for_thresh >= 22.0)] = KOPPEN_DFA
+    koppen[is_Df & (T_warmest_for_thresh < 22.0) & (months_above_10 >= 4)] = KOPPEN_DFB
+    koppen[is_Df & (T_warmest_for_thresh < 22.0) & (months_above_10 < 4) & ~is_extreme_cold] = KOPPEN_DFC
     koppen[is_Df & is_extreme_cold] = KOPPEN_DWD
 
     # Dsa, Dsb, Dsc (rare - dry summer continental)
-    koppen[is_Ds & (T_warmest >= 22.0)] = KOPPEN_DFA  # Treat as Dfa
-    koppen[is_Ds & (T_warmest < 22.0)] = KOPPEN_DFB   # Treat as Dfb
+    koppen[is_Ds & (T_warmest_for_thresh >= 22.0)] = KOPPEN_DFA  # Treat as Dfa
+    koppen[is_Ds & (T_warmest_for_thresh < 22.0)] = KOPPEN_DFB   # Treat as Dfb
 
     # Dwa, Dwb, Dwc, Dwd (dry winter continental - e.g., Manchuria)
-    koppen[is_Dw & (T_warmest >= 22.0)] = KOPPEN_DFA
-    koppen[is_Dw & (T_warmest < 22.0) & (months_above_10 >= 4)] = KOPPEN_DFB
-    koppen[is_Dw & (T_warmest < 22.0) & (months_above_10 < 4) & ~is_extreme_cold] = KOPPEN_DFC
+    koppen[is_Dw & (T_warmest_for_thresh >= 22.0)] = KOPPEN_DFA
+    koppen[is_Dw & (T_warmest_for_thresh < 22.0) & (months_above_10 >= 4)] = KOPPEN_DFB
+    koppen[is_Dw & (T_warmest_for_thresh < 22.0) & (months_above_10 < 4) & ~is_extreme_cold] = KOPPEN_DFC
     koppen[is_Dw & is_extreme_cold] = KOPPEN_DWD
 
     return koppen

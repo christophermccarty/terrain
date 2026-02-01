@@ -296,7 +296,8 @@ def simulate_step(
             # Time to update Köppen classification
             land_mask_for_biomes = (state.elevation > 0.02).astype(np.float32)
             koppen_new = classify_koppen(
-                monthly_temp, monthly_precip, land_mask_for_biomes
+                monthly_temp, monthly_precip, land_mask_for_biomes,
+                elevation=state.elevation
             )
             # Convert Köppen to legacy biome for backward compatibility
             biome_new = koppen_to_legacy_biome(koppen_new)
