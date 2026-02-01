@@ -364,14 +364,16 @@ def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 1) -> np.ndarra
     # High albedo at poles - transition starts around 60°
     transition_start = 65.0  # degrees
     
-    # Seasonal variation: reduce ice albedo slightly during summer due to partial melt
-    # Winter: A_ice = 0.90 (full ice cover), Summer: A_ice = 0.80 (partial melt)
+    # Seasonal variation: reduce ice albedo during summer due to melt ponds & open water
+    # Real Arctic/Antarctic has high albedo (0.8-0.9) for pure ice, but effective albedo
+    # is reduced by melt ponds, leads, and open water. Using lower values to account for this.
+    # Winter: A_ice = 0.65 (mixed ice/water), Summer: A_ice = 0.50 (significant melt)
     obliq = np.deg2rad(23.44)
     gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / 365.2422
     delta = np.arcsin(np.sin(obliq) * np.sin(gamma))
-    # Summer: |delta| > 15°, reduce albedo; Winter: |delta| < 15°, full albedo
+    # Summer: |delta| > 15°, reduce albedo significantly; Winter: |delta| < 15°, higher albedo
     season_factor = np.clip(1.0 - 0.5 * (np.abs(delta) / np.deg2rad(15.0)), 0.5, 1.0)
-    A_ice = 0.75 + 0.08 * season_factor  # Range: 0.75-0.83
+    A_ice = 0.50 + 0.15 * season_factor  # Range: 0.50-0.65 (reduced from 0.75-0.83)
     
     # Linear transition from transition_start to 90°
     transition_range = 90.0 - transition_start
@@ -436,8 +438,8 @@ def temperature_kelvin_for_lat(
     
     # LATITUDE-DEPENDENT GREENHOUSE EFFECT (realistic atmospheric physics)
     abs_lat_deg = np.rad2deg(np.abs(lat))
-    epsilon_equator = 0.78  # Increased from 0.75 to 0.78 to warm equator and global mean more aggressively
-    epsilon_pole = 0.55     # Increased from 0.50 to 0.55 to reduce polar extremes further
+    epsilon_equator = 0.78  # Increased from 0.75 to warm equator and global mean
+    epsilon_pole = 0.70     # Increased from 0.65 to 0.70 to trap even more heat at poles
     lat_factor = np.cos(np.deg2rad(abs_lat_deg))  # 1.0 at equator, 0.0 at poles
     epsilon_lat = epsilon_pole + (epsilon_equator - epsilon_pole) * lat_factor
     
@@ -485,8 +487,8 @@ def temperature_kelvin_for_lat(
     
     # Maximum latent heat flux during peak melting conditions
     # Peak value: 150 W/m² at poles during midsummer with full sun
-    # FURTHER REDUCED to prevent excessive polar cooling (global mean too cold)
-    F_latent_max = 30.0 * float(polar_cooling_scale)  # Reduced from 50 to 30 W/m² to warm poles more aggressively
+    # HEAVILY REDUCED to prevent excessive polar cooling
+    F_latent_max = 10.0 * float(polar_cooling_scale)  # Reduced from 30 to 10 W/m² to allow polar warming
     
     # Apply latent heat flux loss only during melt season
     # Scales with solar intensity (more sun = more melting)
@@ -516,7 +518,7 @@ def temperature_kelvin_for_lat(
     # Convective flux scales with temperature excess above freezing (273K)
     # Only active when surface is warm enough to drive convection (>260K = -13°C)
     T_excess = np.maximum(T_estimate - 260.0, 0.0)  # Kelvin above -13°C
-    convection_efficiency = 0.4 * float(polar_cooling_scale)  # Reduced from 0.6 to 0.4 W/m² per K excess to warm poles more
+    convection_efficiency = 0.15 * float(polar_cooling_scale)  # Reduced from 0.4 to 0.15 W/m² per K excess to prevent excessive polar cooling
     
     # Apply convective export in polar regions (>50° latitude)
     polar_convection_mask = abs_lat_deg > 50.0
@@ -540,9 +542,10 @@ def temperature_kelvin_for_lat(
     T = np.power(F_net / (sigma * gh_denom), 0.25)
     
     # Minimum temperature floor during polar night (accounts for heat transport/thermal inertia)
-    # Earth's coldest recorded: -89.2°C (184K) at Vostok, but typical polar winter is -50°C to -60°C (223-213K)
-    # Increased to 240K (-33°C) to match Earth reference pole_temp_winter and warm global mean
-    T_min = 240.0  # Increased from 230K to 240K to warm poles and reduce gradient
+    # Earth's coldest recorded: -89.2°C (184K) at Vostok, typical polar winter: -50°C to -60°C (223-213K)
+    # Lowered to 200K (-73°C) to allow realistic Antarctic winter temperatures
+    # Previous floor of 240K (-33°C) was too high and caused all high-latitude temps to hit the floor
+    T_min = 200.0  # Lowered from 240K to allow realistic polar cold
     T = np.maximum(T, T_min)
     
     # Store in cache if enabled

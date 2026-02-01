@@ -129,13 +129,16 @@ def calculate_ocean_heat_transport(
     # Peak at mid-latitudes (30-60°) where major currents (Gulf Stream) exist
     # Gaussian profile centered at 45° with width ~20°
     current_strength = np.exp(-((abs_lat_rows - 45.0) / 20.0)**2)  # (Hc,)
-    
+
     # Temperature gradient drives heat transport
     # Use finite difference to approximate meridional gradient
+    # CRITICAL FIX: Gradient should be (T_north - T_south) so that heat flows
+    # from warm equator TO cold poles (positive gradient = poleward flux)
+    # Row indexing: row 0 = 90°N, row Hc-1 = 90°S (increasing row = southward)
     T_ocean_gradient = np.zeros_like(T_ocean_zonal)
-    T_ocean_gradient[1:-1] = (T_ocean_zonal[2:] - T_ocean_zonal[:-2]) / 2.0
-    T_ocean_gradient[0] = T_ocean_zonal[1] - T_ocean_zonal[0]
-    T_ocean_gradient[-1] = T_ocean_zonal[-1] - T_ocean_zonal[-2]
+    T_ocean_gradient[1:-1] = (T_ocean_zonal[:-2] - T_ocean_zonal[2:]) / 2.0  # FIXED: (north - south)
+    T_ocean_gradient[0] = T_ocean_zonal[0] - T_ocean_zonal[1]  # FIXED: North pole gradient
+    T_ocean_gradient[-1] = T_ocean_zonal[-2] - T_ocean_zonal[-1]  # FIXED: South pole gradient
     
     # Poleward flux: move heat from warm (low lat) to cold (high lat)
     # Positive gradient (warm south) = poleward heat flux
@@ -196,10 +199,14 @@ def calculate_ocean_heat_transport(
     exchange_coefficient = float(exchange_coefficient)  # K per day (weak coupling)
     
     # Ocean releases/absorbs heat based on temperature excess
+    # CRITICAL FIX: This term was adding excessive heat to poles (+3K/day), causing
+    # Antarctic to warm by +40°C in winter. Disabled temporarily - proper ocean
+    # heat transport is handled by the flux divergence term above.
+    # TODO: Reformulate this to properly model ocean-atmosphere coupling without
+    # creating unrealistic poleward heat transport.
     T_excess = T_eff - T_equator
-    heat_exchange = -exchange_coefficient * exchange_strength[:, np.newaxis] * T_excess * dt_days
-    # Clamp heat exchange to prevent extreme adjustments
-    heat_exchange = np.clip(heat_exchange, -3.0, 3.0)  # Max ±3K per day
+    heat_exchange = np.zeros_like(T)  # DISABLED: was causing +3K/day warming at poles
+    # Old (broken) formula: heat_exchange = -exchange_coefficient * exchange_strength * T_excess * dt_days
     heat_exchange = heat_exchange * is_ocean.astype(np.float32)
     
     # Add heat exchange to adjustment
