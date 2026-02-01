@@ -213,7 +213,7 @@ def simulate_step(
     ocean_exchange_inertia: float = 0.35,
     epsilon_equator: float = 0.72,
     epsilon_pole: float = 0.50,
-    polar_cooling_scale: float = 0.6,
+    polar_cooling_scale: float = 0.3,  # Reduced from 0.6 to allow more polar warming
     ice_freeze_temp: float = 269.5,
     ice_melt_temp: float = 273.35,
     ice_freeze_rate: float = 0.06,
@@ -1071,7 +1071,15 @@ def _evolve_temperature(
     lapse_rate = 6.5  # K/km
     alt_km = elevation_to_alt_km(elev_c)
     T_eq = T_eq - lapse_rate * alt_km
-    
+
+    # --- Ocean Temperature Cap (CRITICAL FIX for ocean overheating) ---
+    # Real-world ocean SST maximum is ~32°C (305K) due to strong evaporative cooling.
+    # The base temperature calculation (radiative equilibrium) produces 43-48°C for
+    # subtropical oceans because it doesn't account for evaporation.
+    # Cap ocean equilibrium temperature at 305K to match real-world physics.
+    # This represents the fact that ocean evaporation prevents SST from exceeding ~32°C.
+    T_eq = np.where(sea_mask, np.minimum(T_eq, 305.0), T_eq)
+
     # Relaxation rate k (1/days)
     # Ocean: Slow (0.05/day = 20 day time constant) for better thermal inertia
     # Land: Fast (1.0/day = 1 day time constant)
@@ -1108,11 +1116,24 @@ def _evolve_temperature(
 
         # Latent cooling: 2.5 K per mm/day evaporated
         evap_cooling = E * 2.5 * days
+
+        # --- Enhanced evaporative cooling for hot oceans ---
+        # Real tropical oceans have intense evaporation that prevents SST > 32°C
+        # Add extra evaporative cooling that scales with temperature above 30°C (303K)
+        # This represents the nonlinear increase in evaporation at high SST
+        # REDUCED: Changed threshold from 28C to 30C and coefficient from 0.5 to 0.3
+        # to allow tropical oceans to reach realistic 28-30°C temperatures
+        hot_ocean_excess = np.where(sea_mask & (T > 303.0), T - 303.0, 0.0)
+        hot_ocean_cooling = 0.3 * hot_ocean_excess * days  # Extra 0.3 K/day per degree above 30°C
+        evap_cooling = evap_cooling + hot_ocean_cooling
+
         T = T - evap_cooling
     else:
         # Fallback to simple temperature-dependent evaporation if wind/humidity not available
         base_evap = np.where(sea_mask, 0.01 * (T - 270.0), 0.0)
-        hot_evap = np.where((T > 303.0) & sea_mask, 0.03 * (T - 303.0), 0.0)
+        # Enhanced hot ocean evaporation - kicks in at 30°C (303K)
+        # Coefficient tuned to prevent >32°C while allowing realistic 28-30°C tropics
+        hot_evap = np.where((T > 303.0) & sea_mask, 0.3 * (T - 303.0), 0.0)
         evap_cooling = np.maximum(0.0, base_evap + hot_evap)
         T = T - evap_cooling * days
     
@@ -1150,9 +1171,10 @@ def _evolve_temperature(
 
     # --- FINAL TEMPERATURE CLAMPING (Critical for stability) ---
     # Clamp to realistic Earth-like temperature range
-    # Absolute minimum: -33°C (240K) - typical polar winter (matches T_min in temperature.py)
-    # Absolute maximum: +50°C (323K) - reduced from 60°C to prevent extreme hot spots
-    T = np.clip(T, 240.0, 323.0)  # Reduced maximum from 333K to 323K to prevent extreme temperatures
+    # Absolute minimum: -73°C (200K) - allows for realistic Antarctic winter (Vostok: -89°C)
+    # Absolute maximum: +50°C (323K) - prevents extreme hot spots
+    # Previous floor of 240K (-33°C) was too high and prevented realistic polar temperatures
+    T = np.clip(T, 200.0, 323.0)  # Lowered minimum from 240K to 200K for realistic polar winters
 
     # Track component contributions if requested
     components = {}
