@@ -346,20 +346,67 @@ def simulate_step(
     # Calculate temperature for lagged day (ocean response with 1.5 month delay)
     lag_days = 50.0  # ~1.5 months thermal lag for deep ocean mixed layer
     lagged_day = (new_day - lag_days) % 365.2422
-    T_lat_ocean = temperature_kelvin_for_lat(
+    T_lat_ocean_lagged = temperature_kelvin_for_lat(
         lat,
         day_of_year=int(lagged_day),
         polar_cooling_scale=polar_cooling_scale,
     )
+
+    # CRITICAL: Two corrections to ocean base temperature:
+    #
+    # 1) SEASONAL AMPLITUDE DAMPING: The ocean's thermal time constant is ~1-3 YEARS,
+    #    far longer than a season. SST barely oscillates around the annual mean.
+    #    The 50-day lag shifts phase but doesn't damp amplitude. Without damping,
+    #    winter T_base at 55-60N drops to 210-230K causing unrealistic ice.
+    #
+    # 2) MERIDIONAL HEAT TRANSPORT WARMING: temperature_kelvin_for_lat computes LOCAL
+    #    radiative equilibrium, which ignores the ~2 PW of poleward ocean heat transport.
+    #    Real SST at 55-70N is 12-42K warmer than radiative equilibrium due to Gulf
+    #    Stream, Kuroshio, and thermohaline circulation. This offset is standard in
+    #    energy balance climate models (Budyko 1969, Sellers 1969).
+
+    T_lat_annual_mean = temperature_kelvin_for_lat(
+        lat,
+        day_of_year=80,  # Spring equinox ≈ annual mean insolation
+        polar_cooling_scale=polar_cooling_scale,
+    )
+
+    # Meridional heat transport warming: concentrated at high latitudes
+    # 0K below 40°, ramping to 40K at 70°+ (matches observed SST - radiative eq deficit)
+    # Profile: steep ramp starting at 40° prevents over-warming subtropics
+    # The explicit ocean transport function handles finer redistribution (western
+    # boundary currents, seasonal variation, east-west asymmetry)
+    lat_deg_1d = np.abs(np.rad2deg(lat))
+    transport_warming = 40.0 * np.clip((lat_deg_1d - 40.0) / 30.0, 0.0, 1.0) ** 1.5
+
+    # Seasonal fraction: what fraction of the radiative swing the ocean actually feels
+    # Based on ΔT/ΔT_rad ≈ 1/sqrt(1 + (2π τ/P)²) where τ ~ 1-3 years, P = 1 year
+    # Equator (τ~0.7yr): ~24%, Mid-lat (τ~1.5yr): ~10%, Polar (τ~3yr): ~5%
+    ocean_seasonal_frac = 0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_1d))
+
+    # Final ocean base: annual mean + transport warming + small seasonal oscillation
+    T_lat_ocean = (T_lat_annual_mean + transport_warming
+                   + ocean_seasonal_frac * (T_lat_ocean_lagged - T_lat_annual_mean))
+
     T_base_ocean = np.repeat(T_lat_ocean[:, None], Wc, axis=1).astype(np.float32) + co2_temp_offset
     # Full-resolution fallback base temperature (used when wind evolves at full resolution
     # before `state.temperature` is initialized).
     lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
-    T_lat_ocean_full = temperature_kelvin_for_lat(
+    T_lat_ocean_full_lagged = temperature_kelvin_for_lat(
         lat_full,
         day_of_year=int(lagged_day),
         polar_cooling_scale=polar_cooling_scale,
     )
+    T_lat_annual_mean_full = temperature_kelvin_for_lat(
+        lat_full,
+        day_of_year=80,
+        polar_cooling_scale=polar_cooling_scale,
+    )
+    lat_deg_full = np.abs(np.rad2deg(lat_full))
+    transport_warming_full = 40.0 * np.clip((lat_deg_full - 40.0) / 30.0, 0.0, 1.0) ** 1.5
+    ocean_seasonal_frac_full = 0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_full))
+    T_lat_ocean_full = (T_lat_annual_mean_full + transport_warming_full
+                        + ocean_seasonal_frac_full * (T_lat_ocean_full_lagged - T_lat_annual_mean_full))
     T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32) + co2_temp_offset
     
     # Blend based on land fraction (will be calculated in _evolve_temperature)
@@ -643,13 +690,22 @@ def simulate_step(
     if P_full is not None and T_full is not None:
         T_full = T_full - (latent_cooling_coeff * P_full * float(days))
         T_full = np.clip(T_full, 150.0, 330.0)
-    ice_full = update_sea_ice(
-        T_full, state.elevation, state.ice_cover, days,
-        freeze_temp=ice_freeze_temp,
-        melt_temp=ice_melt_temp,
-        freeze_rate=ice_freeze_rate,
-        melt_rate=ice_melt_rate,
-    ) if T_full is not None else None
+    if T_full is not None:
+        ice_full, delta_ice = update_sea_ice(
+            T_full, state.elevation, state.ice_cover, days,
+            freeze_temp=ice_freeze_temp,
+            melt_temp=ice_melt_temp,
+            freeze_rate=ice_freeze_rate,
+            melt_rate=ice_melt_rate,
+        )
+        # Ice-ocean latent heat feedback: freezing releases heat, melting absorbs heat
+        # L_f=334 kJ/kg, rho_ice=917 kg/m³, ~1m effective thickness, ~100m mixed layer
+        # gives ~3K per unit ice fraction change
+        latent_scale = 3.0  # K per unit ice fraction change
+        is_ocean_full = state.elevation <= float(np.median(state.elevation))
+        T_full = T_full + delta_ice * latent_scale * is_ocean_full.astype(np.float32)
+    else:
+        ice_full = None
 
     # Debug logging if requested
     if debug_log:
@@ -1080,11 +1136,29 @@ def _evolve_temperature(
     # This represents the fact that ocean evaporation prevents SST from exceeding ~32°C.
     T_eq = np.where(sea_mask, np.minimum(T_eq, 305.0), T_eq)
 
-    # Relaxation rate k (1/days)
-    # Ocean: Slow (0.05/day = 20 day time constant) for better thermal inertia
-    # Land: Fast (1.0/day = 1 day time constant)
-    # REDUCED ocean rate from 0.1 to 0.05 to increase thermal inertia and reduce oscillations
-    k_relax = np.where(sea_mask, 0.05, 1.0)
+    # Relaxation rate k (1/days) based on mixed-layer depth
+    # Real oceans have latitude-dependent mixed layer depth:
+    #   Tropics: ~30-50m (thin thermocline, trade winds)
+    #   Mid-latitudes: ~50-150m (seasonal deepening)
+    #   High latitudes: ~200-500m (deep convective mixing in winter)
+    # Deeper mixed layers = more thermal inertia = slower response to forcing
+    abs_lat_1d = np.abs(np.rad2deg(lat))  # lat computed at line 948
+    abs_lat_2d_relax = np.repeat(abs_lat_1d[:, None], Wc, axis=1)
+    mld = 30.0 + 170.0 * (abs_lat_2d_relax / 90.0) ** 1.5  # 30m tropical, ~200m polar
+    k_ocean = np.clip(1.0 / (mld * 0.5), 0.005, 0.07)  # 14-200 day time constants
+
+    # Ice insulation: asymmetric effect on ocean-atmosphere coupling
+    # Ice insulates against COOLING (prevents heat loss in winter) but does NOT
+    # block warming — solar radiation melts ice from above, warm currents erode
+    # from below, and leads/polynyas allow heat exchange. This prevents ice from
+    # becoming permanently locked in at mid-latitudes.
+    cooling_direction = T_eq < T  # True where forcing would cool the ocean
+    ice_insulation = np.where(
+        cooling_direction,
+        1.0 - 0.7 * sea_ice,  # 70% insulation against cooling (keeps ocean warm under ice)
+        1.0,                    # No insulation against warming (allows spring melt)
+    )
+    k_relax = np.where(sea_mask, k_ocean * ice_insulation, 1.0)
     
     # Apply Radiative forcing via relaxation
     # Limit relaxation to prevent extreme jumps and reduce oscillations
@@ -1157,6 +1231,7 @@ def _evolve_temperature(
         exchange_coefficient=float(ocean_exchange_coeff),
         exchange_inertia=float(ocean_exchange_inertia),
         prev_T=T_prev,
+        ice_cover=sea_ice,
     )
     # Clamp ocean transport to prevent extreme adjustments
     T_ocean_adj = np.clip(T_ocean_adj, -10.0, 10.0)  # Max ±10K per day

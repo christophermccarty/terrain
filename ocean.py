@@ -37,10 +37,16 @@ def update_sea_ice(
     melt_temp: float = 273.35,
     freeze_rate: float = 0.06,
     melt_rate: float = 0.16,
-) -> np.ndarray:
-    """Update sea ice fraction based on persistent cold ocean temperatures."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Update sea ice fraction based on persistent cold ocean temperatures.
+
+    Returns:
+        (ice_new, delta_ice): Updated ice fraction and change in ice fraction
+            this step. delta_ice > 0 means freezing, < 0 means melting.
+    """
     is_ocean = _ocean_mask_from_elevation(elevation)
     ice = np.zeros_like(T, dtype=np.float32) if prev_ice is None else np.asarray(prev_ice, dtype=np.float32)
+    ice_prev = ice.copy()
     T = np.asarray(T, dtype=np.float32)
     freeze = (T <= freeze_temp) & is_ocean
     melt = (T >= melt_temp) & is_ocean
@@ -48,7 +54,9 @@ def update_sea_ice(
         ice = np.where(freeze, np.minimum(1.0, ice + freeze_rate * dt_days), ice)
     if np.any(melt):
         ice = np.where(melt, np.maximum(0.0, ice - melt_rate * dt_days), ice)
-    return np.where(is_ocean, ice, 0.0)
+    ice_new = np.where(is_ocean, ice, 0.0)
+    delta_ice = ice_new - np.where(is_ocean, ice_prev, 0.0)
+    return ice_new, delta_ice
 
 
 def calculate_ocean_heat_transport(
@@ -64,6 +72,7 @@ def calculate_ocean_heat_transport(
     exchange_coefficient: float = 0.05,
     exchange_inertia: float = 0.0,
     prev_T: np.ndarray | None = None,
+    ice_cover: np.ndarray | None = None,
 ) -> np.ndarray:
     """Calculate ocean heat transport and return temperature adjustment.
     
@@ -129,6 +138,21 @@ def calculate_ocean_heat_transport(
     # Peak at mid-latitudes (30-60°) where major currents (Gulf Stream) exist
     # Gaussian profile centered at 45° with width ~20°
     current_strength = np.exp(-((abs_lat_rows - 45.0) / 20.0)**2)  # (Hc,)
+
+    # Polar damping: real ocean currents weaken poleward of ~75°
+    # (limited basin connectivity under permanent ice cap)
+    # Transport must remain strong through 60-70° to deliver Gulf Stream / Kuroshio
+    # heat that prevents unrealistic mid-latitude ice formation
+    polar_damp = np.clip((75.0 - abs_lat_rows) / 15.0, 0.1, 1.0)  # 1.0 at <60°, 0.1 at >75°
+    current_strength = current_strength * polar_damp
+
+    # Ice partially blocks surface currents, but deep thermohaline circulation
+    # continues beneath ice. Limit damping to 50% to preserve sub-ice transport.
+    if ice_cover is not None:
+        ice_arr = np.clip(np.asarray(ice_cover, dtype=np.float32), 0.0, 1.0)
+        ice_ocean = ice_arr * is_ocean.astype(np.float32)
+        ice_zonal = np.sum(ice_ocean, axis=1) / np.maximum(ocean_count, 1.0)
+        current_strength = current_strength * (1.0 - 0.5 * ice_zonal)
 
     # Temperature gradient drives heat transport
     # Use finite difference to approximate meridional gradient

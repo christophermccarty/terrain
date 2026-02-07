@@ -660,8 +660,8 @@ def main() -> None:
     profiler.enable()
     
     # Try to load default heightmap, fall back to procedural if not found
-    # default_heightmap_path = r"D:\dev\planetsim\images\16_bit_dem_small_512.tif"
-    default_heightmap_path = r"C:\dev\planetsim\images\16_bit_dem_small_512.tif"
+    default_heightmap_path = r"D:\dev\planetsim\images\16_bit_dem_small_512.tif" #desktop location
+    # default_heightmap_path = r"C:\dev\planetsim\images\16_bit_dem_small_512.tif" #laptop location
     try:
         with log_time(f"Loading default heightmap from {default_heightmap_path}"):
             heightmap_img = Image.open(default_heightmap_path)
