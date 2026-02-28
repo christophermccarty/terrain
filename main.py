@@ -66,26 +66,28 @@ class SimulationThread(Thread):
                 continue
 
             try:
-                # Run one simulation step
-                new_state, temp_components = simulate_step(
-                    self.state,
-                    days=self.days_per_step,
-                    wind_block_size=self.wind_block_size,
-                    debug_log=False,
-                    track_components=True,
-                )
-                self.state = new_state
-
-                # Record diagnostics if available
-                if self.diagnostics is not None:
-                    self.diagnostics.record_step(
-                        new_state,
-                        new_state.day_of_year,
-                        days_elapsed=self.days_per_step,
-                        component_contributions=temp_components
+                # Sub-stepping: run multiple 1-day steps per UI frame
+                num_substeps = max(1, int(self.days_per_step))
+                for _ in range(num_substeps):
+                    new_state, temp_components = simulate_step(
+                        self.state,
+                        days=1.0,
+                        wind_block_size=self.wind_block_size,
+                        debug_log=False,
+                        track_components=True,
                     )
+                    self.state = new_state
 
-                # Push to UI (non-blocking, drop if UI busy)
+                    # Record diagnostics each sub-step for correct averaging
+                    if self.diagnostics is not None:
+                        self.diagnostics.record_step(
+                            new_state,
+                            new_state.day_of_year,
+                            days_elapsed=1.0,
+                            component_contributions=temp_components
+                        )
+
+                # Push final state to UI (non-blocking, drop if UI busy)
                 try:
                     self.state_queue.put_nowait(new_state)
                     self.component_queue.put_nowait(temp_components)
@@ -408,7 +410,7 @@ def main() -> None:
         diagnostics.history.clear()
         diagnostics.component_history.clear()
         diagnostics.total_days = 0.0
-        sim_cycle_var.set("Year: 1")
+        sim_cycle_var.set("Y1 M1")
         graphs_controller.reset()
     
     # Simulation controls
@@ -419,7 +421,7 @@ def main() -> None:
     tk.Label(sim_controls, text="Simulation:").pack(side="left", padx=(4,0))
     sim_status_label = tk.Label(sim_controls, textvariable=sim_status_var, width=12, anchor="w")
     sim_status_label.pack(side="left", padx=4)
-    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var, width=10, anchor="w")
+    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var, width=12, anchor="w")
     sim_cycle_label.pack(side="left", padx=8)
     tk.Button(sim_controls, text="Start", command=lambda: start_simulation()).pack(side="left", padx=2)
     tk.Button(sim_controls, text="Stop", command=lambda: stop_simulation()).pack(side="left", padx=2)
@@ -428,6 +430,19 @@ def main() -> None:
     def on_graphs_toggle():
         graphs_controller.set_enabled(graphs_enabled_var.get())
     tk.Checkbutton(sim_controls, text="Graphs", variable=graphs_enabled_var, command=on_graphs_toggle).pack(side="left", padx=6)
+
+    # Time scale dropdown
+    time_scale_options = {"1 Day": 1, "1 Week": 7, "1 Month": 30}
+    time_scale_var = tk.StringVar(value="1 Day")
+    def on_time_scale_change(*_args):
+        nonlocal sim_speed
+        days = time_scale_options[time_scale_var.get()]
+        sim_speed = days
+        if sim_thread is not None and sim_thread.is_alive():
+            sim_thread.update_days_per_step(days)
+    time_scale_var.trace_add("write", on_time_scale_change)
+    tk.Label(sim_controls, text="Speed:").pack(side="left", padx=(12, 0))
+    tk.OptionMenu(sim_controls, time_scale_var, *time_scale_options.keys()).pack(side="left", padx=2)
 
     # Wind controls
     wind_arrows_var = tk.IntVar(value=int(settings.get("wind_arrows", default_settings["wind_arrows"])))
@@ -941,7 +956,7 @@ def main() -> None:
         canvas.itemconfig(img_id, image=tk_img)
         # Update status with simulation day (only if not paused)
         if use_sim_data and not sim_paused:
-            sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
+            sim_status_var.set(f"Day: {sim_state.day_of_year:.0f}")
         # Clear lat/lon when switching out of map
         if mode_var.get() != "map":
             latlon_var.set("")
@@ -968,7 +983,9 @@ def main() -> None:
         sim_paused = False
         sim_status_var.set("Running")
         # Diagnostics tracks total time; use it to display cycle count (years).
-        sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
+        year = int(diagnostics.total_days // 365.2422) + 1
+        month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+        sim_cycle_var.set(f"Y{year} M{month}")
         # If particle view is selected, start animation loop.
         nonlocal particle_anim_running
         if mode_var.get() == "map" and view_var.get() == "Wind Particles" and not particle_anim_running:
@@ -1107,9 +1124,11 @@ def main() -> None:
                     temp_components = None
 
                 # Update UI with new state
-                sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
+                year = int(diagnostics.total_days // 365.2422) + 1
+                month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+                sim_cycle_var.set(f"Y{year} M{month}")
                 if not sim_paused:
-                    sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
+                    sim_status_var.set(f"Day: {sim_state.day_of_year:.0f}")
 
                 # Update display
                 render()
