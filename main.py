@@ -378,17 +378,27 @@ def main() -> None:
         # Run for 365 days
         states, _ = simulate_multiple_steps(sim_state, total_days=365.0, step_days=1.0)
         
-        # Analyze final state
+        # Analyze final state snapshot.
         final_state = states[-1]
         stats = diagnostics.analyze_snapshot(final_state)
         diagnostics.print_report(stats)
+        # Wind speed and direction magnitudes vs Earth
+        diagnostics.print_wind_report(stats)
         # Circulation validation (surface 3-cell proxies)
         circ = diagnostics.analyze_circulation(stats)
         diagnostics.print_circulation_report(circ)
-        
-        messagebox.showinfo("Benchmark Complete", 
+        # Latitude band temperature/precip comparison
+        from diagnostics import compute_latitude_band_stats, print_latitude_band_report
+        band_stats = compute_latitude_band_stats(final_state)
+        print_latitude_band_report(band_stats)
+        # Sea ice extent vs Earth references
+        diagnostics.print_ice_report(stats)
+
+        cs = stats.get("circulation_score", 0.0)
+        messagebox.showinfo("Benchmark Complete",
             f"Global Mean Temp: {stats['global_mean_temp']:.1f} K\n"
-            f"Equator-Pole Gradient: {stats['gradient_north']:.1f} K\n"
+            f"Equator-Pole Gradient (N): {stats['gradient_north']:.1f} K  (Earth 45-60 K)\n"
+            f"Circulation Score: {cs:.2f}  (higher = more Earth-like)\n"
             "Check console for full report.")
         
         sim_status_var.set("Stopped")
@@ -747,9 +757,44 @@ def main() -> None:
     LOG.info("Startup profile (top 20):")
     stats.print_stats(20)
     tk_img = ImageTk.PhotoImage(img)
-    canvas = tk.Canvas(root, width=tex0.shape[1], height=tex0.shape[0], highlightthickness=0)
-    canvas.pack()
+    # Map area: canvas on the left, legend panel on the right (unused window space)
+    map_row = tk.Frame(root)
+    map_row.pack(side="top")
+    canvas = tk.Canvas(map_row, width=tex0.shape[1], height=tex0.shape[0], highlightthickness=0)
+    canvas.pack(side="left")
     img_id = canvas.create_image(0, 0, image=tk_img, anchor="nw")
+
+    # --- Biome legend panel ---
+    # Shown only when the Biomes map view is active; hidden otherwise.
+    from climate_averages import KOPPEN_NAMES as _KNAMES, KOPPEN_COLORS as _KCLR
+    _LEG_BG  = "#1e1e2e"
+    _LEG_FG  = "#d8d8f0"
+    _LEG_DIM = "#77779a"
+    legend_outer = tk.Frame(map_row, bg=_LEG_BG, padx=2, pady=2)
+    # Not packed here — _on_view_change shows/hides it based on current view.
+    tk.Label(legend_outer, text="Köppen Climate Zones",
+             bg=_LEG_BG, fg="white", font=("TkDefaultFont", 9, "bold"),
+             anchor="w").pack(fill="x", padx=6, pady=(6, 2))
+    tk.Frame(legend_outer, bg="#4a4a6a", height=1).pack(fill="x", padx=6, pady=(0, 4))
+    for _ci in range(1, 20):
+        _rgb_f = _KCLR[_ci]
+        _hex = "#{:02x}{:02x}{:02x}".format(
+            int(_rgb_f[0] * 255), int(_rgb_f[1] * 255), int(_rgb_f[2] * 255)
+        )
+        _full = _KNAMES.get(_ci, f"Type {_ci}")
+        _parts = _full.split(" - ", 1)
+        _code_str = _parts[0]
+        _desc = _parts[1] if len(_parts) > 1 else ""
+        _row = tk.Frame(legend_outer, bg=_LEG_BG)
+        _row.pack(fill="x", padx=6, pady=1)
+        tk.Canvas(_row, width=13, height=13, bg=_hex, highlightthickness=0).pack(
+            side="left", padx=(0, 5))
+        tk.Label(_row, text=f"{_code_str:<5}{_desc}", bg=_LEG_BG, fg=_LEG_FG,
+                 font=("Courier", 8), anchor="w").pack(side="left")
+    tk.Frame(legend_outer, bg="#4a4a6a", height=1).pack(fill="x", padx=6, pady=(4, 2))
+    tk.Label(legend_outer, text="Reclassified every 30 sim-days",
+             bg=_LEG_BG, fg=_LEG_DIM, font=("TkDefaultFont", 7),
+             anchor="w").pack(fill="x", padx=6, pady=(0, 6))
 
     def render():
         nonlocal tk_img, terrain_mode
@@ -1173,8 +1218,17 @@ def main() -> None:
             render()
 
     root.bind("<Key>", on_key)
-    mode_var.trace_add("write", lambda *_: render())
-    view_var.trace_add("write", lambda *_: render())
+
+    def _on_view_change(*_):
+        render()
+        # Show the legend only in Biomes map view; hide it everywhere else
+        if view_var.get() == "Biomes" and mode_var.get() == "map":
+            legend_outer.pack(side="left", anchor="nw", padx=(4, 4), pady=4)
+        else:
+            legend_outer.pack_forget()
+
+    mode_var.trace_add("write", _on_view_change)
+    view_var.trace_add("write", _on_view_change)
     def on_close():
         nonlocal sim_thread
         # Stop simulation thread if running
