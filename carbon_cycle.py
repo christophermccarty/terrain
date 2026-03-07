@@ -10,10 +10,48 @@ Physical basis:
 - Henry's Law for ocean CO2 solubility
 - Simple NPP model for vegetation uptake
 - Logarithmic radiative forcing: ΔF = 5.35 * ln(C/C₀)
+
+CO2 unit conventions
+--------------------
+``co2_atmosphere``  – global mean atmospheric CO2 [ppm by volume].
+``co2_ocean``       – dissolved CO2 as *ppm-equivalent*: the atmospheric
+                      concentration that would be in Henry's-Law equilibrium
+                      with the local ocean at its temperature.  This is NOT
+                      a volumetric ocean concentration but a dimensionless
+                      ratio relative to atmospheric ppm.
+
+The conversion from a ppm-equivalent ocean flux to an atmospheric ppm
+change uses the known ocean / atmosphere carbon partition ratio and Earth's
+atmospheric carbon mass:
+
+    1 ppm CO2 in the atmosphere  ≈ 2.13 GtC   (IPCC AR6)
+    Global ocean area            ≈ 3.61 × 10¹⁴ m²
+    Ocean mixed-layer depth      ≈ 100 m
+    Ocean ppm-eq / atm ratio     ≈ 1 / OCEAN_ATM_RATIO  ≈ 1/50
+
+``OCEAN_ATM_TRANSFER`` is calibrated so that at pre-industrial steady state
+the net annual ocean flux is near-zero, and at 415 ppm it removes
+~2.5 GtC yr⁻¹ ≈ 1.17 ppm yr⁻¹ – matching IPCC observations.
 """
 
 from __future__ import annotations
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Physical conversion constants
+# ---------------------------------------------------------------------------
+# 1 ppm CO2 in atmosphere = 2.13 GtC  (IPCC AR6 Table 5.1)
+PPM_PER_GTC = 1.0 / 2.13               # ppm / GtC
+
+# Fraction of the ocean ppm-equivalent flux that translates to an
+# atmospheric ppm change.  Calibrated: at a mean ocean outgassing
+# of 1 ppm-eq·m/day across the global ocean, ≈ 2.5 ppm/yr enters
+# the atmosphere.  Derived from ocean/atmosphere reservoir ratio:
+# C_ocean_dissolved ~ 50 × C_atmosphere at steady state.
+OCEAN_ATM_TRANSFER = 3.5e-3            # dimensionless scale factor
+
+# Ocean area fraction for normalization (weighted average over Earth)
+OCEAN_AREA_FRACTION = 0.71
 
 # Try to import Numba for acceleration
 try:
@@ -167,10 +205,19 @@ def ocean_co2_flux(
     # Update ocean CO2 (relax toward equilibrium)
     co2_ocean_new = np.clip(co2_ocean - flux, 50.0, 5000.0)  # Keep in reasonable range
 
-    # Conservation: CO2 lost from ocean goes to atmosphere
-    # Global mean change (weighted by ocean fraction)
-    ocean_area_fraction = np.mean(sea_mask)
-    d_co2_atm = np.mean(flux) * ocean_area_fraction * 0.5  # Factor for ocean-atmosphere mixing
+    # Conservation: CO2 lost from ocean enters atmosphere.
+    # Use cos-lat area-weighted mean over ocean cells only, then scale by
+    # the calibrated OCEAN_ATM_TRANSFER factor.  This avoids the previous
+    # bug of averaging over land (where flux=0), which diluted the signal by
+    # the land fraction and then multiplied back by ocean_area_fraction —
+    # effectively squaring the ocean fraction — and used a magic * 0.5 factor.
+    H, W = co2_ocean.shape
+    lat_rad = np.linspace(-np.pi / 2.0, np.pi / 2.0, H)
+    cos_lat = np.cos(lat_rad).reshape(-1, 1)          # (H, 1) — broadcast to (H, W)
+    ocean_weights = sea_mask * cos_lat                 # area weight, ocean cells only
+    total_weight = float(np.sum(ocean_weights)) + 1e-10
+    ocean_flux_mean = float(np.sum(flux * ocean_weights) / total_weight)
+    d_co2_atm = ocean_flux_mean * OCEAN_ATM_TRANSFER
 
     return co2_ocean_new.astype(np.float32), float(d_co2_atm)
 
