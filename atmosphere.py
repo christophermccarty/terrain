@@ -13,6 +13,7 @@ from __future__ import annotations
 from functools import lru_cache
 import numpy as np
 from temperature import temperature_kelvin_for_lat
+from planet_params import PlanetParams, EARTH
 
 # Numba JIT compilation for performance
 try:
@@ -463,6 +464,7 @@ def evolve_wind(
     baroclinic_mix: float = 0.0,
     cell_relax_days: float = 0.0,
     time_days: float | None = None,
+    planet_params: PlanetParams | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -479,23 +481,21 @@ def evolve_wind(
     """
     H, W = u.shape
     dt_total = dt_days * 86400.0  # seconds
+    pp = planet_params or EARTH
 
-    # TESTING: Increase sub-steps to stabilize explicit physics (PGF, Coriolis, friction)
-    # Even though semi-Lagrangian is unconditionally stable, explicit terms need smaller dt
-    R_earth = 6.371e6
     lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
     lat_2d = np.repeat(lat[:, None], W, axis=1)
-    dx = R_earth * (2 * np.pi / W) * np.cos(lat_2d)
-    dy = R_earth * (np.pi / H)
+    dx = pp.radius_m * (2 * np.pi / W) * np.cos(lat_2d)
+    dy = pp.radius_m * (np.pi / H)
 
-    # Increase to 24 sub-steps for maximum stability (eliminates tropical oscillations)
-    n_steps = 24  # Was 8, then 16, now 24 for stability
+    # With the rotation-matrix Coriolis (unconditionally stable), 24 sub-steps
+    # are no longer needed for stability.  8 sub-steps keep PGF and friction
+    # accurate while halving the per-day wind computation cost.
+    n_steps = 8
     dt_sub = dt_total / n_steps
 
-    # Grid parameters
-    # Coriolis parameter f = 2*Omega*sin(lat)
-    Omega = 7.2921e-5
-    f = 2.0 * Omega * np.sin(lat_2d)
+    # Coriolis parameter f = 2Ω sin(φ)  — uses planet_params.omega
+    f = pp.coriolis_parameter(lat_2d)  # (H, W) float32
     abs_lat_deg_2d = np.abs(np.rad2deg(lat_2d)).astype(np.float32)
     # Equatorial damping: in a single-layer model, PGF can over-accelerate winds where f≈0.
     # Boost drag within ~±12° to recover calmer doldrums and prevent equatorial jets.
@@ -520,19 +520,27 @@ def evolve_wind(
     else:
         p_anom = pressure
 
-    # TESTING: Disable planetary waves to check if they're causing daily direction changes
-    # These waves rotate every 6-14 days, causing pressure patterns to shift each day
-    # TODO: Either disable permanently or slow them down significantly (periods of 30-60 days)
-    if False and time_days is not None:  # Disabled for now
-        lon = np.linspace(-np.pi, np.pi, W, endpoint=False, dtype=np.float32)
+    # Synoptic-scale planetary waves: re-enabled with longer periods (20-45 days vs 6-14).
+    # Shorter periods (6-14 days) caused daily direction reversals; slower waves produce
+    # persistent, slowly-moving pressure cells that create emergent highs/lows without thrashing.
+    if time_days is not None:
+        lon_1d = np.linspace(-np.pi, np.pi, W, endpoint=False, dtype=np.float32)
         abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
-        storm_w = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32)  # (H,)
+        storm_w = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32)  # (H,) mid-lat window
         t = float(time_days)
         wave = np.zeros((H, W), dtype=np.float32)
-        # hPa-scale perturbations -> Pa
-        for k, per, ph, amp_hpa in ((3.0, 6.0, 0.3, 1.2), (5.0, 9.0, 1.1, 0.9), (7.0, 14.0, -0.7, 0.6)):
-            wave += (amp_hpa * 100.0) * np.cos(k * lon[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32)
+        # Wavenumbers 3-7, periods 20-45 days: slow Rossby-like propagation.
+        # Amplitudes reduced 40% from initial values (1.0/0.75/0.5 → 0.6/0.45/0.3 hPa)
+        # to avoid over-perturbing the pressure field when combined with the terrain term.
+        for k, per, ph, amp_hpa in ((3.0, 20.0, 0.3, 0.6), (5.0, 30.0, 1.1, 0.45), (7.0, 45.0, -0.7, 0.3)):
+            wave += (amp_hpa * 100.0) * np.cos(k * lon_1d[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32)
         p_anom = p_anom + storm_w[:, None] * wave
+
+    # NOTE: A constant land-sea pressure contrast was tried here but removed.
+    # Antarctica (~all land) got a permanent +150 Pa high, driving persistent cold-air
+    # outflow and triggering runaway SH sea-ice cooling (SH pole → 201 K).
+    # The land-sea contrast is already partially encoded in the temperature field T via
+    # land/ocean differential heating in simulate.py's _evolve_temperature.
         
     dp_dx = _ddx_periodic(p_anom) / (dx + 1e-3)
     # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
@@ -582,48 +590,47 @@ def evolve_wind(
         k_cell = 1.0 / (tau_cell * 86400.0)
     
     for _ in range(n_steps):
-        # Phase 4: Semi-Lagrangian advection (unconditionally stable)
+        # 1. Semi-Lagrangian advection (unconditionally stable)
         u_adv, v_adv = _advect_wind_semi_lagrangian(u_curr, v_curr, dt_sub, dx, dy)
 
-        # Phase 4 FIX: Evaluate physics terms at advected state for consistency
-        # Friction and Coriolis (use Numba kernels if available for speedup)
+        # 2. Coriolis — exact rotation matrix (operator splitting).
+        #    R(θ) = [cos θ,  sin θ; -sin θ, cos θ]   with θ = f · dt_sub
+        #    This is the exact solution to du/dt = f·v, dv/dt = -f·u and is
+        #    unconditionally stable for any dt, unlike the first-order Euler
+        #    tendency (du = f·v·dt) that required 24 sub-steps.
+        theta = f * dt_sub           # (H, W), radians of rotation per sub-step
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        u_rot = cos_t * u_adv + sin_t * v_adv
+        v_rot = -sin_t * u_adv + cos_t * v_adv
+
+        # 3. PGF + friction evaluated at the Coriolis-rotated state
         if NUMBA_AVAILABLE and elevation is not None:
-            # Fast path: Numba-accelerated kernels
-            # Evaluate at advected state (u_adv, v_adv) for consistency with semi-Lagrangian
             du_fric, dv_fric = _friction_kernel_numba(
-                u_adv, v_adv, elevation.astype(np.float32),
+                u_rot, v_rot, elevation.astype(np.float32),
                 float(drag_base), float(drag_elev_scale),
-                eq_window.astype(np.float32), 1.0  # dt=1.0, will multiply by dt_sub below
+                eq_window.astype(np.float32), 1.0
             )
-            du_cor, dv_cor = _coriolis_kernel_numba(
-                u_adv, v_adv, f.astype(np.float32), 1.0  # dt=1.0, will multiply by dt_sub below
-            )
-            # BUG FIX: Friction kernel now returns quadratic friction with dt included
-            # Don't multiply by |u| again or apply dt twice
-            # Friction uses dt=1.0 internally, so multiply by dt_sub
-            du = pgf_u * dt_sub + du_cor * dt_sub + du_fric * dt_sub
-            dv = pgf_v * dt_sub + dv_cor * dt_sub + dv_fric * dt_sub
+            du = (pgf_u + du_fric) * dt_sub
+            dv = (pgf_v + dv_fric) * dt_sub
         else:
-            # Fallback: original NumPy implementation
-            # Evaluate at advected state (u_adv, v_adv)
             drag = float(drag_base)
             if elevation is not None:
                 drag += float(drag_elev_scale) * elevation
             drag = drag + (2.0e-6 * eq_window)
-            friction_u = -drag * u_adv * np.abs(u_adv)
-            friction_v = -drag * v_adv * np.abs(v_adv)
-            du = (pgf_u + f * v_adv + friction_u) * dt_sub
-            dv = (pgf_v - f * u_adv + friction_v) * dt_sub
+            friction_u = -drag * u_rot * np.abs(u_rot)
+            friction_v = -drag * v_rot * np.abs(v_rot)
+            du = (pgf_u + friction_u) * dt_sub
+            dv = (pgf_v + friction_v) * dt_sub
 
-        # Mix toward baroclinic jet target (eddy momentum flux convergence proxy)
+        # 4. Baroclinic jet mixing
         if b_amp != 0.0 and b_mix > 0.0:
-            # relaxation rate (1/s)
             k = 1.0 / (b_mix * 86400.0)
-            u_zm = np.mean(u_adv, axis=1, keepdims=True)  # (H,1) - use advected state
+            u_zm = np.mean(u_rot, axis=1, keepdims=True)  # (H,1)
             du = du + (u_jet - u_zm) * k * dt_sub
 
-        u_curr = u_adv + du * damping
-        v_curr = v_adv + dv * damping
+        u_curr = u_rot + du * damping
+        v_curr = v_rot + dv * damping
 
         # Relax zonal-mean toward 3-cell surface targets (apply directly so it isn't
         # weakened by the global `damping` factor above).
@@ -633,12 +640,17 @@ def evolve_wind(
             v_zm = np.mean(v_curr, axis=1, keepdims=True)  # (H,1)
             # Pull u toward the target across all latitudes, with stronger forcing where needed
             u_t = np.clip(u_target, -15.0, 15.0).astype(np.float32)  # Allow stronger targets
-            # Disable tropical forcing to prevent oscillations - only mid-lat and polar
-            a_u_row = np.clip(a * (1.0 + 0.0 * w_trade[:, None] + 5.0 * w_mid[:, None] + 10.0 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
+            # Trade relaxation re-enabled (2×): without this, trades rely only on PGF which is
+            # weak in the tropics (small T gradient), leaving trades at ~0.7 m/s vs target -5 m/s.
+            # Mid-lat (5×) and polar (10×) remain unchanged.
+            a_u_row = np.clip(a * (1.0 + 2.0 * w_trade[:, None] + 5.0 * w_mid[:, None] + 10.0 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
             u_curr = u_curr + (u_t[:, None] - u_zm) * a_u_row
-            # Relax v more strongly in mid-lats, but keep it modest so bands can meander.
-            # (Ferrel surface flow is otherwise easily flipped by Coriolis coupling from strong u.)
-            a_v_row = np.clip(a * (3.0 + 90.0 * w_mid[:, None] + 150.0 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
+            # Relax v with differentiated mid-lat / polar strength.
+            # Mid-lat (6×): enough freedom for longitudinal variability in mid-lat eddies.
+            # Polar (25×): strong constraint prevents unrestricted poleward/equatorward
+            # surges that caused extreme SH cooling when v-relaxation was too loose (8×).
+            # With tau_cell=3d, a≈0.042: mid-lat → 29%, polar → 65% per sub-step.
+            a_v_row = np.clip(a * (1.0 + 6.0 * w_mid[:, None] + 25.0 * w_polar[:, None]), 0.0, 0.65).astype(np.float32)
             v_curr = v_curr + (v_target[:, None] - v_zm) * a_v_row
         
         # Soft clamp to prevent explosion
@@ -1277,6 +1289,16 @@ def generate_precipitation(
     ascent = ascent / (np.mean(ascent) + 1e-6)
     ascent = np.clip(ascent + 0.15 * _laplacian(ascent), 0.0, 3.0)
 
+    # Subsidence drying: suppresses precipitation in divergent (descending) regions.
+    # In the real atmosphere the Hadley cell's descending branch at ~25-35° drives
+    # subtropical high pressure → subsidence → compression warming → low RH → dry belt.
+    # Without this, divergent zones (horse latitudes) get as much rain as convergent zones.
+    div_pos = np.clip(div, 0.0, None)
+    subsidence_norm = div_pos / (np.mean(div_pos) + 1e-6)
+    subsidence_norm = np.clip(subsidence_norm, 0.0, 2.5)
+    # Reduce precipitation by up to ~65% in strong-subsidence regions.
+    subsidence_suppression = np.clip(1.0 - 0.26 * subsidence_norm, 0.35, 1.0).astype(np.float32)
+
     # Orographic uplift signal
     gx = _ddx_periodic(elev)
     gy = np.gradient(elev, axis=0)
@@ -1299,14 +1321,16 @@ def generate_precipitation(
     convective = np.clip(P_convective / 10.0, 0.0, 2.0)  # Scale to [0, 2] for blending
     convective = np.clip(convective + 0.1 * conv, 0.0, 2.0)
 
-    # Blend drivers into precipitation potential
+    # Blend drivers into precipitation potential, then apply subsidence drying.
+    # Subsidence_suppression reduces precip in divergent (descending) zones,
+    # creating the subtropical dry belt that the convergence-only scheme lacks.
     precip_potential = uplift_coeff * (
         0.40 * rh +
         0.20 * conv +
         0.20 * orog +
         0.15 * convective +
         0.15 * ascent
-    )
+    ) * subsidence_suppression
 
     if NUMBA_AVAILABLE:
         # Fast path: Numba-accelerated smoothing
