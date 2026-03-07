@@ -73,6 +73,7 @@ def calculate_ocean_heat_transport(
     exchange_inertia: float = 0.0,
     prev_T: np.ndarray | None = None,
     ice_cover: np.ndarray | None = None,
+    T_equilibrium: np.ndarray | None = None,
 ) -> np.ndarray:
     """Calculate ocean heat transport and return temperature adjustment.
     
@@ -107,7 +108,6 @@ def calculate_ocean_heat_transport(
     # Calculate latitude for each row
     lat_rows = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * 180.0  # degrees, -90 to +90
     abs_lat_rows = np.abs(lat_rows)
-    lat_rows_2d = lat_rows[:, np.newaxis]  # (Hc, 1) for broadcasting
     
     # Initialize temperature adjustment
     T_adjustment = np.zeros_like(T)
@@ -122,7 +122,13 @@ def calculate_ocean_heat_transport(
     # Avoid np.nanmean (which can warn on all-NaN rows) by doing explicit sum/count.
     ocean_count = np.sum(is_ocean, axis=1).astype(np.float32)  # (Hc,)
     ocean_sum = np.sum(T * is_ocean.astype(np.float32), axis=1)  # (Hc,)
-    global_mean = float(np.mean(T))
+    # Area-weighted global mean as neutral fallback for rows that have no ocean.
+    # On an equirectangular grid each row represents a different area ∝ cos(lat),
+    # so we must weight by cos(lat) to avoid over-representing polar rows.
+    cos_lat_1d = np.cos(np.deg2rad(lat_rows))                   # (Hc,)
+    lat_weight = cos_lat_1d[:, np.newaxis]                       # (Hc, 1) broadcast
+    total_area = float(np.sum(lat_weight))
+    global_mean = float(np.sum(T * lat_weight) / max(total_area, 1.0))
     with np.errstate(invalid='ignore', divide='ignore'):
         T_ocean_zonal = ocean_sum / np.maximum(ocean_count, 1.0)
     # Replace "no ocean in this latitude row" with a neutral fallback to prevent sharp jumps
@@ -139,20 +145,23 @@ def calculate_ocean_heat_transport(
     # Gaussian profile centered at 45° with width ~20°
     current_strength = np.exp(-((abs_lat_rows - 45.0) / 20.0)**2)  # (Hc,)
 
-    # Polar damping: real ocean currents weaken poleward of ~75°
-    # (limited basin connectivity under permanent ice cap)
-    # Transport must remain strong through 60-70° to deliver Gulf Stream / Kuroshio
-    # heat that prevents unrealistic mid-latitude ice formation
-    polar_damp = np.clip((75.0 - abs_lat_rows) / 15.0, 0.1, 1.0)  # 1.0 at <60°, 0.1 at >75°
+    # Polar damping: real ocean currents weaken at the highest latitudes,
+    # but the Antarctic Circumpolar Current remains strong through 65-70°.
+    # Extended full-transport zone to 65° (was 60°); minimum raised to 20% (was 10%).
+    # Previously: clip((75-lat)/15, 0.1, 1.0) → 3.5% effective transport at 70°S under ice.
+    # Now: clip((80-lat)/15, 0.2, 1.0) → at 70°S: 0.67 × 0.7 (ice 30%) = 47% — enough to warm.
+    polar_damp = np.clip((80.0 - abs_lat_rows) / 15.0, 0.2, 1.0)  # 1.0 at <65°, 0.2 at >80°
     current_strength = current_strength * polar_damp
 
-    # Ice partially blocks surface currents, but deep thermohaline circulation
-    # continues beneath ice. Limit damping to 50% to preserve sub-ice transport.
+    # Ice partially blocks surface currents, but the deep thermohaline circulation and
+    # Antarctic Circumpolar Current continue under ice. Reduced from 50% to 30% blocking.
+    # At 50%: combined with polar_damp this left ~3.5% transport at 70°S — too weak for
+    # seasonal melt. At 30%: ~47% transport reaches 70°S, allowing summer ice loss.
     if ice_cover is not None:
         ice_arr = np.clip(np.asarray(ice_cover, dtype=np.float32), 0.0, 1.0)
         ice_ocean = ice_arr * is_ocean.astype(np.float32)
         ice_zonal = np.sum(ice_ocean, axis=1) / np.maximum(ocean_count, 1.0)
-        current_strength = current_strength * (1.0 - 0.5 * ice_zonal)
+        current_strength = current_strength * (1.0 - 0.3 * ice_zonal)
 
     # Temperature gradient drives heat transport
     # Use finite difference to approximate meridional gradient
@@ -207,34 +216,28 @@ def calculate_ocean_heat_transport(
     # High latitudes: ocean warmer than air → heat release
     # Low latitudes: ocean cooler than air → heat absorption
     
-    # Equatorial reference temperature (warm baseline)
-    # Apply inertia by blending toward the previous ocean temperature.
-    if prev_T is not None and exchange_inertia > 0.0:
-        a = float(np.clip(exchange_inertia, 0.0, 1.0))
-        T_eff = (1.0 - a) * T + a * np.asarray(prev_T, dtype=np.float32)
-    else:
-        T_eff = T
-    T_equator = np.mean(T_eff[abs_lat_rows < 10.0, :])
-    
-    # Heat exchange scales with latitude (stronger at high latitudes)
-    # Reduce polar coupling to avoid excessive heat loss from ocean surface.
-    exchange_strength = (abs_lat_rows / 90.0) ** 1.5  # 0 at equator, 1 at poles
-    exchange_strength = float(exchange_strength_floor) + float(exchange_strength_span) * exchange_strength
-    exchange_coefficient = float(exchange_coefficient)  # K per day (weak coupling)
-    
-    # Ocean releases/absorbs heat based on temperature excess
-    # CRITICAL FIX: This term was adding excessive heat to poles (+3K/day), causing
-    # Antarctic to warm by +40°C in winter. Disabled temporarily - proper ocean
-    # heat transport is handled by the flux divergence term above.
-    # TODO: Reformulate this to properly model ocean-atmosphere coupling without
-    # creating unrealistic poleward heat transport.
-    T_excess = T_eff - T_equator
-    heat_exchange = np.zeros_like(T)  # DISABLED: was causing +3K/day warming at poles
-    # Old (broken) formula: heat_exchange = -exchange_coefficient * exchange_strength * T_excess * dt_days
-    heat_exchange = heat_exchange * is_ocean.astype(np.float32)
-    
-    # Add heat exchange to adjustment
-    T_adjustment = T_adjustment + heat_exchange
+    # Ocean-atmosphere exchange: restore T toward radiative equilibrium.
+    # The old approach used T_equator as the restoring target, which added an
+    # unconditional poleward flux and caused +3 K/day warming at poles.
+    # Now we accept T_equilibrium from simulate.py (the per-cell radiative
+    # equilibrium).  Rate 0.03 K/day → ~30-day ocean skin-layer timescale.
+    # If T_equilibrium is not provided the exchange remains zero (safe default).
+    if T_equilibrium is not None:
+        if prev_T is not None and exchange_inertia > 0.0:
+            a = float(np.clip(exchange_inertia, 0.0, 1.0))
+            T_eff = (1.0 - a) * T + a * np.asarray(prev_T, dtype=np.float32)
+        else:
+            T_eff = T
+        T_ref = np.asarray(T_equilibrium, dtype=np.float32)
+        exchange_rate = 0.03  # K/day
+        heat_exchange = -exchange_rate * (T_eff - T_ref) * dt_days
+        # Latitude factor: slightly stronger coupling at high latitudes where
+        # ocean-atmosphere temperature contrast drives the largest heat flux.
+        lat_factor = 0.5 + 0.5 * (abs_lat_rows / 90.0)
+        heat_exchange = heat_exchange * lat_factor[:, np.newaxis]
+        heat_exchange = np.clip(heat_exchange, -2.0, 2.0)   # ≤ 2 K/step
+        heat_exchange = heat_exchange * is_ocean.astype(np.float32)
+        T_adjustment = T_adjustment + heat_exchange
     
     # Final clamp on total ocean adjustment
     T_adjustment = np.clip(T_adjustment, -10.0, 10.0)  # Max ±10K total per day
@@ -358,11 +361,21 @@ def get_major_ocean_currents(
     u += u_gyre * 0.2  # Scale to ~0.2 m/s
     v += v_gyre * 0.1  # Scale to ~0.1 m/s
     
-    # Western boundary current intensification (Gulf Stream, Kuroshio)
-    # Strong poleward flow on western boundaries
-    western_boundary = np.exp(-((lon_grid + 90.0) / 30.0)**2)  # Peak at ~90°W
-    boundary_current = western_boundary * gyre_strength * 1.0  # Strong (1 m/s)
-    v += boundary_current * np.sign(lat_grid)
+    # Western boundary current intensification (Gulf Stream, Kuroshio).
+    # When elevation is available, derive WBC locations from topology: any
+    # mid-latitude ocean cell with land immediately to its west is a WBC site.
+    # This works for any planet or continent configuration.
+    # Falls back to a hardcoded Gaussian at 90°W (Earth Gulf-Stream only) when
+    # no elevation map is provided.
+    if elevation is not None:
+        is_ocean_e = _ocean_mask_from_elevation(elevation)
+        land_west_e = np.roll(~is_ocean_e, 1, axis=1)   # land one column to the west
+        midlat = (np.abs(lat_grid) >= 20.0) & (np.abs(lat_grid) <= 65.0)
+        wbc_mask = is_ocean_e & land_west_e & midlat
+        v += wbc_mask.astype(np.float32) * np.sign(lat_grid) * 1.0
+    else:
+        western_boundary = np.exp(-((lon_grid + 90.0) / 30.0)**2)  # Earth-specific fallback
+        v += western_boundary * gyre_strength * np.sign(lat_grid)
     
     # Equatorial currents (eastward near equator)
     equatorial_mask = np.exp(-(lat_grid / 10.0)**2)  # Gaussian at equator

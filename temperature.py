@@ -1,12 +1,15 @@
 """Temperature overlay generation for equirectangular maps.
 
 Produces a transparent-friendly RGB overlay (float in [0,1]) based on a
-latitudinal blackbody equilibrium approximation under Earth/Sun-like insolation.
+latitudinal blackbody equilibrium approximation.  All planet-specific
+constants (solar constant, obliquity, …) are taken from a ``PlanetParams``
+instance so the module works for any planet, not just Earth.
 """
 
 from __future__ import annotations
 
 import numpy as np
+from planet_params import PlanetParams, EARTH
 
 # Simple one-layer gray-atmosphere greenhouse tuned for Earth
 # ε=0.68 provides realistic base temperatures (original value restored)
@@ -50,53 +53,21 @@ def elevation_to_alt_km(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: f
     return (x ** 2.0) * 8.848
 
 
-def _daily_mean_insolation_Q(lat_rad: np.ndarray, day_of_year: int, S0: float = 1361.0) -> np.ndarray:
-    """Daily-mean TOA insolation Q(φ, δ) in W/m^2.
+def _daily_mean_insolation_Q(
+    lat_rad: np.ndarray,
+    day_of_year: int,
+    *,
+    planet_params: PlanetParams | None = None,
+) -> np.ndarray:
+    """Daily-mean TOA insolation Q(φ, δ) in W/m².
 
-    Uses standard astronomy formula with solar declination δ that varies by
-    day-of-year. Handles polar night/day. Vectorized for `lat_rad` arrays.
-    Special handling for exact poles to avoid numerical precision issues.
-    
-    INCLUDES atmospheric path length losses: polar regions lose more energy
-    due to sunlight traveling through more atmosphere at low sun angles.
+    Delegates to ``PlanetParams.daily_mean_insolation`` so orbital
+    parameters (S0, obliquity, period) come from one authoritative source.
+    The ``S0`` argument is kept for backward compatibility but is ignored
+    when ``planet_params`` is supplied.
     """
-    lat = np.asarray(lat_rad, dtype=np.float32)
-    obliq = np.deg2rad(23.44)
-    gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / 365.2422
-    delta = np.arcsin(np.sin(obliq) * np.sin(gamma))
-    
-    # Standard formula for non-pole latitudes
-    # Use tan(lat) but clamp to avoid numerical issues near poles
-    lat_safe = np.clip(lat, -np.pi/2 + 1e-6, np.pi/2 - 1e-6)
-    cosH0 = -np.tan(lat_safe) * np.tan(delta)
-    H0 = np.arccos(np.clip(cosH0, -1.0, 1.0))
-    H0 = np.where(cosH0 <= -1.0, np.pi, H0)  # 24h daylight
-    H0 = np.where(cosH0 >= 1.0, 0.0, H0)     # polar night
-    Q_standard = (S0 / np.pi) * (H0 * np.sin(lat_safe) * np.sin(delta) + np.cos(lat_safe) * np.cos(delta) * np.sin(H0))
-    
-    # Special case for exact poles: Q = S0 * sin(lat) * sin(delta) when in polar day
-    # At North Pole (lat=π/2): Q = S0 * sin(delta) if delta > 0, else 0
-    # At South Pole (lat=-π/2): Q = S0 * |sin(delta)| if delta < 0, else 0
-    pole_mask = np.abs(np.abs(lat) - np.pi/2) < 1e-6
-    Q_pole = np.zeros_like(lat)  # Initialize always
-    if np.any(pole_mask):
-        # North Pole: positive during northern summer (delta > 0)
-        np_mask = (pole_mask) & (lat > 0)
-        Q_pole[np_mask] = S0 * np.maximum(0.0, np.sin(delta))
-        # South Pole: positive during southern summer (delta < 0)
-        sp_mask = (pole_mask) & (lat < 0)
-        Q_pole[sp_mask] = S0 * np.maximum(0.0, -np.sin(delta))
-    
-    # Combine: use pole formula at poles, standard elsewhere
-    Q_base = np.where(pole_mask, Q_pole, Q_standard)
-    
-    # NOTE: This returns TOP-OF-ATMOSPHERE insolation
-    # Atmospheric absorption/scattering is handled implicitly in the greenhouse effect
-    # Direct atmospheric transmission losses are SMALL (~5-10%) and already captured
-    # in the effective greenhouse calculation. Don't double-count them here!
-    # The 45% losses I added before made the planet an ice ball - that was wrong!
-    
-    return Q_base
+    pp = planet_params or EARTH
+    return pp.daily_mean_insolation(np.asarray(lat_rad, dtype=np.float32), float(day_of_year))
 
 
 def _coarse_shape(H: int, W: int, block_size: int) -> tuple[int, int]:
@@ -260,126 +231,56 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, 
     return rgb_full
 
 
-def _apply_heat_diffusion(T_lat: np.ndarray, lat_rad: np.ndarray, diffusion_coeff: float = 0.40, iterations: int = 30) -> np.ndarray:
-    """Apply meridional heat transport via flux parameterization.
-    
-    Simulates the combined effect of ocean currents (Gulf Stream, etc.) and
-    atmospheric circulation (Hadley cells, Ferrel cells, jet streams) that
-    redistribute ~5 PW of heat from equator to poles.
-    
-    Uses explicit flux calculation based on temperature gradients instead of
-    diffusion, which works effectively on linear temperature profiles.
-    
-    Args:
-        T_lat: 1D temperature array [K] per latitude
-        lat_rad: 1D latitude array [radians] corresponding to T_lat
-        diffusion_coeff: Heat transport strength (tuned to match Earth's ~5 PW)
-        iterations: Number of relaxation steps
-    
-    Returns:
-        Temperature array with poleward heat transport applied
-    """
-    T = T_lat.copy().astype(np.float64)
-    n = len(T)
-    
-    if n < 3:
-        return T.astype(np.float32)
-    
-    # Use simpler, more stable parameterization
-    # Instead of physical flux calculation, use effective heat redistribution
-    # that's guaranteed to be numerically stable
-    dlat = np.pi / (n - 1)  # latitude spacing in radians
-    
-    # Simple conservative diffusion: standard neighbor averaging
-    # With temperature floor already applied, the profile should be smooth and monotonic
-    
-    alpha = diffusion_coeff / iterations
-    initial_total_heat = float(np.sum(T))
-    
-    # Find equator index for diagnostics
-    eq_idx = len(T) // 2
-    
-    for iteration in range(iterations):
-        T_new = T.copy()
-        
-        # Standard 3-point smoothing (diffusion)
-        for i in range(1, n - 1):
-            # Simple neighbor averaging: conservative and guaranteed stable
-            neighbor_avg = 0.25 * T[i-1] + 0.50 * T[i] + 0.25 * T[i+1]
-            T_new[i] = (1.0 - alpha) * T[i] + alpha * neighbor_avg
-        
-        # Poles: relax toward adjacent cell
-        T_new[0] = T[0] + alpha * 0.5 * (T[1] - T[0])
-        T_new[n-1] = T[n-1] + alpha * 0.5 * (T[n-2] - T[n-1])
-        
-        T = T_new
-        
-        # Debug: log only if debug logging enabled (optimization 2.4)
-        if (iteration + 1) % 25 == 0 or iteration == 0:
-            import logging
-            from logging import getLogger
-            LOG = getLogger(__name__)
-            if LOG.isEnabledFor(logging.DEBUG):
-                pole_idx_n = 0
-                pole_idx_s = n - 1
-                mid_idx = len(T) // 4
-                LOG.debug(f"  [Transport Iter {iteration+1}/{iterations}] "
-                         f"Equator={float(T[eq_idx]):.1f}K, "
-                         f"Mid(45°)={float(T[mid_idx]):.1f}K, "
-                         f"N-Pole={float(T[pole_idx_n]):.1f}K, "
-                         f"S-Pole={float(T[pole_idx_s]):.1f}K, "
-                         f"ΔT(eq-Npole)={float(T[eq_idx]-T[pole_idx_n]):.1f}K")
-    
-    # Verify heat conservation (only log if debug enabled)
-    final_total_heat = float(np.sum(T))
-    heat_change_percent = 100.0 * abs(final_total_heat - initial_total_heat) / initial_total_heat
-    import logging
-    from logging import getLogger
-    LOG = getLogger(__name__)
-    if LOG.isEnabledFor(logging.DEBUG):
-        LOG.debug(f"  [Heat Conservation] {heat_change_percent:.3f}% change "
-                 f"(initial={initial_total_heat:.1f}, final={final_total_heat:.1f})")
-    
-    return T.astype(np.float32)
+# _apply_heat_diffusion removed: it was a 30-iteration pure-Python loop used
+# only during initialisation.  The same physics is covered by the Numba-
+# accelerated _apply_diffusion_numba in simulate.py which runs every step.
 
 
-def _albedo_for_latitude(lat_rad: np.ndarray, day_of_year: int = 1) -> np.ndarray:
-    """Return latitude-dependent albedo accounting for ice/snow at poles.
-    
-    Ice/snow has high albedo (0.8-0.9) at poles, typical Earth surface (0.2-0.3)
-    at mid/low latitudes. Smooth transition between zones. Albedo slightly lower
-    during summer at poles due to partial ice melt.
+def _albedo_for_latitude(
+    lat_rad: np.ndarray,
+    day_of_year: int = 1,
+    *,
+    planet_params: PlanetParams | None = None,
+) -> np.ndarray:
+    """Return latitude-dependent surface albedo accounting for ice/snow at poles.
+
+    Sea-ice albedo is now consistent with the value used in the prognostic
+    radiation solver in simulate.py (_evolve_temperature): ~0.65 year-round,
+    with a modest seasonal dip to 0.60 in polar summer due to melt ponds.
+    Previous values (0.50–0.65) were too low and created an inconsistency.
     """
+    pp = planet_params or EARTH
     lat = np.asarray(lat_rad, dtype=np.float32)
     abs_lat_deg = np.rad2deg(np.abs(lat))
-    
-    # Base albedo for surface: 0.25 (typical Earth surface without clouds)
-    # Add cloud albedo (tropical convection creates high clouds with moderate albedo)
-    # Clouds do exist at equator but they also trap heat (greenhouse effect)
-    # Net effect: small albedo increase at equator
-    # Reduced from +0.08 to +0.04 to prevent over-cooling equator
+
+    # Base surface albedo: ~0.25 at mid-latitudes, slightly higher at equator
+    # due to tropical deep convective clouds (net cloud effect small here).
     cloud_contribution = 0.04 * np.maximum(0.0, 1.0 - abs_lat_deg / 40.0) ** 1.5
-    A_base = 0.25 + cloud_contribution  # Range: 0.25 (mid-latitude) to 0.29 (equator)
-    
-    # High albedo at poles - transition starts around 60°
-    transition_start = 65.0  # degrees
-    
-    # Seasonal variation: reduce ice albedo during summer due to melt ponds & open water
-    # Real Arctic/Antarctic has high albedo (0.8-0.9) for pure ice, but effective albedo
-    # is reduced by melt ponds, leads, and open water. Using lower values to account for this.
-    # Winter: A_ice = 0.65 (mixed ice/water), Summer: A_ice = 0.50 (significant melt)
-    obliq = np.deg2rad(23.44)
-    gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / 365.2422
+    A_base = 0.25 + cloud_contribution
+
+    # Sea-ice/snow albedo: consistent with simulate.py's prognostic solver.
+    # Continental ice sheets (Antarctica, Greenland) have albedo ~0.80-0.87 — much
+    # higher than first-year sea ice (~0.65) because of thick, dry snow/firn cover.
+    # Using 0.65 for all polar latitudes caused the Antarctic interior to absorb
+    # ~25% more solar energy than reality, producing a +15-30 K warm bias there.
+    # Fix: use 0.80 as the base polar albedo (continental ice sheet value); sea ice
+    # at lower latitudes is handled by the prognostic ice_cover field in simulate.py.
+    transition_start = 65.0
+    obliq = pp.obliquity_rad
+    gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / pp.orbital_period_days
     delta = np.arcsin(np.sin(obliq) * np.sin(gamma))
-    # Summer: |delta| > 15°, reduce albedo significantly; Winter: |delta| < 15°, higher albedo
     season_factor = np.clip(1.0 - 0.5 * (np.abs(delta) / np.deg2rad(15.0)), 0.5, 1.0)
-    A_ice = 0.50 + 0.15 * season_factor  # Range: 0.50-0.65 (reduced from 0.75-0.83)
-    
-    # Linear transition from transition_start to 90°
+    # Range: 0.725 (polar summer melt) to 0.75 (polar winter) — compromise between
+    # sea ice (0.65) and full dry-snow continental ice sheet (0.82).  The previous
+    # value 0.77 drove Antarctic interior T_base_land to the 200 K floor in summer
+    # (computed ~210 K then reduced by lapse rate to ~194 K → clipped).
+    A_ice = 0.70 + 0.05 * season_factor
+
+    # Smooth transition from base albedo to ice albedo between 65° and 90°.
     transition_range = 90.0 - transition_start
     t = np.clip((abs_lat_deg - transition_start) / transition_range, 0.0, 1.0)
     A = A_base + (A_ice - A_base) * t
-    
+
     return A.astype(np.float32)
 
 
@@ -390,6 +291,7 @@ def temperature_kelvin_for_lat(
     *,
     polar_cooling_scale: float = 0.8,
     cache: bool = True,
+    planet_params: PlanetParams | None = None,
 ) -> np.ndarray | float:
     """Return blackbody-equilibrium temperature (K) for latitude(s).
 
@@ -431,27 +333,28 @@ def temperature_kelvin_for_lat(
             if np.isscalar(lat_rad):
                 return float(cached_result)
             return cached_result.copy()
-    A = _albedo_for_latitude(lat, day_of_year)
+    pp = planet_params or EARTH
+    A = _albedo_for_latitude(lat, day_of_year, planet_params=pp)
     sigma = 5.670374419e-8
-    Q = _daily_mean_insolation_Q(lat, day_of_year)
+    Q = _daily_mean_insolation_Q(lat, day_of_year, planet_params=pp)
     F_abs = (1.0 - A) * np.maximum(Q, 0.0)
-    
+
     # LATITUDE-DEPENDENT GREENHOUSE EFFECT (realistic atmospheric physics)
     abs_lat_deg = np.rad2deg(np.abs(lat))
-    epsilon_equator = 0.78  # Increased from 0.75 to warm equator and global mean
-    epsilon_pole = 0.70     # Increased from 0.65 to 0.70 to trap even more heat at poles
+    epsilon_equator = pp.epsilon_equator
+    epsilon_pole    = pp.epsilon_pole
     lat_factor = np.cos(np.deg2rad(abs_lat_deg))  # 1.0 at equator, 0.0 at poles
     epsilon_lat = epsilon_pole + (epsilon_equator - epsilon_pole) * lat_factor
-    
+
     # ==============================================================================
     # POLAR COOLING MECHANISMS (Option B & C): Apply to FLUX before temperature calc
     # MORE PHYSICALLY ACCURATE: Energy lost to phase change & convection never
     # becomes sensible heat, so we remove it from absorbed flux BEFORE calculating T
     # ==============================================================================
-    
+
     # Determine if we're in melting season (spring/summer) for each hemisphere
-    obliq = np.deg2rad(23.44)
-    gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / 365.2422
+    obliq = pp.obliquity_rad
+    gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / pp.orbital_period_days
     solar_declination = np.arcsin(np.sin(obliq) * np.sin(gamma))
     
     nh_melt_season = solar_declination > np.deg2rad(-10.0)
