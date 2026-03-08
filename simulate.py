@@ -11,10 +11,22 @@ from typing import NamedTuple
 from pathlib import Path
 from datetime import datetime
 import pickle
-from atmosphere import generate_wind_field, generate_precipitation
+from atmosphere import (
+    generate_wind_field, generate_precipitation,
+    evolve_wind, _upsample_bilinear_many,
+)
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
 from ocean import calculate_ocean_heat_transport, update_sea_ice
-from carbon_cycle import carbon_cycle_step, co2_temperature_response, CO2_PREINDUSTRIAL
+from carbon_cycle import (
+    carbon_cycle_step, co2_temperature_response, CO2_PREINDUSTRIAL,
+    co2_radiative_forcing, vegetation_albedo,
+)
+from climate_averages import (
+    update_climate_averages, compute_stable_biomes,
+    update_monthly_statistics, classify_koppen, koppen_to_legacy_biome,
+)
+from masks import get_masks
+from planet_params import PlanetParams, EARTH
 
 # Numba JIT compilation for performance
 try:
@@ -44,10 +56,12 @@ _OCEAN_ADJ_CACHE: dict = {"adj": None, "last_update_day": -9999.0}
 # ============================================================================
 
 @jit(nopython=True, parallel=True, cache=True)
-def _advect_temperature_x_numba(T: np.ndarray, u_scale: np.ndarray,
-                                heat_coeff: float, days: float) -> np.ndarray:
+def _advect_temperature_x_numba(T: np.ndarray, u: np.ndarray,
+                                u_cfl: np.ndarray) -> np.ndarray:
     """Advect temperature in x-direction (periodic boundaries).
 
+    u_cfl is the pre-computed CFL number |u|*dt/dx, clipped to [0, 0.5].
+    Sign of u selects upwind direction.
     Returns updated temperature field.
     """
     H, W = T.shape
@@ -59,8 +73,8 @@ def _advect_temperature_x_numba(T: np.ndarray, u_scale: np.ndarray,
             j_east = (j + 1) % W
             j_west = (j - 1 + W) % W
 
-            # Upwind advection
-            if u_scale[i, j] >= 0:
+            # Upwind advection: u>0 means westward flow in grid coords
+            if u[i, j] >= 0:
                 T_x = T[i, j_west]
             else:
                 T_x = T[i, j_east]
@@ -72,17 +86,19 @@ def _advect_temperature_x_numba(T: np.ndarray, u_scale: np.ndarray,
             elif T_diff < -12.0:
                 T_diff = -12.0
 
-            # Apply advection
-            T_out[i, j] = T[i, j] + 0.4 * heat_coeff * u_scale[i, j] * T_diff * days
+            # Apply CFL-correct advection
+            T_out[i, j] = T[i, j] + u_cfl[i, j] * T_diff
 
     return T_out
 
 
 @jit(nopython=True, parallel=True, cache=True)
-def _advect_temperature_y_numba(T: np.ndarray, v_scale: np.ndarray,
-                                heat_coeff: float, days: float) -> np.ndarray:
+def _advect_temperature_y_numba(T: np.ndarray, v: np.ndarray,
+                                v_cfl: np.ndarray) -> np.ndarray:
     """Advect temperature in y-direction (edge boundaries).
 
+    v_cfl is the pre-computed CFL number |v|*dt/dy, clipped to [0, 0.5].
+    Sign of v selects upwind direction.
     Returns updated temperature field.
     """
     H, W = T.shape
@@ -91,7 +107,7 @@ def _advect_temperature_y_numba(T: np.ndarray, v_scale: np.ndarray,
     for i in prange(1, H-1):  # Skip poles (edges)
         for j in range(W):
             # Upwind advection
-            if v_scale[i, j] >= 0:
+            if v[i, j] >= 0:
                 T_y = T[i + 1, j]  # Southward (positive v)
             else:
                 T_y = T[i - 1, j]  # Northward (negative v)
@@ -103,8 +119,8 @@ def _advect_temperature_y_numba(T: np.ndarray, v_scale: np.ndarray,
             elif T_diff < -12.0:
                 T_diff = -12.0
 
-            # Apply advection
-            T_out[i, j] = T[i, j] + 0.4 * heat_coeff * v_scale[i, j] * T_diff * days
+            # Apply CFL-correct advection
+            T_out[i, j] = T[i, j] + v_cfl[i, j] * T_diff
 
     return T_out
 
@@ -216,14 +232,14 @@ def simulate_step(
     ocean_exchange_span: float = 0.35,
     ocean_exchange_coeff: float = 0.08,
     ocean_exchange_inertia: float = 0.35,
-    epsilon_equator: float = 0.72,
-    epsilon_pole: float = 0.50,
+    epsilon_equator: float | None = None,
+    epsilon_pole: float | None = None,
     polar_cooling_scale: float = 0.3,  # Reduced from 0.6 to allow more polar warming
-    ice_freeze_temp: float = 271.0,   # Sea water freezes at ~271.3K (-1.85°C); raised from 269.5K
-    ice_melt_temp: float = 271.5,    # Sea ice melts at ~271.3-272K; was 273.35K (fresh-water biased)
-    ice_freeze_rate: float = 0.06,
-    ice_melt_rate: float = 0.16,
-    ice_albedo_strength: float = 0.50,  # Reduced from 0.6: weakens bi-stable ice-albedo runaway; eff albedo=0.33
+    ice_freeze_temp: float = 269.9,  # Require colder water before new sea ice forms
+    ice_melt_temp: float = 271.4,    # Preserve some hysteresis without locking in subpolar ice
+    ice_freeze_rate: float = 0.045,
+    ice_melt_rate: float = 0.19,
+    ice_albedo_strength: float = 0.30,  # Reduced from 0.50: weakens ice-albedo runaway; eff full-ice albedo=0.22
     heat_transport_coeff: float = 0.8,
     thermal_diffusion: float = 0.04,
     latent_cooling_coeff: float = 0.015,
@@ -231,6 +247,7 @@ def simulate_step(
     co2_climate_feedback: float = 0.8,
     debug_log: bool = False,
     track_components: bool = False,
+    planet_params: PlanetParams | None = None,
 ) -> tuple[PlanetState, dict]:
     """Advance planet state forward by `days`.
 
@@ -256,7 +273,10 @@ def simulate_step(
     Returns:
         New state with updated day_of_year and atmospheric fields
     """
-    new_day = (state.day_of_year + days) % 365.2422
+    pp = planet_params if planet_params is not None else EARTH
+    eps_eq = float(pp.epsilon_equator if epsilon_equator is None else epsilon_equator)
+    eps_pole = float(pp.epsilon_pole if epsilon_pole is None else epsilon_pole)
+    new_day = (state.day_of_year + days) % pp.orbital_period_days
     new_total_days = float(state.total_days) + float(days)
     H, W = state.elevation.shape
     Hc, Wc = (max(1, (H + block_size - 1) // block_size),
@@ -271,10 +291,6 @@ def simulate_step(
     # Update 10-year rolling climate averages for general smoothing
     # Update monthly statistics for Köppen seasonality detection
     # Reclassify Köppen climate zones every 30 days
-    from climate_averages import (
-        update_climate_averages, compute_stable_biomes,
-        update_monthly_statistics, classify_koppen, koppen_to_legacy_biome
-    )
 
     # Update climate averages (exponential moving average)
     temp_avg, precip_avg, sample_days = update_climate_averages(
@@ -299,7 +315,7 @@ def simulate_step(
     if monthly_temp is not None and monthly_precip is not None:
         if days_since_biome_update >= BIOME_UPDATE_INTERVAL or state.koppen_type is None:
             # Time to update Köppen classification
-            land_mask_for_biomes = (state.elevation > 0.02).astype(np.float32)
+            _, land_mask_for_biomes = get_masks(state.elevation)
             koppen_new = classify_koppen(
                 monthly_temp, monthly_precip, land_mask_for_biomes,
                 elevation=state.elevation
@@ -329,7 +345,6 @@ def simulate_step(
     # The forcing represents the equilibrium temperature offset that the simulation should relax toward.
     co2_temp_offset = 0.0
     if enable_carbon_cycle:
-        from carbon_cycle import co2_radiative_forcing, co2_temperature_response
         co2_forcing = co2_radiative_forcing(state.co2_atmosphere, CO2_PREINDUSTRIAL)
         co2_temp_offset = co2_temperature_response(co2_forcing, co2_climate_feedback)
         if debug_log:
@@ -345,6 +360,7 @@ def simulate_step(
         lat,
         day_of_year=int(new_day),
         polar_cooling_scale=polar_cooling_scale,
+        planet_params=pp,
     )
     T_base_land = np.repeat(T_lat_land[:, None], Wc, axis=1).astype(np.float32) + co2_temp_offset
     # Land summer temperature cap: temperature_kelvin_for_lat gives radiative equilibrium,
@@ -352,10 +368,10 @@ def simulate_step(
     # capacity, and turbulent exchange all limit summer temperatures.
     # At 55-65°N the formula returns ~305 K (32°C) in summer — unrealistically hot —
     # pulling the simulation 12-13°C above Earth via the land_blend.
-    # Cap: 303 K (30°C) at the equator, tapering linearly to 288 K (15°C) at 60°+.
+    # Cap: 301 K (~28°C) at the equator, tapering linearly to 286 K (13°C) at 60°+.
     # This matches observed mid-latitude summer maxima for mean daily temperatures.
     _abs_lat_deg_land = np.abs(np.rad2deg(lat))  # (Hc,)
-    _land_cap_1d = 303.0 - 15.0 * np.clip(_abs_lat_deg_land / 60.0, 0.0, 1.0)
+    _land_cap_1d = 301.0 - 15.0 * np.clip(_abs_lat_deg_land / 60.0, 0.0, 1.0)
     # Atmospheric meridional heat transport warms high-latitude land.
     # The Ferrel cell and synoptic eddies carry ~60% of the ocean transport value
     # poleward even over the Antarctic continent.  Without this, Antarctic winter
@@ -364,7 +380,7 @@ def simulate_step(
     # at the pole lifts the winter minimum to ~210 K and the annual mean to ~220-226 K.
     # Symmetric for both poles (no AMOC; that term is ocean-only and applied separately).
     _atm_land_transport_1d = (
-        0.60 * 40.0 * np.clip((_abs_lat_deg_land - 40.0) / 30.0, 0.0, 1.0) ** 1.5
+        0.42 * 34.0 * np.clip((_abs_lat_deg_land - 42.0) / 28.0, 0.0, 1.0) ** 1.5
     )
     T_base_land = T_base_land + _atm_land_transport_1d[:, None].astype(np.float32)
     # Re-apply summer cap: atmospheric transport can only raise winter/polar-night
@@ -372,12 +388,13 @@ def simulate_step(
     T_base_land = np.minimum(T_base_land, _land_cap_1d[:, None].astype(np.float32))
 
     # Calculate temperature for lagged day (ocean response with 1.5 month delay)
-    lag_days = 50.0  # ~1.5 months thermal lag for deep ocean mixed layer
-    lagged_day = (new_day - lag_days) % 365.2422
+    lag_days = 50.0 * (float(pp.orbital_period_days) / 365.2422)  # scale thermal lag with year length
+    lagged_day = (new_day - lag_days) % float(pp.orbital_period_days)
     T_lat_ocean_lagged = temperature_kelvin_for_lat(
         lat,
         day_of_year=int(lagged_day),
         polar_cooling_scale=polar_cooling_scale,
+        planet_params=pp,
     )
 
     # CRITICAL: Two corrections to ocean base temperature:
@@ -395,8 +412,9 @@ def simulate_step(
 
     T_lat_annual_mean = temperature_kelvin_for_lat(
         lat,
-        day_of_year=80,  # Spring equinox ≈ annual mean insolation
+        day_of_year=(80.0 / 365.2422) * float(pp.orbital_period_days),  # Earth-relative spring equinox proxy
         polar_cooling_scale=polar_cooling_scale,
+        planet_params=pp,
     )
 
     # Meridional heat transport warming: concentrated at high latitudes
@@ -421,15 +439,25 @@ def simulate_step(
     # SH transport raised from 50% to 65% of base: the Southern Ocean needs more warmth
     # to avoid its own cold runaway, while still remaining cooler than AMOC-warmed NH.
     lat_deg_1d = np.abs(np.rad2deg(lat))
-    _transport_base = 40.0 * np.clip((lat_deg_1d - 40.0) / 30.0, 0.0, 1.0) ** 1.5
-    _amoc_bonus = np.where(lat > 0, 18.0 * np.clip((lat_deg_1d - 40.0) / 25.0, 0.0, 1.0), 0.0)  # start 50->40N
-    _sh_factor = np.where(lat > 0, 1.0, 0.70)   # SH gets 70% of base transport (no AMOC; was 0.65)
+    _transport_base = 34.0 * np.clip((lat_deg_1d - 42.0) / 28.0, 0.0, 1.0) ** 1.5
+    # AMOC bonus: 18K ramp 40-65°N (unchanged) + extra 10K ramp 65-85°N only.
+    # 65°N is already well-calibrated (-2°C vs Earth -2°C), so we only add warmth
+    # above 65°N where the NH ice runaway causes an 8-10 K cold bias.
+    _amoc_bonus = np.where(
+        lat > 0,
+        16.0 * np.clip((lat_deg_1d - 42.0) / 23.0, 0.0, 1.0)
+        + 6.0 * np.clip((lat_deg_1d - 68.0) / 16.0, 0.0, 1.0),
+        0.0,
+    )  # NH only; at 85°N total = 28K
+    _sh_factor = np.where(lat > 0, 1.0, 0.58)   # SH gets weaker baseline transport than NH (no AMOC)
     transport_warming = _transport_base * _sh_factor + _amoc_bonus
 
     # Seasonal fraction: what fraction of the radiative swing the ocean actually feels
     # Based on ΔT/ΔT_rad ≈ 1/sqrt(1 + (2π τ/P)²) where τ ~ 1-3 years, P = 1 year
     # Equator (τ~0.7yr): ~24%, Mid-lat (τ~1.5yr): ~10%, Polar (τ~3yr): ~5%
-    ocean_seasonal_frac = 0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_1d))
+    obliq_factor = np.clip(float(pp.obliquity_deg) / 23.44, 0.6, 2.0) ** 0.5
+    ocean_seasonal_frac = (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_1d))) * obliq_factor
+    ocean_seasonal_frac = np.clip(ocean_seasonal_frac, 0.03, 0.45)
 
     # Final ocean base: annual mean + transport warming + small seasonal oscillation
     T_lat_ocean = (T_lat_annual_mean + transport_warming
@@ -443,18 +471,26 @@ def simulate_step(
         lat_full,
         day_of_year=int(lagged_day),
         polar_cooling_scale=polar_cooling_scale,
+        planet_params=pp,
     )
     T_lat_annual_mean_full = temperature_kelvin_for_lat(
         lat_full,
-        day_of_year=80,
+        day_of_year=(80.0 / 365.2422) * float(pp.orbital_period_days),
         polar_cooling_scale=polar_cooling_scale,
+        planet_params=pp,
     )
     lat_deg_full = np.abs(np.rad2deg(lat_full))
-    _transport_base_full = 40.0 * np.clip((lat_deg_full - 40.0) / 30.0, 0.0, 1.0) ** 1.5
-    _amoc_bonus_full = np.where(lat_full > 0, 18.0 * np.clip((lat_deg_full - 40.0) / 25.0, 0.0, 1.0), 0.0)  # start 50->40N
-    _sh_factor_full = np.where(lat_full > 0, 1.0, 0.70)
+    _transport_base_full = 34.0 * np.clip((lat_deg_full - 42.0) / 28.0, 0.0, 1.0) ** 1.5
+    _amoc_bonus_full = np.where(
+        lat_full > 0,
+        16.0 * np.clip((lat_deg_full - 42.0) / 23.0, 0.0, 1.0)
+        + 6.0 * np.clip((lat_deg_full - 68.0) / 16.0, 0.0, 1.0),
+        0.0,
+    )
+    _sh_factor_full = np.where(lat_full > 0, 1.0, 0.58)
     transport_warming_full = _transport_base_full * _sh_factor_full + _amoc_bonus_full
-    ocean_seasonal_frac_full = 0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_full))
+    ocean_seasonal_frac_full = (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_full))) * obliq_factor
+    ocean_seasonal_frac_full = np.clip(ocean_seasonal_frac_full, 0.03, 0.45)
     T_lat_ocean_full = (T_lat_annual_mean_full + transport_warming_full
                         + ocean_seasonal_frac_full * (T_lat_ocean_full_lagged - T_lat_annual_mean_full))
     T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32) + co2_temp_offset
@@ -497,7 +533,6 @@ def simulate_step(
         
     # Evolve wind at `wind_block_size` resolution (can differ from temperature/precip `block_size`)
     # Then upsample to full resolution for precipitation
-    from atmosphere import evolve_wind
     # Cached diagnostic wind for relaxation (once per day/shape/params).
     def _diag_wind_cached(h: int, w: int, temp_field: np.ndarray, elev_field: np.ndarray):
         key = (
@@ -508,6 +543,10 @@ def simulate_step(
             float(wind_target_zonal_pressure),
             float(wind_target_terrain_pressure_amp),
             float(wind_target_terrain_flow_amp),
+            round(float(pp.solar_constant), 4),
+            round(float(pp.obliquity_deg), 4),
+            round(float(pp.sidereal_day_hours), 4),
+            round(float(pp.radius_m), 1),
         )
         cache = _RELAX_CACHE
         if cache["key"] == key and cache["u"] is not None and cache["v"] is not None:
@@ -524,6 +563,7 @@ def simulate_step(
             terrain_pressure_amp=float(wind_target_terrain_pressure_amp),
             terrain_flow_amp=float(wind_target_terrain_flow_amp),
             time_days=new_total_days,
+            planet_params=pp,
         )
         cache.update({"key": key, "u": u_diag, "v": v_diag})
         return u_diag, v_diag
@@ -548,6 +588,7 @@ def simulate_step(
                 lat_w,
                 day_of_year=int(lagged_day),
                 polar_cooling_scale=polar_cooling_scale,
+                planet_params=pp,
             )
             T_for_wind = np.repeat(T_lat_ocean_w[:, None], Wcw, axis=1).astype(np.float32)
 
@@ -568,6 +609,7 @@ def simulate_step(
             baroclinic_mix=float(wind_baroclinic_mix),
             cell_relax_days=float(wind_cell_relax_days),
             time_days=float(new_total_days),
+            planet_params=pp,
         )
 
         # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
@@ -579,7 +621,6 @@ def simulate_step(
             v_coarse_evol = (1.0 - a) * v_coarse_evol + a * v_diag
         
         # Upsample back to full resolution using bilinear interpolation
-        from atmosphere import _upsample_bilinear_many
         uv = _upsample_bilinear_many({"u": u_coarse_evol, "v": v_coarse_evol}, H, W, wind_bs)
         u_full, v_full = uv["u"], uv["v"]
     else:
@@ -591,7 +632,6 @@ def simulate_step(
         T_wind_full = state.temperature if state.temperature is not None else T_base_ocean_full
         elev_wind_full = state.elevation
         if wind_bs < block_size and block_size > 1:
-            from atmosphere import _upsample_bilinear_many
             to_up = {}
             to_up["T"] = T_prev_coarse if state.temperature is not None else T_base
             if elev_c is not None:
@@ -617,6 +657,7 @@ def simulate_step(
             baroclinic_mix=float(wind_baroclinic_mix),
             cell_relax_days=float(wind_cell_relax_days),
             time_days=float(new_total_days),
+            planet_params=pp,
         )
         if wind_relax > 0.0:
             T_for_wind = T_wind_full
@@ -686,8 +727,8 @@ def simulate_step(
         ocean_exchange_span=ocean_exchange_span,
         ocean_exchange_coeff=ocean_exchange_coeff,
         ocean_exchange_inertia=ocean_exchange_inertia,
-        epsilon_equator=epsilon_equator,
-        epsilon_pole=epsilon_pole,
+        epsilon_equator=eps_eq,
+        epsilon_pole=eps_pole,
         ice_albedo_strength=ice_albedo_strength,
         humidity=humidity_coarse,
         track_components=track_components,  # Track components for diagnostics
@@ -695,6 +736,8 @@ def simulate_step(
         vegetation_biomass=biomass_coarse,   # For vegetation albedo (Phase 4)
         biome=biome_coarse,  # Phase 1: Stable biomes for albedo
         koppen_type=koppen_coarse,  # Köppen classification for detailed albedo
+        planet_params=pp,
+        elev_c=elev_c,  # Pre-computed coarse elevation
     )
     
     # Upsample components to full resolution if needed
@@ -702,7 +745,6 @@ def simulate_step(
         temp_components_full = {}
         to_up = {k: v for k, v in temp_components.items() if isinstance(v, np.ndarray) and v.shape == (Hc, Wc)}
         if to_up:
-            from atmosphere import _upsample_bilinear_many
             up = _upsample_bilinear_many(to_up, H, W, block_size)
             temp_components_full.update(up)
         for name, field in temp_components.items():
@@ -712,7 +754,6 @@ def simulate_step(
         temp_components = temp_components_full
     
     if block_size > 1:
-        from atmosphere import _upsample_bilinear_many
         up = _upsample_bilinear_many({"T": T_coarse, "cloud": cloud_c}, H, W, block_size)
         T_full, cloud_full = up["T"], up["cloud"]
     else:
@@ -757,7 +798,7 @@ def simulate_step(
         # L_f=334 kJ/kg, rho_ice=917 kg/m³, ~1m effective thickness, ~100m mixed layer
         # gives ~3K per unit ice fraction change
         latent_scale = 3.0  # K per unit ice fraction change
-        is_ocean_full = state.elevation <= float(np.median(state.elevation))
+        is_ocean_full, _ = get_masks(state.elevation)
         T_full = T_full + delta_ice * latent_scale * is_ocean_full.astype(np.float32)
     else:
         ice_full = None
@@ -959,6 +1000,8 @@ def _evolve_temperature(
     vegetation_biomass: np.ndarray | None = None,
     biome: np.ndarray | None = None,  # Phase 1: Stable biome classification
     koppen_type: np.ndarray | None = None,  # Köppen climate classification
+    planet_params: PlanetParams | None = None,
+    elev_c: np.ndarray | None = None,  # Pre-computed coarse elevation (avoids recomputation)
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -974,59 +1017,68 @@ def _evolve_temperature(
     assert T_prev.shape == (Hc, Wc)
     
     # 1. Prepare Surface Properties
-    # Downsample elevation
-    elev_pad = np.pad(elevation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-    elev_c = elev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    elev_median = float(np.median(elev_c))
-    
-    # Land/Sea Masks
-    sea_mask = elev_c <= elev_median
-    land_mask = ~sea_mask
+    # Downsample elevation (skip if caller already provides coarse elev)
+    if elev_c is None:
+        elev_pad = np.pad(elevation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        elev_c = elev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+    # Land/Sea Masks — elev_c is a transient coarse array; skip cache to avoid stale hits
+    sea_mask, land_mask = get_masks(elev_c, use_cache=False)
     land_fraction = land_mask.astype(np.float32) # Simplified for now
     
     # 2. Wind Field (Prognostic or Diagnostic)
     if wind_u is None or wind_v is None:
-        u, v = generate_wind_field(Hc, Wc, day_of_year=day_of_year, block_size=1, elevation=elev_c)
+        u, v = generate_wind_field(
+            Hc,
+            Wc,
+            day_of_year=day_of_year,
+            block_size=1,
+            elevation=elev_c,
+            planet_params=_pp,
+        )
     else:
         u, v = wind_u, wind_v
         
-    dt = days * 86400.0
-    
+    dt_sec = days * 86400.0
+
     # 3. Thermodynamic Energy Balance
     # dT/dt = Advection + Radiation + Phase Change + Diffusion
-    
+
     T = T_prev.copy()
-    
+
     # --- Advection (Wind Transport) ---
-    # Use Numba-accelerated kernels if available for significant speedup
-    u_ref = 15.0
-    u_scale = np.clip(np.abs(u) / u_ref, 0, 1.0).astype(np.float32)
-    v_scale = np.clip(np.abs(v) / u_ref, 0, 1.0).astype(np.float32)
+    # CFL-correct upwind advection: c = |u| * dt / dx, capped at 0.5 for stability.
+    # dx varies with latitude (spherical geometry): dx = 2π R cos(φ) / Wc
+    # dy is uniform: dy = π R / Hc
+    _pp = planet_params if planet_params is not None else EARTH
+    lat_1d = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
+    cos_lat = np.cos(lat_1d).clip(0.05, 1.0)  # avoid dx→0 at poles
+    dx_lat = (2.0 * np.pi * _pp.radius_m * cos_lat / Wc).astype(np.float32)  # (Hc,)
+    dy = float(np.pi * _pp.radius_m / Hc)
+
+    dx_2d = dx_lat[:, None]  # broadcast to (Hc, Wc)
+    u_cfl = np.clip(np.abs(u) * dt_sec / dx_2d, 0.0, 0.5).astype(np.float32)
+    v_cfl = np.clip(np.abs(v) * dt_sec / dy, 0.0, 0.5).astype(np.float32)
 
     # Only copy when component tracking is active — avoids one full-array allocation per step.
     T_before_advection = T.copy() if track_components else None
 
     if NUMBA_AVAILABLE:
-        # Fast path: Numba-accelerated advection
-        T = _advect_temperature_x_numba(T.astype(np.float32), u_scale,
-                                       float(heat_transport_coeff), float(days))
-        T = _advect_temperature_y_numba(T.astype(np.float32), v_scale,
-                                       float(heat_transport_coeff), float(days))
+        # Fast path: Numba-accelerated CFL-correct advection
+        T = _advect_temperature_x_numba(T.astype(np.float32), u.astype(np.float32), u_cfl)
+        T = _advect_temperature_y_numba(T.astype(np.float32), v.astype(np.float32), v_cfl)
     else:
-        # Fallback: original NumPy implementation
-        # Zonal - with stability check to prevent extreme gradients
+        # Fallback: NumPy upwind implementation
         T_east = np.roll(T, -1, axis=1)
         T_west = np.roll(T, 1, axis=1)
         T_x = np.where(u >= 0, T_west, T_east)
         T_diff_x = np.clip(T_x - T, -12.0, 12.0)
-        T = T + 0.4 * heat_transport_coeff * u_scale * T_diff_x * days
+        T = T + u_cfl * T_diff_x
 
-        # Meridional - with stability check
         T_north = np.roll(T, -1, axis=0)
         T_south = np.roll(T, 1, axis=0)
         T_y = np.where(v >= 0, T_south, T_north)
         T_diff_y = np.clip(T_y - T, -12.0, 12.0)
-        T = T + 0.4 * heat_transport_coeff * v_scale * T_diff_y * days
+        T = T + v_cfl * T_diff_y
 
     # --- Diffusion (Mixing) ---
     T_before_diffusion = T.copy() if track_components else None
@@ -1101,7 +1153,6 @@ def _evolve_temperature(
     # Phase 1 improvement: Use stable biomes from long-term climate averages (not daily weather)
     # Köppen classification provides more detailed albedo values
     if vegetation_biomass is not None and biome is not None:
-        from carbon_cycle import vegetation_albedo
         albedo_veg = vegetation_albedo(biome, base_land_albedo=0.2, koppen_type=koppen_type)
         # Use vegetation albedo for land, ocean base albedo for sea
         albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.65 * sea_ice, albedo_veg)
@@ -1117,22 +1168,23 @@ def _evolve_temperature(
     albedo_total = albedo_sfc * (1 - cloud_fraction) + 0.5 * cloud_fraction
     
     # Insolation Q (Daily mean) - use proper astronomical calculation
-    # Use Earth's obliquity (23.44°) not 0.4 radians
-    obliq = np.deg2rad(23.44)
-    gamma = 2.0 * np.pi * (day_of_year - 80.0) / 365.2422
+    _pp = planet_params if planet_params is not None else EARTH
+    obliq = _pp.obliquity_rad
+    gamma = 2.0 * np.pi * (day_of_year - 80.0) / _pp.orbital_period_days
     decl = np.arcsin(np.sin(obliq) * np.sin(gamma))
-    
+    S0 = _pp.effective_solar_constant(day_of_year)
+
     # Clamp to avoid domain errors in polar regions
     lat_safe = np.clip(lat_2d, -np.pi/2 + 1e-6, np.pi/2 - 1e-6)
     cos_h = np.clip(-np.tan(lat_safe) * np.tan(decl), -1.0, 1.0)
     h = np.arccos(cos_h) # hour angle radians (0 to pi)
     h = np.where(cos_h <= -1.0, np.pi, h)  # 24h daylight
     h = np.where(cos_h >= 1.0, 0.0, h)     # polar night
-    
-    Q = 1361.0 * (1.0/np.pi) * (h * np.sin(lat_safe)*np.sin(decl) + np.cos(lat_safe)*np.cos(decl)*np.sin(h))
+
+    Q = S0 * (1.0/np.pi) * (h * np.sin(lat_safe)*np.sin(decl) + np.cos(lat_safe)*np.cos(decl)*np.sin(h))
     Q = np.maximum(0.0, Q)
     
-    S_absorbed = Q * (1.0 - albedo_total)
+    S_absorbed = np.maximum(0.0, Q * (1.0 - albedo_total) + _pp.aerosol_forcing_w_m2)
     
     # Outgoing Longwave (L_out) = sigma * T^4 * epsilon
     # Greenhouse effect reduces OLR - use latitude-dependent epsilon (like temperature.py)
@@ -1171,9 +1223,9 @@ def _evolve_temperature(
     # CRITICAL FIX: Blend radiation equilibrium with base temperature
     # T_base comes from temperature_kelvin_for_lat which has proper polar cooling physics
     # We should trust it more, especially at poles where radiation-only calculation fails
-    # Use weighted blend: 95% base (which has proper physics) + 5% radiation-only
-    # Increased from 90/10 to 95/5 to better preserve correct base temperatures and warm global mean
-    T_eq = 0.95 * T_base + 0.05 * T_eq_rad
+    # Use a mostly base-driven blend, but let radiation pull more strongly than before
+    # so broad imposed warmth in T_base does not dominate the equilibrium.
+    T_eq = 0.90 * T_base + 0.10 * T_eq_rad
 
     # --- Orographic cooling (lapse rate) ---
     # Previously missing: high terrain never cooled as a function of altitude.
@@ -1199,6 +1251,18 @@ def _evolve_temperature(
     abs_lat_1d = np.abs(np.rad2deg(lat))  # lat computed at line 948
     abs_lat_2d_relax = np.repeat(abs_lat_1d[:, None], Wc, axis=1)
     mld = 30.0 + 170.0 * (abs_lat_2d_relax / 90.0) ** 1.5  # 30m tropical, ~200m polar
+    # Seasonal polar MLD reduction: Arctic/Antarctic meltwater halocline creates a
+    # shallow warm layer (~20-30m) in summer, allowing rapid surface warming → ice melt.
+    # Without this, the ~186m polar MLD gives a 93-day thermal time constant — too slow
+    # for summer T to reach ice_melt_temp=260K during the 90-day Arctic summer.
+    _summer_solstice_day = (172.0 / 365.2422) * float(_pp.orbital_period_days)
+    _gamma_mld = 2.0 * np.pi * (float(day_of_year) - _summer_solstice_day) / float(_pp.orbital_period_days)
+    _nh_summer = float(0.5 * (1.0 + np.cos(_gamma_mld)))   # 1.0 at NH summer, 0 at NH winter
+    _sh_summer = float(0.5 * (1.0 - np.cos(_gamma_mld)))   # 1.0 at SH summer (day ~355)
+    _hemi_summer = np.where(lat_2d >= 0, _nh_summer, _sh_summer)  # (Hc, Wc)
+    _polar_ramp = np.clip((abs_lat_2d_relax - 55.0) / 30.0, 0.0, 1.0)  # 0 at 55°, 1 at 85°+
+    # Up to 80% MLD reduction at poles in polar summer → ~37m → 19-day time constant
+    mld = mld * (1.0 - 0.80 * _polar_ramp * _hemi_summer)
     k_ocean = np.clip(1.0 / (mld * 0.5), 0.005, 0.07)  # 14-200 day time constants
 
     # Ice insulation: asymmetric effect on ocean-atmosphere coupling
@@ -1319,7 +1383,7 @@ def _evolve_temperature(
     # (Ideally this emerges from dynamics, but keeping parameterization for stability)
     # Recalculate Hadley simply - REDUCED from 5K to 0.5K per day (was too strong)
     lat_deg = np.rad2deg(np.abs(lat_2d))
-    subsidence = 0.2 * np.exp(-((lat_deg - 30.0)/10.0)**2) * days  # Reduced further (was 0.5); prevents SH 25-35° overheating
+    subsidence = 0.10 * np.exp(-((lat_deg - 30.0)/10.0)**2) * days
     T = T + subsidence
 
     # --- FINAL TEMPERATURE CLAMPING (Critical for stability) ---

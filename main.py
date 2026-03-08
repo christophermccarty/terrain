@@ -30,7 +30,8 @@ from terrain import (
 )
 from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb, generate_precipitation
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
-from ocean import _ocean_mask_from_elevation, generate_ocean_currents
+from ocean import generate_ocean_currents
+from masks import get_masks
 from terrain import precipitation_to_rgb
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
 from diagnostics import ClimateDiagnostics
@@ -74,7 +75,7 @@ class SimulationThread(Thread):
                         days=1.0,
                         wind_block_size=self.wind_block_size,
                         debug_log=False,
-                        track_components=True,
+                        track_components=self.diagnostics is not None,
                     )
                     self.state = new_state
 
@@ -663,7 +664,7 @@ def main() -> None:
                 speed = np.hypot(u, v).astype(np.float32)
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
-                ocean_mask = _ocean_mask_from_elevation(tex)
+                ocean_mask, _ = get_masks(tex)
                 mask3 = ocean_mask[..., None].astype(np.float32)
                 comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
                 arr = (comb * 255).astype(np.uint8)
@@ -870,7 +871,7 @@ def main() -> None:
                     h, w = tex.shape
                     with log_time("Generate temperature overlay"):
                         ocean_rgb = generate_temperature_overlay(h, w, elevation=tex)
-                ocean_mask = _ocean_mask_from_elevation(tex)
+                ocean_mask, _ = get_masks(tex)
                 base = np.zeros_like(ocean_rgb, dtype=np.float32)
                 base[ocean_mask] = ocean_rgb[ocean_mask]
                 if use_sim_data and sim_state.ice_cover is not None:
@@ -988,7 +989,7 @@ def main() -> None:
                 speed = np.hypot(u, v).astype(np.float32)
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
-                ocean_mask = _ocean_mask_from_elevation(tex)
+                ocean_mask, _ = get_masks(tex)
                 mask3 = ocean_mask[..., None].astype(np.float32)
                 comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
                 arr = (comb * 255).astype(np.uint8)
