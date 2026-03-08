@@ -14,6 +14,7 @@ from functools import lru_cache
 import numpy as np
 from temperature import temperature_kelvin_for_lat
 from planet_params import PlanetParams, EARTH
+from masks import get_masks
 
 # Numba JIT compilation for performance
 try:
@@ -113,19 +114,8 @@ def _majority_filter(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
 
 
 def _derive_land_sea_masks(elevation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    elev = elevation.astype(np.float32)
-    # If elevation contains a meaningful ocean mask (common in loaded DEM workflow),
-    # treat near-zero as ocean instead of using a median split.
-    ocean_eps = 1e-6
-    zeros_frac = float(np.mean(elev <= ocean_eps))
-    if zeros_frac > 0.02:
-        sea = elev <= ocean_eps
-        land = ~sea
-    else:
-        thresh = float(np.median(elev))
-        land = elev > thresh
-    land = _majority_filter(land, iterations=2)
-    sea = ~land
+    """Compatibility wrapper around the canonical mask utility."""
+    sea, land = get_masks(np.asarray(elevation, dtype=np.float32), use_cache=False)
     return land, sea
 
 
@@ -576,15 +566,15 @@ def evolve_wind(
         abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
         sign_lat = np.sign(lat_2d[:, 0]).astype(np.float32)  # +N, -S
         # Broaden the windows + reduce amplitudes to avoid razor-thin zonal bands.
-        w_trade = np.exp(-((abs_deg_1d - 15.0) / 12.0) ** 2).astype(np.float32)
-        w_mid = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32)
-        w_polar = np.exp(-((abs_deg_1d - 75.0) / 14.0) ** 2).astype(np.float32)
+        w_trade = np.exp(-((abs_deg_1d - 14.0) / 8.5) ** 2).astype(np.float32)
+        w_mid = np.exp(-((abs_deg_1d - 48.0) / 13.0) ** 2).astype(np.float32)
+        w_polar = np.exp(-((abs_deg_1d - 74.0) / 9.0) ** 2).astype(np.float32)
         # Optimized circulation targets for realistic Earth-like winds with sub-stepping
-        # Trade winds (easterlies): -5 m/s, Westerlies: +8 m/s, Polar easterlies: -4 m/s
-        u_target = (-5.0 * w_trade + 8.0 * w_mid - 4.0 * w_polar).astype(np.float32)  # m/s
+        # Trade winds (easterlies), stronger mid-lat westerlies, weaker polar easterlies.
+        u_target = (-6.0 * w_trade + 11.5 * w_mid - 1.5 * w_polar).astype(np.float32)  # m/s
         # v_target: Hadley (equatorward), Ferrel (poleward), Polar (equatorward), by hemisphere.
-        # Moderate meridional circulation
-        v_target = (-3.0 * w_trade + 7.5 * w_mid - 4.5 * w_polar).astype(np.float32) * sign_lat  # m/s
+        # Strengthen Ferrel return flow while reducing polar leakage into the 30-60° band.
+        v_target = (-6.4 * w_trade + 10.0 * w_mid - 1.0 * w_polar).astype(np.float32) * sign_lat  # m/s
         # Remove the equator sign ambiguity (sign(0)=0) so the equator stays calm.
         v_target = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target).astype(np.float32)
         k_cell = 1.0 / (tau_cell * 86400.0)
@@ -643,14 +633,15 @@ def evolve_wind(
             # Trade relaxation re-enabled (2×): without this, trades rely only on PGF which is
             # weak in the tropics (small T gradient), leaving trades at ~0.7 m/s vs target -5 m/s.
             # Mid-lat (5×) and polar (10×) remain unchanged.
-            a_u_row = np.clip(a * (1.0 + 2.0 * w_trade[:, None] + 5.0 * w_mid[:, None] + 10.0 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
+            a_u_row = np.clip(a * (1.0 + 2.5 * w_trade[:, None] + 9.0 * w_mid[:, None] + 2.5 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
             u_curr = u_curr + (u_t[:, None] - u_zm) * a_u_row
             # Relax v with differentiated mid-lat / polar strength.
             # Mid-lat (6×): enough freedom for longitudinal variability in mid-lat eddies.
+            # Trade (2×): matches u-relaxation strength so PGF can't hold v poleward in tropics.
             # Polar (25×): strong constraint prevents unrestricted poleward/equatorward
             # surges that caused extreme SH cooling when v-relaxation was too loose (8×).
-            # With tau_cell=3d, a≈0.042: mid-lat → 29%, polar → 65% per sub-step.
-            a_v_row = np.clip(a * (1.0 + 6.0 * w_mid[:, None] + 25.0 * w_polar[:, None]), 0.0, 0.65).astype(np.float32)
+            # With tau_cell=3d, a≈0.042: trade → 12.5%, mid-lat → 29%, polar → 65% per sub-step.
+            a_v_row = np.clip(a * (1.0 + 5.0 * w_trade[:, None] + 12.0 * w_mid[:, None] + 3.0 * w_polar[:, None]), 0.0, 0.75).astype(np.float32)
             v_curr = v_curr + (v_target[:, None] - v_zm) * a_v_row
         
         # Soft clamp to prevent explosion
@@ -679,6 +670,7 @@ def generate_wind_field(
     terrain_pressure_amp: float = 1.0,
     terrain_flow_amp: float = 1.0,
     time_days: float | None = None,
+    planet_params: PlanetParams | None = None,
     debug_log: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v) near-surface winds derived from pressure gradients.
@@ -689,6 +681,7 @@ def generate_wind_field(
     ensures divergence-free flow while preserving realistic meridional components.
     """
 
+    pp = planet_params or EARTH
     H = int(height)
     W = int(width)
     Hc, Wc = _coarse_shape(H, W, block_size)
@@ -737,16 +730,16 @@ def generate_wind_field(
             raise ValueError(f"temperature must be shape {(H, W)} or {(Hc, Wc)}; got {temp.shape}")
         # Mild smoothing only (keep gradients that actually drive winds).
         T = np.clip(T + 0.05 * _laplacian(T), 200.0, 330.0)
-        season_phase = 2.0 * np.pi * (day_of_year - 80) / 365.2422
+        season_phase = 2.0 * np.pi * (day_of_year - 80) / pp.orbital_period_days
         land_f = land_mask.astype(np.float32)
     else:
         # Build 2D temperature field with land-sea contrast and longitudinal variation
-        T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year).astype(np.float32)
+        T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year, planet_params=pp).astype(np.float32)
         T = np.repeat(T_lat[:, None], Wc, axis=1).astype(np.float32)
         
         # Land-sea temperature contrast (land warmer in summer, cooler in winter)
         land_f = land_mask.astype(np.float32)
-        season_phase = 2.0 * np.pi * (day_of_year - 80) / 365.2422
+        season_phase = 2.0 * np.pi * (day_of_year - 80) / pp.orbital_period_days
         seasonal_contrast = 8.0 * np.sin(season_phase) * np.cos(lat[:, None])  # NH summer = positive
         T += seasonal_contrast * land_f
         
@@ -826,15 +819,15 @@ def generate_wind_field(
     # Derive geostrophic winds from pressure gradients
     # In geostrophic balance: u ∝ -∂p/∂y, v ∝ ∂p/∂x (Northern Hemisphere)
     # Scale by Coriolis parameter f = 2Ω sin(φ)
-    f_coriolis = 2.0 * 7.2921e-5 * np.sin(lat)  # Earth's rotation rate
+    f_coriolis = pp.coriolis_parameter(lat).astype(np.float32)
     # Avoid division by zero at equator: enforce minimum magnitude while preserving sign
-    f_min = 3e-5  # Increased from 1e-5 for stronger damping near equator
+    f_min = max(3e-5, 0.1 * abs(float(pp.omega)))
     mask_pos = f_coriolis >= 0
     f_coriolis = np.where(mask_pos, np.maximum(f_coriolis, f_min), np.minimum(f_coriolis, -f_min))
     
     # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
     # Use proper metric terms (meters), consistent with `evolve_wind`.
-    R_earth = 6.371e6
+    R_earth = float(pp.radius_m)
     lat_2d = np.repeat(lat[:, None], Wc, axis=1)
     dx = R_earth * (2 * np.pi / Wc) * np.cos(lat_2d)
     dy = R_earth * (np.pi / Hc)
@@ -858,13 +851,13 @@ def generate_wind_field(
     lat0 = np.deg2rad(25.0)
     absn = np.clip(abs_lat / lat0, 0.0, 1.0)
     trade_profile = np.sin(np.pi * absn)  # 0 at equator and 25°, peak near 12.5°
-    u_tropical = -(2.8 * trade_profile[:, None]) * (1.0 + 0.12 * np.sin(lon[None, :] * 1.4))  # easterlies
-    v_tropical = -0.6 * np.tanh(lat[:, None] / np.deg2rad(10.0)) * (1.0 - absn[:, None])  # toward equator
+    u_tropical = -(4.0 * trade_profile[:, None]) * (1.0 + 0.12 * np.sin(lon[None, :] * 1.4))  # easterlies
+    v_tropical = -1.5 * np.tanh(lat[:, None] / np.deg2rad(9.0)) * (1.0 - absn[:, None])  # toward equator
     
     # Blend: tropical model in tropics, geostrophic elsewhere
     # Tropical zones use primarily tropical model with small geostrophic component
-    geo_scale_mid = 0.08
-    geo_scale_trop = 0.02
+    geo_scale_mid = 0.16
+    geo_scale_trop = 0.03
     u_geo = np.where(tropical_mask[:, None], 
                      u_tropical + geo_scale_trop * u_geo,  # Small geostrophic contribution
                      geo_scale_mid * u_geo)  # Mid/high latitudes use geostrophic
@@ -899,13 +892,16 @@ def generate_wind_field(
     # We approximate an upper-level westerly anomaly from |dT/dy| and mix a fraction down.
     # Use the same metric as the pressure-gradient step above (meters per latitude row).
     dT_dy = np.gradient(T, axis=0) / dy
-    jet_window = np.exp(-((abs_deg[:, None] - 45.0) / 18.0) ** 2).astype(np.float32)
-    thermal_wind_coeff = 2.0e6  # tuned: |dT/dy|~1e-5 K/m -> ~20 m/s aloft
+    jet_window = np.exp(-((abs_deg[:, None] - 48.0) / 14.0) ** 2).astype(np.float32)
+    thermal_wind_coeff = 2.8e6  # tuned: stronger mid-lat jet support without polar amplification
     u_aloft = thermal_wind_coeff * jet_window * np.abs(dT_dy)
-    surface_mix = 0.20
+    surface_mix = 0.24
     uc = uc + surface_mix * u_aloft
-    lat_amp = 0.06 + 0.60 * (lat_factor ** 1.6)
-    global_amp = 0.30
+    trop_amp = 0.16 * np.exp(-((abs_deg - 15.0) / 12.0) ** 2)
+    mid_amp = 0.72 * np.exp(-((abs_deg - 48.0) / 14.0) ** 2)
+    polar_amp = 0.04 * np.exp(-((abs_deg - 76.0) / 12.0) ** 2)
+    lat_amp = 0.10 + trop_amp + mid_amp + polar_amp
+    global_amp = 0.65
     uc = uc * lat_amp[:, None] * global_amp
     vc = vc * lat_amp[:, None] * global_amp
     
@@ -922,6 +918,23 @@ def generate_wind_field(
     # Blend: mostly from pressure gradients, streamfunction ensures consistency
     uc = 0.75 * uc + 0.25 * u_stream
     vc = 0.75 * vc + 0.25 * v_stream
+
+    # The pressure-gradient solve captures synoptic structure but still under-produces
+    # the near-surface 3-cell climatology, especially Ferrel flow. Apply a weak
+    # zonal-mean correction so the diagnostic wind remains a useful relaxation target.
+    sign_lat = np.sign(lat).astype(np.float32)
+    w_trade = np.exp(-((abs_deg - 14.0) / 9.0) ** 2).astype(np.float32)
+    w_mid = np.exp(-((abs_deg - 48.0) / 13.0) ** 2).astype(np.float32)
+    w_polar = np.exp(-((abs_deg - 74.0) / 10.0) ** 2).astype(np.float32)
+    u_surface = (-3.5 * w_trade + 8.5 * w_mid - 1.5 * w_polar).astype(np.float32)
+    v_surface = (-3.5 * w_trade + 5.0 * w_mid - 1.2 * w_polar).astype(np.float32) * sign_lat
+    v_surface = np.where(abs_deg < 2.0, 0.0, v_surface).astype(np.float32)
+    uc_zm = np.mean(uc, axis=1, keepdims=True)
+    vc_zm = np.mean(vc, axis=1, keepdims=True)
+    u_nudge = (0.18 + 0.18 * w_mid[:, None] + 0.06 * w_trade[:, None]).astype(np.float32)
+    v_nudge = (0.16 + 0.12 * w_trade[:, None] + 0.18 * w_mid[:, None]).astype(np.float32)
+    uc = uc + (u_surface[:, None] - uc_zm) * u_nudge
+    vc = vc + (v_surface[:, None] - vc_zm) * v_nudge
     
     # Apply terrain effects: blocking, channeling, deflection
     if terrain_influence > 0:
@@ -1188,13 +1201,18 @@ def generate_precipitation(
     H = int(height)
     W = int(width)
     elev = elevation.astype(np.float32)
+    lat_deg = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+    abs_lat_deg = np.abs(lat_deg)
+    itcz_window = np.exp(-((abs_lat_deg / 14.0) ** 2)).astype(np.float32)
+    storm_window = np.exp(-((abs_lat_deg - 48.0) / 15.0) ** 2).astype(np.float32)
+    drybelt_window = np.exp(-((abs_lat_deg - 28.0) / 8.0) ** 2).astype(np.float32)
 
     land_mask, sea_mask = _derive_land_sea_masks(elev)
     land_f = land_mask.astype(np.float32)
     sea_f = sea_mask.astype(np.float32)
 
     if temperature is None:
-        lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
+        lat = np.deg2rad(lat_deg).astype(np.float32)
         T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year)
         temperature = np.repeat(T_lat[:, None], W, axis=1).astype(np.float32)
     else:
@@ -1297,7 +1315,11 @@ def generate_precipitation(
     subsidence_norm = div_pos / (np.mean(div_pos) + 1e-6)
     subsidence_norm = np.clip(subsidence_norm, 0.0, 2.5)
     # Reduce precipitation by up to ~65% in strong-subsidence regions.
-    subsidence_suppression = np.clip(1.0 - 0.26 * subsidence_norm, 0.35, 1.0).astype(np.float32)
+    subsidence_suppression = np.clip(
+        1.0 - 0.34 * subsidence_norm - 0.18 * drybelt_window[:, None],
+        0.22,
+        1.0,
+    ).astype(np.float32)
 
     # Orographic uplift signal
     gx = _ddx_periodic(elev)
@@ -1319,18 +1341,26 @@ def generate_precipitation(
     )
     # Normalize convective contribution to blend with other terms
     convective = np.clip(P_convective / 10.0, 0.0, 2.0)  # Scale to [0, 2] for blending
-    convective = np.clip(convective + 0.1 * conv, 0.0, 2.0)
+    convective = np.clip(convective + 0.15 * conv, 0.0, 2.0)
+    convective = convective * (0.45 + 1.35 * itcz_window[:, None]) * (
+        0.35 + 0.65 * np.clip(ascent, 0.0, 1.5) / 1.5
+    )
 
     # Blend drivers into precipitation potential, then apply subsidence drying.
     # Subsidence_suppression reduces precip in divergent (descending) zones,
     # creating the subtropical dry belt that the convergence-only scheme lacks.
+    rh_release = rh * (0.34 + 0.55 * itcz_window[:, None] + 0.04 * storm_window[:, None])
+    conv_driver = conv * (0.40 + 0.55 * itcz_window[:, None] + 0.04 * storm_window[:, None])
+    ascent_driver = ascent * (0.58 + 0.35 * itcz_window[:, None] + 0.08 * storm_window[:, None])
     precip_potential = uplift_coeff * (
-        0.40 * rh +
-        0.20 * conv +
+        0.18 * rh_release +
+        0.24 * conv_driver +
         0.20 * orog +
-        0.15 * convective +
-        0.15 * ascent
+        0.24 * convective +
+        0.20 * ascent_driver
     ) * subsidence_suppression
+    lat_shape = np.clip(0.84 + 0.62 * itcz_window[:, None] - 0.12 * storm_window[:, None], 0.55, 1.55)
+    precip_potential = precip_potential * lat_shape
 
     if NUMBA_AVAILABLE:
         # Fast path: Numba-accelerated smoothing

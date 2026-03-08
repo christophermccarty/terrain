@@ -10,21 +10,16 @@ atmospheric transport. This is critical for moderating high-latitude climates.
 """
 
 import numpy as np
+from masks import get_masks
 
 
 def _ocean_mask_from_elevation(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: float = 0.05) -> np.ndarray:
-    """Return boolean ocean mask from normalized elevation.
-
-    - Loaded DEMs in this project encode ocean as exactly 0.0.
-    - Procedural terrain does not, so we fall back to a median sea level split
-      (matching the rest of the simulation).
-    """
-    elev = np.asarray(elevation, dtype=np.float32)
-    zeros_frac = float(np.mean(elev == 0.0)) if elev.size else 0.0
-    if zeros_frac > assume_loaded_if_zeros_frac:
-        return elev == 0.0
-    elev_median = float(np.median(elev))
-    return elev <= elev_median
+    """Compatibility wrapper for callers that still expect an ocean-only helper."""
+    sea_mask, _ = get_masks(
+        np.asarray(elevation, dtype=np.float32),
+        assume_loaded_if_zeros_frac=assume_loaded_if_zeros_frac,
+    )
+    return sea_mask
 
 
 def update_sea_ice(
@@ -44,16 +39,25 @@ def update_sea_ice(
         (ice_new, delta_ice): Updated ice fraction and change in ice fraction
             this step. delta_ice > 0 means freezing, < 0 means melting.
     """
-    is_ocean = _ocean_mask_from_elevation(elevation)
+    is_ocean, _ = get_masks(elevation)
     ice = np.zeros_like(T, dtype=np.float32) if prev_ice is None else np.asarray(prev_ice, dtype=np.float32)
     ice_prev = ice.copy()
     T = np.asarray(T, dtype=np.float32)
-    freeze = (T <= freeze_temp) & is_ocean
-    melt = (T >= melt_temp) & is_ocean
-    if np.any(freeze):
-        ice = np.where(freeze, np.minimum(1.0, ice + freeze_rate * dt_days), ice)
-    if np.any(melt):
-        ice = np.where(melt, np.maximum(0.0, ice - melt_rate * dt_days), ice)
+    H = T.shape[0]
+    lat_deg = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+    abs_lat = np.abs(lat_deg)[:, None]
+    polar_factor = np.clip((abs_lat - 45.0) / 35.0, 0.0, 1.0).astype(np.float32)
+
+    cold_excess = np.clip((freeze_temp - T) / 2.5, 0.0, 1.5).astype(np.float32)
+    warm_excess = np.clip((T - melt_temp) / 2.5, 0.0, 1.5).astype(np.float32)
+    open_water = (1.0 - np.clip(ice, 0.0, 1.0)).astype(np.float32)
+
+    # Growth is fastest over newly exposed cold water and increases toward the poles.
+    growth = freeze_rate * dt_days * cold_excess * open_water * (0.55 + 0.45 * polar_factor)
+    # Melt accelerates once temperatures rise well above the persistence threshold.
+    melt = melt_rate * dt_days * warm_excess * (0.65 + 0.35 * ice)
+
+    ice = np.where(is_ocean, np.clip(ice + growth - melt, 0.0, 1.0), 0.0)
     ice_new = np.where(is_ocean, ice, 0.0)
     delta_ice = ice_new - np.where(is_ocean, ice_prev, 0.0)
     return ice_new, delta_ice
@@ -103,7 +107,7 @@ def calculate_ocean_heat_transport(
     """
     # Identify ocean vs land from elevation.
     # NOTE: use a stable mask for loaded DEMs (ocean=0) to avoid latitudinal ringing/stripes.
-    is_ocean = _ocean_mask_from_elevation(elevation)
+    is_ocean, _ = get_masks(elevation)
     
     # Calculate latitude for each row
     lat_rows = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * 180.0  # degrees, -90 to +90
@@ -140,10 +144,16 @@ def calculate_ocean_heat_transport(
         z = np.pad(T_ocean_zonal, 1, mode="edge")
         T_ocean_zonal = (0.25 * z[:-2] + 0.50 * z[1:-1] + 0.25 * z[2:]).astype(np.float32)
     
-    # Calculate poleward heat flux
-    # Peak at mid-latitudes (30-60°) where major currents (Gulf Stream) exist
-    # Gaussian profile centered at 45° with width ~20°
-    current_strength = np.exp(-((abs_lat_rows - 45.0) / 20.0)**2)  # (Hc,)
+    # Calculate poleward heat flux.
+    # NH: Gulf Stream / AMOC deposit heat at ~45-65°N → Gaussian centred at 45°N.
+    # SH: Southern Ocean (ACC) is primarily *zonal*; it does NOT create strong
+    #     meridional heat convergence at 45°S.  Using the same |lat| Gaussian
+    #     symmetrically over-warms SH mid-latitudes by ~10 K.  Use a flat
+    #     reduced profile (35 % of peak) for SH so heat is deposited at the
+    #     high-latitude end via polar_damp rather than at 45°S.
+    nh_strength = np.exp(-((lat_rows - 45.0) / 20.0) ** 2)          # positive at NH latitudes
+    sh_strength = 0.35 * np.ones_like(lat_rows)                      # flat ~ACC-like
+    current_strength = np.where(lat_rows >= 0, nh_strength, sh_strength)  # (Hc,)
 
     # Polar damping: real ocean currents weaken at the highest latitudes,
     # but the Antarctic Circumpolar Current remains strong through 65-70°.
@@ -274,7 +284,7 @@ def compute_ekman_transport(
     H, W = wind_u.shape
 
     # Ocean mask (where currents exist)
-    is_ocean = elevation <= 0.02
+    is_ocean, _ = get_masks(elevation)
 
     # Latitude grid for Coriolis deflection
     lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi  # radians, -π/2 to +π/2
@@ -368,7 +378,7 @@ def get_major_ocean_currents(
     # Falls back to a hardcoded Gaussian at 90°W (Earth Gulf-Stream only) when
     # no elevation map is provided.
     if elevation is not None:
-        is_ocean_e = _ocean_mask_from_elevation(elevation)
+        is_ocean_e, _ = get_masks(elevation)
         land_west_e = np.roll(~is_ocean_e, 1, axis=1)   # land one column to the west
         midlat = (np.abs(lat_grid) >= 20.0) & (np.abs(lat_grid) <= 65.0)
         wbc_mask = is_ocean_e & land_west_e & midlat
@@ -412,7 +422,7 @@ def generate_ocean_currents(
     and redirect flow for realistic coastal current patterns.
     """
     H, W = elevation.shape
-    is_ocean = _ocean_mask_from_elevation(elevation)
+    is_ocean, _ = get_masks(elevation)
     is_land = ~is_ocean
 
     # Phase 3: Pass wind fields to enable Ekman transport coupling

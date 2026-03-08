@@ -13,7 +13,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from atmosphere import generate_wind_field, render_wind_arrows, generate_precipitation, wind_speed_to_rgb
-from ocean import generate_ocean_currents, _ocean_mask_from_elevation
+from ocean import generate_ocean_currents
+from masks import get_masks
 import logging
 import time
 from contextlib import contextmanager
@@ -359,7 +360,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
         speed = np.hypot(u, v).astype(np.float32)
         base_rgb = wind_speed_to_rgb(speed)
         arrows = render_wind_arrows(tex_h, tex_w, u, v, target_arrows=250)
-        ocean_mask = _ocean_mask_from_elevation(tex)
+        ocean_mask, _ = get_masks(tex)
         mask3 = ocean_mask[..., None].astype(np.float32)
         base_rgb = base_rgb * mask3
         arrows = arrows * mask3

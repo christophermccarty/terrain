@@ -36,6 +36,7 @@ the net annual ocean flux is near-zero, and at 415 ppm it removes
 
 from __future__ import annotations
 import numpy as np
+from masks import get_masks
 
 # ---------------------------------------------------------------------------
 # Physical conversion constants
@@ -689,9 +690,12 @@ def carbon_cycle_step(
         # Start at equilibrium with preindustrial CO2
         co2_ocean = ocean_co2_solubility(temperature, CO2_PREINDUSTRIAL)
 
+    sea_mask_b, land_mask_b = get_masks(state.elevation)
+    sea_mask = sea_mask_b.astype(np.float32)
+    land_mask = land_mask_b.astype(np.float32)
+
     if biomass is None:
         # Initialize biomass based on biome
-        land_mask = (state.elevation > 0.02).astype(np.float32)
         biome = compute_biome_type(temperature, precipitation, land_mask)
         biomass = np.where(biome == 3, CARBON_FOREST_MAX * 0.7, 0.0)  # 70% of max for forests
         biomass = np.where(biome == 2, CARBON_GRASSLAND_MAX * 0.5, biomass)  # 50% for grassland
@@ -699,12 +703,10 @@ def carbon_cycle_step(
 
     # Ocean CO2 exchange
     wind_speed = np.sqrt(state.wind_u**2 + state.wind_v**2) if state.wind_u is not None else np.ones_like(temperature) * 5.0
-    sea_mask = (state.elevation <= 0.02).astype(np.float32)
     co2_ocean_eq = ocean_co2_solubility(temperature, co2_atm)
     co2_ocean_new, d_co2_ocean = ocean_co2_flux(co2_ocean, co2_ocean_eq, wind_speed, sea_mask, dt_days)
 
     # Vegetation carbon dynamics
-    land_mask = (state.elevation > 0.02).astype(np.float32)
     biome = compute_biome_type(temperature, precipitation, land_mask)
     npp = vegetation_npp(biome, temperature, precipitation, co2_atm)
     biomass_new, d_co2_veg = vegetation_carbon_balance(biomass, npp, temperature, dt_days)

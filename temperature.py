@@ -312,20 +312,41 @@ def temperature_kelvin_for_lat(
     """
     # Check cache if enabled (optimization 2.6)
     lat = np.asarray(lat_rad, dtype=np.float32)
+    pp = planet_params or EARTH
     cache_key = None
     if cache:
         day_int = int(day_of_year) % 365
+        pp_key = (
+            round(float(pp.solar_constant), 4),
+            round(float(pp.obliquity_deg), 4),
+            round(float(pp.orbital_period_days), 4),
+            round(float(pp.epsilon_equator), 4),
+            round(float(pp.epsilon_pole), 4),
+            round(float(pp.aerosol_optical_depth), 4),
+        )
         # Create cache key from latitude array shape and hash of values
         if np.isscalar(lat_rad):
-            cache_key = (day_int, 'scalar', float(lat_rad), epsilon_atm, float(polar_cooling_scale))
+            cache_key = (
+                day_int,
+                'scalar',
+                round(float(lat_rad), 4),
+                float(epsilon_atm),
+                float(polar_cooling_scale),
+                pp_key,
+            )
         else:
             # Use hash of first, middle, and last values for efficiency (sufficient for typical use)
             n = len(lat)
             if n > 0:
-                lat_hash = (float(lat[0]), float(lat[n//2]) if n > 1 else 0.0, float(lat[-1]) if n > 1 else 0.0, n)
+                lat_hash = (
+                    round(float(lat[0]), 4),
+                    round(float(lat[n//2]) if n > 1 else 0.0, 4),
+                    round(float(lat[-1]) if n > 1 else 0.0, 4),
+                    n,
+                )
             else:
                 lat_hash = (0.0, 0.0, 0.0, 0)
-            cache_key = (day_int, lat_hash, epsilon_atm, float(polar_cooling_scale))
+            cache_key = (day_int, lat_hash, float(epsilon_atm), float(polar_cooling_scale), pp_key)
         
         if cache_key in _TEMP_BASE_CACHE:
             cached_result = _TEMP_BASE_CACHE[cache_key]
@@ -333,7 +354,6 @@ def temperature_kelvin_for_lat(
             if np.isscalar(lat_rad):
                 return float(cached_result)
             return cached_result.copy()
-    pp = planet_params or EARTH
     A = _albedo_for_latitude(lat, day_of_year, planet_params=pp)
     sigma = 5.670374419e-8
     Q = _daily_mean_insolation_Q(lat, day_of_year, planet_params=pp)
