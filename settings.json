@@ -6,5 +6,6 @@
   "gain": 0.5,
   "wind_arrows": 500,
   "wind_scale": 0.75,
-  "wind_block_size": 8
+  "wind_block_size": 8,
+  "auto_save_state": true
 }

@@ -12,6 +12,7 @@ import cProfile
 import pstats
 import logging
 import time
+from pathlib import Path
 from threading import Thread, Event
 from queue import Queue, Empty
 
@@ -33,9 +34,11 @@ from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from ocean import generate_ocean_currents
 from masks import get_masks
 from terrain import precipitation_to_rgb
-from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
+from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps, save_state, load_state
 from diagnostics import ClimateDiagnostics
 import graphs
+
+AUTOSAVE_PATH = Path("saves/autosave.pkl")
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
@@ -129,6 +132,8 @@ def main() -> None:
     size = 512
     yaw = 0.0; pitch = 0.0; roll = 0.0
     settings = load_settings()
+    _auto_save_enabled: bool = bool(settings.get("auto_save_state", False))
+    _saved_state_days: float | None = None  # total_days of the loaded autosave (for display)
     default_settings = {
         "seed": 42,
         "octaves": 4,
@@ -376,11 +381,78 @@ def main() -> None:
         root.update()
         
         LOG.info("Starting 1-year benchmark...")
-        # Run for 365 days
-        states, _ = simulate_multiple_steps(sim_state, total_days=365.0, step_days=1.0)
-        
+
+        # --- T_BASE PROFILE (instant, no simulation needed) ---
+        # This shows whether the temperature TARGETS are calibrated correctly
+        # before we even run a single step.  If T_base is wrong, no amount of
+        # tuning other parameters will fix the climate.
+        from diagnostics import compute_t_base_profile, print_t_base_report
+        print_t_base_report(compute_t_base_profile())
+
+        # --- RUN 365 days in monthly chunks to collect ice snapshots ---
+        # Month day-counts and cumulative start days (non-leap year)
+        MONTHLY_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        _MONTH_START = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        # Determine which calendar month the simulation is currently in so the
+        # monthly labels align with the simulation's actual day_of_year.
+        _doy = sim_state.day_of_year % 365.0
+        _start_month_idx = max(
+            (i for i, s in enumerate(_MONTH_START) if s <= _doy),
+            default=0,
+        )
+        monthly_ice_nh: list[float] = []
+        monthly_ice_sh: list[float] = []
+        monthly_T55N: list[float] = []  # key diagnostic latitude
+        monthly_T65N: list[float] = []
+        monthly_T75N: list[float] = []
+
+        current = sim_state
+        for month_i, mdays in enumerate(MONTHLY_DAYS):
+            states, _ = simulate_multiple_steps(current, total_days=float(mdays), step_days=1.0)
+            current = states[-1]
+            # Monthly ice snapshot
+            snap = diagnostics.analyze_snapshot(current)
+            monthly_ice_nh.append(snap.get("ice_frac_nh", 0.0))
+            monthly_ice_sh.append(snap.get("ice_frac_sh", 0.0))
+            # Zonal mean temperature at key NH latitudes (use air temperature)
+            T = current.air_temperature if current.air_temperature is not None else current.temperature
+            if T is not None:
+                H = T.shape[0]
+                lat_rows = (0.5 - (np.arange(H) + 0.5) / H) * 180.0
+                def _zonal_T(lat_c: float) -> float:
+                    idx = int(np.argmin(np.abs(lat_rows - lat_c)))
+                    return float(np.mean(T[idx, :])) - 273.15
+                monthly_T55N.append(_zonal_T(55.0))
+                monthly_T65N.append(_zonal_T(65.0))
+                monthly_T75N.append(_zonal_T(75.0))
+
+        final_state = current
+
+        # --- PRINT MONTHLY ICE / TEMPERATURE EVOLUTION ---
+        _ALL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        # Rotate month names so index 0 = the calendar month the benchmark started in
+        MONTH_NAMES = [_ALL_MONTHS[(_start_month_idx + i) % 12] for i in range(12)]
+        print(f"\n--- MONTHLY ICE & HIGH-LAT TEMPERATURE EVOLUTION (starting ~{_ALL_MONTHS[_start_month_idx]}, day {_doy:.0f}) ---")
+        print(f"{'Month':>5} | {'NH ice%':>7} | {'SH ice%':>7} | {'T55N(°C)':>9} | {'T65N(°C)':>9} | {'T75N(°C)':>9}")
+        print("-" * 62)
+        for i, name in enumerate(MONTH_NAMES):
+            ni = monthly_ice_nh[i]*100 if i < len(monthly_ice_nh) else float('nan')
+            si = monthly_ice_sh[i]*100 if i < len(monthly_ice_sh) else float('nan')
+            t55 = monthly_T55N[i] if i < len(monthly_T55N) else float('nan')
+            t65 = monthly_T65N[i] if i < len(monthly_T65N) else float('nan')
+            t75 = monthly_T75N[i] if i < len(monthly_T75N) else float('nan')
+            print(f"{name:>5} | {ni:>7.1f} | {si:>7.1f} | {t55:>+9.1f} | {t65:>+9.1f} | {t75:>+9.1f}")
+        print("-" * 62)
+        nh_min = min(monthly_ice_nh)*100 if monthly_ice_nh else 0
+        nh_max = max(monthly_ice_nh)*100 if monthly_ice_nh else 0
+        print(f"  NH ice range: {nh_min:.1f}% – {nh_max:.1f}%  (Earth: ~3% summer to ~8% winter)")
+        t55_range = f"{min(monthly_T55N):+.1f}°C – {max(monthly_T55N):+.1f}°C" if monthly_T55N else "N/A"
+        t65_range = f"{min(monthly_T65N):+.1f}°C – {max(monthly_T65N):+.1f}°C" if monthly_T65N else "N/A"
+        print(f"  T55N seasonal range: {t55_range}  (Earth: ~-5°C winter to +15°C summer)")
+        print(f"  T65N seasonal range: {t65_range}  (Earth: ~-15°C winter to +10°C summer)")
+        print("-----------------------------------------------------\n")
+
         # Analyze final state snapshot.
-        final_state = states[-1]
         stats = diagnostics.analyze_snapshot(final_state)
         diagnostics.print_report(stats)
         # Wind speed and direction magnitudes vs Earth
@@ -406,6 +478,48 @@ def main() -> None:
 
     tk.Button(controls, text="Export Data", command=export_data).pack(side="right", padx=10)
     tk.Button(controls, text="Benchmark", command=run_benchmark).pack(side="right", padx=10)
+
+    # --- State save/load controls ---
+    auto_save_var = tk.BooleanVar(value=_auto_save_enabled)
+    save_info_var = tk.StringVar(value="")
+
+    def _refresh_save_info() -> None:
+        if AUTOSAVE_PATH.exists():
+            size_kb = AUTOSAVE_PATH.stat().st_size / 1024
+            save_info_var.set(f"Save: {size_kb:.0f} KB")
+        else:
+            save_info_var.set("No save")
+
+    def _do_save_state() -> None:
+        nonlocal sim_state
+        if sim_state is None:
+            messagebox.showinfo("Save State", "No simulation state to save. Start the simulation first.")
+            return
+        try:
+            save_state(sim_state, AUTOSAVE_PATH)
+            _refresh_save_info()
+            total_years = sim_state.total_days / 365.2422
+            messagebox.showinfo("Save State", f"State saved.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def _do_clear_save() -> None:
+        if AUTOSAVE_PATH.exists():
+            AUTOSAVE_PATH.unlink()
+        _refresh_save_info()
+        messagebox.showinfo("Clear Save", "Saved state cleared. Next start will use fresh initial conditions.")
+
+    def _on_auto_save_toggle() -> None:
+        nonlocal _auto_save_enabled
+        _auto_save_enabled = auto_save_var.get()
+
+    save_row = tk.Frame(root)
+    save_row.pack(fill="x")
+    tk.Checkbutton(save_row, text="Auto-save/load state", variable=auto_save_var, command=_on_auto_save_toggle).pack(side="left", padx=4)
+    tk.Button(save_row, text="Save State Now", command=_do_save_state).pack(side="left", padx=4)
+    tk.Button(save_row, text="Clear Saved State", command=_do_clear_save).pack(side="left", padx=4)
+    tk.Label(save_row, textvariable=save_info_var, anchor="w", fg="gray").pack(side="left", padx=8)
+    _refresh_save_info()
 
     def _init_sim_state_from_elevation(elev: np.ndarray) -> None:
         """Initialize sim_state immediately (but do not start stepping)."""
@@ -851,9 +965,9 @@ def main() -> None:
             
             if view_var.get() == "Temperature":
                 if use_sim_data and sim_state.temperature is not None:
-                    # Use simulation temperature, convert to overlay RGB using same high-quality mapping
                     from temperature import temperature_to_rgb
-                    T = sim_state.temperature
+                    # Show 2m air temperature; fall back to T_sst for old saves
+                    T = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
                     overlay = temperature_to_rgb(T)
                 else:
                     h, w = tex.shape
@@ -1010,9 +1124,20 @@ def main() -> None:
     def start_simulation():
         nonlocal sim_state, sim_thread, sim_running, sim_paused
         if sim_state is None:
-            # Initialize simulation from current elevation
-            tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
-            _init_sim_state_from_elevation(tex)
+            # Load autosave if enabled and available; otherwise create fresh state
+            if _auto_save_enabled and AUTOSAVE_PATH.exists():
+                try:
+                    sim_state = load_state(AUTOSAVE_PATH)
+                    total_years = sim_state.total_days / 365.2422
+                    sim_status_var.set(f"Loaded Y{total_years:.1f}")
+                    LOG.info(f"Autosave loaded: day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+                except Exception as e:
+                    LOG.warning(f"Failed to load autosave ({e}); starting fresh.")
+                    tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+                    _init_sim_state_from_elevation(tex)
+            else:
+                tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+                _init_sim_state_from_elevation(tex)
 
         # Start or resume simulation thread
         if sim_thread is None or not sim_thread.is_alive():
@@ -1141,9 +1266,10 @@ def main() -> None:
                 px_str = f", {pixel_display}" if pixel_display else ""
                 latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, current {speed:5.2f} m/s")
             else:
-                # Use simulation temperature if available
+                # Use air temperature for cursor display (what you feel at the surface)
                 if use_sim_data and sim_state.temperature is not None:
-                    T_kelvin = float(sim_state.temperature[int(y), int(x)])
+                    _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
+                    T_kelvin = float(_T_disp[int(y), int(x)])
                 else:
                     T_kelvin = temperature_kelvin_for_lat(np.deg2rad(lat))
                 # Convert Kelvin to Celsius
@@ -1237,6 +1363,14 @@ def main() -> None:
             sim_thread.stop()
             sim_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
         # Persist current UI parameters to settings.json
+        # Autosave simulation state if enabled
+        if _auto_save_enabled and sim_state is not None:
+            try:
+                save_state(sim_state, AUTOSAVE_PATH)
+                LOG.info(f"Autosave written: day {sim_state.total_days:.0f}")
+            except Exception as e:
+                LOG.warning(f"Autosave failed: {e}")
+
         s = {
             "seed": int(seed_var.get()),
             "octaves": int(octaves_var.get()),
@@ -1246,6 +1380,7 @@ def main() -> None:
             "wind_arrows": int(wind_arrows_var.get()),
             "wind_scale": float(wind_scale_var.get()),
             "wind_block_size": int(wind_block_size_var.get()),
+            "auto_save_state": bool(_auto_save_enabled),
         }
         save_settings(s)
         graphs_controller.close()

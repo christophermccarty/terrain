@@ -18,7 +18,7 @@ from masks import get_masks
 
 # Numba JIT compilation for performance
 try:
-    from numba import jit, prange
+    from numba import jit, prange  # pyright: ignore[reportMissingImports]
     NUMBA_AVAILABLE = True
 except ImportError:
     # Fallback: create dummy decorators if Numba not installed
@@ -1266,8 +1266,10 @@ def generate_precipitation(
     q = np.clip(base_q + sources, 0.0, qsat)
 
     # Moisture advection/diffusion (semi-Lagrangian-ish)
-    u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * 0.4
-    v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * 0.4
+    u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
+    v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * (
+        0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
+    )
 
     if NUMBA_AVAILABLE:
         # Fast path: Numba-accelerated advection with adaptive diffusion
@@ -1276,14 +1278,16 @@ def generate_precipitation(
             lap_q = _laplacian_numba(q)
             # Adaptive diffusion: stronger in regions with sharp gradients
             q_grad_strength = np.abs(lap_q) / (np.mean(np.abs(lap_q)) + 1e-9)
-            diffusion_coeff = 0.12 * (1.0 + 0.3 * np.clip(q_grad_strength, 0.0, 2.0))
+            diffusion_coeff = (0.11 + 0.03 * storm_window[:, None]) * (
+                1.0 + 0.3 * np.clip(q_grad_strength, 0.0, 2.0)
+            )
             q = q + diffusion_coeff * lap_q
             q = np.clip(q, 0.0, qsat)
     else:
         # Fallback: original NumPy implementation
         for _ in range(3):
             q = _advect_scalar(q, u, v, u_scale, v_scale)
-            q = q + 0.12 * _laplacian(q)
+            q = q + (0.11 + 0.03 * storm_window[:, None]) * _laplacian(q)
             q = np.clip(q, 0.0, qsat)
 
     # Moisture-flux convergence driver
@@ -1340,26 +1344,30 @@ def generate_precipitation(
         max_rate_mm_day=10.0,  # Realistic tropical thunderstorm rate
     )
     # Normalize convective contribution to blend with other terms
+    conv_norm = np.clip(conv, 0.0, 1.5) / 1.5
+    ascent_norm = np.clip(ascent, 0.0, 1.5) / 1.5
     convective = np.clip(P_convective / 10.0, 0.0, 2.0)  # Scale to [0, 2] for blending
-    convective = np.clip(convective + 0.15 * conv, 0.0, 2.0)
-    convective = convective * (0.45 + 1.35 * itcz_window[:, None]) * (
-        0.35 + 0.65 * np.clip(ascent, 0.0, 1.5) / 1.5
+    convective = np.clip(convective + 0.10 * conv, 0.0, 2.0)
+    convective = convective * (0.20 + 1.00 * itcz_window[:, None]) * (
+        0.18 + 0.82 * conv_norm
+    ) * (
+        0.22 + 0.78 * ascent_norm
     )
 
     # Blend drivers into precipitation potential, then apply subsidence drying.
     # Subsidence_suppression reduces precip in divergent (descending) zones,
     # creating the subtropical dry belt that the convergence-only scheme lacks.
-    rh_release = rh * (0.34 + 0.55 * itcz_window[:, None] + 0.04 * storm_window[:, None])
-    conv_driver = conv * (0.40 + 0.55 * itcz_window[:, None] + 0.04 * storm_window[:, None])
-    ascent_driver = ascent * (0.58 + 0.35 * itcz_window[:, None] + 0.08 * storm_window[:, None])
+    rh_release = rh * (0.26 + 0.52 * itcz_window[:, None] + 0.06 * storm_window[:, None])
+    conv_driver = conv * (0.34 + 0.52 * itcz_window[:, None] + 0.08 * storm_window[:, None])
+    ascent_driver = ascent * (0.54 + 0.35 * itcz_window[:, None] + 0.08 * storm_window[:, None])
     precip_potential = uplift_coeff * (
         0.18 * rh_release +
         0.24 * conv_driver +
         0.20 * orog +
-        0.24 * convective +
-        0.20 * ascent_driver
+        0.20 * convective +
+        0.22 * ascent_driver
     ) * subsidence_suppression
-    lat_shape = np.clip(0.84 + 0.62 * itcz_window[:, None] - 0.12 * storm_window[:, None], 0.55, 1.55)
+    lat_shape = np.clip(0.80 + 0.50 * itcz_window[:, None] + 0.02 * storm_window[:, None], 0.60, 1.35)
     precip_potential = precip_potential * lat_shape
 
     if NUMBA_AVAILABLE:
@@ -1371,6 +1379,8 @@ def generate_precipitation(
         # Fallback: original NumPy implementation
         for _ in range(3):
             precip_potential = np.clip(precip_potential + 0.18 * _laplacian(precip_potential), 0.0, 3.0)
+    post_shape = np.clip(0.92 + 0.20 * itcz_window[:, None] - 0.10 * storm_window[:, None], 0.82, 1.12)
+    precip_potential = np.clip(precip_potential * post_shape, 0.0, 3.0)
 
     # Convert potential to precipitation (mm/day) with moisture conservation
     remove_frac = np.clip(rain_efficiency * precip_potential * dt, 0.0, 1.0)
@@ -1382,6 +1392,13 @@ def generate_precipitation(
         scale = float(np.clip(target_mean_mm_day / (mean_p + 1e-6), 0.2, 3.0))
         dq = np.clip(dq * scale, 0.0, q)
         P = dq * (column_mm_per_q / dt)
+    rain_export_factor = np.clip(
+        0.94 - 0.14 * itcz_window[:, None] + 0.08 * storm_window[:, None],
+        0.70,
+        1.06,
+    ).astype(np.float32)
+    dq = np.clip(dq * rain_export_factor, 0.0, q)
+    P = dq * (column_mm_per_q / dt)
     if max_precip_mm_day > 0.0:
         cap = np.minimum(1.0, max_precip_mm_day / (P + 1e-9))
         dq = dq * cap
