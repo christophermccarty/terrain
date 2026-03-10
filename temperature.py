@@ -465,10 +465,16 @@ def temperature_kelvin_for_lat(
     T = np.power(F_net / (sigma * gh_denom), 0.25)
     
     # Minimum temperature floor during polar night (accounts for heat transport/thermal inertia)
-    # Earth's coldest recorded: -89.2°C (184K) at Vostok, typical polar winter: -50°C to -60°C (223-213K)
-    # Lowered to 200K (-73°C) to allow realistic Antarctic winter temperatures
-    # Previous floor of 240K (-33°C) was too high and caused all high-latitude temps to hit the floor
-    T_min = 200.0  # Lowered from 240K to allow realistic polar cold
+    # Earth's coldest recorded ANNUAL MEAN: Vostok ~216K (-57°C).
+    # Daily winter extremes can be lower, but the annual-mean proxy (equinox calculation used
+    # for T_lat_annual_mean) must reflect the annual average, not the worst-case daily minimum.
+    # 215K (-58°C) is a physically motivated floor: it matches Vostok mean, prevents the
+    # annual-mean proxy from being colder than any observed long-term mean on Earth, and
+    # allows the atmospheric/ocean transport terms in simulate.py to produce realistic
+    # high-latitude temperatures without being dragged down by an unrealistically cold baseline.
+    # Previous value of 200K (-73°C) caused NH land at 65-85°N to converge toward ~210-215K in
+    # winter (via land_blend=0.2/day), making the zonal annual mean 10-20°C colder than Earth.
+    T_min = 215.0  # Raised from 200K: realistic minimum for annual-mean radiative proxy
     T = np.maximum(T, T_min)
     
     # Store in cache if enabled

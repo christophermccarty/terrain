@@ -46,16 +46,17 @@ def update_sea_ice(
     H = T.shape[0]
     lat_deg = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
     abs_lat = np.abs(lat_deg)[:, None]
-    polar_factor = np.clip((abs_lat - 45.0) / 35.0, 0.0, 1.0).astype(np.float32)
+    polar_factor = np.clip((abs_lat - 55.0) / 25.0, 0.0, 1.0).astype(np.float32)
+    margin_factor = (1.0 - polar_factor).astype(np.float32)
 
     cold_excess = np.clip((freeze_temp - T) / 2.5, 0.0, 1.5).astype(np.float32)
     warm_excess = np.clip((T - melt_temp) / 2.5, 0.0, 1.5).astype(np.float32)
     open_water = (1.0 - np.clip(ice, 0.0, 1.0)).astype(np.float32)
 
     # Growth is fastest over newly exposed cold water and increases toward the poles.
-    growth = freeze_rate * dt_days * cold_excess * open_water * (0.55 + 0.45 * polar_factor)
+    growth = freeze_rate * dt_days * cold_excess * open_water * (0.22 + 0.78 * polar_factor)
     # Melt accelerates once temperatures rise well above the persistence threshold.
-    melt = melt_rate * dt_days * warm_excess * (0.65 + 0.35 * ice)
+    melt = melt_rate * dt_days * warm_excess * (0.75 + 0.25 * ice + 0.35 * margin_factor)
 
     ice = np.where(is_ocean, np.clip(ice + growth - melt, 0.0, 1.0), 0.0)
     ice_new = np.where(is_ocean, ice, 0.0)
@@ -152,8 +153,9 @@ def calculate_ocean_heat_transport(
     #     reduced profile (35 % of peak) for SH so heat is deposited at the
     #     high-latitude end via polar_damp rather than at 45°S.
     nh_strength = np.exp(-((lat_rows - 45.0) / 20.0) ** 2)          # positive at NH latitudes
+    nh_subpolar_bonus = 0.22 * np.clip((lat_rows - 52.0) / 18.0, 0.0, 1.0)
     sh_strength = 0.35 * np.ones_like(lat_rows)                      # flat ~ACC-like
-    current_strength = np.where(lat_rows >= 0, nh_strength, sh_strength)  # (Hc,)
+    current_strength = np.where(lat_rows >= 0, nh_strength + nh_subpolar_bonus, sh_strength)  # (Hc,)
 
     # Polar damping: real ocean currents weaken at the highest latitudes,
     # but the Antarctic Circumpolar Current remains strong through 65-70°.
@@ -171,7 +173,8 @@ def calculate_ocean_heat_transport(
         ice_arr = np.clip(np.asarray(ice_cover, dtype=np.float32), 0.0, 1.0)
         ice_ocean = ice_arr * is_ocean.astype(np.float32)
         ice_zonal = np.sum(ice_ocean, axis=1) / np.maximum(ocean_count, 1.0)
-        current_strength = current_strength * (1.0 - 0.3 * ice_zonal)
+        ice_block = np.where(lat_rows >= 0, 0.18, 0.26).astype(np.float32)
+        current_strength = current_strength * (1.0 - ice_block * ice_zonal)
 
     # Temperature gradient drives heat transport
     # Use finite difference to approximate meridional gradient
