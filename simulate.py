@@ -836,6 +836,13 @@ def simulate_step(
     else:
         humidity_coarse = None
 
+    # Downsample previous-step snow depth for albedo in _evolve_temperature
+    if state.snow_depth is not None:
+        _sd_pad = np.pad(state.snow_depth.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
+        snow_depth_coarse = _sd_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+    else:
+        snow_depth_coarse = None
+
     # Downsample precipitation and vegetation biomass for vegetation albedo (Phase 4)
     if state.precipitation is not None:
         P_pad = np.pad(state.precipitation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
@@ -906,6 +913,7 @@ def simulate_step(
         koppen_type=koppen_phys_coarse,  # albedo-effective: EF→ET for immature ice sheets
         planet_params=pp,
         elev_c=elev_c,
+        snow_depth=snow_depth_coarse,
     )
     T_coarse = T_sst_coarse  # alias: T_coarse continues to mean T_sst going forward
     
@@ -976,6 +984,31 @@ def simulate_step(
         T_full = T_full + delta_ice * latent_scale * is_ocean_full.astype(np.float32)
     else:
         ice_full = None
+
+    # Snow depth evolution (degree-day accumulation / melt model)
+    # Only over land; ocean has sea ice instead of snow pack.
+    # Physics:
+    #   Accumulation  — fraction of precipitation that falls as snow (T-dependent)
+    #   Melt          — degree-day factor: 3 mm SWE per °C per day above freezing
+    #   Sublimation   — 0.1 % of current pack per day (slow but persistent)
+    #   Cap at 10 m SWE (realistic maximum for land ice / deep snow pack)
+    _T_air_for_snow = T_air_full if T_air_full is not None else T_full
+    _snow_prev = state.snow_depth if state.snow_depth is not None else np.zeros((H, W), dtype=np.float32)
+    if P_full is not None and _T_air_for_snow is not None:
+        _, _land_snow = get_masks(state.elevation)
+        _T_air_c = _T_air_for_snow - 273.15  # °C
+        # Snow fraction: 1 at ≤−3°C, 0 at ≥+2°C (linear ramp through the mixed-phase zone)
+        _snow_frac = np.clip((-_T_air_c + 2.0) / 5.0, 0.0, 1.0).astype(np.float32)
+        # Snowfall in m SWE/day (P_full is mm/day liquid-water equiv; 1 mm = 0.001 m SWE)
+        _snowfall = P_full * _snow_frac * 1e-3
+        # Melt: 3 mm SWE per °C per day (standard degree-day factor for temperate/polar snow)
+        _melt = np.clip(_T_air_c, 0.0, None).astype(np.float32) * 3.0e-3
+        # Sublimation: 0.1% of pack per day
+        _sublim = _snow_prev * 0.001
+        _snow_new = _snow_prev + (_snowfall - _melt - _sublim) * float(days)
+        snow_depth_new = np.where(_land_snow, np.clip(_snow_new, 0.0, 10.0), 0.0).astype(np.float32)
+    else:
+        snow_depth_new = _snow_prev
 
     # Debug logging if requested
     if debug_log:
@@ -1060,7 +1093,7 @@ def simulate_step(
         humidity=humidity_next,
         soil_moisture=soil_next,
         cloud_cover=cloud_full,
-        snow_depth=None,
+        snow_depth=snow_depth_new,
         ice_cover=ice_full,
         co2_atmosphere=co2_atm_new,
         co2_ocean=co2_ocean_new,
@@ -1179,6 +1212,7 @@ def _evolve_temperature(
     koppen_type: np.ndarray | None = None,
     planet_params: PlanetParams | None = None,
     elev_c: np.ndarray | None = None,
+    snow_depth: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -1283,8 +1317,13 @@ def _evolve_temperature(
     
     # === PASS 2: T_sst dynamics — radiation, relaxation, ocean transport ===
 
-    # Snow/ice cover based on surface temperature (T_sst)
-    snow_cover = np.clip((273.15 - T_sst) / 10.0, 0.0, 1.0)
+    # Snow cover — use physically-tracked snow depth when available.
+    # Full cover at ≥0.1 m SWE (≈0.3 m fresh snow); falls off linearly below.
+    # Fallback to temperature-derived estimate when snow_depth not yet tracked.
+    if snow_depth is not None:
+        snow_cover = np.clip(snow_depth / 0.1, 0.0, 1.0).astype(np.float32)
+    else:
+        snow_cover = np.clip((273.15 - T_sst) / 10.0, 0.0, 1.0)
     sea_ice = np.zeros_like(T_sst, dtype=np.float32) if ice_cover is None else np.clip(ice_cover.astype(np.float32), 0.0, 1.0)
     sea_ice = np.where(sea_mask, sea_ice, 0.0)
     if ice_albedo_strength != 1.0:
