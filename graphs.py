@@ -14,7 +14,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from ocean import _ocean_mask_from_elevation
+from masks import get_masks
 
 
 class LiveGraphsWindow:
@@ -316,7 +316,7 @@ class LiveGraphsWindow:
     def _ocean_mean_temp(state) -> float:
         if state.elevation is None or state.temperature is None:
             return float("nan")
-        ocean_mask = _ocean_mask_from_elevation(state.elevation)
+        ocean_mask, _ = get_masks(state.elevation)
         if not np.any(ocean_mask):
             return float("nan")
         return float(np.mean(state.temperature[ocean_mask]))

@@ -1,0 +1,5 @@
+# This directory is a Syncthing folder marker.
+# Do not delete.
+
+folderID: opdyu-czwhr
+created: 2026-01-25T12:44:33-07:00

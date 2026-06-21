@@ -12,6 +12,9 @@ import cProfile
 import pstats
 import logging
 import time
+from pathlib import Path
+from threading import Thread, Event
+from queue import Queue, Empty
 
 from terrain import (
     generate_sphere_image,
@@ -28,16 +31,121 @@ from terrain import (
 )
 from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb, generate_precipitation
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
-from ocean import _ocean_mask_from_elevation, generate_ocean_currents
+from ocean import generate_ocean_currents
+from masks import get_masks
 from terrain import precipitation_to_rgb
-from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps
+from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps, save_state, load_state, TimeScaleMode
 from diagnostics import ClimateDiagnostics
 import graphs
+
+AUTOSAVE_PATH = Path("saves/autosave.pkl")
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
 _OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None}
 _PRECIP_VIEW_CACHE = {"key": None, "P": None}
+
+
+class SimulationThread(Thread):
+    """Background thread that runs physics simulation independently of UI."""
+
+    def __init__(self, initial_state, days_per_step=1.0, wind_block_size=8, diagnostics=None,
+                 time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY):
+        super().__init__(daemon=True)
+        self.state = initial_state
+        self.days_per_step = days_per_step
+        self.wind_block_size = wind_block_size
+        self.diagnostics = diagnostics
+        self.time_scale_mode = time_scale_mode
+        self.running = Event()
+        self.paused = Event()
+        self.paused.set()  # Start paused
+        self.state_queue = Queue(maxsize=1)  # Only keep latest state
+        self.component_queue = Queue(maxsize=1)  # Track temperature components
+
+    def run(self):
+        """Main simulation loop (runs in background thread)."""
+        self.running.set()
+        while self.running.is_set():
+            if self.paused.is_set():
+                time.sleep(0.05)  # Sleep when paused (50ms)
+                continue
+
+            try:
+                # Select sub-stepping strategy based on time scale mode.
+                # Each entry is (step_days, update_wind):
+                #   DAILY   — 1 × 1-day full physics (most accurate)
+                #   WEEKLY  — 7 × 1-day full physics (7 simulated days per frame)
+                #   MONTHLY — 5 × 6-day steps, no wind (≈30 days; ~5× faster than 30 daily)
+                #   ANNUAL  — 52 × 7-day steps, no wind (≈364 days; stable large-step physics)
+                mode = self.time_scale_mode
+                if mode == TimeScaleMode.WEEKLY:
+                    substeps = [(1.0, True)] * 7
+                elif mode == TimeScaleMode.MONTHLY:
+                    substeps = [(6.0, False)] * 5
+                elif mode == TimeScaleMode.ANNUAL:
+                    substeps = [(7.0, False)] * 52
+                else:  # DAILY (default)
+                    substeps = [(1.0, True)]
+
+                new_state = self.state
+                temp_components: dict = {}
+                for step_days, do_wind in substeps:
+                    new_state, temp_components = simulate_step(
+                        new_state,
+                        days=step_days,
+                        wind_block_size=self.wind_block_size,
+                        update_wind=do_wind,
+                        debug_log=False,
+                        track_components=self.diagnostics is not None,
+                        time_scale=mode,
+                    )
+
+                    # Record diagnostics each sub-step for correct time-averaging
+                    if self.diagnostics is not None:
+                        self.diagnostics.record_step(
+                            new_state,
+                            new_state.day_of_year,
+                            days_elapsed=step_days,
+                            component_contributions=temp_components
+                        )
+
+                self.state = new_state
+
+                # Push final state to UI (non-blocking, drop if UI busy)
+                try:
+                    self.state_queue.put_nowait(new_state)
+                    self.component_queue.put_nowait(temp_components)
+                except Exception:
+                    pass  # Drop frame if queue full
+
+            except Exception as e:
+                LOG.error(f"Simulation thread error: {e}")
+                self.paused.set()  # Auto-pause on error
+
+    def pause(self):
+        """Pause simulation."""
+        self.paused.set()
+
+    def resume(self):
+        """Resume simulation."""
+        self.paused.clear()
+
+    def stop(self):
+        """Stop simulation thread."""
+        self.running.clear()
+
+    def update_days_per_step(self, days):
+        """Update simulation speed (legacy; kept for backward compatibility)."""
+        self.days_per_step = days
+
+    def update_time_scale(self, mode: TimeScaleMode):
+        """Switch time-scale mode (affects sub-stepping strategy)."""
+        self.time_scale_mode = mode
+
+    def update_wind_block_size(self, block_size):
+        """Update wind resolution."""
+        self.wind_block_size = block_size
 
 
 def main() -> None:
@@ -49,6 +157,8 @@ def main() -> None:
     size = 512
     yaw = 0.0; pitch = 0.0; roll = 0.0
     settings = load_settings()
+    _auto_save_enabled: bool = bool(settings.get("auto_save_state", False))
+    _saved_state_days: float | None = None  # total_days of the loaded autosave (for display)
     default_settings = {
         "seed": 42,
         "octaves": 4,
@@ -68,6 +178,7 @@ def main() -> None:
 
     # Simulation state
     sim_state: PlanetState | None = None
+    sim_thread: SimulationThread | None = None
     sim_running = False
     sim_paused = False
     sim_speed = 1.0  # days per step
@@ -93,6 +204,7 @@ def main() -> None:
         "Temperature",
         "Ocean Temperature",
         "Precipitation",
+        "Biomes",
         "Wind Arrows",
         "Ocean Currents",
         "Wind Particles",
@@ -294,26 +406,145 @@ def main() -> None:
         root.update()
         
         LOG.info("Starting 1-year benchmark...")
-        # Run for 365 days
-        states, _ = simulate_multiple_steps(sim_state, total_days=365.0, step_days=1.0)
-        
-        # Analyze final state
-        final_state = states[-1]
+
+        # --- T_BASE PROFILE (instant, no simulation needed) ---
+        # This shows whether the temperature TARGETS are calibrated correctly
+        # before we even run a single step.  If T_base is wrong, no amount of
+        # tuning other parameters will fix the climate.
+        from diagnostics import compute_t_base_profile, print_t_base_report
+        print_t_base_report(compute_t_base_profile())
+
+        # --- RUN 365 days in monthly chunks to collect ice snapshots ---
+        # Month day-counts and cumulative start days (non-leap year)
+        MONTHLY_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        _MONTH_START = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        # Determine which calendar month the simulation is currently in so the
+        # monthly labels align with the simulation's actual day_of_year.
+        _doy = sim_state.day_of_year % 365.0
+        _start_month_idx = max(
+            (i for i, s in enumerate(_MONTH_START) if s <= _doy),
+            default=0,
+        )
+        monthly_ice_nh: list[float] = []
+        monthly_ice_sh: list[float] = []
+        monthly_T55N: list[float] = []  # key diagnostic latitude
+        monthly_T65N: list[float] = []
+        monthly_T75N: list[float] = []
+
+        current = sim_state
+        for month_i, mdays in enumerate(MONTHLY_DAYS):
+            states, _ = simulate_multiple_steps(current, total_days=float(mdays), step_days=1.0)
+            current = states[-1]
+            # Monthly ice snapshot
+            snap = diagnostics.analyze_snapshot(current)
+            monthly_ice_nh.append(snap.get("ice_frac_nh", 0.0))
+            monthly_ice_sh.append(snap.get("ice_frac_sh", 0.0))
+            # Zonal mean temperature at key NH latitudes (use air temperature)
+            T = current.air_temperature if current.air_temperature is not None else current.temperature
+            if T is not None:
+                H = T.shape[0]
+                lat_rows = (0.5 - (np.arange(H) + 0.5) / H) * 180.0
+                def _zonal_T(lat_c: float) -> float:
+                    idx = int(np.argmin(np.abs(lat_rows - lat_c)))
+                    return float(np.mean(T[idx, :])) - 273.15
+                monthly_T55N.append(_zonal_T(55.0))
+                monthly_T65N.append(_zonal_T(65.0))
+                monthly_T75N.append(_zonal_T(75.0))
+
+        final_state = current
+
+        # --- PRINT MONTHLY ICE / TEMPERATURE EVOLUTION ---
+        _ALL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        # Rotate month names so index 0 = the calendar month the benchmark started in
+        MONTH_NAMES = [_ALL_MONTHS[(_start_month_idx + i) % 12] for i in range(12)]
+        print(f"\n--- MONTHLY ICE & HIGH-LAT TEMPERATURE EVOLUTION (starting ~{_ALL_MONTHS[_start_month_idx]}, day {_doy:.0f}) ---")
+        print(f"{'Month':>5} | {'NH ice%':>7} | {'SH ice%':>7} | {'T55N(°C)':>9} | {'T65N(°C)':>9} | {'T75N(°C)':>9}")
+        print("-" * 62)
+        for i, name in enumerate(MONTH_NAMES):
+            ni = monthly_ice_nh[i]*100 if i < len(monthly_ice_nh) else float('nan')
+            si = monthly_ice_sh[i]*100 if i < len(monthly_ice_sh) else float('nan')
+            t55 = monthly_T55N[i] if i < len(monthly_T55N) else float('nan')
+            t65 = monthly_T65N[i] if i < len(monthly_T65N) else float('nan')
+            t75 = monthly_T75N[i] if i < len(monthly_T75N) else float('nan')
+            print(f"{name:>5} | {ni:>7.1f} | {si:>7.1f} | {t55:>+9.1f} | {t65:>+9.1f} | {t75:>+9.1f}")
+        print("-" * 62)
+        nh_min = min(monthly_ice_nh)*100 if monthly_ice_nh else 0
+        nh_max = max(monthly_ice_nh)*100 if monthly_ice_nh else 0
+        print(f"  NH ice range: {nh_min:.1f}% – {nh_max:.1f}%  (Earth: ~3% summer to ~8% winter)")
+        t55_range = f"{min(monthly_T55N):+.1f}°C – {max(monthly_T55N):+.1f}°C" if monthly_T55N else "N/A"
+        t65_range = f"{min(monthly_T65N):+.1f}°C – {max(monthly_T65N):+.1f}°C" if monthly_T65N else "N/A"
+        print(f"  T55N seasonal range: {t55_range}  (Earth: ~-5°C winter to +15°C summer)")
+        print(f"  T65N seasonal range: {t65_range}  (Earth: ~-15°C winter to +10°C summer)")
+        print("-----------------------------------------------------\n")
+
+        # Analyze final state snapshot.
         stats = diagnostics.analyze_snapshot(final_state)
         diagnostics.print_report(stats)
+        # Wind speed and direction magnitudes vs Earth
+        diagnostics.print_wind_report(stats)
         # Circulation validation (surface 3-cell proxies)
         circ = diagnostics.analyze_circulation(stats)
         diagnostics.print_circulation_report(circ)
-        
-        messagebox.showinfo("Benchmark Complete", 
+        # Latitude band temperature/precip comparison
+        from diagnostics import compute_latitude_band_stats, print_latitude_band_report
+        band_stats = compute_latitude_band_stats(final_state)
+        print_latitude_band_report(band_stats)
+        # Sea ice extent vs Earth references
+        diagnostics.print_ice_report(stats)
+
+        cs = stats.get("circulation_score", 0.0)
+        messagebox.showinfo("Benchmark Complete",
             f"Global Mean Temp: {stats['global_mean_temp']:.1f} K\n"
-            f"Equator-Pole Gradient: {stats['gradient_north']:.1f} K\n"
+            f"Equator-Pole Gradient (N): {stats['gradient_north']:.1f} K  (Earth 45-60 K)\n"
+            f"Circulation Score: {cs:.2f}  (higher = more Earth-like)\n"
             "Check console for full report.")
         
         sim_status_var.set("Stopped")
 
     tk.Button(controls, text="Export Data", command=export_data).pack(side="right", padx=10)
     tk.Button(controls, text="Benchmark", command=run_benchmark).pack(side="right", padx=10)
+
+    # --- State save/load controls ---
+    auto_save_var = tk.BooleanVar(value=_auto_save_enabled)
+    save_info_var = tk.StringVar(value="")
+
+    def _refresh_save_info() -> None:
+        if AUTOSAVE_PATH.exists():
+            size_kb = AUTOSAVE_PATH.stat().st_size / 1024
+            save_info_var.set(f"Save: {size_kb:.0f} KB")
+        else:
+            save_info_var.set("No save")
+
+    def _do_save_state() -> None:
+        nonlocal sim_state
+        if sim_state is None:
+            messagebox.showinfo("Save State", "No simulation state to save. Start the simulation first.")
+            return
+        try:
+            save_state(sim_state, AUTOSAVE_PATH)
+            _refresh_save_info()
+            total_years = sim_state.total_days / 365.2422
+            messagebox.showinfo("Save State", f"State saved.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def _do_clear_save() -> None:
+        if AUTOSAVE_PATH.exists():
+            AUTOSAVE_PATH.unlink()
+        _refresh_save_info()
+        messagebox.showinfo("Clear Save", "Saved state cleared. Next start will use fresh initial conditions.")
+
+    def _on_auto_save_toggle() -> None:
+        nonlocal _auto_save_enabled
+        _auto_save_enabled = auto_save_var.get()
+
+    save_row = tk.Frame(root)
+    save_row.pack(fill="x")
+    tk.Checkbutton(save_row, text="Auto-save/load state", variable=auto_save_var, command=_on_auto_save_toggle).pack(side="left", padx=4)
+    tk.Button(save_row, text="Save State Now", command=_do_save_state).pack(side="left", padx=4)
+    tk.Button(save_row, text="Clear Saved State", command=_do_clear_save).pack(side="left", padx=4)
+    tk.Label(save_row, textvariable=save_info_var, anchor="w", fg="gray").pack(side="left", padx=8)
+    _refresh_save_info()
 
     def _init_sim_state_from_elevation(elev: np.ndarray) -> None:
         """Initialize sim_state immediately (but do not start stepping)."""
@@ -329,7 +560,7 @@ def main() -> None:
         diagnostics.history.clear()
         diagnostics.component_history.clear()
         diagnostics.total_days = 0.0
-        sim_cycle_var.set("Year: 1")
+        sim_cycle_var.set("Y1 M1")
         graphs_controller.reset()
     
     # Simulation controls
@@ -338,9 +569,9 @@ def main() -> None:
     sim_status_var = tk.StringVar(value="Stopped")
     sim_cycle_var = tk.StringVar(value="Year: 1")
     tk.Label(sim_controls, text="Simulation:").pack(side="left", padx=(4,0))
-    sim_status_label = tk.Label(sim_controls, textvariable=sim_status_var)
+    sim_status_label = tk.Label(sim_controls, textvariable=sim_status_var, width=12, anchor="w")
     sim_status_label.pack(side="left", padx=4)
-    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var)
+    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var, width=12, anchor="w")
     sim_cycle_label.pack(side="left", padx=8)
     tk.Button(sim_controls, text="Start", command=lambda: start_simulation()).pack(side="left", padx=2)
     tk.Button(sim_controls, text="Stop", command=lambda: stop_simulation()).pack(side="left", padx=2)
@@ -349,6 +580,27 @@ def main() -> None:
     def on_graphs_toggle():
         graphs_controller.set_enabled(graphs_enabled_var.get())
     tk.Checkbutton(sim_controls, text="Graphs", variable=graphs_enabled_var, command=on_graphs_toggle).pack(side="left", padx=6)
+
+    # Time scale dropdown — each option maps to a TimeScaleMode
+    time_scale_options = {
+        "1 Day":   TimeScaleMode.DAILY,
+        "1 Week":  TimeScaleMode.WEEKLY,
+        "1 Month": TimeScaleMode.MONTHLY,
+        "1 Year":  TimeScaleMode.ANNUAL,
+    }
+    time_scale_var = tk.StringVar(value="1 Day")
+    def on_time_scale_change(*_args):
+        nonlocal sim_speed
+        mode = time_scale_options[time_scale_var.get()]
+        # sim_speed is kept as a rough "days per frame" for any legacy display code
+        sim_speed = {"1 Day": 1, "1 Week": 7, "1 Month": 30, "1 Year": 365}.get(
+            time_scale_var.get(), 1
+        )
+        if sim_thread is not None and sim_thread.is_alive():
+            sim_thread.update_time_scale(mode)
+    time_scale_var.trace_add("write", on_time_scale_change)
+    tk.Label(sim_controls, text="Speed:").pack(side="left", padx=(12, 0))
+    tk.OptionMenu(sim_controls, time_scale_var, *time_scale_options.keys()).pack(side="left", padx=2)
 
     # Wind controls
     wind_arrows_var = tk.IntVar(value=int(settings.get("wind_arrows", default_settings["wind_arrows"])))
@@ -530,13 +782,17 @@ def main() -> None:
                     _update_wind_particles()
                 return
             if view_var.get() == "Wind Arrows":
-                wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
-                if _WIND_CACHE["key"] != wkey:
-                    with log_time("Generate wind field+arrows"):
-                        u, v = generate_wind_field(*tex.shape, elevation=tex, upsample="bilinear", weather_amp=0.35, debug_log=False)
-                        _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
+                # Use simulated wind if available, otherwise generate synthetic wind
+                if sim_state is not None and sim_running and sim_state.wind_u is not None:
+                    u, v = sim_state.wind_u, sim_state.wind_v
                 else:
-                    u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
+                    wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
+                    if _WIND_CACHE["key"] != wkey:
+                        with log_time("Generate wind field+arrows"):
+                            u, v = generate_wind_field(*tex.shape, elevation=tex, upsample="bilinear", weather_amp=0.35, debug_log=False)
+                            _WIND_CACHE.update({"key": wkey, "u": u, "v": v})
+                    else:
+                        u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
                 speed = np.hypot(u, v).astype(np.float32)
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
@@ -545,14 +801,17 @@ def main() -> None:
             elif view_var.get() == "Ocean Currents":
                 ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents")
                 if _OCEAN_CURRENT_CACHE["key"] != ckey:
-                    u, v = generate_ocean_currents(tex, day_of_year=day, time_days=float(day))
+                    # Phase 3: Pass wind fields for Ekman transport coupling
+                    wu = sim_state.wind_u if (sim_state is not None and sim_running) else None
+                    wv = sim_state.wind_v if (sim_state is not None and sim_running) else None
+                    u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=float(day))
                     _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
                 else:
                     u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
                 speed = np.hypot(u, v).astype(np.float32)
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
-                ocean_mask = _ocean_mask_from_elevation(tex)
+                ocean_mask, _ = get_masks(tex)
                 mask3 = ocean_mask[..., None].astype(np.float32)
                 comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
                 arr = (comb * 255).astype(np.uint8)
@@ -566,7 +825,7 @@ def main() -> None:
         canvas.itemconfig(img_id, image=tk_img)
 
     tk.Button(controls, text="Regenerate", command=do_regen).pack(side="left", padx=6)
-    latlon_label = tk.Label(controls, textvariable=latlon_var)
+    latlon_label = tk.Label(controls, textvariable=latlon_var, width=70, anchor="e")
     latlon_label.pack(side="right")
 
     # Profile initial generation once at startup
@@ -574,7 +833,8 @@ def main() -> None:
     profiler.enable()
     
     # Try to load default heightmap, fall back to procedural if not found
-    default_heightmap_path = r"D:\dev\planetsim\images\16_bit_dem_small_512.tif"
+    default_heightmap_path = r"D:\dev\planetsim\images\16_bit_dem_small_512.tif" #desktop location
+    # default_heightmap_path = r"C:\dev\planetsim\images\16_bit_dem_small_512.tif" #laptop location
     try:
         with log_time(f"Loading default heightmap from {default_heightmap_path}"):
             heightmap_img = Image.open(default_heightmap_path)
@@ -645,9 +905,44 @@ def main() -> None:
     LOG.info("Startup profile (top 20):")
     stats.print_stats(20)
     tk_img = ImageTk.PhotoImage(img)
-    canvas = tk.Canvas(root, width=tex0.shape[1], height=tex0.shape[0], highlightthickness=0)
-    canvas.pack()
+    # Map area: canvas on the left, legend panel on the right (unused window space)
+    map_row = tk.Frame(root)
+    map_row.pack(side="top")
+    canvas = tk.Canvas(map_row, width=tex0.shape[1], height=tex0.shape[0], highlightthickness=0)
+    canvas.pack(side="left")
     img_id = canvas.create_image(0, 0, image=tk_img, anchor="nw")
+
+    # --- Biome legend panel ---
+    # Shown only when the Biomes map view is active; hidden otherwise.
+    from climate_averages import KOPPEN_NAMES as _KNAMES, KOPPEN_COLORS as _KCLR
+    _LEG_BG  = "#1e1e2e"
+    _LEG_FG  = "#d8d8f0"
+    _LEG_DIM = "#77779a"
+    legend_outer = tk.Frame(map_row, bg=_LEG_BG, padx=2, pady=2)
+    # Not packed here — _on_view_change shows/hides it based on current view.
+    tk.Label(legend_outer, text="Köppen Climate Zones",
+             bg=_LEG_BG, fg="white", font=("TkDefaultFont", 9, "bold"),
+             anchor="w").pack(fill="x", padx=6, pady=(6, 2))
+    tk.Frame(legend_outer, bg="#4a4a6a", height=1).pack(fill="x", padx=6, pady=(0, 4))
+    for _ci in range(1, 20):
+        _rgb_f = _KCLR[_ci]
+        _hex = "#{:02x}{:02x}{:02x}".format(
+            int(_rgb_f[0] * 255), int(_rgb_f[1] * 255), int(_rgb_f[2] * 255)
+        )
+        _full = _KNAMES.get(_ci, f"Type {_ci}")
+        _parts = _full.split(" - ", 1)
+        _code_str = _parts[0]
+        _desc = _parts[1] if len(_parts) > 1 else ""
+        _row = tk.Frame(legend_outer, bg=_LEG_BG)
+        _row.pack(fill="x", padx=6, pady=1)
+        tk.Canvas(_row, width=13, height=13, bg=_hex, highlightthickness=0).pack(
+            side="left", padx=(0, 5))
+        tk.Label(_row, text=f"{_code_str:<5}{_desc}", bg=_LEG_BG, fg=_LEG_FG,
+                 font=("Courier", 8), anchor="w").pack(side="left")
+    tk.Frame(legend_outer, bg="#4a4a6a", height=1).pack(fill="x", padx=6, pady=(4, 2))
+    tk.Label(legend_outer, text="Reclassified every 30 sim-days",
+             bg=_LEG_BG, fg=_LEG_DIM, font=("TkDefaultFont", 7),
+             anchor="w").pack(fill="x", padx=6, pady=(0, 6))
 
     def render():
         nonlocal tk_img, terrain_mode
@@ -703,9 +998,9 @@ def main() -> None:
             
             if view_var.get() == "Temperature":
                 if use_sim_data and sim_state.temperature is not None:
-                    # Use simulation temperature, convert to overlay RGB using same high-quality mapping
                     from temperature import temperature_to_rgb
-                    T = sim_state.temperature
+                    # Show 2m air temperature; fall back to T_sst for old saves
+                    T = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
                     overlay = temperature_to_rgb(T)
                 else:
                     h, w = tex.shape
@@ -723,7 +1018,7 @@ def main() -> None:
                     h, w = tex.shape
                     with log_time("Generate temperature overlay"):
                         ocean_rgb = generate_temperature_overlay(h, w, elevation=tex)
-                ocean_mask = _ocean_mask_from_elevation(tex)
+                ocean_mask, _ = get_masks(tex)
                 base = np.zeros_like(ocean_rgb, dtype=np.float32)
                 base[ocean_mask] = ocean_rgb[ocean_mask]
                 if use_sim_data and sim_state.ice_cover is not None:
@@ -757,6 +1052,49 @@ def main() -> None:
                 overlay, alpha = precipitation_to_rgb(P)
                 comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+            elif view_var.get() == "Biomes":
+                # Biome visualization - prefer Köppen classification for detailed climate zones
+                from climate_averages import KOPPEN_COLORS
+
+                # Use Köppen if available, fall back to legacy biomes
+                if use_sim_data and sim_state.koppen_type is not None:
+                    # Köppen classification (20 climate types, updated every 30 days)
+                    koppen = sim_state.koppen_type
+                    biome_rgb = KOPPEN_COLORS[koppen]
+                    alpha = (koppen > 0).astype(np.float32)  # 0 = ocean
+                elif use_sim_data and sim_state.biome_type is not None:
+                    # Legacy biome classification (5 types)
+                    biome = sim_state.biome_type
+                    biome_colors = np.array([
+                        [0.0, 0.0, 0.0],    # Ocean
+                        [0.9, 0.8, 0.5],    # Desert
+                        [0.6, 0.8, 0.3],    # Grassland
+                        [0.1, 0.5, 0.1],    # Forest
+                        [0.7, 0.75, 0.8],   # Tundra
+                    ], dtype=np.float32)
+                    biome_rgb = biome_colors[biome]
+                    alpha = (biome > 0).astype(np.float32)
+                elif use_sim_data and sim_state.temperature is not None and sim_state.precipitation is not None:
+                    # Fallback: compute from instantaneous values
+                    from carbon_cycle import compute_biome_type
+                    land_mask = (tex > 0.02).astype(np.float32)
+                    biome = compute_biome_type(sim_state.temperature, sim_state.precipitation, land_mask)
+                    biome_colors = np.array([
+                        [0.0, 0.0, 0.0], [0.9, 0.8, 0.5], [0.6, 0.8, 0.3],
+                        [0.1, 0.5, 0.1], [0.7, 0.75, 0.8],
+                    ], dtype=np.float32)
+                    biome_rgb = biome_colors[biome]
+                    alpha = (biome > 0).astype(np.float32)
+                else:
+                    biome_rgb = None
+                    alpha = None
+
+                if biome_rgb is not None:
+                    # Blend with terrain (ocean uses base, land uses biome/Köppen color)
+                    comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * biome_rgb
+                    arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+                else:
+                    arr = (base_rgb * 255).astype(np.uint8)
             elif view_var.get() == "Cloud Cover":
                 if use_sim_data and sim_state.cloud_cover is not None:
                     C = sim_state.cloud_cover
@@ -798,7 +1136,7 @@ def main() -> None:
                 speed = np.hypot(u, v).astype(np.float32)
                 base_rgb = wind_speed_to_rgb(speed)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
-                ocean_mask = _ocean_mask_from_elevation(tex)
+                ocean_mask, _ = get_masks(tex)
                 mask3 = ocean_mask[..., None].astype(np.float32)
                 comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
                 arr = (comb * 255).astype(np.uint8)
@@ -811,43 +1149,81 @@ def main() -> None:
         canvas.itemconfig(img_id, image=tk_img)
         # Update status with simulation day (only if not paused)
         if use_sim_data and not sim_paused:
-            sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
+            sim_status_var.set(f"Day: {sim_state.day_of_year:.0f}")
         # Clear lat/lon when switching out of map
         if mode_var.get() != "map":
             latlon_var.set("")
 
     def start_simulation():
-        nonlocal sim_state, sim_running, sim_paused
+        nonlocal sim_state, sim_thread, sim_running, sim_paused
         if sim_state is None:
-            # Initialize simulation from current elevation
-            tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
-            _init_sim_state_from_elevation(tex)
+            # Load autosave if enabled and available; otherwise create fresh state
+            if _auto_save_enabled and AUTOSAVE_PATH.exists():
+                try:
+                    sim_state = load_state(AUTOSAVE_PATH)
+                    total_years = sim_state.total_days / 365.2422
+                    sim_status_var.set(f"Loaded Y{total_years:.1f}")
+                    LOG.info(f"Autosave loaded: day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+                except Exception as e:
+                    LOG.warning(f"Failed to load autosave ({e}); starting fresh.")
+                    tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+                    _init_sim_state_from_elevation(tex)
+            else:
+                tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+                _init_sim_state_from_elevation(tex)
+
+        # Start or resume simulation thread
+        if sim_thread is None or not sim_thread.is_alive():
+            sim_thread = SimulationThread(
+                sim_state,
+                days_per_step=sim_speed,
+                wind_block_size=int(wind_block_size_var.get()),
+                diagnostics=diagnostics,
+                time_scale_mode=time_scale_options.get(time_scale_var.get(), TimeScaleMode.DAILY),
+            )
+            sim_thread.start()
+
+        sim_thread.resume()
         sim_running = True
         sim_paused = False
         sim_status_var.set("Running")
         # Diagnostics tracks total time; use it to display cycle count (years).
-        sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
+        year = int(diagnostics.total_days // 365.2422) + 1
+        month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+        sim_cycle_var.set(f"Y{year} M{month}")
         # If particle view is selected, start animation loop.
         nonlocal particle_anim_running
         if mode_var.get() == "map" and view_var.get() == "Wind Particles" and not particle_anim_running:
             particle_anim_running = True
             _update_wind_particles()
-        update_simulation()
+        # Start UI update loop
+        update_from_simulation()
     
     def stop_simulation():
-        nonlocal sim_running, sim_paused
+        nonlocal sim_thread, sim_running, sim_paused
+        if sim_thread:
+            sim_thread.pause()
         sim_running = False
         sim_paused = False
         sim_status_var.set("Stopped")
     
     def pause_simulation():
-        nonlocal sim_paused
+        nonlocal sim_thread, sim_paused
         if sim_running:
             sim_paused = not sim_paused
+            if sim_thread:
+                if sim_paused:
+                    sim_thread.pause()
+                else:
+                    sim_thread.resume()
             sim_status_var.set("Paused" if sim_paused else "Running")
     
     def reset_simulation():
-        nonlocal sim_state, sim_running, sim_paused
+        nonlocal sim_state, sim_thread, sim_running, sim_paused
+        # Stop the simulation thread if running
+        if sim_thread:
+            sim_thread.stop()
+            sim_thread = None
         # Reset to a freshly initialized (stopped) state from current elevation.
         use_sim_data = sim_state is not None and sim_running
         if use_sim_data and sim_state is not None and sim_state.elevation is not None:
@@ -908,7 +1284,7 @@ def main() -> None:
                     u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
                 px_str = f", {pixel_display}" if pixel_display else ""
-                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, wind {speed:.1f} m/s")
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, wind {speed:5.1f} m/s")
             elif view_var.get() == "Ocean Currents":
                 day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
                 tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
@@ -922,50 +1298,58 @@ def main() -> None:
                     u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
                 px_str = f", {pixel_display}" if pixel_display else ""
-                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, current {speed:.2f} m/s")
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, current {speed:5.2f} m/s")
             else:
-                # Use simulation temperature if available
+                # Use air temperature for cursor display (what you feel at the surface)
                 if use_sim_data and sim_state.temperature is not None:
-                    T_kelvin = float(sim_state.temperature[int(y), int(x)])
+                    _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
+                    T_kelvin = float(_T_disp[int(y), int(x)])
                 else:
                     T_kelvin = temperature_kelvin_for_lat(np.deg2rad(lat))
                 # Convert Kelvin to Celsius
                 T_celsius = T_kelvin - 273.15
                 px_str = f", {pixel_display}" if pixel_display else ""
-                latlon_var.set(f"lat {lat:.2f}°, lon {lon:.2f}°{px_str}, elev {alt_m:.0f}m, T {T_celsius:.1f}°C")
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, T {T_celsius:6.1f}°C")
         else:
             latlon_var.set("")
     
-    def update_simulation():
-        nonlocal sim_state
-        if sim_running and not sim_paused and sim_state is not None:
-            # Advance simulation
-            sim_state, temp_components = simulate_step(
-                sim_state,
-                days=sim_speed,
-                wind_block_size=int(wind_block_size_var.get()),
-                debug_log=False,  # Disabled - use export data for analysis instead
-                track_components=True,  # Always track components for diagnostics
-            )
-            
-            # Record diagnostics with component tracking
-            if sim_state is not None:
-                diagnostics.record_step(
-                    sim_state, 
-                    sim_state.day_of_year, 
-                    days_elapsed=sim_speed,
-                    component_contributions=temp_components
-                )
-                sim_cycle_var.set(f"Year: {int(diagnostics.total_days // 365.2422) + 1}")
-                # Always update day label here (Wind Particles render path can return early).
-                sim_status_var.set(f"Day: {sim_state.day_of_year:.1f}")
-            # Update display
-            render()
-            # Update cursor display at last known mouse position
-            if mode_var.get() == "map":
-                update_cursor_display(last_mouse_pos[0], last_mouse_pos[1])
-            # Schedule next update (100ms = ~10 FPS)
-            root.after(100, update_simulation)
+    def update_from_simulation():
+        """Pull latest state from simulation thread and update UI (called by timer)."""
+        nonlocal sim_state, sim_thread
+
+        if sim_thread:
+            try:
+                # Non-blocking get - pull latest state if available
+                new_state = sim_thread.state_queue.get_nowait()
+                sim_state = new_state
+
+                # Also try to get temperature components (for diagnostics)
+                try:
+                    temp_components = sim_thread.component_queue.get_nowait()
+                except Empty:
+                    temp_components = None
+
+                # Update UI with new state
+                year = int(diagnostics.total_days // 365.2422) + 1
+                month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+                sim_cycle_var.set(f"Y{year} M{month}")
+                if not sim_paused:
+                    sim_status_var.set(f"Day: {sim_state.day_of_year:.0f}")
+
+                # Update display
+                render()
+
+                # Update cursor display at last known mouse position
+                if mode_var.get() == "map":
+                    update_cursor_display(last_mouse_pos[0], last_mouse_pos[1])
+
+            except Empty:
+                # No new state available - that's okay, just skip this update
+                pass
+
+        # Schedule next UI update (50ms = ~20 FPS for UI responsiveness)
+        if sim_running or sim_thread:
+            root.after(50, update_from_simulation)
     
     def on_motion(e):
         nonlocal last_mouse_pos
@@ -995,10 +1379,32 @@ def main() -> None:
             render()
 
     root.bind("<Key>", on_key)
-    mode_var.trace_add("write", lambda *_: render())
-    view_var.trace_add("write", lambda *_: render())
+
+    def _on_view_change(*_):
+        render()
+        # Show the legend only in Biomes map view; hide it everywhere else
+        if view_var.get() == "Biomes" and mode_var.get() == "map":
+            legend_outer.pack(side="left", anchor="nw", padx=(4, 4), pady=4)
+        else:
+            legend_outer.pack_forget()
+
+    mode_var.trace_add("write", _on_view_change)
+    view_var.trace_add("write", _on_view_change)
     def on_close():
+        nonlocal sim_thread
+        # Stop simulation thread if running
+        if sim_thread:
+            sim_thread.stop()
+            sim_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
         # Persist current UI parameters to settings.json
+        # Autosave simulation state if enabled
+        if _auto_save_enabled and sim_state is not None:
+            try:
+                save_state(sim_state, AUTOSAVE_PATH)
+                LOG.info(f"Autosave written: day {sim_state.total_days:.0f}")
+            except Exception as e:
+                LOG.warning(f"Autosave failed: {e}")
+
         s = {
             "seed": int(seed_var.get()),
             "octaves": int(octaves_var.get()),
@@ -1008,6 +1414,7 @@ def main() -> None:
             "wind_arrows": int(wind_arrows_var.get()),
             "wind_scale": float(wind_scale_var.get()),
             "wind_block_size": int(wind_block_size_var.get()),
+            "auto_save_state": bool(_auto_save_enabled),
         }
         save_settings(s)
         graphs_controller.close()
