@@ -1,0 +1,14 @@
+{
+  "_comment": "Ocean/ice parameter sweep — tune sea ice extent and ocean heat transport.",
+  "param_space": {
+    "thermal_diffusion":    [0.01, 0.10],
+    "ice_albedo_strength":  [0.10, 0.55],
+    "ice_freeze_temp":      [268.5, 271.0],
+    "ice_melt_temp":        [270.5, 273.0],
+    "ocean_transport_coeff":[0.15, 0.60],
+    "ocean_exchange_coeff": [0.03, 0.15]
+  },
+  "fixed_params": {
+    "wind_damping": 0.50
+  }
+}

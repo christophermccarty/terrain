@@ -13,7 +13,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from atmosphere import generate_wind_field, render_wind_arrows, generate_precipitation, wind_speed_to_rgb
-from ocean import generate_ocean_currents, _ocean_mask_from_elevation
+from ocean import generate_ocean_currents
+from masks import get_masks
 import logging
 import time
 from contextlib import contextmanager
@@ -237,23 +238,35 @@ def colorize(elev: np.ndarray) -> np.ndarray:
 
 
 def precipitation_to_rgb(precip_mm_day: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (rgb, alpha) precipitation overlay from mm/day."""
-    p = np.clip(precip_mm_day.astype(np.float32), 0.0, 120.0)
-    norm = np.log1p(p) / np.log1p(120.0)
-    stops = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+    """Return (rgb, alpha) precipitation overlay from mm/day.
+
+    Uses weather radar color scheme:
+    - Light green: trace precipitation (~0-2 mm/day)
+    - Green: light rain (~2-8 mm/day)
+    - Yellow: moderate rain (~8-20 mm/day)
+    - Orange: heavy rain (~20-50 mm/day)
+    - Red: very heavy rain (~50-100 mm/day)
+    - Magenta: extreme precipitation (>100 mm/day)
+    """
+    p = np.clip(precip_mm_day.astype(np.float32), 0.0, 150.0)
+    norm = np.log1p(p) / np.log1p(150.0)
+    # Weather radar style stops (6 colors for finer gradation)
+    stops = np.array([0.0, 0.15, 0.35, 0.55, 0.75, 0.90, 1.0], dtype=np.float32)
     colors = np.array([
-        [0.85, 0.90, 1.00],
-        [0.35, 0.65, 0.95],
-        [0.20, 0.80, 0.55],
-        [0.95, 0.85, 0.25],
-        [0.85, 0.20, 0.20],
+        [0.60, 0.85, 0.60],  # 0.0: Light green (trace)
+        [0.20, 0.75, 0.20],  # 0.15: Green (light rain ~2 mm/day)
+        [1.00, 1.00, 0.00],  # 0.35: Yellow (moderate ~8 mm/day)
+        [1.00, 0.65, 0.00],  # 0.55: Orange (heavy ~20 mm/day)
+        [1.00, 0.00, 0.00],  # 0.75: Red (very heavy ~50 mm/day)
+        [0.85, 0.00, 0.50],  # 0.90: Magenta (extreme ~100 mm/day)
+        [0.60, 0.00, 0.60],  # 1.0: Purple (max ~150 mm/day)
     ], dtype=np.float32)
     idx = np.clip(np.searchsorted(stops, norm, side="right") - 1, 0, len(stops) - 2)
     t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx] + 1e-9)
     c0 = colors[idx]
     c1 = colors[idx + 1]
     rgb = c0 + (c1 - c0) * t[..., None]
-    alpha = np.clip(norm ** 0.6 * 0.9, 0.0, 0.9)
+    alpha = np.clip(norm ** 0.5 * 0.85, 0.0, 0.9)
     return rgb, alpha
 
 
@@ -347,7 +360,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
         speed = np.hypot(u, v).astype(np.float32)
         base_rgb = wind_speed_to_rgb(speed)
         arrows = render_wind_arrows(tex_h, tex_w, u, v, target_arrows=250)
-        ocean_mask = _ocean_mask_from_elevation(tex)
+        ocean_mask, _ = get_masks(tex)
         mask3 = ocean_mask[..., None].astype(np.float32)
         base_rgb = base_rgb * mask3
         arrows = arrows * mask3

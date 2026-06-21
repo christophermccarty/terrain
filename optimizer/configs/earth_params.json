@@ -1,0 +1,36 @@
+{
+  "_comment": "Current best Earth parameters (defaults from simulate_step). Captured 2026-06-20.",
+  "fixed_params": {
+    "block_size": 3,
+    "thermal_diffusion": 0.04,
+    "ice_albedo_strength": 0.30,
+    "ice_freeze_temp": 269.9,
+    "ice_melt_temp": 271.4,
+    "ice_freeze_rate": 0.045,
+    "ice_melt_rate": 0.19,
+    "polar_cooling_scale": 0.3,
+    "ocean_transport_coeff": 0.3,
+    "ocean_exchange_floor": 0.65,
+    "ocean_exchange_span": 0.35,
+    "ocean_exchange_coeff": 0.08,
+    "ocean_exchange_inertia": 0.35,
+    "wind_damping": 0.50,
+    "wind_baroclinic_jet_amp": 1000000.0,
+    "wind_baroclinic_mix": 2.0,
+    "wind_cell_relax_days": 3.0,
+    "wind_pgf_temp_scale": 450.0,
+    "wind_pgf_terrain_scale": 900.0,
+    "wind_drag_base": 2e-07,
+    "wind_drag_elev_scale": 6e-07,
+    "wind_vmax_clip": 50.0,
+    "latent_cooling_coeff": 0.015,
+    "co2_climate_feedback": 0.8
+  },
+  "earth_reference_scores": {
+    "_note": "Run python optimizer/runner.py --mode single to update these.",
+    "global_mean_t_target_K": 288.0,
+    "gradient_nh_target_K": 52.5,
+    "ice_frac_nh_target": 0.05,
+    "mean_precip_target_mm_day": 2.7
+  }
+}
