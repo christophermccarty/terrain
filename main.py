@@ -34,7 +34,7 @@ from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from ocean import generate_ocean_currents
 from masks import get_masks
 from terrain import precipitation_to_rgb
-from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps, save_state, load_state
+from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps, save_state, load_state, TimeScaleMode
 from diagnostics import ClimateDiagnostics
 import graphs
 
@@ -49,12 +49,14 @@ _PRECIP_VIEW_CACHE = {"key": None, "P": None}
 class SimulationThread(Thread):
     """Background thread that runs physics simulation independently of UI."""
 
-    def __init__(self, initial_state, days_per_step=1.0, wind_block_size=8, diagnostics=None):
+    def __init__(self, initial_state, days_per_step=1.0, wind_block_size=8, diagnostics=None,
+                 time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY):
         super().__init__(daemon=True)
         self.state = initial_state
         self.days_per_step = days_per_step
         self.wind_block_size = wind_block_size
         self.diagnostics = diagnostics
+        self.time_scale_mode = time_scale_mode
         self.running = Event()
         self.paused = Event()
         self.paused.set()  # Start paused
@@ -70,32 +72,51 @@ class SimulationThread(Thread):
                 continue
 
             try:
-                # Sub-stepping: run multiple 1-day steps per UI frame
-                num_substeps = max(1, int(self.days_per_step))
-                for _ in range(num_substeps):
+                # Select sub-stepping strategy based on time scale mode.
+                # Each entry is (step_days, update_wind):
+                #   DAILY   — 1 × 1-day full physics (most accurate)
+                #   WEEKLY  — 7 × 1-day full physics (7 simulated days per frame)
+                #   MONTHLY — 5 × 6-day steps, no wind (≈30 days; ~5× faster than 30 daily)
+                #   ANNUAL  — 52 × 7-day steps, no wind (≈364 days; stable large-step physics)
+                mode = self.time_scale_mode
+                if mode == TimeScaleMode.WEEKLY:
+                    substeps = [(1.0, True)] * 7
+                elif mode == TimeScaleMode.MONTHLY:
+                    substeps = [(6.0, False)] * 5
+                elif mode == TimeScaleMode.ANNUAL:
+                    substeps = [(7.0, False)] * 52
+                else:  # DAILY (default)
+                    substeps = [(1.0, True)]
+
+                new_state = self.state
+                temp_components: dict = {}
+                for step_days, do_wind in substeps:
                     new_state, temp_components = simulate_step(
-                        self.state,
-                        days=1.0,
+                        new_state,
+                        days=step_days,
                         wind_block_size=self.wind_block_size,
+                        update_wind=do_wind,
                         debug_log=False,
                         track_components=self.diagnostics is not None,
+                        time_scale=mode,
                     )
-                    self.state = new_state
 
-                    # Record diagnostics each sub-step for correct averaging
+                    # Record diagnostics each sub-step for correct time-averaging
                     if self.diagnostics is not None:
                         self.diagnostics.record_step(
                             new_state,
                             new_state.day_of_year,
-                            days_elapsed=1.0,
+                            days_elapsed=step_days,
                             component_contributions=temp_components
                         )
+
+                self.state = new_state
 
                 # Push final state to UI (non-blocking, drop if UI busy)
                 try:
                     self.state_queue.put_nowait(new_state)
                     self.component_queue.put_nowait(temp_components)
-                except:
+                except Exception:
                     pass  # Drop frame if queue full
 
             except Exception as e:
@@ -115,8 +136,12 @@ class SimulationThread(Thread):
         self.running.clear()
 
     def update_days_per_step(self, days):
-        """Update simulation speed."""
+        """Update simulation speed (legacy; kept for backward compatibility)."""
         self.days_per_step = days
+
+    def update_time_scale(self, mode: TimeScaleMode):
+        """Switch time-scale mode (affects sub-stepping strategy)."""
+        self.time_scale_mode = mode
 
     def update_wind_block_size(self, block_size):
         """Update wind resolution."""
@@ -556,15 +581,23 @@ def main() -> None:
         graphs_controller.set_enabled(graphs_enabled_var.get())
     tk.Checkbutton(sim_controls, text="Graphs", variable=graphs_enabled_var, command=on_graphs_toggle).pack(side="left", padx=6)
 
-    # Time scale dropdown
-    time_scale_options = {"1 Day": 1, "1 Week": 7, "1 Month": 30}
+    # Time scale dropdown — each option maps to a TimeScaleMode
+    time_scale_options = {
+        "1 Day":   TimeScaleMode.DAILY,
+        "1 Week":  TimeScaleMode.WEEKLY,
+        "1 Month": TimeScaleMode.MONTHLY,
+        "1 Year":  TimeScaleMode.ANNUAL,
+    }
     time_scale_var = tk.StringVar(value="1 Day")
     def on_time_scale_change(*_args):
         nonlocal sim_speed
-        days = time_scale_options[time_scale_var.get()]
-        sim_speed = days
+        mode = time_scale_options[time_scale_var.get()]
+        # sim_speed is kept as a rough "days per frame" for any legacy display code
+        sim_speed = {"1 Day": 1, "1 Week": 7, "1 Month": 30, "1 Year": 365}.get(
+            time_scale_var.get(), 1
+        )
         if sim_thread is not None and sim_thread.is_alive():
-            sim_thread.update_days_per_step(days)
+            sim_thread.update_time_scale(mode)
     time_scale_var.trace_add("write", on_time_scale_change)
     tk.Label(sim_controls, text="Speed:").pack(side="left", padx=(12, 0))
     tk.OptionMenu(sim_controls, time_scale_var, *time_scale_options.keys()).pack(side="left", padx=2)
@@ -1145,7 +1178,8 @@ def main() -> None:
                 sim_state,
                 days_per_step=sim_speed,
                 wind_block_size=int(wind_block_size_var.get()),
-                diagnostics=diagnostics
+                diagnostics=diagnostics,
+                time_scale_mode=time_scale_options.get(time_scale_var.get(), TimeScaleMode.DAILY),
             )
             sim_thread.start()
 

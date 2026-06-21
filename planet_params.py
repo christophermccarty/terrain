@@ -14,14 +14,13 @@ state, _ = simulate_step(state, days=1.0, planet_params=EARTH)
 
 # Mars-like simulation
 mars = PlanetParams(
-    solar_constant=590.0,
+    solar_constant=589.0,
     obliquity_deg=25.19,
-    orbital_period_days=687.0,
+    orbital_period_days=686.97,
     sidereal_day_hours=24.623,
     radius_m=3.3895e6,
     surface_gravity=3.71,
-    surface_pressure_pa=610.0,
-    obliquity_deg=25.19,
+    surface_pressure_pa=636.0,
 )
 """
 
@@ -105,6 +104,34 @@ class PlanetParams:
     aerosol_optical_depth: float = 0.0
     """Stratospheric aerosol optical depth (AOD).
     0 = clear sky; ~0.1 typical Pinatubo forcing."""
+
+    # ------------------------------------------------------------------ #
+    # Surface / ocean
+    # ------------------------------------------------------------------ #
+    ocean_fraction: float = 0.71
+    """Fraction of the surface covered by liquid-water ocean [0–1].
+    Earth ≈ 0.71.  Dry planets (Mars) = 0.  Used to scale ocean heat
+    capacity, evaporation rates, and Ekman transport coefficients."""
+
+    has_liquid_water_ocean: bool = True
+    """Whether the planet has a stable liquid-water ocean.
+    When False, ocean heat transport and sea-ice dynamics are suppressed."""
+
+    rotation_direction: int = 1
+    """Prograde (+1) or retrograde (-1) rotation relative to the orbit.
+    Flips the sign of the Coriolis parameter.  Earth = +1, Venus = −1."""
+
+    # ------------------------------------------------------------------ #
+    # Carbon / atmosphere composition
+    # ------------------------------------------------------------------ #
+    co2_baseline_ppm: float = 280.0
+    """Pre-industrial CO2 reference concentration [ppm].  Used as C₀ in
+    the radiative forcing formula ΔF = 5.35 ln(C/C₀).  Only meaningful
+    for N₂-dominated atmospheres (Earth-like); set to 1 for CO₂-dominated
+    atmospheres (Mars) where a different forcing model should be used."""
+
+    co2_initial_ppm: float = 415.0
+    """Initial atmospheric CO2 concentration at simulation start [ppm]."""
 
     # ------------------------------------------------------------------ #
     # Derived convenience properties
@@ -199,11 +226,48 @@ class PlanetParams:
         return np.maximum(0.0, Q).astype(np.float32)
 
     def coriolis_parameter(self, lat_rad: np.ndarray) -> np.ndarray:
-        """Coriolis parameter f = 2Ω sin(φ) [rad/s]."""
-        return (2.0 * self.omega * np.sin(np.asarray(lat_rad, dtype=np.float32))).astype(np.float32)
+        """Coriolis parameter f = 2Ω sin(φ) [rad/s].
+        Sign flipped for retrograde rotators (rotation_direction = -1)."""
+        return (
+            2.0 * self.omega * float(self.rotation_direction)
+            * np.sin(np.asarray(lat_rad, dtype=np.float32))
+        ).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
 # Singleton: Earth with present-day orbital parameters
 # ---------------------------------------------------------------------------
 EARTH = PlanetParams()
+
+# ---------------------------------------------------------------------------
+# Singleton: Mars — present-day orbital / physical parameters
+# ---------------------------------------------------------------------------
+# References:
+#   Solar constant at Mars: 1361 / 1.524² ≈ 589 W/m²
+#   Perihelion: Ls=250° ≈ day 477 of the Martian year (southern summer)
+#   Surface pressure: ~636 Pa (global mean, varies ±10% with season/dust)
+#   Atmosphere: 95% CO2, ~3% N2/Ar trace → mean molar mass ≈ 0.0435 kg/mol
+#   Epsilon near-blackbody: thin atmosphere, modest CO2 greenhouse bands (~5 K effect)
+#   has_liquid_water_ocean=False → ocean transport and sea-ice suppressed in simulate.py
+MARS = PlanetParams(
+    solar_constant=589.0,
+    obliquity_deg=25.19,
+    orbital_period_days=686.97,
+    eccentricity=0.0934,
+    perihelion_day=477.0,
+    sidereal_day_hours=24.623,
+    radius_m=3.3895e6,
+    surface_gravity=3.71,
+    surface_pressure_pa=636.0,
+    mean_molar_mass=0.0435,
+    gas_constant_dry=191.0,     # R_univ / M_CO2 = 8314 / 44
+    cp_dry=735.0,
+    epsilon_equator=0.90,       # Near-blackbody; thin CO2 greenhouse adds ~5 K
+    epsilon_pole=0.95,
+    aerosol_optical_depth=0.0,
+    ocean_fraction=0.0,
+    has_liquid_water_ocean=False,
+    rotation_direction=1,
+    co2_baseline_ppm=1.0,       # CO2-dominated atmosphere; Earth formula not applicable
+    co2_initial_ppm=1.0,
+)

@@ -10,6 +10,23 @@ import numpy as np
 from typing import NamedTuple
 from pathlib import Path
 from datetime import datetime
+from enum import Enum
+
+
+class TimeScaleMode(Enum):
+    """Time integration strategy for different simulation speeds.
+
+    DAILY   — 1 day per UI frame, full physics (highest accuracy).
+    WEEKLY  — 7 days per UI frame, 7 × 1-day sub-steps (same physics).
+    MONTHLY — ~30 days per UI frame, 5 × 6-day sub-steps, no wind evolution
+              (faster; weather variability is parameterized away).
+    ANNUAL  — ~365 days per UI frame, 52 × 7-day sub-steps, no wind or storms
+              (fastest; only slow climate variables evolve accurately).
+    """
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    ANNUAL = "annual"
 import pickle
 from atmosphere import (
     generate_wind_field, generate_precipitation,
@@ -43,6 +60,20 @@ except ImportError:
 
 # Cache for diagnostic/relaxation wind to avoid recomputing every step.
 _RELAX_CACHE = {"key": None, "u": None, "v": None}
+
+
+def _coarsen(arr: np.ndarray, Hc: int, Wc: int, bs: int) -> np.ndarray:
+    """Downsample (H,W) → (Hc,Wc) by block-averaging.
+
+    Avoids np.pad when the grid divides evenly (the common case for standard
+    block sizes), which eliminates a full-array copy per field per step.
+    """
+    a: np.ndarray = arr if arr.dtype == np.float32 else arr.astype(np.float32)
+    H, W = a.shape
+    ph, pw = Hc * bs - H, Wc * bs - W
+    if ph > 0 or pw > 0:
+        a = np.pad(a, ((0, ph), (0, pw)), mode="edge")
+    return a.reshape(Hc, bs, Wc, bs).mean(axis=(1, 3)).astype(np.float32)
 
 # Cache for ocean heat transport adjustment.
 # Ocean dynamics are slow (decorrelation time ~30 days), so we recompute
@@ -241,7 +272,6 @@ def simulate_step(
     ice_freeze_rate: float = 0.045,
     ice_melt_rate: float = 0.19,
     ice_albedo_strength: float = 0.30,  # Reduced from 0.50: weakens ice-albedo runaway; eff full-ice albedo=0.22
-    heat_transport_coeff: float = 0.8,
     thermal_diffusion: float = 0.04,
     latent_cooling_coeff: float = 0.015,
     enable_carbon_cycle: bool = True,
@@ -249,7 +279,16 @@ def simulate_step(
     debug_log: bool = False,
     track_components: bool = False,
     planet_params: PlanetParams | None = None,
+    time_scale: TimeScaleMode = TimeScaleMode.DAILY,
+    feedback_flags: dict[str, bool] | None = None,
 ) -> tuple[PlanetState, dict]:
+    # Supported flags (all default True when absent):
+    #   'ice_albedo'        — sea ice effect on surface albedo + latent heat
+    #   'snow_albedo'       — snow pack effect on surface albedo
+    #   'amoc_acc'          — dynamic AMOC/ACC circulation weakening with ice
+    #   'co2_greenhouse'    — CO2 temperature offset applied to T_base
+    #   'vegetation_albedo' — biome/Köppen-based land albedo
+    #   'ocean_transport'   — ocean heat transport ΔT calculation
     """Advance planet state forward by `days`.
 
     Updates temperature, wind, and precipitation based on new day_of_year.
@@ -310,6 +349,16 @@ def simulate_step(
     else:
         amoc_factor = 1.0
         acc_factor  = 1.0
+
+    # Apply feedback flags — freeze individual feedback loops at neutral state for testing.
+    # Planet-level disables (has_liquid_water_ocean=False) are merged in as flag overrides.
+    _fb = dict(feedback_flags) if feedback_flags else {}
+    if not pp.has_liquid_water_ocean:
+        _fb.setdefault('ocean_transport', False)
+        _fb.setdefault('ice_albedo', False)
+    if not _fb.get('amoc_acc', True):
+        amoc_factor = 1.0
+        acc_factor = 1.0
 
     eps_eq = float(pp.epsilon_equator if epsilon_equator is None else epsilon_equator)
     eps_pole = float(pp.epsilon_pole if epsilon_pole is None else epsilon_pole)
@@ -448,8 +497,9 @@ def simulate_step(
     # not added to final temperature afterward (which would cause runaway warming).
     # The forcing represents the equilibrium temperature offset that the simulation should relax toward.
     co2_temp_offset = 0.0
-    if enable_carbon_cycle:
-        co2_forcing = co2_radiative_forcing(state.co2_atmosphere, CO2_PREINDUSTRIAL)
+    _co2_ref = pp.co2_baseline_ppm if pp.co2_baseline_ppm > 1.0 else CO2_PREINDUSTRIAL
+    if enable_carbon_cycle and _fb.get('co2_greenhouse', True):
+        co2_forcing = co2_radiative_forcing(state.co2_atmosphere, _co2_ref)
         co2_temp_offset = co2_temperature_response(co2_forcing, co2_climate_feedback)
         if debug_log:
             LOG.info(f"CO2={state.co2_atmosphere:.1f} ppm, forcing={co2_forcing:.2f} W/m², T_offset={co2_temp_offset:.2f}K")
@@ -551,7 +601,8 @@ def simulate_step(
     # SH transport raised from 50% to 65% of base: the Southern Ocean needs more warmth
     # to avoid its own cold runaway, while still remaining cooler than AMOC-warmed NH.
     lat_deg_1d = np.abs(np.rad2deg(lat))
-    _transport_base = 34.0 * np.clip((lat_deg_1d - 42.0) / 28.0, 0.0, 1.0) ** 1.5
+    _ocean_scale = float(pp.has_liquid_water_ocean)
+    _transport_base = _ocean_scale * 34.0 * np.clip((lat_deg_1d - 42.0) / 28.0, 0.0, 1.0) ** 1.5
     # AMOC bonus: 18K ramp 40-65°N (unchanged) + extra 10K ramp 65-85°N only.
     # 65°N is already well-calibrated (-2°C vs Earth -2°C), so we only add warmth
     # above 65°N where the NH ice runaway causes an 8-10 K cold bias.
@@ -564,7 +615,7 @@ def simulate_step(
     # AMOC bonus scaled by dynamic feedback factor (amoc_factor: 0.30–1.00).
     # When NH polar ice 60-75°N is extensive, thermohaline sinking weakens and
     # the warming delivered to the sub-polar North Atlantic is reduced.
-    _amoc_bonus = amoc_factor * np.where(
+    _amoc_bonus = _ocean_scale * amoc_factor * np.where(
         lat > 0,
         3.0 * np.clip((lat_deg_1d - 42.0) / 23.0, 0.0, 1.0)
         + 15.0 * np.clip((lat_deg_1d - 65.0) / 10.0, 0.0, 1.0),
@@ -573,7 +624,7 @@ def simulate_step(
     # ACC (Antarctic Circumpolar Current) bonus scaled by acc_factor (0.50–1.00).
     # Extensive Antarctic sea ice partially blocks CDW upwelling and reduces
     # the net poleward heat delivery by the ACC.
-    _acc_bonus = acc_factor * np.where(
+    _acc_bonus = _ocean_scale * acc_factor * np.where(
         lat < 0,
         8.0 * np.clip((lat_deg_1d - 55.0) / 10.0, 0.0, 1.0)
         + 20.0 * np.clip((lat_deg_1d - 65.0) / 10.0, 0.0, 1.0),
@@ -616,14 +667,14 @@ def simulate_step(
         planet_params=pp,
     )
     lat_deg_full = np.abs(np.rad2deg(lat_full))
-    _transport_base_full = 34.0 * np.clip((lat_deg_full - 42.0) / 28.0, 0.0, 1.0) ** 1.5
-    _amoc_bonus_full = amoc_factor * np.where(
+    _transport_base_full = _ocean_scale * 34.0 * np.clip((lat_deg_full - 42.0) / 28.0, 0.0, 1.0) ** 1.5
+    _amoc_bonus_full = _ocean_scale * amoc_factor * np.where(
         lat_full > 0,
         3.0 * np.clip((lat_deg_full - 42.0) / 23.0, 0.0, 1.0)
         + 15.0 * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
         0.0,
     )
-    _acc_bonus_full = acc_factor * np.where(
+    _acc_bonus_full = _ocean_scale * acc_factor * np.where(
         lat_full < 0,
         8.0 * np.clip((lat_deg_full - 55.0) / 10.0, 0.0, 1.0)
         + 20.0 * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
@@ -646,31 +697,24 @@ def simulate_step(
     T_base = T_base_ocean  # Start with ocean (lagged), land will be corrected in evolution
     
     # Compute coarse elevation grid for wind/temperature evolution
-    if state.elevation is not None:
-        elev_pad = np.pad(state.elevation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        elev_c = elev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        elev_c = None
-    
+    elev_c = _coarsen(state.elevation, Hc, Wc, block_size) if state.elevation is not None else None
+
     # Update temperature with wind advection and land-sea effects
-    if state.temperature is not None:
-        T_prev_pad = np.pad(state.temperature.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        T_prev_coarse = T_prev_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        T_prev_coarse = T_base.copy()
+    T_prev_coarse = (
+        _coarsen(state.temperature, Hc, Wc, block_size)
+        if state.temperature is not None else T_base.copy()
+    )
 
     # Downsample T_air; initialize from T_sst if not yet present (first step or old save)
     _T_air_src = state.air_temperature if state.air_temperature is not None else state.temperature
-    if _T_air_src is not None:
-        _T_air_pad = np.pad(_T_air_src.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        T_air_coarse = _T_air_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        T_air_coarse = T_prev_coarse.copy()
-    if state.ice_cover is not None:
-        ice_pad = np.pad(state.ice_cover.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        ice_prev_coarse = ice_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        ice_prev_coarse = None
+    T_air_coarse = (
+        _coarsen(_T_air_src, Hc, Wc, block_size)
+        if _T_air_src is not None else T_prev_coarse.copy()
+    )
+    ice_prev_coarse = (
+        _coarsen(state.ice_cover, Hc, Wc, block_size)
+        if state.ice_cover is not None else None
+    )
     
     # ------------------------------------------------------
     # NEW: Prognostic Wind Evolution (Physics Items 16-33)
@@ -723,17 +767,12 @@ def simulate_step(
 
     if wind_bs > 1:
         # Downsample wind/temperature/elevation for evolution on the wind grid.
-        u_pad = np.pad(u_full.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
-        v_pad = np.pad(v_full.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
-        u_coarse_evol = u_pad.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
-        v_coarse_evol = v_pad.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
-
-        elev_pad_w = np.pad(state.elevation.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
-        elev_c_w = elev_pad_w.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
+        u_coarse_evol = _coarsen(u_full, Hcw, Wcw, wind_bs)
+        v_coarse_evol = _coarsen(v_full, Hcw, Wcw, wind_bs)
+        elev_c_w = _coarsen(state.elevation, Hcw, Wcw, wind_bs)
 
         if state.temperature is not None:
-            T_pad_w = np.pad(state.temperature.astype(np.float32), ((0, Hcw*wind_bs - H), (0, Wcw*wind_bs - W)), mode="edge")
-            T_for_wind = T_pad_w.reshape(Hcw, wind_bs, Wcw, wind_bs).mean(axis=(1, 3))
+            T_for_wind = _coarsen(state.temperature, Hcw, Wcw, wind_bs)
         else:
             # When temperature is not yet initialized, use the same lagged-ocean base but on the wind grid.
             lat_w = (0.5 - (np.arange(Hcw, dtype=np.float32) + 0.5) / Hcw) * np.pi
@@ -821,55 +860,47 @@ def simulate_step(
 
     # Winds to couple into temperature evolution operate on the temperature grid (Hc,Wc).
     if block_size > 1:
-        u_pad_t = np.pad(u_full.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        v_pad_t = np.pad(v_full.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        u_coarse = u_pad_t.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-        v_coarse = v_pad_t.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+        u_coarse = _coarsen(u_full, Hc, Wc, block_size)
+        v_coarse = _coarsen(v_full, Hc, Wc, block_size)
     else:
         u_coarse = u_full
         v_coarse = v_full
 
     # Apply temperature evolution with advection and radiation
-    if state.humidity is not None:
-        hum_pad = np.pad(state.humidity.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        humidity_coarse = hum_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        humidity_coarse = None
-
+    humidity_coarse = (
+        _coarsen(state.humidity, Hc, Wc, block_size) if state.humidity is not None else None
+    )
     # Downsample previous-step snow depth for albedo in _evolve_temperature
-    if state.snow_depth is not None:
-        _sd_pad = np.pad(state.snow_depth.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        snow_depth_coarse = _sd_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        snow_depth_coarse = None
-
+    snow_depth_coarse = (
+        _coarsen(state.snow_depth, Hc, Wc, block_size) if state.snow_depth is not None else None
+    )
     # Downsample precipitation and vegetation biomass for vegetation albedo (Phase 4)
-    if state.precipitation is not None:
-        P_pad = np.pad(state.precipitation.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        precipitation_coarse = P_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        precipitation_coarse = None
+    precipitation_coarse = (
+        _coarsen(state.precipitation, Hc, Wc, block_size) if state.precipitation is not None else None
+    )
+    biomass_coarse = (
+        _coarsen(state.vegetation_biomass, Hc, Wc, block_size)
+        if state.vegetation_biomass is not None else None
+    )
 
-    if state.vegetation_biomass is not None:
-        biomass_pad = np.pad(state.vegetation_biomass.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        biomass_coarse = biomass_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
-    else:
-        biomass_coarse = None
-
-    # Downsample biomes to coarse resolution if available.
-    # Use the center element of each block instead of element [0,0] — the center
-    # is representative of the block and avoids the top-left corner bias.
+    # Downsample biomes / Köppen to coarse resolution (center-of-block sample, not average).
     _mid = block_size // 2
     if biome_new is not None:
-        biome_pad = np.pad(biome_new.astype(np.int32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        biome_coarse = biome_pad.reshape(Hc, block_size, Wc, block_size)[:, _mid, :, _mid]
+        _bs = block_size
+        _bh, _bw = Hc * _bs - H, Wc * _bs - W
+        _bp = biome_new.astype(np.int32)
+        if _bh > 0 or _bw > 0:
+            _bp = np.pad(_bp, ((0, _bh), (0, _bw)), mode="edge")
+        biome_coarse: np.ndarray | None = _bp.reshape(Hc, _bs, Wc, _bs)[:, _mid, :, _mid]
     else:
         biome_coarse = None
 
-    # Downsample Köppen classification to coarse resolution if available
     if koppen_new is not None:
-        koppen_pad = np.pad(koppen_new.astype(np.int32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        koppen_coarse = koppen_pad.reshape(Hc, block_size, Wc, block_size)[:, _mid, :, _mid]
+        _kp = koppen_new.astype(np.int32)
+        _bh, _bw = Hc * block_size - H, Wc * block_size - W
+        if _bh > 0 or _bw > 0:
+            _kp = np.pad(_kp, ((0, _bh), (0, _bw)), mode="edge")
+        koppen_coarse: np.ndarray | None = _kp.reshape(Hc, block_size, Wc, block_size)[:, _mid, :, _mid]
     else:
         koppen_coarse = None
 
@@ -879,8 +910,7 @@ def simulate_step(
     # 0.80 ice-sheet albedo before they have accumulated enough ice to warrant it.
     # The displayed/stored koppen_type is unchanged — only the albedo computation differs.
     if koppen_coarse is not None:
-        _isa_pad = np.pad(ice_sheet_age_new.astype(np.float32), ((0, Hc*block_size - H), (0, Wc*block_size - W)), mode="edge")
-        _isa_coarse = _isa_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
+        _isa_coarse = _coarsen(ice_sheet_age_new, Hc, Wc, block_size)
         _immature_ef = (koppen_coarse == 19) & (_isa_coarse < ICE_SHEET_THRESHOLD_DAYS)
         koppen_phys_coarse = koppen_coarse.copy()
         koppen_phys_coarse[_immature_ef] = 18  # treat as ET (tundra) albedo
@@ -895,7 +925,6 @@ def simulate_step(
         wind_u=u_coarse, wind_v=v_coarse,
         T_base_land=T_base_land,
         ice_cover=ice_prev_coarse,
-        heat_transport_coeff=heat_transport_coeff,
         thermal_diffusion=thermal_diffusion,
         ocean_transport_coeff=ocean_transport_coeff,
         ocean_exchange_floor=ocean_exchange_floor,
@@ -914,6 +943,7 @@ def simulate_step(
         planet_params=pp,
         elev_c=elev_c,
         snow_depth=snow_depth_coarse,
+        feedback_flags=feedback_flags,
     )
     T_coarse = T_sst_coarse  # alias: T_coarse continues to mean T_sst going forward
     
@@ -968,7 +998,7 @@ def simulate_step(
     # Applying it again here was a double-count and has been removed.
     if T_full is not None:
         T_full = np.clip(T_full, 150.0, 330.0)
-    if T_full is not None:
+    if T_full is not None and pp.has_liquid_water_ocean:
         ice_full, delta_ice = update_sea_ice(
             T_full, state.elevation, state.ice_cover, days,
             freeze_temp=ice_freeze_temp,
@@ -979,11 +1009,12 @@ def simulate_step(
         # Ice-ocean latent heat feedback: freezing releases heat, melting absorbs heat
         # L_f=334 kJ/kg, rho_ice=917 kg/m³, ~1m effective thickness, ~100m mixed layer
         # gives ~3K per unit ice fraction change
-        latent_scale = 3.0  # K per unit ice fraction change
-        is_ocean_full, _ = get_masks(state.elevation)
-        T_full = T_full + delta_ice * latent_scale * is_ocean_full.astype(np.float32)
+        if _fb.get('ice_albedo', True):
+            latent_scale = 3.0  # K per unit ice fraction change
+            is_ocean_full, _ = get_masks(state.elevation)
+            T_full = T_full + delta_ice * latent_scale * is_ocean_full.astype(np.float32)
     else:
-        ice_full = None
+        ice_full = state.ice_cover  # preserve existing (e.g. dry planet polar CO2 ice)
 
     # Snow depth evolution (degree-day accumulation / melt model)
     # Only over land; ocean has sea ice instead of snow pack.
@@ -1191,7 +1222,6 @@ def _evolve_temperature(
     T_air_prev: np.ndarray | None = None,
     wind_u: np.ndarray | None = None,
     wind_v: np.ndarray | None = None,
-    heat_transport_coeff: float = 0.8,
     land_sea_contrast: float = 0.0,
     thermal_diffusion: float = 0.04,
     T_base_land: np.ndarray | None = None,
@@ -1213,6 +1243,7 @@ def _evolve_temperature(
     planet_params: PlanetParams | None = None,
     elev_c: np.ndarray | None = None,
     snow_depth: np.ndarray | None = None,
+    feedback_flags: dict[str, bool] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -1304,8 +1335,10 @@ def _evolve_temperature(
     # T_air relaxes toward surface temperature (T_sst).
     # Over ocean: ~4-day time constant (efficient sensible heat flux at ocean surface).
     # Over land: ~2-day time constant (land surface heats/cools overlying air quickly).
+    # Fraction capped at 0.5 so relaxation is stable for any dt (no overshoot).
     k_air_surface = np.where(sea_mask, 0.25, 0.50).astype(np.float32)
-    T_air = (T_air + k_air_surface * (T_sst - T_air) * float(days)).astype(np.float32)
+    _air_frac = np.minimum(k_air_surface * float(days), 0.5).astype(np.float32)
+    T_air = (T_air + _air_frac * (T_sst - T_air)).astype(np.float32)
         
     # --- Radiative Balance (Physics Item 1, 2, 10, 12) ---
     # Incoming Solar (S_in) - Albedo (A)
@@ -1317,6 +1350,7 @@ def _evolve_temperature(
     
     # === PASS 2: T_sst dynamics — radiation, relaxation, ocean transport ===
 
+    _fb_t = feedback_flags or {}
     # Snow cover — use physically-tracked snow depth when available.
     # Full cover at ≥0.1 m SWE (≈0.3 m fresh snow); falls off linearly below.
     # Fallback to temperature-derived estimate when snow_depth not yet tracked.
@@ -1324,10 +1358,14 @@ def _evolve_temperature(
         snow_cover = np.clip(snow_depth / 0.1, 0.0, 1.0).astype(np.float32)
     else:
         snow_cover = np.clip((273.15 - T_sst) / 10.0, 0.0, 1.0)
+    if not _fb_t.get('snow_albedo', True):
+        snow_cover = np.zeros_like(T_sst, dtype=np.float32)
     sea_ice = np.zeros_like(T_sst, dtype=np.float32) if ice_cover is None else np.clip(ice_cover.astype(np.float32), 0.0, 1.0)
     sea_ice = np.where(sea_mask, sea_ice, 0.0)
     if ice_albedo_strength != 1.0:
         sea_ice = np.clip(sea_ice * float(ice_albedo_strength), 0.0, 1.0)
+    if not _fb_t.get('ice_albedo', True):
+        sea_ice = np.zeros_like(T_sst, dtype=np.float32)
 
     # Cloud cover — humidity lives in the atmosphere, so use T_air for Clausius-Clapeyron
     Tc = np.clip(T_air - 273.15, -60.0, 60.0)
@@ -1362,7 +1400,7 @@ def _evolve_temperature(
     # Compute biome-based vegetation albedo (if biomass field exists)
     # Phase 1 improvement: Use stable biomes from long-term climate averages (not daily weather)
     # Köppen classification provides more detailed albedo values
-    if vegetation_biomass is not None and biome is not None:
+    if vegetation_biomass is not None and biome is not None and _fb_t.get('vegetation_albedo', True):
         albedo_veg = vegetation_albedo(biome, base_land_albedo=0.2, koppen_type=koppen_type)
         # Use vegetation albedo for land, ocean base albedo for sea
         albedo_sfc = np.where(sea_mask, 0.06 * (1.0 - sea_ice) + 0.65 * sea_ice, albedo_veg)
@@ -1429,27 +1467,29 @@ def _evolve_temperature(
     T_eq = T_eq - lapse_rate * alt_km
 
     # --- Ocean Temperature Bounds (SST cap + freeze-point floor) ---
-    # Upper cap (SST max ~29°C = 302K): evaporative cooling prevents ocean from exceeding
-    # this in practice. The radiative equilibrium formula ignores latent heat and would
-    # otherwise push subtropical SSTs to 43-48°C.  Earth's tropical zonal-mean SST is
-    # 28-29°C; 302K matches this while preventing runaway tropical heating.
-    T_eq = np.where(sea_mask, np.minimum(T_eq, 302.0), T_eq)
-    # Latitude-dependent T_eq ocean floor — prevents ice-albedo runaway at mid-latitudes
-    # while still allowing polar sea ice:
-    #
-    # At mid-latitudes (|lat| ≤ 60°): floor = 271K (above ice_freeze_temp=269.9K).
-    #   Without this, ice forming at 55°N (albedo→0.65) drives T_eq_rad→140K, so
-    #   T_eq = 0.9×278.75 + 0.1×140 = 265.9K < freeze → ice-albedo runaway to 52°N.
-    #   With floor=271K the equilibrium always pulls T_sst above freezing → ice melts. ✓
-    #
-    # At high latitudes (|lat| ≥ 75°): floor = 266K (below freeze_temp).
-    #   Allows genuine Arctic/Antarctic sea ice to form and persist. ✓
-    #
-    # Linear ramp between 60° and 75° so there is no sharp boundary.
-    _abs_lat_floor = np.abs(np.rad2deg(lat_2d))
-    _ramp = np.clip((_abs_lat_floor - 60.0) / 15.0, 0.0, 1.0)   # 0 at 60°, 1 at 75°+
-    T_eq_floor = (271.0 * (1.0 - _ramp) + 266.0 * _ramp).astype(np.float32)
-    T_eq = np.where(sea_mask, np.maximum(T_eq, T_eq_floor), T_eq)
+    # These bounds parameterize Earth's liquid-water ocean physics; suppress for dry planets.
+    if _pp.has_liquid_water_ocean:
+        # Upper cap (SST max ~29°C = 302K): evaporative cooling prevents ocean from exceeding
+        # this in practice. The radiative equilibrium formula ignores latent heat and would
+        # otherwise push subtropical SSTs to 43-48°C.  Earth's tropical zonal-mean SST is
+        # 28-29°C; 302K matches this while preventing runaway tropical heating.
+        T_eq = np.where(sea_mask, np.minimum(T_eq, 302.0), T_eq)
+        # Latitude-dependent T_eq ocean floor — prevents ice-albedo runaway at mid-latitudes
+        # while still allowing polar sea ice:
+        #
+        # At mid-latitudes (|lat| ≤ 60°): floor = 271K (above ice_freeze_temp=269.9K).
+        #   Without this, ice forming at 55°N (albedo→0.65) drives T_eq_rad→140K, so
+        #   T_eq = 0.9×278.75 + 0.1×140 = 265.9K < freeze → ice-albedo runaway to 52°N.
+        #   With floor=271K the equilibrium always pulls T_sst above freezing → ice melts. ✓
+        #
+        # At high latitudes (|lat| ≥ 75°): floor = 266K (below freeze_temp).
+        #   Allows genuine Arctic/Antarctic sea ice to form and persist. ✓
+        #
+        # Linear ramp between 60° and 75° so there is no sharp boundary.
+        _abs_lat_floor = np.abs(np.rad2deg(lat_2d))
+        _ramp = np.clip((_abs_lat_floor - 60.0) / 15.0, 0.0, 1.0)   # 0 at 60°, 1 at 75°+
+        T_eq_floor = (271.0 * (1.0 - _ramp) + 266.0 * _ramp).astype(np.float32)
+        T_eq = np.where(sea_mask, np.maximum(T_eq, T_eq_floor), T_eq)
 
     # Relaxation rate k (1/days) based on mixed-layer depth
     # Real oceans have latitude-dependent mixed layer depth:
@@ -1486,8 +1526,11 @@ def _evolve_temperature(
     )
     k_relax = np.where(sea_mask, k_ocean * ice_insulation, 0.1)
 
-    # Relax T_sst toward radiative+transport equilibrium — no artificial clip
-    T_sst = (T_sst + k_relax * (T_eq - T_sst) * float(days)).astype(np.float32)
+    # Relax T_sst toward radiative+transport equilibrium.
+    # Fraction capped at 0.5 for unconditional stability at any dt (large-step modes
+    # like MONTHLY/ANNUAL use dt=6-7 days where k_relax*dt can exceed 1 without this).
+    _sst_frac = np.minimum(k_relax * float(days), 0.5).astype(np.float32)
+    T_sst = (T_sst + _sst_frac * (T_eq - T_sst)).astype(np.float32)
     
     # --- Evaporation: bulk aerodynamic formula, applied to T_sst ---
     # Ocean evaporation depends on SST (surface saturation) and near-surface air humidity.
@@ -1545,7 +1588,12 @@ def _evolve_temperature(
     _oc_key = (Hc, Wc, round(day_of_year))
     _total = float(np.sum(T_sst))  # cheap proxy to detect if grid changed
     days_since_ocean = float(day_of_year) - float(_oc.get("last_update_day", -9999.0))
-    if (
+    if not _fb_t.get('ocean_transport', True):
+        T_ocean_adj = np.zeros((Hc, Wc), dtype=np.float32)
+        _oc["adj"] = T_ocean_adj
+        _oc["key"] = _oc_key
+        _oc["last_update_day"] = float(day_of_year)
+    elif (
         _oc.get("adj") is None
         or _oc.get("key") != _oc_key
         or abs(days_since_ocean) >= OCEAN_UPDATE_INTERVAL_DAYS

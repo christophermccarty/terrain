@@ -121,18 +121,19 @@ def _derive_land_sea_masks(elevation: np.ndarray) -> tuple[np.ndarray, np.ndarra
 
 def _laplacian(field: np.ndarray) -> np.ndarray:
     # Periodic in longitude (axis=1), clamped at poles (axis=0).
-    pad_y = np.pad(field, ((1, 1), (0, 0)), mode="edge")
-    c = pad_y[1:-1, :]
-    n = pad_y[0:-2, :]
-    s = pad_y[2:, :]
-    e = np.roll(c, -1, axis=1)
-    w = np.roll(c, 1, axis=1)
-    return n + s + e + w - 4.0 * c
+    n = np.concatenate([field[:1, :], field[:-1, :]], axis=0)   # north (edge-clamped)
+    s = np.concatenate([field[1:, :], field[-1:, :]], axis=0)   # south (edge-clamped)
+    e = np.concatenate([field[:, 1:], field[:, :1]], axis=1)    # east (periodic)
+    w = np.concatenate([field[:, -1:], field[:, :-1]], axis=1)  # west (periodic)
+    return n + s + e + w - 4.0 * field
 
 
 def _ddx_periodic(field: np.ndarray) -> np.ndarray:
     """Central difference in x with periodic wrap (axis=1). Returns derivative per grid index."""
-    return 0.5 * (np.roll(field, -1, axis=1) - np.roll(field, 1, axis=1))
+    return 0.5 * (
+        np.concatenate([field[:, 1:], field[:, :1]], axis=1)
+        - np.concatenate([field[:, -1:], field[:, :-1]], axis=1)
+    )
 
 
 def _advect_scalar(
