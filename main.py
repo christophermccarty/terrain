@@ -183,6 +183,7 @@ def main() -> None:
     sim_paused = False
     sim_speed = 1.0  # days per step
     last_mouse_pos = (0, 0)  # Track last mouse position for cursor updates
+    _sim_ever_started = False  # False until user clicks Start for the first time
     
     # Terrain mode: "procedural" or "loaded"
     terrain_mode = "procedural"
@@ -534,6 +535,30 @@ def main() -> None:
         _refresh_save_info()
         messagebox.showinfo("Clear Save", "Saved state cleared. Next start will use fresh initial conditions.")
 
+    def _do_load_state() -> None:
+        nonlocal sim_state, sim_running, sim_paused, sim_thread
+        if not AUTOSAVE_PATH.exists():
+            messagebox.showinfo("Load State", "No saved state found.\nUse 'Save State Now' to create one first.")
+            return
+        # Stop and discard the thread so Start recreates it from the loaded state
+        if sim_thread and sim_thread.is_alive():
+            sim_thread.stop()
+            sim_thread = None
+        sim_running = False
+        sim_paused = False
+        try:
+            sim_state = load_state(AUTOSAVE_PATH)
+            total_years = sim_state.total_days / 365.2422
+            sim_status_var.set("Stopped")
+            year = int(sim_state.total_days // 365.2422) + 1
+            month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+            sim_cycle_var.set(f"Y{year} M{month}")
+            _refresh_save_info()
+            render()
+            messagebox.showinfo("Load State", f"State loaded.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+
     def _on_auto_save_toggle() -> None:
         nonlocal _auto_save_enabled
         _auto_save_enabled = auto_save_var.get()
@@ -542,6 +567,7 @@ def main() -> None:
     save_row.pack(fill="x")
     tk.Checkbutton(save_row, text="Auto-save/load state", variable=auto_save_var, command=_on_auto_save_toggle).pack(side="left", padx=4)
     tk.Button(save_row, text="Save State Now", command=_do_save_state).pack(side="left", padx=4)
+    tk.Button(save_row, text="Load State", command=_do_load_state).pack(side="left", padx=4)
     tk.Button(save_row, text="Clear Saved State", command=_do_clear_save).pack(side="left", padx=4)
     tk.Label(save_row, textvariable=save_info_var, anchor="w", fg="gray").pack(side="left", padx=8)
     _refresh_save_info()
@@ -912,6 +938,25 @@ def main() -> None:
     canvas.pack(side="left")
     img_id = canvas.create_image(0, 0, image=tk_img, anchor="nw")
 
+    # --- Cursor tooltip: small floating panel that follows the mouse ---
+    _tooltip_var = tk.StringVar(value="")
+    _tooltip_win = tk.Toplevel(root)
+    _tooltip_win.overrideredirect(True)
+    _tooltip_win.withdraw()
+    _tooltip_win.wm_attributes("-topmost", True)
+    _tt_frame = tk.Frame(_tooltip_win, bg="#0d1117", bd=1, relief="solid")
+    _tt_frame.pack()
+    tk.Label(
+        _tt_frame,
+        textvariable=_tooltip_var,
+        bg="#0d1117",
+        fg="#c9d1d9",
+        font=("Courier", 9),
+        justify="left",
+        padx=8,
+        pady=5,
+    ).pack()
+
     # --- Biome legend panel ---
     # Shown only when the Biomes map view is active; hidden otherwise.
     from climate_averages import KOPPEN_NAMES as _KNAMES, KOPPEN_COLORS as _KCLR
@@ -1155,9 +1200,9 @@ def main() -> None:
             latlon_var.set("")
 
     def start_simulation():
-        nonlocal sim_state, sim_thread, sim_running, sim_paused
-        if sim_state is None:
-            # Load autosave if enabled and available; otherwise create fresh state
+        nonlocal sim_state, sim_thread, sim_running, sim_paused, _sim_ever_started
+        if not _sim_ever_started:
+            # On first Start: load autosave if enabled and available
             if _auto_save_enabled and AUTOSAVE_PATH.exists():
                 try:
                     sim_state = load_state(AUTOSAVE_PATH)
@@ -1166,11 +1211,7 @@ def main() -> None:
                     LOG.info(f"Autosave loaded: day {sim_state.total_days:.0f} ({total_years:.2f} years)")
                 except Exception as e:
                     LOG.warning(f"Failed to load autosave ({e}); starting fresh.")
-                    tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
-                    _init_sim_state_from_elevation(tex)
-            else:
-                tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
-                _init_sim_state_from_elevation(tex)
+        _sim_ever_started = True
 
         # Start or resume simulation thread
         if sim_thread is None or not sim_thread.is_alive():
@@ -1187,8 +1228,7 @@ def main() -> None:
         sim_running = True
         sim_paused = False
         sim_status_var.set("Running")
-        # Diagnostics tracks total time; use it to display cycle count (years).
-        year = int(diagnostics.total_days // 365.2422) + 1
+        year = int(sim_state.total_days // 365.2422) + 1
         month = int((sim_state.day_of_year / 365.2422) * 12) + 1
         sim_cycle_var.set(f"Y{year} M{month}")
         # If particle view is selected, start animation loop.
@@ -1234,8 +1274,9 @@ def main() -> None:
         render()
     
     def update_cursor_display(x: int, y: int):
-        """Update the cursor display for given canvas coordinates."""
+        """Update the cursor display and tooltip for given canvas coordinates."""
         if mode_var.get() != "map":
+            _tooltip_win.withdraw()
             return
         use_sim_data = sim_state is not None and sim_running
         if use_sim_data and sim_state.elevation is not None:
@@ -1244,37 +1285,36 @@ def main() -> None:
             tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
         h, w = tex.shape
         if 0 <= x < w and 0 <= y < h:
-            # Equirectangular: x∈[0,w) -> φ∈[-π,π), y∈[0,h) -> θ∈[-π/2,π/2]
             lon = (x / w) * 360.0 - 180.0
             lat = 90.0 - (y / h) * 180.0
-            # Calculate elevation/altitude
             elev_raw = float(tex[int(y), int(x)])
-            # Check if using loaded heightmap (generic normalization) or procedural (power-law)
             if terrain_mode == "loaded":
-                # Generic elevation mapping (works with any heightmap):
-                # 0.0: Ocean = 0m
-                # 0.0-0.03: Low-lying (rivers, basins, coastal) = 0-100m linear
-                # 0.03-1.0: Higher elevations = 100-8848m (power curve x^2.5)
                 pixel_display = f"norm {elev_raw:.3f}"
                 if elev_raw == 0.0:
-                    alt_m = 0.0  # Ocean
+                    alt_m = 0.0
                 elif elev_raw <= 0.03:
-                    # Low-lying areas: 0-100m linear
                     alt_m = (elev_raw / 0.03) * 100.0
                 else:
-                    # Higher elevations: 100m to 8848m using power curve
-                    normalized = (elev_raw - 0.03) / 0.97  # 0.0 to 1.0
+                    normalized = (elev_raw - 0.03) / 0.97
                     alt_m = 100.0 + (normalized ** 2.5) * 8748.0
+                is_ocean = (elev_raw == 0.0)
             else:
-                # Procedural terrain uses power-law with sea level at 0.2
-                pixel_display = ""  # No pixel value for procedural
+                pixel_display = ""
                 sea_level = 0.2
                 if elev_raw <= sea_level:
                     alt_m = 0.0
                 else:
                     elevation_above_sea = elev_raw - sea_level
                     alt_m = (elevation_above_sea / (1.0 - sea_level)) ** 2.0 * 8848.0
-            if view_var.get() == "Wind Arrows" or view_var.get() == "Wind Particles":
+                is_ocean = (elev_raw <= sea_level)
+
+            lat_str = f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}"
+            lon_str = f"{abs(lon):.2f}°{'E' if lon >= 0 else 'W'}"
+            hdr = f"{lat_str}  {lon_str}"
+            px_str = f", {pixel_display}" if pixel_display else ""
+            view = view_var.get()
+
+            if view in ("Wind Arrows", "Wind Particles"):
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
                 elif _WIND_CACHE["u"] is None or _WIND_CACHE["u"].shape != (h, w):
@@ -1282,10 +1322,16 @@ def main() -> None:
                     _WIND_CACHE.update({"key": (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear"), "u": u, "v": v})
                 else:
                     u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
-                speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
-                px_str = f", {pixel_display}" if pixel_display else ""
+                u_val = float(u[int(y), int(x)])
+                v_val = float(v[int(y), int(x)])
+                speed = float(np.hypot(u_val, v_val))
+                angle = float(np.degrees(np.arctan2(v_val, u_val))) % 360
+                dirs = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE']
+                dir_str = dirs[int((angle + 22.5) / 45) % 8]
                 latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, wind {speed:5.1f} m/s")
-            elif view_var.get() == "Ocean Currents":
+                tt_lines = [hdr, f"Elev:  {alt_m:,.0f} m", f"Wind:  {speed:.1f} m/s {dir_str}"]
+
+            elif view == "Ocean Currents":
                 day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
                 tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
                 ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents", int(tdays))
@@ -1297,21 +1343,93 @@ def main() -> None:
                 else:
                     u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
-                px_str = f", {pixel_display}" if pixel_display else ""
                 latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, current {speed:5.2f} m/s")
-            else:
-                # Use air temperature for cursor display (what you feel at the surface)
+                tt_lines = [hdr, f"Current: {speed:.3f} m/s"]
+
+            elif view == "Temperature":
+                if use_sim_data and sim_state.temperature is not None:
+                    _T_air = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
+                    T_air_c = float(_T_air[int(y), int(x)]) - 273.15
+                    T_sst_c = float(sim_state.temperature[int(y), int(x)]) - 273.15
+                else:
+                    T_air_c = temperature_kelvin_for_lat(np.deg2rad(lat)) - 273.15
+                    T_sst_c = None
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, T {T_air_c:6.1f}°C")
+                tt_lines = [hdr, f"Elev:    {alt_m:,.0f} m", f"Air T:   {T_air_c:.1f}°C"]
+                if T_sst_c is not None and is_ocean:
+                    tt_lines.append(f"SST:     {T_sst_c:.1f}°C")
+
+            elif view == "Ocean Temperature":
+                if use_sim_data and sim_state.temperature is not None:
+                    T_sst_c = float(sim_state.temperature[int(y), int(x)]) - 273.15
+                else:
+                    T_sst_c = temperature_kelvin_for_lat(np.deg2rad(lat)) - 273.15
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, SST {T_sst_c:.1f}°C")
+                tt_lines = [hdr, f"SST:     {T_sst_c:.1f}°C"]
+                if use_sim_data and sim_state.ice_cover is not None:
+                    ice = float(sim_state.ice_cover[int(y), int(x)])
+                    if ice > 0.01:
+                        tt_lines.append(f"Ice:     {ice * 100:.0f}%")
+
+            elif view == "Precipitation":
+                if use_sim_data and sim_state.precipitation is not None:
+                    precip = float(sim_state.precipitation[int(y), int(x)])
+                else:
+                    precip = 0.0
+                if use_sim_data and sim_state.temperature is not None:
+                    _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
+                    T_celsius = float(_T_disp[int(y), int(x)]) - 273.15
+                else:
+                    T_celsius = temperature_kelvin_for_lat(np.deg2rad(lat)) - 273.15
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, T {T_celsius:.1f}°C")
+                tt_lines = [hdr, f"Precip:  {precip:.3f} mm/day", f"Air T:   {T_celsius:.1f}°C"]
+
+            elif view == "Biomes":
+                biome_name = "Ocean" if is_ocean else "Land"
+                if use_sim_data and sim_state.koppen_type is not None:
+                    kt = int(sim_state.koppen_type[int(y), int(x)])
+                    biome_name = _KNAMES.get(kt, f"Type {kt}") if kt > 0 else "Ocean"
+                elif use_sim_data and sim_state.biome_type is not None:
+                    bt = int(sim_state.biome_type[int(y), int(x)])
+                    legacy = {0: "Ocean", 1: "Desert", 2: "Grassland", 3: "Forest", 4: "Tundra"}
+                    biome_name = legacy.get(bt, f"Biome {bt}")
+                if use_sim_data and sim_state.temperature is not None:
+                    _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
+                    T_celsius = float(_T_disp[int(y), int(x)]) - 273.15
+                else:
+                    T_celsius = temperature_kelvin_for_lat(np.deg2rad(lat)) - 273.15
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, {biome_name}")
+                tt_lines = [hdr, biome_name, f"Air T:   {T_celsius:.1f}°C"]
+
+            elif view == "Cloud Cover":
+                if use_sim_data and sim_state.cloud_cover is not None:
+                    cloud = float(sim_state.cloud_cover[int(y), int(x)])
+                else:
+                    cloud = 0.0
+                if use_sim_data and sim_state.temperature is not None:
+                    _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
+                    T_celsius = float(_T_disp[int(y), int(x)]) - 273.15
+                else:
+                    T_celsius = temperature_kelvin_for_lat(np.deg2rad(lat)) - 273.15
+                latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, clouds {cloud * 100:.0f}%, T {T_celsius:.1f}°C")
+                tt_lines = [hdr, f"Clouds:  {cloud * 100:.0f}%", f"Air T:   {T_celsius:.1f}°C"]
+
+            else:  # Terrain and fallback
                 if use_sim_data and sim_state.temperature is not None:
                     _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
                     T_kelvin = float(_T_disp[int(y), int(x)])
                 else:
                     T_kelvin = temperature_kelvin_for_lat(np.deg2rad(lat))
-                # Convert Kelvin to Celsius
                 T_celsius = T_kelvin - 273.15
-                px_str = f", {pixel_display}" if pixel_display else ""
                 latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, T {T_celsius:6.1f}°C")
+                terrain_type = "Ocean" if is_ocean else "Land"
+                tt_lines = [hdr, terrain_type, f"Elev:  {alt_m:,.0f} m", f"Air T: {T_celsius:.1f}°C"]
+
+            _tooltip_var.set("\n".join(tt_lines))
         else:
             latlon_var.set("")
+            _tooltip_var.set("")
+            _tooltip_win.withdraw()
     
     def update_from_simulation():
         """Pull latest state from simulation thread and update UI (called by timer)."""
@@ -1330,7 +1448,7 @@ def main() -> None:
                     temp_components = None
 
                 # Update UI with new state
-                year = int(diagnostics.total_days // 365.2422) + 1
+                year = int(sim_state.total_days // 365.2422) + 1
                 month = int((sim_state.day_of_year / 365.2422) * 12) + 1
                 sim_cycle_var.set(f"Y{year} M{month}")
                 if not sim_paused:
@@ -1355,6 +1473,14 @@ def main() -> None:
         nonlocal last_mouse_pos
         last_mouse_pos = (e.x, e.y)
         update_cursor_display(e.x, e.y)
+        if mode_var.get() == "map" and _tooltip_var.get():
+            rx = canvas.winfo_rootx() + e.x + 16
+            ry = canvas.winfo_rooty() + e.y + 16
+            _tooltip_win.wm_geometry(f"+{rx}+{ry}")
+            _tooltip_win.deiconify()
+            _tooltip_win.lift()
+        else:
+            _tooltip_win.withdraw()
 
     step = np.deg2rad(5.0)
     def on_key(e):
@@ -1423,6 +1549,7 @@ def main() -> None:
     root.bind("<Escape>", lambda e: on_close())
     root.protocol("WM_DELETE_WINDOW", on_close)
     canvas.bind("<Motion>", on_motion)
+    canvas.bind("<Leave>", lambda e: _tooltip_win.withdraw())
     root.mainloop()
 
 
