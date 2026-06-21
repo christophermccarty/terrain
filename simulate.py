@@ -602,20 +602,19 @@ def simulate_step(
     # to avoid its own cold runaway, while still remaining cooler than AMOC-warmed NH.
     lat_deg_1d = np.abs(np.rad2deg(lat))
     _ocean_scale = float(pp.has_liquid_water_ocean)
-    _transport_base = _ocean_scale * 34.0 * np.clip((lat_deg_1d - 42.0) / 28.0, 0.0, 1.0) ** 1.5
-    # AMOC bonus: 18K ramp 40-65°N (unchanged) + extra 10K ramp 65-85°N only.
-    # 65°N is already well-calibrated (-2°C vs Earth -2°C), so we only add warmth
-    # above 65°N where the NH ice runaway causes an 8-10 K cold bias.
+    # Scale AMOC/ACC with planet rotation rate and ocean fraction.
+    # AMOC strength ∝ ω^0.4 (Coriolis drives western boundary currents; weaker on slow rotators).
+    # AMOC suppressed entirely for retrograde rotators (Coriolis deflects opposite → no WBC).
+    # ACC is primarily wind-driven so scales only with ocean_fraction, not rotation.
+    _EARTH_OMEGA = 7.2921e-5  # rad/s  (2π / 23.9345 h)
+    _rotation_scale = float(np.clip((pp.omega / _EARTH_OMEGA) ** 0.4, 0.05, 2.0))
+    _ocean_frac_scale = float(pp.ocean_fraction / 0.71)
+    _amoc_scale = _ocean_scale * _rotation_scale * _ocean_frac_scale * float(pp.rotation_direction > 0)
+    _acc_scale  = _ocean_scale * _ocean_frac_scale
+    _transport_base = _acc_scale * 34.0 * np.clip((lat_deg_1d - 42.0) / 28.0, 0.0, 1.0) ** 1.5
     # AMOC bonus: steep ramp from 65-75°N (3K at 65°N → 18K at 75°N+).
-    # Previous formula gave 16K at 65°N → T_base = +17°C (15K over Earth SST +2°C).
-    # This over-warm T_base at 65°N then advected to the Arctic via wind, pushing T85N
-    # to +15°C in summer and causing a near-zero NH gradient.
-    # New formula gives 3K at 65°N → T_base = +5°C (≈ Earth SST +2-8°C, ok),
-    # while maintaining 18K at 75-85°N → T_base = -6°C (gap -4.5K from -1.5°C, ok).
-    # AMOC bonus scaled by dynamic feedback factor (amoc_factor: 0.30–1.00).
-    # When NH polar ice 60-75°N is extensive, thermohaline sinking weakens and
-    # the warming delivered to the sub-polar North Atlantic is reduced.
-    _amoc_bonus = _ocean_scale * amoc_factor * np.where(
+    # Scaled by dynamic feedback factor (amoc_factor: 0.30–1.00) and planet rotation/ocean params.
+    _amoc_bonus = _amoc_scale * amoc_factor * np.where(
         lat > 0,
         3.0 * np.clip((lat_deg_1d - 42.0) / 23.0, 0.0, 1.0)
         + 15.0 * np.clip((lat_deg_1d - 65.0) / 10.0, 0.0, 1.0),
@@ -624,7 +623,7 @@ def simulate_step(
     # ACC (Antarctic Circumpolar Current) bonus scaled by acc_factor (0.50–1.00).
     # Extensive Antarctic sea ice partially blocks CDW upwelling and reduces
     # the net poleward heat delivery by the ACC.
-    _acc_bonus = _ocean_scale * acc_factor * np.where(
+    _acc_bonus = _acc_scale * acc_factor * np.where(
         lat < 0,
         8.0 * np.clip((lat_deg_1d - 55.0) / 10.0, 0.0, 1.0)
         + 20.0 * np.clip((lat_deg_1d - 65.0) / 10.0, 0.0, 1.0),
@@ -644,7 +643,10 @@ def simulate_step(
         (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_1d))) * obliq_factor
         + 0.60 * high_obliq_boost * polar_lat_boost
     )
-    ocean_seasonal_frac = np.clip(ocean_seasonal_frac, 0.03, 0.45)
+    # High-obliquity planets have larger polar insolation swings; allow a proportionally
+    # higher seasonal fraction rather than capping at Earth's 0.45.
+    _seasonal_cap = float(min(0.45 * obliq_factor, 0.85))
+    ocean_seasonal_frac = np.clip(ocean_seasonal_frac, 0.03, _seasonal_cap)
 
     # Final ocean base: annual mean + transport warming + small seasonal oscillation
     T_lat_ocean = (T_lat_annual_mean + transport_warming
@@ -667,14 +669,14 @@ def simulate_step(
         planet_params=pp,
     )
     lat_deg_full = np.abs(np.rad2deg(lat_full))
-    _transport_base_full = _ocean_scale * 34.0 * np.clip((lat_deg_full - 42.0) / 28.0, 0.0, 1.0) ** 1.5
-    _amoc_bonus_full = _ocean_scale * amoc_factor * np.where(
+    _transport_base_full = _acc_scale * 34.0 * np.clip((lat_deg_full - 42.0) / 28.0, 0.0, 1.0) ** 1.5
+    _amoc_bonus_full = _amoc_scale * amoc_factor * np.where(
         lat_full > 0,
         3.0 * np.clip((lat_deg_full - 42.0) / 23.0, 0.0, 1.0)
         + 15.0 * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
         0.0,
     )
-    _acc_bonus_full = _ocean_scale * acc_factor * np.where(
+    _acc_bonus_full = _acc_scale * acc_factor * np.where(
         lat_full < 0,
         8.0 * np.clip((lat_deg_full - 55.0) / 10.0, 0.0, 1.0)
         + 20.0 * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
@@ -687,7 +689,7 @@ def simulate_step(
         (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_full))) * obliq_factor
         + 0.60 * high_obliq_boost * polar_lat_boost_full
     )
-    ocean_seasonal_frac_full = np.clip(ocean_seasonal_frac_full, 0.03, 0.45)
+    ocean_seasonal_frac_full = np.clip(ocean_seasonal_frac_full, 0.03, _seasonal_cap)
     T_lat_ocean_full = (T_lat_annual_mean_full + transport_warming_full
                         + ocean_seasonal_frac_full * (T_lat_ocean_full_lagged - T_lat_annual_mean_full))
     T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32) + co2_temp_offset
