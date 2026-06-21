@@ -242,6 +242,8 @@ def run_simulation(
         elevation = _make_default_elevation(H, W)
 
     state = create_initial_state(elevation, day_of_year=80.0)
+    # Apply planet-specific initial CO2 (create_initial_state uses PlanetState default 400 ppm).
+    state = state._replace(co2_atmosphere=planet_params.co2_initial_ppm)
 
     # --- Spinup ---
     cycle_days_spinup = _DAYS_PER_CYCLE[spinup_time_scale]
@@ -300,3 +302,99 @@ def run_simulation(
         has_inf=has_inf,
     )
     return state, metrics
+
+
+def _extract_long_snapshot(state: PlanetState, H: int, year: int) -> dict:
+    """Extract a richer diagnostic dict for long-run tracking."""
+    snap = _extract_snapshot(state, H)
+    snap["year"] = float(year)
+    snap["co2_ppm"] = float(state.co2_atmosphere)
+    if state.ice_cover is not None:
+        snap["ice_frac_global"] = float(np.mean(state.ice_cover))
+    else:
+        snap["ice_frac_global"] = 0.0
+    if state.vegetation_biomass is not None:
+        snap["mean_biomass"] = float(np.mean(state.vegetation_biomass))
+    else:
+        snap["mean_biomass"] = 0.0
+    # Köppen distribution: fraction of cells with ice-cap (EF=19) and tropical (Af=0,Am=1,Aw=2)
+    if state.koppen_type is not None:
+        k = state.koppen_type
+        snap["koppen_ef_frac"] = float(np.mean(k == 19))
+        snap["koppen_tropical_frac"] = float(np.mean((k >= 0) & (k <= 2)))
+    else:
+        snap["koppen_ef_frac"] = 0.0
+        snap["koppen_tropical_frac"] = 0.0
+    T = state.air_temperature if state.air_temperature is not None else state.temperature
+    snap["has_nan"] = bool(T is not None and np.any(np.isnan(T)))
+    snap["has_inf"] = bool(T is not None and np.any(np.isinf(T)))
+    return snap
+
+
+def run_long_simulation(
+    planet_params: PlanetParams = EARTH,
+    years: int = 50,
+    *,
+    H: int = 32,
+    W: int = 64,
+    elevation: np.ndarray | None = None,
+    spinup_years: float = 2.0,
+    sample_every: int = 5,
+    **physics_kwargs,
+) -> tuple[PlanetState, list[dict]]:
+    """Run an ANNUAL-mode simulation for many simulated years.
+
+    Much faster than ``run_simulation`` for multi-decade / multi-century runs
+    because it uses ANNUAL sub-steps throughout and skips expensive eval overhead.
+
+    Parameters
+    ----------
+    planet_params:
+        Physical constants for the simulated planet.
+    years:
+        Number of simulated years to run after spinup.
+    H, W:
+        Grid dimensions. Default 32×64 for speed.
+    elevation:
+        Optional (H, W) elevation array. Synthetic terrain used if None.
+    spinup_years:
+        MONTHLY-mode spinup before switching to ANNUAL. Default 2 years.
+    sample_every:
+        Record diagnostics every N simulated years. Default 5.
+    **physics_kwargs:
+        Forwarded to ``simulate_step``.
+
+    Returns
+    -------
+    state:
+        Final PlanetState.
+    records:
+        List of diagnostic dicts, one per sample point.
+        Keys: year, global_mean_t, gradient_nh, gradient_sh, ice_frac_nh,
+        ice_frac_sh, ice_frac_global, co2_ppm, mean_biomass,
+        koppen_ef_frac, koppen_tropical_frac, has_nan, has_inf.
+    """
+    if elevation is None:
+        elevation = _make_default_elevation(H, W)
+
+    state = create_initial_state(elevation, day_of_year=80.0)
+    state = state._replace(co2_atmosphere=planet_params.co2_initial_ppm)
+
+    # MONTHLY spinup for initial equilibration
+    cycle_days_monthly = _DAYS_PER_CYCLE[TimeScaleMode.MONTHLY]
+    n_spinup = max(1, round(spinup_years * planet_params.orbital_period_days / cycle_days_monthly))
+    for _ in range(n_spinup):
+        state = _advance_one_cycle(
+            state, TimeScaleMode.MONTHLY, planet_params=planet_params, **physics_kwargs
+        )
+
+    # ANNUAL main loop
+    records: list[dict] = []
+    for yr in range(1, years + 1):
+        state = _advance_one_cycle(
+            state, TimeScaleMode.ANNUAL, planet_params=planet_params, **physics_kwargs
+        )
+        if yr % sample_every == 0 or yr == years:
+            records.append(_extract_long_snapshot(state, H, yr))
+
+    return state, records

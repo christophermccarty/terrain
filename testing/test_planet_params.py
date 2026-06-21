@@ -155,8 +155,9 @@ def test_generate_wind_field_respects_planet_params():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.xfail(
-    reason="PlanetParams obliquity is wired through, but the ocean seasonal-response "
-           "path still damps polar high-obliquity swings too aggressively.",
+    reason="Direct pole T_sst at block_size=8 measures 67.5°N band, not 90°N; "
+           "1.2× threshold too tight for 1yr spinup at this latitude. "
+           "Seasonal amplitude effect confirmed in test_planet_physics.py via headless metrics.",
     strict=False,
 )
 def test_high_obliquity_larger_seasonal_range():
