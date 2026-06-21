@@ -52,52 +52,36 @@ def test_zero_obliquity_no_seasons():
 # Mars-like parameters
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason=(
-        "Ocean transport (AMOC/ACC) adds ~36-54K warming at polar latitudes even for Mars, "
-        "because it is calibrated for Earth and not scaled by PlanetParams. "
-        "This keeps Mars global mean well above 250 K despite correct solar forcing. "
-        "Fix requires wiring PlanetParams into the ocean transport parameterization."
-    ),
-    strict=False,
-)
 def test_mars_params_colder_than_earth():
-    """Mars-like parameters should produce a much colder global mean T than Earth.
+    """MARS singleton should produce a much colder global mean T than Earth.
 
-    Mars has: less solar flux (590 vs 1361 W/m²) and a thin CO2 atmosphere with
-    minimal greenhouse effect (high effective emissivity ≈ 0.90).
-    The epsilon values are passed as direct kwargs to simulate_step because
-    PlanetParams.epsilon is not yet threaded into the radiation code path.
+    Mars has: less solar flux (589 vs 1361 W/m²), near-blackbody emissivity (ε≈0.90),
+    and no liquid-water ocean (has_liquid_water_ocean=False suppresses AMOC/ACC transport).
+    Expected Mars equilibrium T ≈ 210–215 K; Earth ≈ 285–290 K.
     """
-    from planet_params import PlanetParams, EARTH
+    from planet_params import MARS, EARTH
     from simulate import create_initial_state, simulate_step
 
-    mars = PlanetParams(
-        solar_constant=590.0,
-        obliquity_deg=25.19,
-        orbital_period_days=687.0,
-        surface_pressure_pa=610.0,
-    )
     elev = np.zeros((32, 64), dtype=np.float32)
 
     state_mars = create_initial_state(elev, day_of_year=80.0)
     for _ in range(365):
         state_mars, _ = simulate_step(state_mars, days=1.0, block_size=8,
-                                      planet_params=mars,
-                                      epsilon_equator=0.90, epsilon_pole=0.85,
+                                      planet_params=MARS,
                                       track_components=False)
 
     state_earth = create_initial_state(elev, day_of_year=80.0)
     for _ in range(365):
         state_earth, _ = simulate_step(state_earth, days=1.0, block_size=8,
+                                       planet_params=EARTH,
                                        track_components=False)
 
     T_mars  = float(np.mean(state_mars.temperature))
     T_earth = float(np.mean(state_earth.temperature))
     assert T_mars < T_earth - 20.0, (
-        f"Mars-like mean T ({T_mars:.1f} K) not significantly colder than Earth ({T_earth:.1f} K)"
+        f"Mars mean T ({T_mars:.1f} K) not significantly colder than Earth ({T_earth:.1f} K)"
     )
-    assert T_mars < 250.0, f"Mars-like mean T = {T_mars:.1f} K (expected < 250 K)"
+    assert T_mars < 250.0, f"Mars mean T = {T_mars:.1f} K (expected < 250 K)"
 
 
 # ---------------------------------------------------------------------------

@@ -205,7 +205,7 @@ def run_quick_benchmark(days: int = 90, grid_H: int = 60, grid_W: int = 120) -> 
     import inspect
     sig = inspect.signature(_ss)
     key_params = ["ice_freeze_temp", "ice_melt_temp", "ice_albedo_strength",
-                  "heat_transport_coeff", "thermal_diffusion", "polar_cooling_scale"]
+                  "thermal_diffusion", "polar_cooling_scale"]
     print("  Key simulation parameters (defaults):")
     for p in key_params:
         default = sig.parameters[p].default if p in sig.parameters else "N/A"
