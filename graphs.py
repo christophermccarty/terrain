@@ -56,6 +56,7 @@ class LiveGraphsWindow:
             "cloud_mean": deque(),
             "albedo_mean": deque(),
             "wind_div_rms": deque(),
+            "co2_ppm": deque(),
             "temp_min": deque(),
             "temp_max": deque(),
             "temp_equator": deque(),
@@ -133,8 +134,9 @@ class LiveGraphsWindow:
         self._lines["albedo_mean"] = ax13.plot([], [], color="tab:pink", label="Albedo")[0]
         ax13.legend(loc="upper right", fontsize=8)
 
-        ax20.set_title("Wind Divergence RMS")
-        self._lines["wind_div_rms"] = ax20.plot([], [], color="tab:brown")[0]
+        ax20.set_title("CO2 (ppm)")
+        self._lines["wind_div_rms"] = ax20.plot([], [], color="tab:brown", alpha=0.0)[0]  # hidden, kept for compat
+        self._lines["co2_ppm"] = ax20.plot([], [], color="tab:green")[0]
 
         ax21.set_title("Temperature Min/Max (K)")
         self._lines["temp_min"] = ax21.plot([], [], color="tab:gray", label="Min")[0]
@@ -232,6 +234,7 @@ class LiveGraphsWindow:
         cloud_mean = float(stats.get("cloud_mean", 0.0))
         albedo_mean = float(stats.get("albedo_mean", 0.3))
         wind_div_rms = float(stats.get("wind_div_rms", 0.0))
+        co2_ppm = float(stats.get("co2_ppm", getattr(state, "co2_atmosphere", 400.0)))
         temp_min = float(stats.get("T_min", np.min(state.temperature)))
         temp_max = float(stats.get("T_max", np.max(state.temperature)))
         temp_equator = float(stats.get("T_equator", 0.0))
@@ -264,6 +267,7 @@ class LiveGraphsWindow:
         self._series["cloud_mean"].append(cloud_mean)
         self._series["albedo_mean"].append(albedo_mean)
         self._series["wind_div_rms"].append(wind_div_rms)
+        self._series["co2_ppm"].append(co2_ppm)
         self._series["temp_min"].append(temp_min)
         self._series["temp_max"].append(temp_max)
         self._series["temp_equator"].append(temp_equator)

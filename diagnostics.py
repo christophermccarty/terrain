@@ -455,6 +455,9 @@ class ClimateDiagnostics:
             "wind_u_zonal_by_lat": zu if (state.wind_u is not None and state.wind_v is not None) else None,
             "wind_v_zonal_by_lat": zv if (state.wind_u is not None and state.wind_v is not None) else None,
             "wind_speed_zonal_by_lat": zspeed if (state.wind_u is not None and state.wind_v is not None) else None,
+
+            # Atmospheric CO2 concentration [ppm]
+            "co2_ppm": float(state.co2_atmosphere) if hasattr(state, "co2_atmosphere") else 400.0,
         }
 
     def record_step(self, state, day_of_year: float, days_elapsed: float = 0.0, component_contributions: Optional[Dict[str, np.ndarray]] = None):
