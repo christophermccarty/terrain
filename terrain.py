@@ -373,6 +373,53 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
     return Image.fromarray(rgb)
 
 
+def project_equirect_on_globe(
+    rgb_float: np.ndarray,
+    size: int = 512,
+    radius: float = 0.96,
+    rot: tuple = (0.0, 0.0, 0.0),
+) -> Image.Image:
+    """Project a pre-computed equirectangular RGB image (H,W,3 float32 [0,1]) onto a sphere.
+
+    Shares the same sphere geometry as generate_sphere_image but lets the caller
+    supply the full composite texture (e.g. biomes, cloud cover, particle trails).
+    """
+    lin = np.linspace(-1.0, 1.0, size)
+    pu, pv = np.meshgrid(lin, -lin)
+    r2_canvas = pu * pu + pv * pv
+    mask = r2_canvas <= (radius * radius)
+    r2_unit = r2_canvas / (radius * radius)
+    z = np.zeros_like(pu)
+    z[mask] = np.sqrt(1.0 - r2_unit[mask])
+    x = pu / radius
+    y = pv / radius
+    normals = np.stack((x, y, z), axis=-1)
+    norms = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-9
+    n0 = normals / norms
+    yaw, pitch, roll = rot
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cx, sx = np.cos(pitch), np.sin(pitch)
+    cz, sz = np.cos(roll), np.sin(roll)
+    Ry = np.array([[ cy, 0.0,  sy], [0.0, 1.0, 0.0], [-sy, 0.0,  cy]])
+    Rx = np.array([[1.0, 0.0, 0.0], [0.0,  cx, -sx], [0.0,  sx,  cx]])
+    Rz = np.array([[ cz, -sz, 0.0], [ sz,  cz, 0.0], [0.0, 0.0, 1.0]])
+    R = Rz @ Ry @ Rx
+    n = n0 @ R.T
+    tex_h, tex_w = rgb_float.shape[:2]
+    phi = np.arctan2(n[..., 2], n[..., 0])
+    theta = np.arcsin(np.clip(n[..., 1], -1.0, 1.0))
+    uu = (phi + np.pi) / (2.0 * np.pi)
+    vv = 0.5 - (theta / np.pi)
+    ix = np.clip((uu * (tex_w - 1)).astype(np.int32), 0, tex_w - 1)
+    iy = np.clip((vv * (tex_h - 1)).astype(np.int32), 0, tex_h - 1)
+    out = np.zeros((size, size, 3), dtype=np.float32)
+    idx = np.where(mask)
+    out[idx] = rgb_float[iy[idx], ix[idx], :]
+    rgb_u8 = (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
+    rgb_u8[~mask] = 0
+    return Image.fromarray(rgb_u8)
+
+
 def get_elevation_cache() -> tuple[np.ndarray | None, tuple | None]:
     """Get current elevation cache state."""
     return _ELEV_TEX, _ELEV_KEY

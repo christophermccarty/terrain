@@ -133,13 +133,8 @@ def test_itcz_convergence_exists(earth_spinup_state):
     assert conv > -0.5, f"ITCZ convergence strongly negative: {conv:.3f}"
 
 
-@pytest.mark.xfail(strict=False, reason="ITCZ convergence currently ~−0.11; positive value needs Hadley tuning")
 def test_itcz_convergence_positive(earth_spinup_state):
-    """ITCZ convergence proxy should be > 0 (Earth: ~+0.3–0.5).
-
-    Current benchmark: −0.112.  Positive value requires better Hadley cell
-    strength and meridional flow near the equator.
-    """
+    """ITCZ convergence proxy should be > 0 (Earth: ~+0.3–0.5)."""
     if earth_spinup_state.wind_v is None:
         pytest.skip("No wind_v in state")
     stats, _ = _diag(earth_spinup_state)

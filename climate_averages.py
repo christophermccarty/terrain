@@ -289,7 +289,7 @@ def _deterministic_noise(H: int, W: int, scale: float = 8.0) -> np.ndarray:
     freq6 = 2.0 * np.pi / (H / 12.0)
     noise += 0.2 * np.cos(x_idx * freq5 + y_idx * freq6 * 0.7)
 
-    return (noise * scale).astype(np.float32)
+    return (noise * scale).astype(np.float32, copy=False)
 
 
 def classify_koppen(

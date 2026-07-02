@@ -89,7 +89,6 @@ def test_monthly_daily_global_mean_agreement():
     )
 
 
-@pytest.mark.xfail(strict=False, reason="Short spinup may not equilibrate enough for <8K agreement")
 def test_monthly_daily_tight_agreement():
     """After 0.5yr spinup, MONTHLY and DAILY should agree within ±8K."""
     m_monthly = _run("monthly", spinup_years=0.5)

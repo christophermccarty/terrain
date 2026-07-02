@@ -152,7 +152,7 @@ def test_sea_ice_forms_below_freeze():
     from ocean import update_sea_ice
     T = np.full((16, 32), 269.0, dtype=np.float32)   # well below 271.0 K
     elev = np.zeros((16, 32), dtype=np.float32)       # all ocean
-    ice, delta = update_sea_ice(T, elev, None, dt_days=10.0)
+    ice, delta, _ = update_sea_ice(T, elev, None, dt_days=10.0)
     assert np.any(ice > 0.0), "No ice formed below freeze threshold"
     assert np.all(delta >= 0.0), "delta_ice < 0 during freezing"
 
@@ -163,7 +163,7 @@ def test_sea_ice_melts_above_melt():
     T = np.full((16, 32), 275.0, dtype=np.float32)   # well above 271.5 K
     elev = np.zeros((16, 32), dtype=np.float32)
     ice_prev = np.full((16, 32), 0.5, dtype=np.float32)
-    ice, delta = update_sea_ice(T, elev, ice_prev, dt_days=5.0)
+    ice, delta, _ = update_sea_ice(T, elev, ice_prev, dt_days=5.0)
     assert np.all(ice < 0.5), "Ice did not melt above melt threshold"
     assert np.all(delta <= 0.0), "delta_ice > 0 during melting"
 
@@ -175,7 +175,7 @@ def test_sea_ice_stays_in_bounds():
     T = rng.uniform(265.0, 280.0, (32, 64)).astype(np.float32)
     elev = np.zeros((32, 64), dtype=np.float32)
     ice_prev = rng.uniform(0.0, 1.0, (32, 64)).astype(np.float32)
-    ice, _ = update_sea_ice(T, elev, ice_prev, dt_days=1.0)
+    ice, _, _h = update_sea_ice(T, elev, ice_prev, dt_days=1.0)
     assert np.all(ice >= 0.0) and np.all(ice <= 1.0), (
         f"Ice out of [0,1]: min={ice.min():.3f} max={ice.max():.3f}"
     )
@@ -191,7 +191,7 @@ def test_sea_ice_land_is_zero():
     elev = np.full((16, 32), 0.5, dtype=np.float32)
     elev[-4:, :] = 0.0   # bottom 4 rows (~25%) are ocean
     land_mask = elev > 0.0  # land = non-zero in loaded-DEM convention
-    ice, _ = update_sea_ice(T, elev, None, dt_days=10.0)
+    ice, _, _h = update_sea_ice(T, elev, None, dt_days=10.0)
     assert np.all(ice[land_mask] == 0.0), "Ice formed on land cells"
 
 

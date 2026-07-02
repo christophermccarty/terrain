@@ -78,6 +78,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0, help="RNG seed")
     p.add_argument("--no-lhs", action="store_true",
                    help="Use uniform random instead of latin hypercube sampling")
+    p.add_argument("--profile", action="store_true",
+                   help="cProfile the run and print top CPU consumers (--mode single only; "
+                        "sweep/bayes run many trials across worker processes, where per-trial "
+                        "profiling is noisy — use scripts/profile_simulate_step.py instead)")
+    p.add_argument("--profile-top", type=int, default=20,
+                   help="Number of functions to print per sort order with --profile")
+    p.add_argument("--profile-out", type=Path, default=None,
+                   help="Save the raw cProfile .prof file here (for snakeviz etc.) with --profile")
     p.add_argument("--verbose", "-v", action="store_true")
     return p
 
@@ -90,8 +98,7 @@ def _run_single(args: argparse.Namespace) -> None:
         physics_kwargs = data.get("fixed_params", data)
 
     print("Running single scored simulation …")
-    t0 = time.perf_counter()
-    _state, metrics = run_simulation(
+    run_kwargs = dict(
         planet_params=EARTH,
         spinup_years=args.spinup_years,
         eval_years=args.eval_years,
@@ -101,7 +108,32 @@ def _run_single(args: argparse.Namespace) -> None:
         eval_time_scale=_SCALE_MAP[args.eval_scale],
         **physics_kwargs,
     )
-    elapsed = time.perf_counter() - t0
+
+    if args.profile:
+        import cProfile
+        import pstats
+
+        profiler = cProfile.Profile()
+        t0 = time.perf_counter()
+        profiler.enable()
+        _state, metrics = run_simulation(**run_kwargs)
+        profiler.disable()
+        elapsed = time.perf_counter() - t0
+
+        if args.profile_out is not None:
+            args.profile_out.parent.mkdir(parents=True, exist_ok=True)
+            profiler.dump_stats(str(args.profile_out))
+            print(f"Raw profile saved to {args.profile_out} (view with `python -m snakeviz {args.profile_out}`)\n")
+
+        stats = pstats.Stats(profiler)
+        print(f"{'='*70}\nTOP {args.profile_top} BY CUMULATIVE TIME\n{'='*70}")
+        stats.sort_stats("cumulative").print_stats(args.profile_top)
+        print(f"{'='*70}\nTOP {args.profile_top} BY INTERNAL TIME (tottime)\n{'='*70}")
+        stats.sort_stats("tottime").print_stats(args.profile_top)
+    else:
+        t0 = time.perf_counter()
+        _state, metrics = run_simulation(**run_kwargs)
+        elapsed = time.perf_counter() - t0
 
     score_fn = ClimateScore(EARTH_REFERENCE)
     score = score_fn.score(metrics)
@@ -233,6 +265,10 @@ def _run_bayes(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.profile and args.mode != "single":
+        print(f"WARNING: --profile is only supported with --mode single; ignoring for --mode {args.mode}.",
+              file=sys.stderr)
 
     if args.mode == "single":
         _run_single(args)

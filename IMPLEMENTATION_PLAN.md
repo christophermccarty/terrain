@@ -1,3 +1,14 @@
+# PlanetSim — Benchmark Recovery Plan (archived)
+
+> **STATUS (2026-07-01): SUPERSEDED.** This plan targeted a specific benchmark regression
+> (weak circulation, SH/NH sea-ice imbalance, wet-subtropics precipitation bias, broad thermal
+> warm bias). All three gate tests it called for now exist and pass:
+> `testing/test_circulation_strength.py`, `testing/test_latitude_band_regression.py`, and
+> `testing/test_polar_balance.py`. Mask convergence is done (`_ocean_mask_from_elevation` in
+> ocean.py is unused dead code now — everything routes through `masks.get_masks`). PlanetParams
+> wiring is done (see PLAN.md Phase 3). Kept for historical context on the reasoning behind those
+> tests; not an open task list. See PLAN.md for current status.
+
 Keep As Partial / Incomplete
 These remain active roadmap items because they are only partly done:
 

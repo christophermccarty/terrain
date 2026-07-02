@@ -35,6 +35,45 @@ def _latitudes_h(height: int) -> np.ndarray:
     return (0.5 - (np.arange(int(height), dtype=np.float32) + 0.5) / float(height)) * np.pi
 
 
+# ---------------------------------------------------------------------------
+# Tunable atmospheric constants
+# These control the large-scale circulation structure and are candidates for
+# optimizer sweeps or per-planet customisation.
+# ---------------------------------------------------------------------------
+
+RHO_AIR: float = 1.225
+"""Air density at sea level [kg/m³].  Used in PGF and geostrophic wind."""
+
+# 3-cell circulation centres and widths [degrees latitude]
+HADLEY_CELL_CENTER_DEG: float = 14.0   # Trade-wind peak latitude
+MID_LAT_JET_CENTER_DEG: float = 48.0   # Westerly jet core latitude
+POLAR_CELL_CENTER_DEG:  float = 74.0   # Polar cell centre latitude
+
+HADLEY_CELL_WIDTH_DEG:  float = 8.5
+MID_LAT_JET_WIDTH_DEG:  float = 13.0
+POLAR_CELL_WIDTH_DEG:   float = 9.0
+
+# Zonal (u) and meridional (v) wind targets for the 3-cell relaxation [m/s]
+U_TARGET_TRADE:  float = -6.0    # Trade easterlies (negative = easterly)
+U_TARGET_MIDLAT: float = 11.5   # Westerly jet
+U_TARGET_POLAR:  float = -1.5   # Polar easterlies
+V_TARGET_TRADE:  float = -6.4   # Equatorward Hadley return flow
+V_TARGET_MIDLAT: float = 10.0   # Poleward Ferrel flow
+V_TARGET_POLAR:  float = -1.0   # Equatorward polar flow
+
+# Rossby/synoptic wave modes: (zonal wavenumber, period_days, phase, amplitude_hPa)
+ROSSBY_MODES: list[tuple[float, float, float, float]] = [
+    (3.0, 20.0,  0.3, 0.60),   # wavenumber-3, 20-day period
+    (5.0, 30.0,  1.1, 0.45),   # wavenumber-5, 30-day period
+    (7.0, 45.0, -0.7, 0.30),   # wavenumber-7, 45-day period
+]
+
+# Precipitation latitude windows [degrees]
+ITCZ_HALF_WIDTH_DEG:   float = 10.0   # ITCZ Gaussian half-width (σ) — narrowed 14→10° to reduce ITCZ over-precipitation
+STORM_TRACK_CENTER_DEG: float = 48.0  # Mid-latitude storm track centre
+DRYBELT_CENTER_DEG:     float = 28.0  # Subtropical dry belt centre
+
+
 def _coarse_shape(H: int, W: int, block_size: int) -> tuple[int, int]:
     bs = max(1, int(block_size))
     Hc = max(1, (H + bs - 1) // bs)
@@ -60,7 +99,7 @@ def _upsample_bilinear(field: np.ndarray, H: int, W: int, block_size: int) -> np
     f1 = field[y1, :].astype(np.float32, copy=False)
     top = f0[:, x0] * (1.0 - wx)[None, :] + f0[:, x1] * wx[None, :]
     bot = f1[:, x0] * (1.0 - wx)[None, :] + f1[:, x1] * wx[None, :]
-    return (top * (1.0 - wy)[:, None] + bot * wy[:, None]).astype(np.float32)
+    return (top * (1.0 - wy)[:, None] + bot * wy[:, None]).astype(np.float32, copy=False)
 
 
 @lru_cache(maxsize=64)
@@ -70,8 +109,8 @@ def _bilinear_plan(H: int, W: int, Hc: int, Wc: int) -> tuple[np.ndarray, np.nda
     x = np.linspace(0, Wc - 1, int(W), dtype=np.float32)
     y0 = np.floor(y).astype(np.int32)
     x0 = np.floor(x).astype(np.int32)
-    wy = (y - y0).astype(np.float32)
-    wx = (x - x0).astype(np.float32)
+    wy = (y - y0).astype(np.float32, copy=False)
+    wx = (x - x0).astype(np.float32, copy=False)
     y0 = np.clip(y0, 0, Hc - 1)
     x0 = np.clip(x0, 0, Wc - 1)
     y1 = np.clip(y0 + 1, 0, Hc - 1)
@@ -92,11 +131,19 @@ def _upsample_bilinear_many(fields: dict[str, np.ndarray], H: int, W: int, block
     keys = list(fields.keys())
     stack = np.stack([fields[k].astype(np.float32, copy=False) for k in keys], axis=0)
     y0, y1, wy, x0, x1, wx = _bilinear_plan(int(H), int(W), int(Hc), int(Wc))
-    f0 = stack[:, y0, :]
-    f1 = stack[:, y1, :]
-    top = f0[:, :, x0] * (1.0 - wx)[None, None, :] + f0[:, :, x1] * wx[None, None, :]
-    bot = f1[:, :, x0] * (1.0 - wx)[None, None, :] + f1[:, :, x1] * wx[None, None, :]
-    out = (top * (1.0 - wy)[None, :, None] + bot * wy[None, :, None]).astype(np.float32)
+
+    if NUMBA_AVAILABLE:
+        out = _upsample_bilinear_numba_kernel(
+            stack,
+            y0.astype(np.int32), y1.astype(np.int32), wy.astype(np.float32),
+            x0.astype(np.int32), x1.astype(np.int32), wx.astype(np.float32),
+        )
+    else:
+        f0 = stack[:, y0, :]
+        f1 = stack[:, y1, :]
+        top = f0[:, :, x0] * (1.0 - wx)[None, None, :] + f0[:, :, x1] * wx[None, None, :]
+        bot = f1[:, :, x0] * (1.0 - wx)[None, None, :] + f1[:, :, x1] * wx[None, None, :]
+        out = (top * (1.0 - wy)[None, :, None] + bot * wy[None, :, None]).astype(np.float32, copy=False)
     return {k: out[i] for i, k in enumerate(keys)}
 
 
@@ -183,25 +230,6 @@ def _friction_kernel_numba(u: np.ndarray, v: np.ndarray, elevation: np.ndarray,
             speed_v = abs(v[i, j])
             du[i, j] = -drag_total * u[i, j] * speed_u * dt
             dv[i, j] = -drag_total * v[i, j] * speed_v * dt
-
-    return du, dv
-
-
-@jit(nopython=True, parallel=True, cache=True)
-def _coriolis_kernel_numba(u: np.ndarray, v: np.ndarray, f: np.ndarray,
-                           dt: float) -> tuple[np.ndarray, np.ndarray]:
-    """Compute Coriolis force tendency: f × (u, v).
-
-    Returns du, dv tendencies (not updated fields).
-    """
-    H, W = u.shape
-    du = np.zeros_like(u)
-    dv = np.zeros_like(v)
-
-    for i in prange(H):
-        for j in range(W):
-            du[i, j] = f[i, j] * v[i, j] * dt
-            dv[i, j] = -f[i, j] * u[i, j] * dt
 
     return du, dv
 
@@ -336,6 +364,40 @@ def compute_convective_precipitation(
 
 
 @jit(nopython=True, parallel=True, cache=True)
+def _upsample_bilinear_numba_kernel(
+    stack: np.ndarray,
+    y0: np.ndarray, y1: np.ndarray, wy: np.ndarray,
+    x0: np.ndarray, x1: np.ndarray, wx: np.ndarray,
+) -> np.ndarray:
+    """Parallel bilinear interpolation: (N, Hc, Wc) → (N, H, W).
+
+    Avoids the large intermediate arrays created by NumPy fancy indexing and
+    parallelises over output rows so all CPU cores contribute.
+    """
+    N = stack.shape[0]
+    H = len(wy)
+    W = len(wx)
+    out = np.zeros((N, H, W), dtype=np.float32)
+    for i in prange(H):
+        iy0 = y0[i]
+        iy1 = y1[i]
+        wi = wy[i]
+        wi1 = 1.0 - wi
+        for j in range(W):
+            ix0 = x0[j]
+            ix1 = x1[j]
+            wj = wx[j]
+            wj1 = 1.0 - wj
+            for n in range(N):
+                f00 = stack[n, iy0, ix0]
+                f01 = stack[n, iy0, ix1]
+                f10 = stack[n, iy1, ix0]
+                f11 = stack[n, iy1, ix1]
+                out[n, i, j] = (f00 * wj1 + f01 * wj) * wi1 + (f10 * wj1 + f11 * wj) * wi
+    return out
+
+
+@jit(nopython=True, parallel=True, cache=True)
 def _moisture_convergence_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Compute moisture flux convergence: -∇·(q·V).
 
@@ -456,6 +518,8 @@ def evolve_wind(
     cell_relax_days: float = 0.0,
     time_days: float | None = None,
     planet_params: PlanetParams | None = None,
+    ice_cover: np.ndarray | None = None,
+    ice_pressure_scale: float = 40.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -487,16 +551,16 @@ def evolve_wind(
 
     # Coriolis parameter f = 2Ω sin(φ)  — uses planet_params.omega
     f = pp.coriolis_parameter(lat_2d)  # (H, W) float32
-    abs_lat_deg_2d = np.abs(np.rad2deg(lat_2d)).astype(np.float32)
+    abs_lat_deg_2d = np.abs(np.rad2deg(lat_2d)).astype(np.float32, copy=False)
     # Equatorial damping: in a single-layer model, PGF can over-accelerate winds where f≈0.
     # Boost drag within ~±12° to recover calmer doldrums and prevent equatorial jets.
-    eq_window = np.exp(-((abs_lat_deg_2d / 12.0) ** 2)).astype(np.float32)
+    eq_window = np.exp(-((abs_lat_deg_2d / 12.0) ** 2)).astype(np.float32, copy=False)
     
     # Gradients dx, dy
     # (dx,dy already computed above)
     
-    rho = 1.225 # kg/m3
-    
+    rho = RHO_AIR
+
     u_curr, v_curr = u.copy(), v.copy()
     
     # Pre-calculate PGF (constant over the day)
@@ -507,7 +571,23 @@ def evolve_wind(
         p_anom = -float(pgf_temp_scale) * ((temperature - 273.15) / 30.0)  # Pa anomaly
         if elevation is not None:
              # Terrain effect: flow around obstacles, high pressure wedge
-             p_anom += float(pgf_terrain_scale) * elevation 
+             p_anom += float(pgf_terrain_scale) * elevation
+        if ice_cover is not None and float(ice_pressure_scale) != 0.0:
+            # Sea ice → wind/pressure feedback. Physically: ice-covered surfaces
+            # radiatively cool efficiently, reinforcing a shallow cold-air dome
+            # (katabatic outflow, polar-high intensification) beyond what the
+            # smoothed T→pressure relationship alone captures.
+            #
+            # CAUTION: a nearly identical *flat, land-based* pressure contrast
+            # was tried and reverted just above (see the NOTE below) because it
+            # caused a runaway ice-albedo feedback loop (SH pole → 201 K).
+            # ice_pressure_scale defaults to 40 Pa at full ice cover — well
+            # below both the terrain term's typical range and the reverted
+            # 150 Pa land-sea contrast — specifically to avoid reproducing
+            # that failure mode. Dynamically coupled to the ice model (grows/
+            # shrinks with `ice_cover`) rather than a static continent-scale
+            # bonus, which should make it self-limiting rather than persistent.
+            p_anom = p_anom + float(ice_pressure_scale) * np.clip(ice_cover, 0.0, 1.0)
     else:
         p_anom = pressure
 
@@ -516,15 +596,15 @@ def evolve_wind(
     # persistent, slowly-moving pressure cells that create emergent highs/lows without thrashing.
     if time_days is not None:
         lon_1d = np.linspace(-np.pi, np.pi, W, endpoint=False, dtype=np.float32)
-        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
-        storm_w = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32)  # (H,) mid-lat window
+        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32, copy=False)  # (H,)
+        storm_w = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32, copy=False)  # (H,) mid-lat window
         t = float(time_days)
         wave = np.zeros((H, W), dtype=np.float32)
         # Wavenumbers 3-7, periods 20-45 days: slow Rossby-like propagation.
         # Amplitudes reduced 40% from initial values (1.0/0.75/0.5 → 0.6/0.45/0.3 hPa)
         # to avoid over-perturbing the pressure field when combined with the terrain term.
-        for k, per, ph, amp_hpa in ((3.0, 20.0, 0.3, 0.6), (5.0, 30.0, 1.1, 0.45), (7.0, 45.0, -0.7, 0.3)):
-            wave += (amp_hpa * 100.0) * np.cos(k * lon_1d[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32)
+        for k, per, ph, amp_hpa in ROSSBY_MODES:
+            wave += (amp_hpa * 100.0) * np.cos(k * lon_1d[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32, copy=False)
         p_anom = p_anom + storm_w[:, None] * wave
 
     # NOTE: A constant land-sea pressure contrast was tried here but removed.
@@ -549,13 +629,13 @@ def evolve_wind(
     if b_amp != 0.0 and b_mix > 0.0:
         # Use zonal-mean temperature gradient so the tendency acts on the zonal-mean jet,
         # matching the climatological effect of baroclinic eddies.
-        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
-        w_mid_1d = np.exp(-((abs_deg_1d - 45.0) / 12.0) ** 2).astype(np.float32)  # (H,)
+        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32, copy=False)  # (H,)
+        w_mid_1d = np.exp(-((abs_deg_1d - 45.0) / 12.0) ** 2).astype(np.float32, copy=False)  # (H,)
         ztemp = np.mean(temperature.astype(np.float32), axis=1, keepdims=True)  # (H,1)
         dT_dy = -np.gradient(ztemp, axis=0) / dy  # (H,1) physical K/m; negate for north→south axis
-        u_jet = (b_amp * w_mid_1d[:, None] * np.abs(dT_dy)).astype(np.float32)  # (H,1)
+        u_jet = (b_amp * w_mid_1d[:, None] * np.abs(dT_dy)).astype(np.float32, copy=False)  # (H,1)
         # Safety clamp: keep the parameterization from generating unrealistic surface jets.
-        u_jet = np.clip(u_jet, 0.0, 70.0).astype(np.float32)
+        u_jet = np.clip(u_jet, 0.0, 70.0).astype(np.float32, copy=False)
 
     # --- 3-cell surface tendency (Hadley/Ferrel/Polar) ---
     # A single-layer model won't spontaneously generate the full overturning circulation.
@@ -564,20 +644,20 @@ def evolve_wind(
     # equatorward/poleward v bands by hemisphere.
     tau_cell = float(cell_relax_days)
     if tau_cell > 0.0:
-        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32)  # (H,)
-        sign_lat = np.sign(lat_2d[:, 0]).astype(np.float32)  # +N, -S
+        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32, copy=False)  # (H,)
+        sign_lat = np.sign(lat_2d[:, 0]).astype(np.float32, copy=False)  # +N, -S
         # Broaden the windows + reduce amplitudes to avoid razor-thin zonal bands.
-        w_trade = np.exp(-((abs_deg_1d - 14.0) / 8.5) ** 2).astype(np.float32)
-        w_mid = np.exp(-((abs_deg_1d - 48.0) / 13.0) ** 2).astype(np.float32)
-        w_polar = np.exp(-((abs_deg_1d - 74.0) / 9.0) ** 2).astype(np.float32)
+        w_trade = np.exp(-((abs_deg_1d - HADLEY_CELL_CENTER_DEG) / HADLEY_CELL_WIDTH_DEG) ** 2).astype(np.float32, copy=False)
+        w_mid = np.exp(-((abs_deg_1d - MID_LAT_JET_CENTER_DEG) / MID_LAT_JET_WIDTH_DEG) ** 2).astype(np.float32, copy=False)
+        w_polar = np.exp(-((abs_deg_1d - POLAR_CELL_CENTER_DEG) / POLAR_CELL_WIDTH_DEG) ** 2).astype(np.float32, copy=False)
         # Optimized circulation targets for realistic Earth-like winds with sub-stepping
         # Trade winds (easterlies), stronger mid-lat westerlies, weaker polar easterlies.
-        u_target = (-6.0 * w_trade + 11.5 * w_mid - 1.5 * w_polar).astype(np.float32)  # m/s
+        u_target = (U_TARGET_TRADE * w_trade + U_TARGET_MIDLAT * w_mid + U_TARGET_POLAR * w_polar).astype(np.float32, copy=False)
         # v_target: Hadley (equatorward), Ferrel (poleward), Polar (equatorward), by hemisphere.
         # Strengthen Ferrel return flow while reducing polar leakage into the 30-60° band.
-        v_target = (-6.4 * w_trade + 10.0 * w_mid - 1.0 * w_polar).astype(np.float32) * sign_lat  # m/s
+        v_target = (V_TARGET_TRADE * w_trade + V_TARGET_MIDLAT * w_mid + V_TARGET_POLAR * w_polar).astype(np.float32, copy=False) * sign_lat
         # Remove the equator sign ambiguity (sign(0)=0) so the equator stays calm.
-        v_target = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target).astype(np.float32)
+        v_target = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target).astype(np.float32, copy=False)
         k_cell = 1.0 / (tau_cell * 86400.0)
     
     for _ in range(n_steps):
@@ -630,11 +710,11 @@ def evolve_wind(
             u_zm = np.mean(u_curr, axis=1, keepdims=True)  # (H,1)
             v_zm = np.mean(v_curr, axis=1, keepdims=True)  # (H,1)
             # Pull u toward the target across all latitudes, with stronger forcing where needed
-            u_t = np.clip(u_target, -15.0, 15.0).astype(np.float32)  # Allow stronger targets
+            u_t = np.clip(u_target, -15.0, 15.0).astype(np.float32, copy=False)  # Allow stronger targets
             # Trade relaxation re-enabled (2×): without this, trades rely only on PGF which is
             # weak in the tropics (small T gradient), leaving trades at ~0.7 m/s vs target -5 m/s.
             # Mid-lat (5×) and polar (10×) remain unchanged.
-            a_u_row = np.clip(a * (1.0 + 2.5 * w_trade[:, None] + 9.0 * w_mid[:, None] + 2.5 * w_polar[:, None]), 0.0, 1.0).astype(np.float32)
+            a_u_row = np.clip(a * (1.0 + 2.5 * w_trade[:, None] + 9.0 * w_mid[:, None] + 2.5 * w_polar[:, None]), 0.0, 1.0).astype(np.float32, copy=False)
             u_curr = u_curr + (u_t[:, None] - u_zm) * a_u_row
             # Relax v with differentiated mid-lat / polar strength.
             # Mid-lat (6×): enough freedom for longitudinal variability in mid-lat eddies.
@@ -642,7 +722,7 @@ def evolve_wind(
             # Polar (25×): strong constraint prevents unrestricted poleward/equatorward
             # surges that caused extreme SH cooling when v-relaxation was too loose (8×).
             # With tau_cell=3d, a≈0.042: trade → 12.5%, mid-lat → 29%, polar → 65% per sub-step.
-            a_v_row = np.clip(a * (1.0 + 5.0 * w_trade[:, None] + 12.0 * w_mid[:, None] + 3.0 * w_polar[:, None]), 0.0, 0.75).astype(np.float32)
+            a_v_row = np.clip(a * (1.0 + 5.0 * w_trade[:, None] + 12.0 * w_mid[:, None] + 3.0 * w_polar[:, None]), 0.0, 0.75).astype(np.float32, copy=False)
             v_curr = v_curr + (v_target[:, None] - v_zm) * a_v_row
         
         # Soft clamp to prevent explosion
@@ -735,8 +815,8 @@ def generate_wind_field(
         land_f = land_mask.astype(np.float32)
     else:
         # Build 2D temperature field with land-sea contrast and longitudinal variation
-        T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year, planet_params=pp).astype(np.float32)
-        T = np.repeat(T_lat[:, None], Wc, axis=1).astype(np.float32)
+        T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year, planet_params=pp).astype(np.float32, copy=False)
+        T = np.repeat(T_lat[:, None], Wc, axis=1).astype(np.float32, copy=False)
         
         # Land-sea temperature contrast (land warmer in summer, cooler in winter)
         land_f = land_mask.astype(np.float32)
@@ -781,8 +861,8 @@ def generate_wind_field(
         t_days = float(time_days) if time_days is not None else float(day_of_year)
         if temperature is not None:
             # Mid-latitude storm-track window
-            storm_window = np.exp(-((abs_deg[:, None] - 45.0) / 18.0) ** 2).astype(np.float32)
-            equ_window = np.exp(-((abs_deg[:, None]) / 12.0) ** 2).astype(np.float32)
+            storm_window = np.exp(-((abs_deg[:, None] - 45.0) / 18.0) ** 2).astype(np.float32, copy=False)
+            equ_window = np.exp(-((abs_deg[:, None]) / 12.0) ** 2).astype(np.float32, copy=False)
             # A small set of deterministic planetary waves
             ks = np.array([3.0, 5.0, 7.0, 9.0], dtype=np.float32)
             periods = np.array([6.0, 9.0, 14.0, 20.0], dtype=np.float32)  # days
@@ -820,7 +900,7 @@ def generate_wind_field(
     # Derive geostrophic winds from pressure gradients
     # In geostrophic balance: u ∝ -∂p/∂y, v ∝ ∂p/∂x (Northern Hemisphere)
     # Scale by Coriolis parameter f = 2Ω sin(φ)
-    f_coriolis = pp.coriolis_parameter(lat).astype(np.float32)
+    f_coriolis = pp.coriolis_parameter(lat).astype(np.float32, copy=False)
     # Avoid division by zero at equator: enforce minimum magnitude while preserving sign
     f_min = max(3e-5, 0.1 * abs(float(pp.omega)))
     mask_pos = f_coriolis >= 0
@@ -832,12 +912,12 @@ def generate_wind_field(
     lat_2d = np.repeat(lat[:, None], Wc, axis=1)
     dx = R_earth * (2 * np.pi / Wc) * np.cos(lat_2d)
     dy = R_earth * (np.pi / Hc)
-    p_pa = (pressure * 100.0).astype(np.float32)  # hPa -> Pa
+    p_pa = (pressure * 100.0).astype(np.float32, copy=False)  # hPa -> Pa
     dp_dy = -np.gradient(p_pa, axis=0) / dy
     dp_dx = _ddx_periodic(p_pa) / (dx + 1e-3)
     
     # Geostrophic wind (m/s)
-    rho = 1.2  # kg/m³ air density
+    rho = RHO_AIR
     u_geo = -(1.0 / (rho * f_coriolis[:, None])) * dp_dy
     v_geo = (1.0 / (rho * f_coriolis[:, None])) * dp_dx
     
@@ -893,7 +973,7 @@ def generate_wind_field(
     # We approximate an upper-level westerly anomaly from |dT/dy| and mix a fraction down.
     # Use the same metric as the pressure-gradient step above (meters per latitude row).
     dT_dy = np.gradient(T, axis=0) / dy
-    jet_window = np.exp(-((abs_deg[:, None] - 48.0) / 14.0) ** 2).astype(np.float32)
+    jet_window = np.exp(-((abs_deg[:, None] - 48.0) / 14.0) ** 2).astype(np.float32, copy=False)
     thermal_wind_coeff = 2.8e6  # tuned: stronger mid-lat jet support without polar amplification
     u_aloft = thermal_wind_coeff * jet_window * np.abs(dT_dy)
     surface_mix = 0.24
@@ -923,17 +1003,17 @@ def generate_wind_field(
     # The pressure-gradient solve captures synoptic structure but still under-produces
     # the near-surface 3-cell climatology, especially Ferrel flow. Apply a weak
     # zonal-mean correction so the diagnostic wind remains a useful relaxation target.
-    sign_lat = np.sign(lat).astype(np.float32)
-    w_trade = np.exp(-((abs_deg - 14.0) / 9.0) ** 2).astype(np.float32)
-    w_mid = np.exp(-((abs_deg - 48.0) / 13.0) ** 2).astype(np.float32)
-    w_polar = np.exp(-((abs_deg - 74.0) / 10.0) ** 2).astype(np.float32)
-    u_surface = (-3.5 * w_trade + 8.5 * w_mid - 1.5 * w_polar).astype(np.float32)
-    v_surface = (-3.5 * w_trade + 5.0 * w_mid - 1.2 * w_polar).astype(np.float32) * sign_lat
-    v_surface = np.where(abs_deg < 2.0, 0.0, v_surface).astype(np.float32)
+    sign_lat = np.sign(lat).astype(np.float32, copy=False)
+    w_trade = np.exp(-((abs_deg - 14.0) / 9.0) ** 2).astype(np.float32, copy=False)
+    w_mid = np.exp(-((abs_deg - 48.0) / 13.0) ** 2).astype(np.float32, copy=False)
+    w_polar = np.exp(-((abs_deg - 74.0) / 10.0) ** 2).astype(np.float32, copy=False)
+    u_surface = (-3.5 * w_trade + 8.5 * w_mid - 1.5 * w_polar).astype(np.float32, copy=False)
+    v_surface = (-3.5 * w_trade + 5.0 * w_mid - 1.2 * w_polar).astype(np.float32, copy=False) * sign_lat
+    v_surface = np.where(abs_deg < 2.0, 0.0, v_surface).astype(np.float32, copy=False)
     uc_zm = np.mean(uc, axis=1, keepdims=True)
     vc_zm = np.mean(vc, axis=1, keepdims=True)
-    u_nudge = (0.18 + 0.18 * w_mid[:, None] + 0.06 * w_trade[:, None]).astype(np.float32)
-    v_nudge = (0.16 + 0.12 * w_trade[:, None] + 0.18 * w_mid[:, None]).astype(np.float32)
+    u_nudge = (0.18 + 0.18 * w_mid[:, None] + 0.06 * w_trade[:, None]).astype(np.float32, copy=False)
+    v_nudge = (0.16 + 0.12 * w_trade[:, None] + 0.18 * w_mid[:, None]).astype(np.float32, copy=False)
     uc = uc + (u_surface[:, None] - uc_zm) * u_nudge
     vc = vc + (v_surface[:, None] - vc_zm) * v_nudge
     
@@ -965,8 +1045,8 @@ def generate_wind_field(
     uc = uc + 0.10 * _laplacian(uc)
     vc = vc + 0.10 * _laplacian(vc)
     
-    uc = np.clip(uc, -u_limit[:, None], u_limit[:, None]).astype(np.float32)
-    vc = np.clip(vc, -v_limit[:, None], v_limit[:, None]).astype(np.float32)
+    uc = np.clip(uc, -u_limit[:, None], u_limit[:, None]).astype(np.float32, copy=False)
+    vc = np.clip(vc, -v_limit[:, None], v_limit[:, None]).astype(np.float32, copy=False)
     
     # Debug logging for wind diagnostics
     if debug_log:
@@ -1183,6 +1263,7 @@ def generate_precipitation(
     wind_v: np.ndarray | None = None,
     humidity: np.ndarray | None = None,
     soil_moisture: np.ndarray | None = None,
+    cloud_fraction: np.ndarray | None = None,
     day_of_year: int = 80,
     dt_days: float = 1.0,
     evap_coeff: float = 1.0,
@@ -1197,27 +1278,33 @@ def generate_precipitation(
     bucket while blending three precipitation triggers: moisture convergence,
     orographic lift, and convective instability. Everything runs at the native
     grid resolution so it can operate in both snapshot and time-stepping modes.
+
+    `cloud_fraction`, if provided, is this step's already-diagnosed cloud cover
+    (from `_evolve_temperature`). It adds a stratiform term so widespread cloud
+    sheets (frontal/persistent cover) produce rain even without a deep-convective
+    trigger, closing the gap where clouds and precipitation were diagnosed from
+    shared RH/ascent fields but never actually informed each other.
     """
 
     H = int(height)
     W = int(width)
-    elev = elevation.astype(np.float32)
+    elev = elevation.astype(np.float32, copy=False)
     lat_deg = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
     abs_lat_deg = np.abs(lat_deg)
-    itcz_window = np.exp(-((abs_lat_deg / 14.0) ** 2)).astype(np.float32)
-    storm_window = np.exp(-((abs_lat_deg - 48.0) / 15.0) ** 2).astype(np.float32)
-    drybelt_window = np.exp(-((abs_lat_deg - 28.0) / 8.0) ** 2).astype(np.float32)
+    itcz_window = np.exp(-((abs_lat_deg / ITCZ_HALF_WIDTH_DEG) ** 2)).astype(np.float32, copy=False)
+    storm_window = np.exp(-((abs_lat_deg - STORM_TRACK_CENTER_DEG) / 15.0) ** 2).astype(np.float32, copy=False)
+    drybelt_window = np.exp(-((abs_lat_deg - DRYBELT_CENTER_DEG) / 8.0) ** 2).astype(np.float32, copy=False)
 
     land_mask, sea_mask = _derive_land_sea_masks(elev)
     land_f = land_mask.astype(np.float32)
     sea_f = sea_mask.astype(np.float32)
 
     if temperature is None:
-        lat = np.deg2rad(lat_deg).astype(np.float32)
+        lat = np.deg2rad(lat_deg).astype(np.float32, copy=False)
         T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year)
-        temperature = np.repeat(T_lat[:, None], W, axis=1).astype(np.float32)
+        temperature = np.repeat(T_lat[:, None], W, axis=1).astype(np.float32, copy=False)
     else:
-        temperature = temperature.astype(np.float32)
+        temperature = temperature.astype(np.float32, copy=False)
 
     u: np.ndarray
     v: np.ndarray
@@ -1231,27 +1318,32 @@ def generate_precipitation(
             debug_log=False,
         )
     else:
-        u = wind_u.astype(np.float32)
-        v = wind_v.astype(np.float32)
+        u = wind_u.astype(np.float32, copy=False)
+        v = wind_v.astype(np.float32, copy=False)
 
     wind_speed = np.sqrt(u * u + v * v) + 1e-6
     temp_norm = np.clip((temperature - 255.0) / 45.0, 0.0, 1.0)
 
     Tc = np.clip(temperature - 273.15, -60.0, 60.0)
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
-    qsat = np.clip(0.622 * es / 1013.25, 0.0, 0.035).astype(np.float32)
+    qsat = np.clip(0.622 * es / 1013.25, 0.0, 0.035).astype(np.float32, copy=False)
 
     if humidity is None:
-        base_q = np.where(sea_mask, 0.013, 0.009).astype(np.float32)
+        base_q = np.where(sea_mask, 0.013, 0.009).astype(np.float32, copy=False)
     else:
-        base_q = humidity.astype(np.float32)
+        base_q = humidity.astype(np.float32, copy=False)
 
     if soil_moisture is None:
-        soil = np.where(land_mask, 0.55, 0.0).astype(np.float32)
+        soil = np.where(land_mask, 0.55, 0.0).astype(np.float32, copy=False)
     else:
         soil = soil_moisture.astype(np.float32)
 
     dt = max(float(dt_days), 1.0)
+    # At large dt (monthly/annual mode) evaporation would saturate the entire humidity
+    # field in one step, erasing the spatial gradients that determine climate zones.
+    # Cap evaporation at 1.5-day equivalent so dry and wet cells stay differentiated
+    # across substeps even when dt=6 (monthly) or dt=7 (annual).
+    dt_evap = min(dt, 1.5)
 
     # Evaporation and evapotranspiration sources
     wind_norm = np.clip(wind_speed / 15.0, 0.0, 1.5)
@@ -1263,7 +1355,7 @@ def generate_precipitation(
         * (0.35 + 0.65 * soil)
         * np.clip(qsat - base_q, 0.0, None)
     )
-    sources = (ocean_evap + land_evap) * dt
+    sources = (ocean_evap + land_evap) * dt_evap
     q = np.clip(base_q + sources, 0.0, qsat)
 
     # Moisture advection/diffusion (semi-Lagrangian-ish)
@@ -1307,10 +1399,11 @@ def generate_precipitation(
         conv = np.clip(conv + 0.15 * _laplacian(conv), 0.0, 3.0)
 
     # Large-scale ascent proxy from wind convergence
+    _lap = _laplacian_numba if NUMBA_AVAILABLE else _laplacian
     div = _ddx_periodic(u) + np.gradient(v, axis=0)
     ascent = np.clip(-div, 0.0, None)
     ascent = ascent / (np.mean(ascent) + 1e-6)
-    ascent = np.clip(ascent + 0.15 * _laplacian(ascent), 0.0, 3.0)
+    ascent = np.clip(ascent + 0.15 * _lap(ascent.astype(np.float32)), 0.0, 3.0)
 
     # Subsidence drying: suppresses precipitation in divergent (descending) regions.
     # In the real atmosphere the Hadley cell's descending branch at ~25-35° drives
@@ -1324,7 +1417,7 @@ def generate_precipitation(
         1.0 - 0.34 * subsidence_norm - 0.18 * drybelt_window[:, None],
         0.22,
         1.0,
-    ).astype(np.float32)
+    ).astype(np.float32, copy=False)
 
     # Orographic uplift signal
     gx = _ddx_periodic(elev)
@@ -1333,7 +1426,7 @@ def generate_precipitation(
     orog = np.clip(gx * u + gy * v, 0.0, None) + 0.25 * slope
     orog = land_f * orog
     orog = orog / (np.percentile(orog, 90.0) + 1e-6)
-    orog = np.clip(orog + 0.15 * _laplacian(orog), 0.0, 2.0)
+    orog = np.clip(orog + 0.15 * _lap(orog.astype(np.float32)), 0.0, 2.0)
 
     # Phase 2: Enhanced convective precipitation with CAPE-like triggering
     # This significantly improves tropical rainfall (ITCZ) realism
@@ -1349,7 +1442,7 @@ def generate_precipitation(
     ascent_norm = np.clip(ascent, 0.0, 1.5) / 1.5
     convective = np.clip(P_convective / 10.0, 0.0, 2.0)  # Scale to [0, 2] for blending
     convective = np.clip(convective + 0.10 * conv, 0.0, 2.0)
-    convective = convective * (0.20 + 1.00 * itcz_window[:, None]) * (
+    convective = convective * (0.05 + 0.90 * itcz_window[:, None]) * (
         0.18 + 0.82 * conv_norm
     ) * (
         0.22 + 0.78 * ascent_norm
@@ -1358,17 +1451,30 @@ def generate_precipitation(
     # Blend drivers into precipitation potential, then apply subsidence drying.
     # Subsidence_suppression reduces precip in divergent (descending) zones,
     # creating the subtropical dry belt that the convergence-only scheme lacks.
-    rh_release = rh * (0.26 + 0.52 * itcz_window[:, None] + 0.06 * storm_window[:, None])
-    conv_driver = conv * (0.34 + 0.52 * itcz_window[:, None] + 0.08 * storm_window[:, None])
-    ascent_driver = ascent * (0.54 + 0.35 * itcz_window[:, None] + 0.08 * storm_window[:, None])
+    rh_release = rh * (0.10 + 0.68 * itcz_window[:, None] + 0.06 * storm_window[:, None])
+    conv_driver = conv * (0.12 + 0.74 * itcz_window[:, None] + 0.08 * storm_window[:, None])
+    ascent_driver = ascent * (0.20 + 0.69 * itcz_window[:, None] + 0.08 * storm_window[:, None])
+    # Stratiform term: existing cloud cover (frontal/persistent sheets) rains even
+    # without a fresh convective trigger. target_mean_mm_day rescaling below keeps
+    # the global mean calibrated, so this mainly reshapes *where* rain falls to track
+    # cloud cover rather than changing the overall total. Weight retuned 0.10 -> 0.06
+    # (2026-07): 0.10 pushed SH subtropical mean precip to 2.83 mm/day, just over
+    # test_subtropical_precip_quantity's 2.8 cap (bisected precisely — 0.09 still
+    # fails at 2.81, 0.08 is the first passing value; 0.06 leaves headroom rather
+    # than sitting right at that boundary again).
+    if cloud_fraction is not None:
+        stratiform = np.clip(cloud_fraction.astype(np.float32), 0.0, 1.0)
+    else:
+        stratiform = np.zeros((H, W), dtype=np.float32)
     precip_potential = uplift_coeff * (
         0.18 * rh_release +
         0.24 * conv_driver +
         0.20 * orog +
         0.20 * convective +
-        0.22 * ascent_driver
+        0.22 * ascent_driver +
+        0.06 * stratiform
     ) * subsidence_suppression
-    lat_shape = np.clip(0.80 + 0.50 * itcz_window[:, None] + 0.02 * storm_window[:, None], 0.60, 1.35)
+    lat_shape = np.clip(0.78 + 0.62 * itcz_window[:, None] + 0.02 * storm_window[:, None], 0.60, 1.40)
     precip_potential = precip_potential * lat_shape
 
     if NUMBA_AVAILABLE:
@@ -1384,7 +1490,11 @@ def generate_precipitation(
     precip_potential = np.clip(precip_potential * post_shape, 0.0, 3.0)
 
     # Convert potential to precipitation (mm/day) with moisture conservation
-    remove_frac = np.clip(rain_efficiency * precip_potential * dt, 0.0, 1.0)
+    # Cap removal fraction: at dt=6 the uncapped value clips to 1.0 (total moisture
+    # stripping), leaving humidity_next≈0 everywhere and erasing spatial gradients.
+    # Limiting to dt=2.0 and 0.85 ensures cells retain ~15% of moisture, so
+    # the next substep starts with a spatially differentiated humidity field.
+    remove_frac = np.clip(rain_efficiency * precip_potential * min(dt, 2.0), 0.0, 0.85)
     dq = np.clip(remove_frac * q, 0.0, q)
     column_mm_per_q = 2000.0  # ~20 mm PW for q=0.01
     P = dq * (column_mm_per_q / dt)
@@ -1397,7 +1507,7 @@ def generate_precipitation(
         0.94 - 0.14 * itcz_window[:, None] + 0.08 * storm_window[:, None],
         0.70,
         1.06,
-    ).astype(np.float32)
+    ).astype(np.float32, copy=False)
     dq = np.clip(dq * rain_export_factor, 0.0, q)
     P = dq * (column_mm_per_q / dt)
     if max_precip_mm_day > 0.0:

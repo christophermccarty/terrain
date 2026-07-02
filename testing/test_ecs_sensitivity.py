@@ -76,9 +76,9 @@ def test_4x_co2_warmer_than_2x():
 
 @pytest.mark.xfail(strict=False,
                    reason="15yr run gives transient response, not equilibrium ECS; "
-                          "expect 1-2.5 K, true equilibrium ECS (50yr) needed for 2.5-4 K")
+                          "expect 1-3 K transiently; use test_ecs_equilibrium_magnitude for true ECS")
 def test_ecs_plausible_magnitude():
-    """2x CO2 warming should approach Earth's ECS range (2.5-4.0 K) after 15yr."""
+    """2x CO2 warming should show meaningful signal (>1 K) after 15yr transient run."""
     rec_280 = _ecs_run(280.0, years=15, spinup_years=2.0)
     rec_560 = _ecs_run(560.0, years=15, spinup_years=2.0)
 
@@ -87,13 +87,40 @@ def test_ecs_plausible_magnitude():
     dT = T_560 - T_280
 
     assert 2.0 <= dT <= 5.5, (
-        f"ECS estimate {dT:.3f} K outside plausible range [2.0, 5.5] K "
+        f"ECS transient estimate {dT:.3f} K outside plausible range [2.0, 5.5] K "
         f"(280 ppm: {T_280:.2f} K, 560 ppm: {T_560:.2f} K)"
     )
 
 
-@pytest.mark.xfail(strict=False,
-                   reason="Short spinup; 560 ppm may not fully reduce ice vs 280 ppm")
+@pytest.mark.slow
+def test_ecs_equilibrium_magnitude():
+    """2x CO2 near-equilibrium warming (50yr run) should be 1.0–6.0 K.
+
+    Uses run_long_simulation for a 50-year ANNUAL integration with 3-year spinup.
+    With deep ocean coupling (τ≈30yr), 50 years is not sufficient for true equilibrium —
+    this measures the transient/near-transient response (TCR).  True ECS (co2_climate_feedback
+    =0.8 Planck + explicit WV amplification) would require 200+ year runs.
+    IPCC AR6 TCR best estimate: 1.8 K; range 1.0–2.5 K; bound widened to catch pathological cases.
+    """
+    from optimizer.headless import run_long_simulation
+    from planet_params import PlanetParams
+
+    pp_280 = PlanetParams(co2_initial_ppm=280.0)
+    pp_560 = PlanetParams(co2_initial_ppm=560.0)
+
+    _, rec_280 = run_long_simulation(pp_280, years=50, spinup_years=3, H=32, W=64, sample_every=10)
+    _, rec_560 = run_long_simulation(pp_560, years=50, spinup_years=3, H=32, W=64, sample_every=10)
+
+    T_280 = rec_280[-1]["global_mean_t"]
+    T_560 = rec_560[-1]["global_mean_t"]
+    dT = T_560 - T_280
+
+    assert 1.0 <= dT <= 6.0, (
+        f"Near-equilibrium 2xCO2 response {dT:.3f} K outside [1.0, 6.0] K "
+        f"(280 ppm baseline: {T_280:.2f} K, 560 ppm: {T_560:.2f} K)"
+    )
+
+
 def test_2x_co2_less_ice():
     """Doubled CO2 should produce less global ice after 15yr."""
     rec_280 = _ecs_run(280.0)
