@@ -13,13 +13,20 @@ import numpy as np
 from masks import get_masks
 
 
-def _ocean_mask_from_elevation(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: float = 0.05) -> np.ndarray:
-    """Compatibility wrapper for callers that still expect an ocean-only helper."""
-    sea_mask, _ = get_masks(
-        np.asarray(elevation, dtype=np.float32),
-        assume_loaded_if_zeros_frac=assume_loaded_if_zeros_frac,
-    )
-    return sea_mask
+def _lat_deg(n: int) -> np.ndarray:
+    """Row-centred latitudes [°] for a grid with n rows (north→south, float32)."""
+    return ((0.5 - (np.arange(n, dtype=np.float32) + 0.5) / n) * 180.0)
+
+
+def _lat_rad(n: int) -> np.ndarray:
+    """Row-centred latitudes [rad] for a grid with n rows (north→south, float32)."""
+    return ((0.5 - (np.arange(n, dtype=np.float32) + 0.5) / n) * np.pi)
+
+
+_K_G_ICE = 3e-5   # Stefan growth constant [m² / (day × cold_excess_unit)]
+_H_ICE_REF = 0.2  # denominator offset to prevent div/0 and limit initial growth [m]
+_K_M_ICE = 0.003  # melt rate [m / (day × K above melt_temp)]
+_H_ICE_MAX = 5.0  # maximum realistic sea ice thickness [m]
 
 
 def update_sea_ice(
@@ -27,31 +34,34 @@ def update_sea_ice(
     elevation: np.ndarray,
     prev_ice: np.ndarray | None,
     dt_days: float,
+    prev_thickness: np.ndarray | None = None,
     *,
     freeze_temp: float = 269.5,
     melt_temp: float = 273.35,
     freeze_rate: float = 0.06,
     melt_rate: float = 0.16,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Update sea ice fraction based on persistent cold ocean temperatures.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Update sea ice fraction and thickness for one time step.
 
     Returns:
-        (ice_new, delta_ice): Updated ice fraction and change in ice fraction
-            this step. delta_ice > 0 means freezing, < 0 means melting.
+        (ice_new, delta_ice, thickness_new):
+            ice_new      — updated ice fraction [0–1]
+            delta_ice    — change in ice fraction (>0 freezing, <0 melting)
+            thickness_new — updated ice thickness [m]; 0 where no ice
     """
     is_ocean, _ = get_masks(elevation)
     ice = np.zeros_like(T, dtype=np.float32) if prev_ice is None else np.asarray(prev_ice, dtype=np.float32)
     ice_prev = ice.copy()
     T = np.asarray(T, dtype=np.float32)
     H = T.shape[0]
-    lat_deg = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+    lat_deg = _lat_deg(H)
     abs_lat = np.abs(lat_deg)[:, None]
-    polar_factor = np.clip((abs_lat - 55.0) / 25.0, 0.0, 1.0).astype(np.float32)
-    margin_factor = (1.0 - polar_factor).astype(np.float32)
+    polar_factor = np.clip((abs_lat - 55.0) / 25.0, 0.0, 1.0).astype(np.float32, copy=False)
+    margin_factor = (1.0 - polar_factor).astype(np.float32, copy=False)
 
-    cold_excess = np.clip((freeze_temp - T) / 2.5, 0.0, 1.5).astype(np.float32)
-    warm_excess = np.clip((T - melt_temp) / 2.5, 0.0, 1.5).astype(np.float32)
-    open_water = (1.0 - np.clip(ice, 0.0, 1.0)).astype(np.float32)
+    cold_excess = np.clip((freeze_temp - T) / 2.5, 0.0, 1.5).astype(np.float32, copy=False)
+    warm_excess = np.clip((T - melt_temp) / 2.5, 0.0, 1.5).astype(np.float32, copy=False)
+    open_water = (1.0 - np.clip(ice, 0.0, 1.0)).astype(np.float32, copy=False)
 
     # Growth is fastest over newly exposed cold water and increases toward the poles.
     growth = freeze_rate * dt_days * cold_excess * open_water * (0.22 + 0.78 * polar_factor)
@@ -61,7 +71,21 @@ def update_sea_ice(
     ice = np.where(is_ocean, np.clip(ice + growth - melt, 0.0, 1.0), 0.0)
     ice_new = np.where(is_ocean, ice, 0.0)
     delta_ice = ice_new - np.where(is_ocean, ice_prev, 0.0)
-    return ice_new, delta_ice
+
+    # --- Thickness evolution (Stefan's law, parameterised) ---
+    # Growth: dh/dt ∝ cold_excess / (h + H_REF) — slows as ice thickens.
+    # Melt:   dh/dt ∝ warm_K — proportional to temperature above melt threshold.
+    h = (np.zeros_like(T, dtype=np.float32)
+         if prev_thickness is None else np.asarray(prev_thickness, dtype=np.float32))
+    growth_h = (_K_G_ICE * cold_excess * ice_new * float(dt_days)
+                / (h + _H_ICE_REF)).astype(np.float32, copy=False)
+    warm_K = np.clip(T - melt_temp, 0.0, None).astype(np.float32, copy=False)
+    melt_h = (_K_M_ICE * warm_K * float(dt_days)).astype(np.float32, copy=False)
+    h_new = np.clip(h + growth_h - melt_h, 0.0, _H_ICE_MAX)
+    # Thickness is zero wherever there is no ice
+    thickness_new = np.where(ice_new > 0.0, h_new, 0.0).astype(np.float32, copy=False)
+
+    return ice_new, delta_ice, thickness_new
 
 
 def calculate_ocean_heat_transport(
@@ -111,7 +135,7 @@ def calculate_ocean_heat_transport(
     is_ocean, _ = get_masks(elevation)
     
     # Calculate latitude for each row
-    lat_rows = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * 180.0  # degrees, -90 to +90
+    lat_rows = _lat_deg(Hc)
     abs_lat_rows = np.abs(lat_rows)
     
     # Initialize temperature adjustment
@@ -125,7 +149,7 @@ def calculate_ocean_heat_transport(
     
     # Calculate zonal (east-west) average temperature in ocean
     # Avoid np.nanmean (which can warn on all-NaN rows) by doing explicit sum/count.
-    ocean_count = np.sum(is_ocean, axis=1).astype(np.float32)  # (Hc,)
+    ocean_count = np.sum(is_ocean, axis=1).astype(np.float32, copy=False)  # (Hc,)
     ocean_sum = np.sum(T * is_ocean.astype(np.float32), axis=1)  # (Hc,)
     # Area-weighted global mean as neutral fallback for rows that have no ocean.
     # On an equirectangular grid each row represents a different area ∝ cos(lat),
@@ -137,13 +161,13 @@ def calculate_ocean_heat_transport(
     with np.errstate(invalid='ignore', divide='ignore'):
         T_ocean_zonal = ocean_sum / np.maximum(ocean_count, 1.0)
     # Replace "no ocean in this latitude row" with a neutral fallback to prevent sharp jumps
-    T_ocean_zonal = np.where(ocean_count > 0.0, T_ocean_zonal, global_mean).astype(np.float32)
+    T_ocean_zonal = np.where(ocean_count > 0.0, T_ocean_zonal, global_mean).astype(np.float32, copy=False)
     
     # Light latitudinal smoothing before taking derivatives (reduces banding/ringing).
-    # This is intentionally minimal (3-pt filter, 2 passes) to keep the climatology similar.
-    for _ in range(2):
+    # Single 3-point pass is sufficient; a second pass adds little beyond the first.
+    for _ in range(1):
         z = np.pad(T_ocean_zonal, 1, mode="edge")
-        T_ocean_zonal = (0.25 * z[:-2] + 0.50 * z[1:-1] + 0.25 * z[2:]).astype(np.float32)
+        T_ocean_zonal = (0.25 * z[:-2] + 0.50 * z[1:-1] + 0.25 * z[2:]).astype(np.float32, copy=False)
     
     # Calculate poleward heat flux.
     # NH: Gulf Stream / AMOC deposit heat at ~45-65°N → Gaussian centred at 45°N.
@@ -173,7 +197,7 @@ def calculate_ocean_heat_transport(
         ice_arr = np.clip(np.asarray(ice_cover, dtype=np.float32), 0.0, 1.0)
         ice_ocean = ice_arr * is_ocean.astype(np.float32)
         ice_zonal = np.sum(ice_ocean, axis=1) / np.maximum(ocean_count, 1.0)
-        ice_block = np.where(lat_rows >= 0, 0.18, 0.26).astype(np.float32)
+        ice_block = np.where(lat_rows >= 0, 0.18, 0.26).astype(np.float32, copy=False)
         current_strength = current_strength * (1.0 - ice_block * ice_zonal)
 
     # Temperature gradient drives heat transport
@@ -290,7 +314,7 @@ def compute_ekman_transport(
     is_ocean, _ = get_masks(elevation)
 
     # Latitude grid for Coriolis deflection
-    lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi  # radians, -π/2 to +π/2
+    lat = _lat_rad(H)
     lat_2d = np.repeat(lat[:, None], W, axis=1)
 
     # Coriolis deflection angle (45° to the right in NH, left in SH)
@@ -350,7 +374,7 @@ def get_major_ocean_currents(
     - Antarctic Circumpolar Current [climatology]
     """
     # Calculate latitude and longitude grids
-    lat_rows = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * 180.0
+    lat_rows = _lat_deg(Hc)
     lon_cols = ((np.arange(Wc, dtype=np.float32) + 0.5) / Wc) * 360.0 - 180.0
     
     lat_grid, lon_grid = np.meshgrid(lat_rows, lon_cols, indexing='ij')
@@ -441,8 +465,8 @@ def generate_ocean_currents(
 
     # Wind-driven surface drift (Ekman-like, modest rotation).
     if wind_u is not None and wind_v is not None:
-        lat_rows = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
-        lat_grid = lat_rows[:, None].astype(np.float32)
+        lat_rows = _lat_deg(H)
+        lat_grid = lat_rows[:, None].astype(np.float32, copy=False)
         sign = np.sign(lat_grid)
         angle = np.deg2rad(20.0) * sign
         ca = np.cos(angle)
@@ -456,7 +480,7 @@ def generate_ocean_currents(
     # Deterministic mesoscale variability for visual dynamics.
     t = float(time_days if time_days is not None else day_of_year)
     lon = ((np.arange(W, dtype=np.float32) + 0.5) / W) * 360.0 - 180.0
-    lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+    lat = _lat_deg(H)
     lon_grid, lat_grid = np.meshgrid(lon, lat)
     phase = 0.6 * np.sin(np.deg2rad(lon_grid * 3.0) + t * 0.08) * np.cos(np.deg2rad(lat_grid * 2.0) - t * 0.06)
     u = u + 0.04 * phase
@@ -485,8 +509,8 @@ def generate_ocean_currents(
     # Detect western ocean boundaries (ocean cells with land to the west).
     western_coast = is_ocean & land_west
     if np.any(western_coast):
-        lat_rows = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
-        lat_grid = lat_rows[:, None].astype(np.float32)
+        lat_rows = _lat_deg(H)
+        lat_grid = lat_rows[:, None].astype(np.float32, copy=False)
         abs_lat = np.abs(lat_grid)
         midlat_mask = (abs_lat >= 20.0) & (abs_lat <= 60.0)
         enhancement = western_coast & midlat_mask
@@ -531,6 +555,59 @@ def apply_ocean_transport(
     
     # Apply adjustment
     T_new = T + T_adjustment
-    
+
     return T_new
 
+
+def evolve_salinity(
+    salinity: np.ndarray,
+    T_sst: np.ndarray,
+    elevation: np.ndarray,
+    precipitation: np.ndarray | None,
+    ice_delta: np.ndarray,
+    dt_days: float = 1.0,
+    pp=None,
+) -> np.ndarray:
+    """Evolve ocean surface salinity [PSU] by one time step.
+
+    Tendencies (PSU/day):
+      E–P balance  : evaporation concentrates, rain dilutes
+      Brine rejection: freezing ice expels salt; melting injects freshwater
+      Restoring     : slow drift back toward reference (deep mixing proxy), τ=2yr
+    """
+    from planet_params import EARTH
+    if pp is None:
+        pp = EARTH
+
+    sea_mask, _ = get_masks(elevation)
+    ocean_f = sea_mask.astype(np.float32)
+
+    sal = salinity.copy()
+
+    # Evaporation: raises salinity where T > 270 K (open water, not frozen)
+    T_above_freeze = np.clip(T_sst - 270.0, 0.0, None).astype(np.float32, copy=False)
+    evap_rate = 0.002 * T_above_freeze  # PSU/day per degree above freeze
+
+    # Precipitation: dilutes salinity (P in mm/day → scale 0.001 to PSU/day units)
+    if precipitation is not None:
+        precip_dilution = precipitation.astype(np.float32, copy=False) * 0.001
+    else:
+        precip_dilution = np.zeros_like(sal)
+
+    ep_tendency = (evap_rate - precip_dilution) * float(dt_days)
+
+    # Brine rejection: freezing (ice_delta > 0) → salt expelled to ocean
+    # Melting (ice_delta < 0) → freshwater → salinity decreases
+    # Scale: 0.5 PSU per unit of ice_delta per day (crude but plausible)
+    brine_tendency = np.clip(ice_delta, -0.5, 0.5) * 0.5 * float(dt_days)
+
+    # Restoring toward reference with τ = 2yr = 730 days
+    tau_restore = 730.0
+    restore_tendency = -(sal - float(pp.salinity_reference_psu)) / tau_restore * float(dt_days)
+
+    sal_new = sal + (ep_tendency + brine_tendency + restore_tendency) * ocean_f
+    sal_new = np.clip(sal_new, 0.0, 45.0).astype(np.float32, copy=False)
+    # Land cells remain 0
+    sal_new = np.where(ocean_f > 0.5, sal_new, 0.0).astype(np.float32, copy=False)
+
+    return sal_new

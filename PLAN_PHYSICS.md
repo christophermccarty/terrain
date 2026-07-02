@@ -1,6 +1,10 @@
 # PlanetSim — Physics Depth Plan
 
 > Created: 2026-06-20
+> **STATUS (2026-07-01): ARCHIVED — Effort 1 (1A-1D) and Effort 2 (2A-2D) are complete and
+> verified in code. Only 2E (ice-age proof-of-concept scenario, a stretch goal) was never run —
+> `experiments/` doesn't exist. See PLAN.md's "Current State Summary" for the live status; this
+> file is kept for historical/design-rationale context only, not as an open task list.**
 
 Two sequential efforts. Effort 1 completes first with passing tests before Effort 2 begins.
 

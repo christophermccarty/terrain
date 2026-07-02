@@ -1,12 +1,12 @@
-"""Main entry point for planet simulator.
+﻿"""Main entry point for planet simulator.
 
 Launches the GUI application for viewing and interacting with the planet simulation.
 All modules are kept separated: terrain, atmosphere, temperature, and simulate.
 """
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk, ImageDraw
 import numpy as np
 import cProfile
 import pstats
@@ -18,6 +18,7 @@ from queue import Queue, Empty
 
 from terrain import (
     generate_sphere_image,
+    project_equirect_on_globe,
     ensure_elevation,
     colorize,
     load_settings,
@@ -174,7 +175,7 @@ def main() -> None:
 
     root = tk.Tk()
     root.title(f"Sphere {size}x{size} (262,144 cells)")
-    root.resizable(False, False)
+    root.resizable(True, True)
 
     # Simulation state
     sim_state: PlanetState | None = None
@@ -183,8 +184,12 @@ def main() -> None:
     sim_paused = False
     sim_speed = 1.0  # days per step
     last_mouse_pos = (0, 0)  # Track last mouse position for cursor updates
+    display_scale_x: float = 1.0  # display pixels per sim pixel (x)
+    display_scale_y: float = 1.0  # display pixels per sim pixel (y)
+    _resize_job = None  # debounce id for window Configure events
     _sim_ever_started = False  # False until user clicks Start for the first time
-    
+    _last_render_arr: np.ndarray | None = None  # latest rendered map pixels for zoom preview
+
     # Terrain mode: "procedural" or "loaded"
     terrain_mode = "procedural"
     loaded_heightmap_path = None
@@ -232,6 +237,29 @@ def main() -> None:
     last_wind_key = None
     last_anim_t = 0.0
     particle_anim_running = False
+    last_particle_mode: str | None = None
+
+    # --- Ocean current particle visualization state ---
+    oc_particle_xy: np.ndarray | None = None
+    oc_particle_age: np.ndarray | None = None
+    oc_trail: np.ndarray | None = None
+    oc_base_rgb_u8: np.ndarray | None = None
+    oc_last_uv_key = None
+    oc_last_anim_t = 0.0
+    oc_anim_running = False
+    oc_last_particle_mode: str | None = None
+
+    def _particle_count_scale() -> float:
+        """Scale decorative particle count down at coarser time-scale modes.
+
+        Wind/ocean particles are purely decorative — animation smoothness
+        matters less when each simulated step represents a week/month/year
+        rather than a day, so it isn't worth paying full per-frame
+        update/render cost at those modes (PLAN.md Phase 5).
+        """
+        return {"1 Day": 1.0, "1 Week": 1.0, "1 Month": 0.5, "1 Year": 0.25}.get(
+            time_scale_var.get(), 1.0
+        )
 
     def _init_particles(h: int, w: int, n: int) -> None:
         """Initialize particles and trail buffer for wind particle animation."""
@@ -246,6 +274,25 @@ def main() -> None:
         base_wind_rgb_u8 = None
         last_anim_t = time.perf_counter()
 
+    def _init_oc_particles(h: int, w: int, n: int, ocean_mask: np.ndarray) -> None:
+        """Initialize ocean current particles, spawning only inside ocean cells."""
+        nonlocal oc_particle_xy, oc_particle_age, oc_trail, oc_base_rgb_u8, oc_last_anim_t
+        rng = np.random.default_rng(2024)
+        n = int(max(200, min(int(n), 30000)))
+        oc_particle_xy = np.empty((n, 2), dtype=np.float32)
+        ocean_ys, ocean_xs = np.where(ocean_mask)
+        if len(ocean_ys) > 0:
+            idx = rng.integers(0, len(ocean_ys), size=n)
+            oc_particle_xy[:, 0] = ocean_xs[idx].astype(np.float32)
+            oc_particle_xy[:, 1] = ocean_ys[idx].astype(np.float32)
+        else:
+            oc_particle_xy[:, 0] = rng.uniform(0, w - 1, size=n).astype(np.float32)
+            oc_particle_xy[:, 1] = rng.uniform(0, h - 1, size=n).astype(np.float32)
+        oc_particle_age = rng.integers(0, 80, size=n, dtype=np.int32)
+        oc_trail = np.zeros((h, w), dtype=np.float32)
+        oc_base_rgb_u8 = None
+        oc_last_anim_t = time.perf_counter()
+
     def _wind_uv_for_display() -> tuple[np.ndarray, np.ndarray] | None:
         """Get (u,v) from sim_state for wind particle animation."""
         nonlocal sim_state
@@ -254,9 +301,10 @@ def main() -> None:
         return sim_state.wind_u, sim_state.wind_v
 
     def _update_wind_particles() -> None:
-        """Animate wind particles in map mode using a fading trail buffer."""
-        nonlocal tk_img, particle_xy, particle_age, trail, base_wind_rgb_u8, last_wind_key, last_anim_t, particle_anim_running
-        if mode_var.get() != "map" or view_var.get() != "Wind Particles":
+        """Animate wind particles in map or globe mode using a fading trail buffer."""
+        nonlocal tk_img, particle_xy, particle_age, trail, base_wind_rgb_u8, last_wind_key, last_anim_t, particle_anim_running, display_scale_x, display_scale_y, last_particle_mode
+        _mode = mode_var.get()
+        if view_var.get() != "Wind Particles" or _mode not in ("map", "globe"):
             particle_anim_running = False
             return
         # Only animate while the simulation is running (Start). Otherwise, show a static frame.
@@ -266,12 +314,34 @@ def main() -> None:
                 return
             u, v = uv
             speed = np.hypot(u, v).astype(np.float32)
-            base_rgb = wind_speed_to_rgb(speed)
+            wind_rgb = wind_speed_to_rgb(speed)
+            _stex = sim_state.elevation if (sim_state is not None and sim_state.elevation is not None) else None
+            if _stex is not None:
+                base_rgb = np.clip(0.60 * colorize(_stex) + 0.40 * wind_rgb, 0.0, 1.0)
+            else:
+                base_rgb = wind_rgb
             out = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
-            new_img = Image.fromarray(out)
+            if _mode == "globe":
+                out_f = out.astype(np.float32) / 255.0
+                _, _ekey = get_elevation_cache()
+                if _ekey is not None and isinstance(_ekey, tuple) and len(_ekey) >= 1 and _ekey[0] == "loaded":
+                    out_f = np.fliplr(out_f)
+                new_img = project_equirect_on_globe(out_f, size=size, radius=0.96, rot=(yaw, pitch, roll))
+                canvas.config(width=size, height=size)
+            else:
+                new_img = Image.fromarray(out)
+                canvas.config(width=out.shape[1], height=out.shape[0])
+            _alloc_w = canvas.winfo_width()
+            _alloc_h = canvas.winfo_height()
+            _img_w, _img_h = new_img.size
+            if _alloc_w > 1 and _alloc_h > 1:
+                _scale = min(_alloc_w / _img_w, _alloc_h / _img_h)
+                if abs(_scale - 1.0) > 0.005:
+                    new_img = new_img.resize((max(1, int(_img_w * _scale)), max(1, int(_img_h * _scale))), Image.NEAREST)
+                display_scale_x = new_img.width / _img_w
+                display_scale_y = new_img.height / _img_h
             tk_img = ImageTk.PhotoImage(new_img)
             canvas.itemconfig(img_id, image=tk_img)
-            canvas.config(width=out.shape[1], height=out.shape[0])
             particle_anim_running = False
             return
 
@@ -280,20 +350,26 @@ def main() -> None:
             return
         tex = sim_state.elevation
         h, w = tex.shape
-        if trail is None or trail.shape != (h, w) or particle_xy is None or particle_age is None:
-            # Particle count: tie to "Arrows" control, but scale up for particles
-            _init_particles(h, w, n=int(wind_arrows_var.get()) * 2)
+        _cur_mode = time_scale_var.get()
+        if (trail is None or trail.shape != (h, w) or particle_xy is None or particle_age is None
+                or last_particle_mode != _cur_mode):
+            # Particle count: tie to "Arrows" control, scale up for particles, then
+            # throttle down at coarser time-scale modes (decorative-only, see above).
+            _init_particles(h, w, n=int(int(wind_arrows_var.get()) * 2 * _particle_count_scale()))
+            last_particle_mode = _cur_mode
 
         uv = _wind_uv_for_display()
         if uv is None:
             return
         u, v = uv
-        # Cache base wind speed colormap, recompute only if u/v identity changes
+        # Cache blended base (terrain + wind speed), recompute only if u/v identity changes
         uv_key = (id(u), id(v), h, w)
         if base_wind_rgb_u8 is None or last_wind_key != uv_key:
             speed = np.hypot(u, v).astype(np.float32)
-            base_rgb = wind_speed_to_rgb(speed)  # absolute scaling now
-            base_wind_rgb_u8 = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
+            wind_rgb = wind_speed_to_rgb(speed)
+            terrain_rgb = colorize(tex)
+            base_rgb = np.clip(0.60 * terrain_rgb + 0.40 * wind_rgb, 0.0, 1.0)
+            base_wind_rgb_u8 = (base_rgb * 255).astype(np.uint8)
             last_wind_key = uv_key
 
         # Time step (seconds) -> normalize to a stable "frames" unit
@@ -368,14 +444,162 @@ def main() -> None:
         out[..., 1] = np.clip(out[..., 1].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
         out[..., 2] = np.clip(out[..., 2].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
 
-        new_img = Image.fromarray(out)
+        if _mode == "globe":
+            out_f = out.astype(np.float32) / 255.0
+            _, _ekey = get_elevation_cache()
+            if _ekey is not None and isinstance(_ekey, tuple) and len(_ekey) >= 1 and _ekey[0] == "loaded":
+                out_f = np.fliplr(out_f)
+            new_img = project_equirect_on_globe(out_f, size=size, radius=0.96, rot=(yaw, pitch, roll))
+            canvas.config(width=size, height=size)
+        else:
+            new_img = Image.fromarray(out)
+            canvas.config(width=w, height=h)
+        _alloc_w = canvas.winfo_width()
+        _alloc_h = canvas.winfo_height()
+        _img_w, _img_h = new_img.size
+        if _alloc_w > 1 and _alloc_h > 1:
+            _scale = min(_alloc_w / _img_w, _alloc_h / _img_h)
+            if abs(_scale - 1.0) > 0.005:
+                new_img = new_img.resize((max(1, int(_img_w * _scale)), max(1, int(_img_h * _scale))), Image.NEAREST)
+            display_scale_x = new_img.width / _img_w
+            display_scale_y = new_img.height / _img_h
         tk_img = ImageTk.PhotoImage(new_img)
         canvas.itemconfig(img_id, image=tk_img)
-        canvas.config(width=w, height=h)
 
         # Schedule next frame
         root.after(50, _update_wind_particles)
-    
+
+    def _update_ocean_particles() -> None:
+        """Animate ocean current particles with a fading trail buffer (map mode only)."""
+        nonlocal tk_img, oc_particle_xy, oc_particle_age, oc_trail, oc_base_rgb_u8, oc_last_uv_key, oc_last_anim_t, oc_anim_running, display_scale_x, display_scale_y, oc_last_particle_mode
+        if view_var.get() != "Ocean Currents" or mode_var.get() != "map":
+            oc_anim_running = False
+            return
+
+        if sim_state is None or sim_state.elevation is None:
+            root.after(100, _update_ocean_particles)
+            return
+        tex = sim_state.elevation
+        h, w = tex.shape
+        ocean_mask, _ = get_masks(tex)
+
+        # Fetch ocean current u, v (reuse shared cache)
+        use_sim_data = sim_state is not None and sim_running
+        day = int(sim_state.day_of_year) if sim_state is not None else 80
+        tdays = float(sim_state.total_days) if sim_state is not None else float(day)
+        wu = sim_state.wind_u if use_sim_data else None
+        wv = sim_state.wind_v if use_sim_data else None
+        ckey = (tex.shape, "oc_particles", int(tdays))
+        if _OCEAN_CURRENT_CACHE["key"] != ckey:
+            u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
+            _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
+        else:
+            u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
+
+        # Initialise particle buffers when needed (also reinit on time-scale mode change,
+        # so particle count re-throttles without requiring a resolution change).
+        _oc_cur_mode = time_scale_var.get()
+        if (oc_trail is None or oc_trail.shape != (h, w) or oc_particle_xy is None
+                or oc_last_particle_mode != _oc_cur_mode):
+            _init_oc_particles(
+                h, w, n=int(int(wind_arrows_var.get()) * 2 * _particle_count_scale()), ocean_mask=ocean_mask
+            )
+            oc_last_particle_mode = _oc_cur_mode
+
+        # Rebuild base image when velocity field changes
+        uv_key = (id(u), id(v), h, w)
+        if oc_base_rgb_u8 is None or oc_last_uv_key != uv_key:
+            speed = np.hypot(u, v).astype(np.float32)
+            terrain_rgb = colorize(tex)
+            current_rgb = wind_speed_to_rgb(speed)
+            mask3 = ocean_mask[..., None].astype(np.float32)
+            # Land: pure terrain; ocean: 60% terrain + 40% current-speed colour
+            base_rgb = np.clip(terrain_rgb * (1.0 - mask3 * 0.40) + current_rgb * mask3 * 0.40, 0.0, 1.0)
+            oc_base_rgb_u8 = (base_rgb * 255).astype(np.uint8)
+            oc_last_uv_key = uv_key
+
+        # Throttle to 20 fps
+        now = time.perf_counter()
+        dt_wall = now - oc_last_anim_t
+        if dt_wall < 0.05:
+            root.after(50, _update_ocean_particles)
+            return
+        oc_last_anim_t = now
+
+        # Fade trail
+        oc_trail *= 0.93
+
+        # Advect particles
+        xy = oc_particle_xy
+        x = xy[:, 0]
+        y = xy[:, 1]
+        xi = np.clip(x.astype(np.int32), 0, w - 1)
+        yi = np.clip(y.astype(np.int32), 0, h - 1)
+        uu = u[yi, xi].astype(np.float32)
+        vv = v[yi, xi].astype(np.float32)
+        sp = np.hypot(uu, vv) + 1e-6
+        vmax = 2.0  # m/s — typical max surface current
+        px_step = (float(wind_scale_var.get()) * 5.0) * (sp / vmax)
+        dx = (uu / sp) * px_step
+        dy = (-vv / sp) * px_step
+        x1 = np.mod((x + dx).astype(np.float32), float(w))
+        y1 = (y + dy).astype(np.float32)
+        xi1 = np.clip(x1.astype(np.int32), 0, w - 1)
+        yi1 = np.clip(y1.astype(np.int32), 0, h - 1)
+        alive = (y1 >= 0.0) & (y1 < float(h)) & ocean_mask[yi1, xi1]
+
+        # Deposit streak
+        inten = (np.clip(sp / vmax, 0.0, 1.0) ** 0.6 * 0.9).astype(np.float32)
+        samples = np.array([0.0, 0.33, 0.66, 1.0], dtype=np.float32)
+        xs = x[:, None] + (x1 - x)[:, None] * samples[None, :]
+        ys = y[:, None] + (y1 - y)[:, None] * samples[None, :]
+        xs = np.mod(xs, float(w))
+        ys_clip = np.clip(ys, 0.0, float(h - 1))
+        xi_s = xs.astype(np.int32).ravel()
+        yi_s = ys_clip.astype(np.int32).ravel()
+        w_s = np.repeat(inten, samples.size)
+        oc_trail[yi_s, xi_s] = np.clip(oc_trail[yi_s, xi_s] + w_s * 0.4, 0.0, 1.0)
+
+        # Update positions and ages
+        oc_particle_xy[:, 0] = x1
+        oc_particle_xy[:, 1] = np.where(alive, y1, y)
+        oc_particle_age -= 1
+
+        # Respawn dead/stranded particles back into ocean cells
+        dead = (oc_particle_age <= 0) | (~alive)
+        if np.any(dead):
+            n_dead = int(np.sum(dead))
+            ocean_ys, ocean_xs = np.where(ocean_mask)
+            if len(ocean_ys) > 0:
+                rng = np.random.default_rng(int(now * 1000) & 0xFFFFFFFF)
+                idx = rng.integers(0, len(ocean_ys), size=n_dead)
+                oc_particle_xy[dead, 0] = ocean_xs[idx].astype(np.float32)
+                oc_particle_xy[dead, 1] = ocean_ys[idx].astype(np.float32)
+                oc_particle_age[dead] = rng.integers(40, 120, size=n_dead, dtype=np.int32)
+
+        # Composite trails onto base image
+        out = oc_base_rgb_u8.copy()
+        streak = (np.clip(oc_trail, 0.0, 1.0) * 255.0).astype(np.uint8)
+        out[..., 0] = np.clip(out[..., 0].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
+        out[..., 1] = np.clip(out[..., 1].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
+        out[..., 2] = np.clip(out[..., 2].astype(np.int16) + streak.astype(np.int16), 0, 255).astype(np.uint8)
+
+        new_img = Image.fromarray(out)
+        canvas.config(width=w, height=h)
+        _alloc_w = canvas.winfo_width()
+        _alloc_h = canvas.winfo_height()
+        _img_w, _img_h = new_img.size
+        if _alloc_w > 1 and _alloc_h > 1:
+            _scale = min(_alloc_w / _img_w, _alloc_h / _img_h)
+            if abs(_scale - 1.0) > 0.005:
+                new_img = new_img.resize((max(1, int(_img_w * _scale)), max(1, int(_img_h * _scale))), Image.NEAREST)
+            display_scale_x = new_img.width / _img_w
+            display_scale_y = new_img.height / _img_h
+        tk_img = ImageTk.PhotoImage(new_img)
+        canvas.itemconfig(img_id, image=tk_img)
+
+        root.after(50, _update_ocean_particles)
+
     def export_data():
         """Export simulation time series data."""
         if not diagnostics.history:
@@ -628,6 +852,21 @@ def main() -> None:
     tk.Label(sim_controls, text="Speed:").pack(side="left", padx=(12, 0))
     tk.OptionMenu(sim_controls, time_scale_var, *time_scale_options.keys()).pack(side="left", padx=2)
 
+    # Year-cycle progress bar
+    _MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    cycle_progress_var = tk.DoubleVar(value=0.0)
+    cycle_detail_var = tk.StringVar(value="")
+    progress_row = tk.Frame(root)
+    progress_row.pack(fill="x", padx=4, pady=(0, 2))
+    tk.Label(progress_row, text="Year:", width=6, anchor="e").pack(side="left")
+    cycle_progress_bar = ttk.Progressbar(
+        progress_row, variable=cycle_progress_var,
+        maximum=100.0, mode="determinate",
+    )
+    cycle_progress_bar.pack(side="left", fill="x", expand=True, padx=(4, 8))
+    tk.Label(progress_row, textvariable=cycle_detail_var, width=26, anchor="w",
+             font=("Courier", 8)).pack(side="left")
+
     # Wind controls
     wind_arrows_var = tk.IntVar(value=int(settings.get("wind_arrows", default_settings["wind_arrows"])))
     wind_scale_var = tk.DoubleVar(value=float(settings.get("wind_scale", default_settings["wind_scale"])))
@@ -778,7 +1017,7 @@ def main() -> None:
     file_menu.add_command(label="Exit", command=root.quit)
 
     def do_regen():
-        nonlocal tk_img, terrain_mode
+        nonlocal tk_img, terrain_mode, display_scale_x, display_scale_y, oc_anim_running, _last_render_arr
         # Only clear cache if using procedural terrain
         if terrain_mode == "procedural":
             clear_elevation_cache()
@@ -820,33 +1059,31 @@ def main() -> None:
                     else:
                         u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
                 speed = np.hypot(u, v).astype(np.float32)
-                base_rgb = wind_speed_to_rgb(speed)
+                base_rgb = np.clip(0.60 * colorize(tex) + 0.40 * wind_speed_to_rgb(speed), 0.0, 1.0)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 comb = np.clip(base_rgb + arrows, 0.0, 1.0)
                 arr = (comb * 255).astype(np.uint8)
             elif view_var.get() == "Ocean Currents":
-                ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents")
-                if _OCEAN_CURRENT_CACHE["key"] != ckey:
-                    # Phase 3: Pass wind fields for Ekman transport coupling
-                    wu = sim_state.wind_u if (sim_state is not None and sim_running) else None
-                    wv = sim_state.wind_v if (sim_state is not None and sim_running) else None
-                    u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=float(day))
-                    _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
-                else:
-                    u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
-                speed = np.hypot(u, v).astype(np.float32)
-                base_rgb = wind_speed_to_rgb(speed)
-                arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
-                ocean_mask, _ = get_masks(tex)
-                mask3 = ocean_mask[..., None].astype(np.float32)
-                comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
-                arr = (comb * 255).astype(np.uint8)
+                if not oc_anim_running:
+                    oc_anim_running = True
+                    _update_ocean_particles()
+                return
             else:
                 rgbf = colorize(tex)
                 arr = (np.clip(rgbf, 0.0, 1.0) * 255).astype(np.uint8)
+            _last_render_arr = arr
             new_img = Image.fromarray(arr)
             h, w = tex.shape
             canvas.config(width=w, height=h)
+        _alloc_w = canvas.winfo_width()
+        _alloc_h = canvas.winfo_height()
+        _img_w, _img_h = new_img.size
+        if _alloc_w > 1 and _alloc_h > 1:
+            _scale = min(_alloc_w / _img_w, _alloc_h / _img_h)
+            if abs(_scale - 1.0) > 0.005:
+                new_img = new_img.resize((max(1, int(_img_w * _scale)), max(1, int(_img_h * _scale))), Image.NEAREST)
+            display_scale_x = new_img.width / _img_w
+            display_scale_y = new_img.height / _img_h
         tk_img = ImageTk.PhotoImage(new_img)
         canvas.itemconfig(img_id, image=tk_img)
 
@@ -925,6 +1162,7 @@ def main() -> None:
     
     rgbf0 = colorize(tex0)
     arr0 = (np.clip(rgbf0, 0.0, 1.0) * 255).astype(np.uint8)
+    _last_render_arr = arr0  # seed zoom preview before first render()
     img = Image.fromarray(arr0)
     profiler.disable()
     stats = pstats.Stats(profiler).strip_dirs().sort_stats(pstats.SortKey.CUMULATIVE)
@@ -933,19 +1171,27 @@ def main() -> None:
     tk_img = ImageTk.PhotoImage(img)
     # Map area: canvas on the left, legend panel on the right (unused window space)
     map_row = tk.Frame(root)
-    map_row.pack(side="top")
-    canvas = tk.Canvas(map_row, width=tex0.shape[1], height=tex0.shape[0], highlightthickness=0)
-    canvas.pack(side="left")
+    map_row.pack(side="top", fill="both", expand=True)
+    canvas = tk.Canvas(map_row, width=tex0.shape[1], height=tex0.shape[0], highlightthickness=0, bg="black")
+    canvas.pack(side="left", fill="both", expand=True)
     img_id = canvas.create_image(0, 0, image=tk_img, anchor="nw")
 
-    # --- Cursor tooltip: small floating panel that follows the mouse ---
+    # --- Cursor tooltip: floating panel with zoom preview + text ---
+    _ZOOM_CELLS = 21    # cells visible each axis; mouse wheel changes this
+    _ZOOM_FACTOR = 8    # display pixels per simulation cell (fixed)
     _tooltip_var = tk.StringVar(value="")
+    _zoom_tk_img = None  # keep reference to prevent GC
     _tooltip_win = tk.Toplevel(root)
     _tooltip_win.overrideredirect(True)
     _tooltip_win.withdraw()
     _tooltip_win.wm_attributes("-topmost", True)
     _tt_frame = tk.Frame(_tooltip_win, bg="#0d1117", bd=1, relief="solid")
     _tt_frame.pack()
+    _zoom_canvas = tk.Canvas(_tt_frame, width=_ZOOM_CELLS * _ZOOM_FACTOR, height=_ZOOM_CELLS * _ZOOM_FACTOR,
+                              bg="#000000", highlightthickness=0)
+    _zoom_canvas.pack(padx=4, pady=(4, 2))
+    _zoom_img_id = _zoom_canvas.create_image(0, 0, anchor="nw")
+    tk.Frame(_tt_frame, bg="#2a2a3a", height=1).pack(fill="x", padx=4)
     tk.Label(
         _tt_frame,
         textvariable=_tooltip_var,
@@ -990,25 +1236,74 @@ def main() -> None:
              anchor="w").pack(fill="x", padx=6, pady=(0, 6))
 
     def render():
-        nonlocal tk_img, terrain_mode
+        nonlocal tk_img, terrain_mode, particle_anim_running, oc_anim_running, display_scale_x, display_scale_y, _last_render_arr
         # Use simulation data if available and running
         use_sim_data = sim_state is not None and sim_running
         
         if mode_var.get() == "globe":
+            day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
+            view_name = view_var.get()
+            if terrain_mode == "loaded":
+                elev_tex, _ = get_elevation_cache()
+                if elev_tex is None:
+                    terrain_mode = "procedural"
+            # Wind Particles: hand off to animation loop (same as map mode)
+            if view_name == "Wind Particles":
+                if not particle_anim_running:
+                    particle_anim_running = True
+                    _update_wind_particles()
+                return
             with log_time("Render globe"):
-                day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
-                view_name = view_var.get()
-                if view_name == "Wind Arrows" or view_name == "Wind Particles":
-                    view_name = "Wind"
-                if view_name == "Ocean Temperature":
-                    view_name = "Temperature"
-                # In loaded mode, ensure elevation is cached before generating sphere
-                if terrain_mode == "loaded":
-                    elev_tex, _ = get_elevation_cache()
-                    if elev_tex is None:
-                        # Cache was cleared, shouldn't happen but fallback to procedural
-                        terrain_mode = "procedural"
-                new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_name, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get(), day_of_year=day)
+                if view_name in ("Biomes", "Cloud Cover"):
+                    # Compute equirectangular composite then project onto sphere
+                    if use_sim_data and sim_state is not None and sim_state.elevation is not None:
+                        tex = sim_state.elevation
+                    elif terrain_mode == "loaded":
+                        tex, _ = get_elevation_cache()
+                        if tex is None:
+                            tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+                    else:
+                        tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
+                    base_rgb = colorize(tex)
+                    if view_name == "Biomes":
+                        from climate_averages import KOPPEN_COLORS
+                        if use_sim_data and sim_state is not None and sim_state.koppen_type is not None:
+                            koppen = sim_state.koppen_type
+                            biome_rgb = KOPPEN_COLORS[koppen]
+                            alpha = (koppen > 0).astype(np.float32)
+                        elif use_sim_data and sim_state is not None and sim_state.biome_type is not None:
+                            biome = sim_state.biome_type
+                            biome_colors = np.array([
+                                [0.0, 0.0, 0.0], [0.9, 0.8, 0.5], [0.6, 0.8, 0.3],
+                                [0.1, 0.5, 0.1], [0.7, 0.75, 0.8],
+                            ], dtype=np.float32)
+                            biome_rgb = biome_colors[biome]
+                            alpha = (biome > 0).astype(np.float32)
+                        else:
+                            biome_rgb = None
+                        if biome_rgb is not None:
+                            comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * biome_rgb
+                        else:
+                            comb = base_rgb
+                    else:  # Cloud Cover
+                        if use_sim_data and sim_state is not None and sim_state.cloud_cover is not None:
+                            C = np.clip(sim_state.cloud_cover.astype(np.float32), 0.0, 1.0)
+                            gray = 0.25 + 0.75 * C
+                            overlay = np.stack([gray, gray, gray], axis=-1)
+                            comb = (1.0 - C[..., None]) * base_rgb + C[..., None] * overlay
+                        else:
+                            comb = base_rgb
+                    # Match the horizontal flip that generate_sphere_image applies for loaded heightmaps
+                    _, elev_key = get_elevation_cache()
+                    if elev_key is not None and isinstance(elev_key, tuple) and len(elev_key) >= 1 and elev_key[0] == "loaded":
+                        comb = np.fliplr(comb)
+                    new_img = project_equirect_on_globe(np.clip(comb, 0.0, 1.0), size=size, radius=0.96, rot=(yaw, pitch, roll))
+                else:
+                    if view_name == "Wind Arrows":
+                        view_name = "Wind"
+                    if view_name == "Ocean Temperature":
+                        view_name = "Temperature"
+                    new_img = generate_sphere_image(size=size, radius=0.96, rot=(yaw, pitch, roll), view=view_name, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get(), day_of_year=day)
             canvas.config(width=size, height=size)
         else:
             # Get elevation from simulation or generate
@@ -1034,7 +1329,6 @@ def main() -> None:
                     else:
                         tex = elev_tex
             if view_var.get() == "Wind Particles":
-                nonlocal particle_anim_running
                 if not particle_anim_running:
                     particle_anim_running = True
                     _update_wind_particles()
@@ -1164,32 +1458,35 @@ def main() -> None:
                     else:
                         u, v = _WIND_CACHE["u"], _WIND_CACHE["v"]
                 speed = np.hypot(u, v).astype(np.float32)
-                base_rgb = wind_speed_to_rgb(speed)
+                base_rgb = np.clip(0.60 * colorize(tex) + 0.40 * wind_speed_to_rgb(speed), 0.0, 1.0)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 arr = (np.clip(base_rgb + arrows, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Ocean Currents":
-                day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
-                tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
-                ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents", int(tdays))
-                if _OCEAN_CURRENT_CACHE["key"] != ckey:
-                    wu = sim_state.wind_u if (use_sim_data and sim_state is not None) else None
-                    wv = sim_state.wind_v if (use_sim_data and sim_state is not None) else None
-                    u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
-                    _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
-                else:
-                    u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
-                speed = np.hypot(u, v).astype(np.float32)
-                base_rgb = wind_speed_to_rgb(speed)
-                arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
-                ocean_mask, _ = get_masks(tex)
-                mask3 = ocean_mask[..., None].astype(np.float32)
-                comb = np.clip((base_rgb + arrows) * mask3, 0.0, 1.0)
-                arr = (comb * 255).astype(np.uint8)
+                if not oc_anim_running:
+                    oc_anim_running = True
+                    _update_ocean_particles()
+                return
             else:
                 arr = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
+            _last_render_arr = arr
             new_img = Image.fromarray(arr)
             h, w = tex.shape
             canvas.config(width=w, height=h)
+        # Scale rendered image to fill the current canvas allocation (window resize support)
+        _alloc_w = canvas.winfo_width()
+        _alloc_h = canvas.winfo_height()
+        _img_w, _img_h = new_img.size
+        if _alloc_w > 1 and _alloc_h > 1:
+            _scale = min(_alloc_w / _img_w, _alloc_h / _img_h)
+            if abs(_scale - 1.0) > 0.005:
+                _dw = max(1, int(_img_w * _scale))
+                _dh = max(1, int(_img_h * _scale))
+                new_img = new_img.resize((_dw, _dh), Image.NEAREST)
+            display_scale_x = new_img.width / _img_w
+            display_scale_y = new_img.height / _img_h
+        else:
+            display_scale_x = 1.0
+            display_scale_y = 1.0
         tk_img = ImageTk.PhotoImage(new_img)
         canvas.itemconfig(img_id, image=tk_img)
         # Update status with simulation day (only if not paused)
@@ -1231,9 +1528,9 @@ def main() -> None:
         year = int(sim_state.total_days // 365.2422) + 1
         month = int((sim_state.day_of_year / 365.2422) * 12) + 1
         sim_cycle_var.set(f"Y{year} M{month}")
-        # If particle view is selected, start animation loop.
+        # If particle view is selected, start animation loop (both map and globe).
         nonlocal particle_anim_running
-        if mode_var.get() == "map" and view_var.get() == "Wind Particles" and not particle_anim_running:
+        if view_var.get() == "Wind Particles" and not particle_anim_running:
             particle_anim_running = True
             _update_wind_particles()
         # Start UI update loop
@@ -1246,6 +1543,8 @@ def main() -> None:
         sim_running = False
         sim_paused = False
         sim_status_var.set("Stopped")
+        cycle_progress_var.set(0.0)
+        cycle_detail_var.set("")
     
     def pause_simulation():
         nonlocal sim_thread, sim_paused
@@ -1271,8 +1570,39 @@ def main() -> None:
         else:
             tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
         _init_sim_state_from_elevation(tex)
+        cycle_progress_var.set(0.0)
+        cycle_detail_var.set("")
         render()
-    
+
+    def _update_zoom_preview(cx: int, cy: int) -> None:
+        """Display magnified patch of the rendered map centered on cursor cell (cx, cy)."""
+        nonlocal _zoom_tk_img
+        if _last_render_arr is None:
+            return
+        harr, warr = _last_render_arr.shape[:2]
+        half = _ZOOM_CELLS // 2
+        y0 = max(0, cy - half)
+        y1 = min(harr, cy + half + 1)
+        x0 = max(0, cx - half)
+        x1 = min(warr, cx + half + 1)
+        patch = _last_render_arr[y0:y1, x0:x1]
+        # Pad to full _ZOOM_CELLS × _ZOOM_CELLS (black border near map edges)
+        pad_arr = np.zeros((_ZOOM_CELLS, _ZOOM_CELLS, 3), dtype=np.uint8)
+        dy0 = half - (cy - y0)
+        dx0 = half - (cx - x0)
+        pad_arr[dy0:dy0 + (y1 - y0), dx0:dx0 + (x1 - x0)] = patch
+        zoom_px = _ZOOM_CELLS * _ZOOM_FACTOR
+        zoom_img = Image.fromarray(pad_arr).resize((zoom_px, zoom_px), Image.NEAREST)
+        # Yellow crosshair at the center cell
+        draw = ImageDraw.Draw(zoom_img)
+        mid = half * _ZOOM_FACTOR + _ZOOM_FACTOR // 2
+        arm = _ZOOM_FACTOR + 3
+        draw.line([(mid - arm, mid), (mid + arm, mid)], fill=(255, 255, 0), width=1)
+        draw.line([(mid, mid - arm), (mid, mid + arm)], fill=(255, 255, 0), width=1)
+        _zoom_canvas.config(width=zoom_px, height=zoom_px)
+        _zoom_tk_img = ImageTk.PhotoImage(zoom_img)
+        _zoom_canvas.itemconfig(_zoom_img_id, image=_zoom_tk_img)
+
     def update_cursor_display(x: int, y: int):
         """Update the cursor display and tooltip for given canvas coordinates."""
         if mode_var.get() != "map":
@@ -1284,6 +1614,9 @@ def main() -> None:
         else:
             tex = ensure_elevation(size, seed=seed_var.get(), octaves=octaves_var.get(), freq=freq_var.get(), lac=lac_var.get(), gain=gain_var.get())
         h, w = tex.shape
+        # Convert canvas (display) coords to simulation grid coords
+        x = int(x / display_scale_x)
+        y = int(y / display_scale_y)
         if 0 <= x < w and 0 <= y < h:
             lon = (x / w) * 360.0 - 180.0
             lat = 90.0 - (y / h) * 180.0
@@ -1425,6 +1758,7 @@ def main() -> None:
                 terrain_type = "Ocean" if is_ocean else "Land"
                 tt_lines = [hdr, terrain_type, f"Elev:  {alt_m:,.0f} m", f"Air T: {T_celsius:.1f}°C"]
 
+            _update_zoom_preview(int(x), int(y))
             _tooltip_var.set("\n".join(tt_lines))
         else:
             latlon_var.set("")
@@ -1453,6 +1787,12 @@ def main() -> None:
                 sim_cycle_var.set(f"Y{year} M{month}")
                 if not sim_paused:
                     sim_status_var.set(f"Day: {sim_state.day_of_year:.0f}")
+
+                # Update year-progress bar
+                _pct = (sim_state.day_of_year / 365.2422) * 100.0
+                cycle_progress_var.set(_pct)
+                _mn = _MONTH_NAMES[(month - 1) % 12]
+                cycle_detail_var.set(f"Day {sim_state.day_of_year:>3.0f}/365  {_mn}  ({_pct:>5.1f}%)")
 
                 # Update display
                 render()
@@ -1546,10 +1886,29 @@ def main() -> None:
         graphs_controller.close()
         root.destroy()
 
+    def _on_window_resize(event):
+        nonlocal _resize_job
+        if event.widget is root:
+            if _resize_job is not None:
+                root.after_cancel(_resize_job)
+            _resize_job = root.after(150, render)
+
+    root.bind("<Configure>", _on_window_resize)
     root.bind("<Escape>", lambda e: on_close())
     root.protocol("WM_DELETE_WINDOW", on_close)
     canvas.bind("<Motion>", on_motion)
     canvas.bind("<Leave>", lambda e: _tooltip_win.withdraw())
+
+    def on_wheel(e):
+        nonlocal _ZOOM_CELLS
+        delta = -1 if (e.delta > 0 or e.num == 4) else 1  # scroll up = zoom in (fewer cells)
+        _ZOOM_CELLS = max(5, min(51, _ZOOM_CELLS + delta * 2))
+        if mode_var.get() == "map" and _tooltip_var.get():
+            _update_zoom_preview(last_mouse_pos[0], last_mouse_pos[1])
+
+    canvas.bind("<MouseWheel>", on_wheel)   # Windows / macOS
+    canvas.bind("<Button-4>", on_wheel)     # Linux scroll up
+    canvas.bind("<Button-5>", on_wheel)     # Linux scroll down
     root.mainloop()
 
 

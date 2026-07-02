@@ -134,6 +134,148 @@ class PlanetParams:
     """Initial atmospheric CO2 concentration at simulation start [ppm]."""
 
     # ------------------------------------------------------------------ #
+    # Climate feedback / tunable physics
+    # These constants can be swept by the optimizer or varied per-planet.
+    # ------------------------------------------------------------------ #
+    co2_climate_feedback: float = 0.8
+    """Climate sensitivity parameter λ [K per W/m²] — Planck response only.
+    Water-vapour amplification is now handled explicitly via wv_greenhouse_factor,
+    which reduces epsilon when RH is high.  Together they reproduce Earth ECS ~3K.
+    The pre-WV value was 1.4 (implicit WV included); lowering to 0.8 avoids
+    double-counting.  MARS keeps 0.8 (no liquid water, no WV feedback)."""
+
+    thermal_diffusivity: float = 0.04
+    """Lateral atmospheric heat diffusion coefficient [K·day⁻¹ per K·cell⁻²].
+    Controls pole-equator temperature gradient; higher = warmer poles."""
+
+    polar_cooling_scale: float = 0.3
+    """Polar latent-heat loss strength [dimensionless, 0–1].
+    Scales the peak latent heat flux in the polar energy budget.
+    Lower values allow more polar warming; higher values sharpen the
+    equator-to-pole gradient."""
+
+    ocean_transport_coeff: float = 0.3
+    """Poleward ocean heat flux scale [dimensionless].
+    Multiplier on the parameterised meridional ocean heat transport.
+    0 = no transport (pure radiative equilibrium), 1 = maximum."""
+
+    amoc_cutoff_lat: float = 80.0
+    """Latitude above which the AMOC bonus tapers to zero [°N].
+    Fixes the known NH pole over-warming artifact: the AMOC 18 K bonus
+    was previously applied uniformly to 90°N.  Taper width is 10°, so
+    the bonus reaches zero at (amoc_cutoff_lat + 10)°N.
+    Default 80° reduces the 18 K Arctic bonus to 9 K at 75°N and 0 K at
+    90°N, without disrupting the sub-polar warmth that anchors the ITCZ."""
+
+    ice_albedo_strength: float = 0.30
+    """Ice-albedo feedback magnitude [dimensionless, 0–1].
+    0 = no ice-albedo effect; 1 = full sea-ice albedo contrast applied.
+    Default 0.30 weakens runaway glaciation while preserving the signal."""
+
+    # ------------------------------------------------------------------ #
+    # Ocean circulation — AMOC / ACC bonus magnitudes
+    # ------------------------------------------------------------------ #
+    amoc_bonus_near: float = 3.0
+    """AMOC warming at the start of the NH sub-polar ramp (42–65°N) [K].
+    Combined with amoc_bonus_far this produces the Gulf-Stream / thermohaline
+    warming that keeps the North Atlantic 10–18 K warmer than radiative equilibrium."""
+
+    amoc_bonus_far: float = 9.0
+    """AMOC peak warming at 75°N+ [K].
+    Reduced from 15 K to 9 K to partially close the known NH gradient gap
+    (model runs 22 K, target 40–65 K) without disrupting the sub-polar warmth
+    that anchors the ITCZ.  Use the amoc sweep script to find the optimal value."""
+
+    acc_bonus_near: float = 8.0
+    """ACC warming at the start of the SH sub-polar ramp (55–65°S) [K].
+    Represents CDW upwelling warming south of the Polar Front."""
+
+    acc_bonus_far: float = 20.0
+    """ACC peak warming at 75°S+ [K]."""
+
+    # ------------------------------------------------------------------ #
+    # Ocean–atmosphere coupling
+    # ------------------------------------------------------------------ #
+    k_airsea: float = 0.001
+    """Air-sea sensible heat exchange coefficient [day⁻¹].
+    Controls how fast T_sst is pulled toward T_air.  At 0.001/day the
+    ocean thermal timescale is ~1000 days (~3 yr), consistent with the
+    mixed-layer depth of 50–100 m.  Values above ~0.003 drive T_sst below
+    the freezing point at 55°N in winter, triggering ice-albedo runaway."""
+
+    ocean_lag_days: float = 50.0
+    """Ocean thermal lag [days].  SST responds to insolation with this delay,
+    representing the heat capacity of the oceanic mixed layer.  Earth ≈ 50 days
+    (phase lag of ~1.5 months).  Scaled by orbital period for non-Earth planets."""
+
+    ekman_strength: float = 0.3
+    """Scaling factor for Ekman wind-driven ocean current advection [0–1].
+    0 = Ekman transport disabled; 1 = full wind-to-current scaling (3% of wind speed).
+    At 0.3, coastal upwelling introduces realistic SST gradients at continental margins.
+    Gated by has_liquid_water_ocean."""
+
+    # ------------------------------------------------------------------ #
+    # Cloud radiative feedback (Feature 1)
+    # ------------------------------------------------------------------ #
+    cloud_greenhouse_factor: float = 0.12
+    """Strength of high-cloud OLR trapping [dimensionless].
+    High clouds (cold tops, T_air < 265K) reduce effective epsilon by this fraction
+    times cloud fraction.  0.12 gives tropical cloud LW CRE ≈ +6–10 W/m².
+    Set 0.0 to disable cloud greenhouse effect."""
+
+    # ------------------------------------------------------------------ #
+    # Water vapor greenhouse (Feature 2)
+    # ------------------------------------------------------------------ #
+    wv_greenhouse_factor: float = 0.10
+    """Strength of water-vapor epsilon reduction [dimensionless].
+    Higher RH → lower epsilon (stronger greenhouse trapping).
+    0.10 restores ~0.6 K/(W/m²) amplification when co2_climate_feedback is the
+    Planck-only value (0.8).  Set 0.0 to disable explicit WV feedback."""
+
+    # ------------------------------------------------------------------ #
+    # Salinity / AMOC freshwater (Feature 3)
+    # ------------------------------------------------------------------ #
+    salinity_reference_psu: float = 35.0
+    """Global mean ocean salinity [PSU].  Used as the restoring target for deep
+    mixing and as the baseline for computing North Atlantic salinity anomalies."""
+
+    salinity_amoc_scale: float = 1.0
+    """Sensitivity of amoc_factor to North Atlantic salinity anomaly [dimensionless].
+    1.0 → +1 PSU anomaly multiplies amoc_factor by 1.15; −2 PSU by ~0.55.
+    0.0 disables salinity–AMOC coupling."""
+
+    # ------------------------------------------------------------------ #
+    # CH4 / permafrost carbon (Feature 4)
+    # ------------------------------------------------------------------ #
+    ch4_baseline_ppb: float = 700.0
+    """Pre-industrial CH4 reference concentration [ppb].  Used as M₀ in the
+    IPCC AR6 forcing formula ΔF = 0.036*(sqrt(M)−sqrt(M₀))."""
+
+    ch4_initial_ppb: float = 1900.0
+    """Initial atmospheric CH4 at simulation start [ppb].  Modern ≈ 1900 ppb."""
+
+    # ------------------------------------------------------------------ #
+    # Deep ocean 2-layer (Feature 5)
+    # ------------------------------------------------------------------ #
+    deep_ocean_exchange_rate: float = 9.13e-5
+    """Heat exchange rate between mixed layer and deep ocean [1/day].
+    τ = 1/rate ≈ 10957 days ≈ 30 yr.  Slows surface warming to realistic TCR."""
+
+    deep_ocean_depth_m: float = 3700.0
+    """Mean abyssal ocean depth [m].  Used only for diagnostic OHC calculations."""
+
+    # ------------------------------------------------------------------ #
+    # Eddy meridional heat flux (Feature 7)
+    # ------------------------------------------------------------------ #
+    eddy_heat_flux_coeff: float = 0.006
+    """Meridional eddy heat flux coefficient [K/day per K/cell²].
+    Represents baroclinic eddy transport by mid-latitude storm tracks (20–70°).
+    Applied as meridional Laplacian diffusion on T_sst, weighted by a
+    storm-track window peaked at 45°.  0.006 adds ~0.5 K of mid-latitude
+    warming per year of spinup relative to a run with the coefficient at 0.
+    Set 0.0 to disable."""
+
+    # ------------------------------------------------------------------ #
     # Derived convenience properties
     # ------------------------------------------------------------------ #
 
@@ -270,4 +412,9 @@ MARS = PlanetParams(
     rotation_direction=1,
     co2_baseline_ppm=1.0,       # CO2-dominated atmosphere; Earth formula not applicable
     co2_initial_ppm=1.0,
+    co2_climate_feedback=0.8,   # No water-vapour amplification on dry Mars
+    wv_greenhouse_factor=0.0,   # Negligible water vapour on Mars
+    cloud_greenhouse_factor=0.0,  # No liquid water clouds
+    ch4_baseline_ppb=0.0,
+    ch4_initial_ppb=0.0,
 )

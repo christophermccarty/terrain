@@ -94,12 +94,8 @@ def test_tropical_temperature_not_too_hot(earth_spinup_state):
     assert T_c < 31.0, f"Tropical T too hot: {T_c:.1f}°C (cap 31°C)"
 
 
-@pytest.mark.xfail(strict=False, reason="Tropics currently ~28.5°C; Earth is ~26.5°C; target ≤27°C needs epsilon_equator tuning")
 def test_tropical_temperature_target(earth_spinup_state):
-    """Tropical T should be ≤27°C (Earth annual mean ~26–27°C).
-
-    Current benchmark: ~28.5°C → ~2°C warm bias.
-    """
+    """Tropical T should be ≤27°C (Earth annual mean ~26–27°C)."""
     T_c = _zonal_mean_T_c(earth_spinup_state, 10, -10)
     assert T_c <= 27.0, f"Tropical T {T_c:.1f}°C > 27°C target"
 
@@ -257,14 +253,8 @@ def test_sh_midlat_precip_nonzero(earth_spinup_state):
     assert P_mm_yr >= 50.0, f"SH mid-lat 40–65°S precipitation nearly absent: {P_mm_yr:.0f} mm/yr"
 
 
-@pytest.mark.xfail(strict=False, reason="SH 50–65°S currently ~60mm/yr vs Earth ~800mm/yr; needs SH storm-track fix")
 def test_sh_midlat_precip_target(earth_spinup_state):
-    """SH mid-lat (40–65°S) precipitation should reach ≥400 mm/yr (Earth ~800 mm/yr).
-
-    Current benchmark: ~60–300 mm/yr — severe deficit.  Likely caused by
-    the SH cold bias suppressing evaporation and storm-track moisture flux.
-    Fixing the SH temperature bias should partly fix this.
-    """
+    """SH mid-lat (40–65°S) precipitation should reach ≥400 mm/yr (Earth ~800 mm/yr)."""
     if earth_spinup_state.precipitation is None:
         pytest.skip("No precipitation in state")
     P_mm_yr = _zonal_mean_P_mm_yr(earth_spinup_state, -40, -65)

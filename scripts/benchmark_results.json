@@ -1,0 +1,77 @@
+[
+  {
+    "timestamp": "2026-07-02T02:05:00.485051+00:00",
+    "target_s_per_year": 90.0,
+    "results": [
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "ANNUAL",
+        "seconds_per_year": 0.7287528000306338,
+        "status": "OK"
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-07-02T02:05:08.999339+00:00",
+    "target_s_per_year": 90.0,
+    "results": [
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "DAILY",
+        "seconds_per_year": 4.786411500012036,
+        "status": "OK"
+      },
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "WEEKLY",
+        "seconds_per_year": 4.63618030003272,
+        "status": "OK"
+      },
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "MONTHLY",
+        "seconds_per_year": 0.7560141999856569,
+        "status": "OK"
+      },
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "ANNUAL",
+        "seconds_per_year": 0.7201907999697141,
+        "status": "OK"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "DAILY",
+        "seconds_per_year": 136.43263120000483,
+        "status": "OVER"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "WEEKLY",
+        "seconds_per_year": 132.84844760003034,
+        "status": "OVER"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "MONTHLY",
+        "seconds_per_year": 25.84086700004991,
+        "status": "OK"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "ANNUAL",
+        "seconds_per_year": 22.183848900021985,
+        "status": "OK"
+      }
+    ]
+  }
+]

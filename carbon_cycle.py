@@ -106,9 +106,15 @@ CO2_FERTILIZATION_BETA = 0.6
 RADIATIVE_FORCING_COEFF = 5.35
 
 # Climate sensitivity parameter [K per W/m²]
-# Converts radiative forcing to temperature change
-# λ = ΔT / ΔF, typical range 0.5-1.2 K/(W/m²)
-CLIMATE_SENSITIVITY = 0.8
+# Converts radiative forcing to temperature change: ΔT = λ × ΔF
+# Synced with PlanetParams.co2_climate_feedback default (1.4).
+# Use 0.8 for the pre-2026 lower-sensitivity calibration.
+CLIMATE_SENSITIVITY = 1.4
+
+# Wildfire thresholds
+WILDFIRE_TEMP_THRESHOLD_K: float = 298.15    # minimum temperature for fire risk [K] (25°C)
+WILDFIRE_DRYNESS_THRESHOLD: float = 0.3      # soil moisture fraction below which fire can ignite
+WILDFIRE_CONSUMPTION_RATE: float = 0.2       # fraction of biomass consumed per fire event
 
 
 # ==============================================================================
@@ -496,9 +502,9 @@ def wildfire_dynamics(
     precipitation: np.ndarray,
     soil_moisture: np.ndarray | None,
     dt_days: float,
-    fire_threshold_temp: float = 298.15,  # 25°C
-    fire_threshold_dryness: float = 0.3,   # Soil moisture < 0.3
-    fire_consumption_rate: float = 0.2,    # Fraction of biomass burned
+    fire_threshold_temp: float = WILDFIRE_TEMP_THRESHOLD_K,
+    fire_threshold_dryness: float = WILDFIRE_DRYNESS_THRESHOLD,
+    fire_consumption_rate: float = WILDFIRE_CONSUMPTION_RATE,
 ) -> tuple[np.ndarray, float]:
     """Simulate wildfire dynamics with CO2 release.
 
@@ -624,7 +630,7 @@ def co2_temperature_response(forcing: float, climate_sensitivity: float = CLIMAT
         Radiative forcing [W/m²]
     climate_sensitivity : float
         Climate sensitivity parameter [K per W/m²]
-        (default: 0.8 K/(W/m²), gives ECS ≈ 3K for 2×CO2)
+        (default: 1.4 K/(W/m²), gives ECS ≈ 5.2K for 2×CO2 at 3.7 W/m²)
 
     Returns:
     --------
@@ -650,6 +656,8 @@ def co2_temperature_response(forcing: float, climate_sensitivity: float = CLIMAT
 def carbon_cycle_step(
     state,  # PlanetState
     dt_days: float,
+    *,
+    biome: np.ndarray | None = None,
 ) -> tuple:
     """Evolve carbon cycle for one time step.
 
@@ -659,6 +667,11 @@ def carbon_cycle_step(
         Current simulation state
     dt_days : float
         Time step [days]
+    biome : np.ndarray (H, W) | None
+        Pre-computed biome classification (see `compute_biome_type`) to use for
+        vegetation NPP, e.g. a caller-side cache refreshed every few days rather
+        than every step (biome doesn't need daily resolution). If None, computed
+        internally from the current `temperature`/`precipitation` as before.
 
     Returns:
     --------
@@ -677,6 +690,13 @@ def carbon_cycle_step(
     - Atmosphere (well-mixed, single value)
     - Ocean (spatially varying, temperature-dependent solubility)
     - Vegetation (spatially varying, climate-dependent growth)
+
+    Wildfire is NOT applied here — it moved to the caller (simulate.py) so it
+    can be cache-gated on the same multi-day interval as biome classification,
+    permafrost thaw, and wetland CH4 (all slow processes relative to a 1-day
+    step; see CARBON_SLOW_UPDATE_INTERVAL_DAYS in simulate.py). This function
+    still handles the genuinely per-step processes: ocean CO2 exchange and
+    vegetation NPP/growth.
     """
     # Get current state
     co2_atm = state.co2_atmosphere
@@ -694,9 +714,11 @@ def carbon_cycle_step(
     sea_mask = sea_mask_b.astype(np.float32)
     land_mask = land_mask_b.astype(np.float32)
 
+    if biome is None:
+        biome = compute_biome_type(temperature, precipitation, land_mask)
+
     if biomass is None:
         # Initialize biomass based on biome
-        biome = compute_biome_type(temperature, precipitation, land_mask)
         biomass = np.where(biome == 3, CARBON_FOREST_MAX * 0.7, 0.0)  # 70% of max for forests
         biomass = np.where(biome == 2, CARBON_GRASSLAND_MAX * 0.5, biomass)  # 50% for grassland
         biomass = biomass.astype(np.float32)
@@ -707,18 +729,11 @@ def carbon_cycle_step(
     co2_ocean_new, d_co2_ocean = ocean_co2_flux(co2_ocean, co2_ocean_eq, wind_speed, sea_mask, dt_days)
 
     # Vegetation carbon dynamics
-    biome = compute_biome_type(temperature, precipitation, land_mask)
     npp = vegetation_npp(biome, temperature, precipitation, co2_atm)
     biomass_new, d_co2_veg = vegetation_carbon_balance(biomass, npp, temperature, dt_days)
 
-    # Wildfire dynamics (Phase 4: Biosphere)
-    soil_moisture = state.soil_moisture if hasattr(state, 'soil_moisture') and state.soil_moisture is not None else None
-    biomass_new, co2_from_fire = wildfire_dynamics(
-        biomass_new, temperature, precipitation, soil_moisture, dt_days
-    )
-
-    # Update atmospheric CO2 (vegetation uptake + ocean exchange + fires)
-    co2_atm_new = co2_atm + d_co2_ocean + d_co2_veg + co2_from_fire
+    # Update atmospheric CO2 (vegetation uptake + ocean exchange)
+    co2_atm_new = co2_atm + d_co2_ocean + d_co2_veg
 
     # Ensure CO2 stays within physically reasonable bounds
     co2_atm_new = np.clip(co2_atm_new, 100.0, 10000.0)  # 100-10000 ppm range
@@ -727,3 +742,112 @@ def carbon_cycle_step(
     co2_forcing = co2_radiative_forcing(co2_atm_new, CO2_PREINDUSTRIAL)
 
     return co2_atm_new, co2_ocean_new, biomass_new, co2_forcing
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: CH4 / permafrost carbon
+# ---------------------------------------------------------------------------
+
+def ch4_radiative_forcing(ch4_ppb: float, ch4_ref_ppb: float = 700.0) -> float:
+    """IPCC AR6 simplified CH4 forcing [W/m²].
+
+    ΔF = 0.036 * (√M − √M₀)  where M, M₀ are CH4 in ppb.
+    Modern forcing (1900 vs 700 ppb) ≈ 0.50 W/m².
+    """
+    if ch4_ref_ppb <= 0.0:
+        return 0.0
+    m = max(ch4_ppb, 0.0)
+    m0 = max(ch4_ref_ppb, 0.0)
+    return float(0.036 * (np.sqrt(m) - np.sqrt(m0)))
+
+
+def permafrost_init(elevation: np.ndarray, T_sst: np.ndarray) -> np.ndarray:
+    """Initialise permafrost carbon field [kgC/m²].
+
+    High-latitude land cells (|lat| > 50°) with mean T < 273K receive
+    15–50 kgC/m² depending on coldness.  Warmer or equatorial land = 0.
+    """
+    H, W = elevation.shape
+    lat_deg = ((0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0)
+    lat_abs = np.abs(lat_deg)[:, np.newaxis] * np.ones((1, W), dtype=np.float32)
+
+    # Land mask: positive elevation proxy (any cell with elev > 0.05 treated as land)
+    from masks import get_masks
+    _, land_mask = get_masks(elevation)
+
+    # Carbon density: colder and higher latitude → more
+    cold_frac = np.clip((273.0 - T_sst) / 20.0, 0.0, 1.0).astype(np.float32, copy=False)
+    lat_frac = np.clip((lat_abs - 50.0) / 30.0, 0.0, 1.0).astype(np.float32, copy=False)
+    carbon = (15.0 + 35.0 * cold_frac * lat_frac).astype(np.float32, copy=False)
+
+    return np.where(land_mask & (lat_abs > 50.0) & (T_sst < 273.0), carbon, 0.0).astype(np.float32, copy=False)
+
+
+def permafrost_thaw_step(
+    permafrost_carbon: np.ndarray,
+    T_sst: np.ndarray,
+    snow_depth: np.ndarray | None,
+    dt_days: float,
+) -> tuple[np.ndarray, float, float]:
+    """Thaw permafrost and partition C release to CO2 and CH4.
+
+    Returns:
+        (updated permafrost_carbon, d_co2_ppm, d_ch4_ppb)
+    """
+    T_soil_C = T_sst - 273.15  # °C
+    # Thaw only when soil is above freezing; snow insulates against thaw
+    snow_ins = np.zeros_like(T_sst)
+    if snow_depth is not None:
+        snow_ins = np.clip(snow_depth / 0.5, 0.0, 1.0).astype(np.float32, copy=False)
+
+    thaw_rate = np.clip(T_soil_C / 10.0, 0.0, 0.02) * (1.0 - snow_ins) * float(dt_days)
+    released_kgc_m2 = permafrost_carbon * thaw_rate
+
+    pfc_new = np.clip(permafrost_carbon - released_kgc_m2, 0.0, None).astype(np.float32, copy=False)
+
+    # Convert global mean release to atmospheric increments
+    # 1 GtC ≈ 0.469 ppm CO2; global land fraction ≈ 0.29; grid cell area proportional
+    # Simple approximation: sum kgC/m², scale by land area / total_atmosphere
+    # Using 1 kgC/m² * land_fraction ≈ 2.18 GtC → 1.02 ppm CO2 (rough)
+    PPM_PER_KGC_PER_M2 = 1.02e-3  # ppm CO2 per (kgC/m²) averaged over globe
+    PPB_CH4_PER_KGC_PER_M2 = 2.27e-4  # ppb CH4 per (kgC/m²) — 20% of C as CH4 (molar corrected)
+
+    total_released = float(np.mean(released_kgc_m2))  # global mean kgC/m²/step
+    d_co2 = total_released * 0.80 * PPM_PER_KGC_PER_M2
+    d_ch4 = total_released * 0.20 * PPB_CH4_PER_KGC_PER_M2
+
+    return pfc_new, d_co2, d_ch4
+
+
+def wetland_ch4_emissions(
+    T_sst: np.ndarray,
+    soil_moisture: np.ndarray | None,
+    land_mask: np.ndarray,
+    dt_days: float,
+) -> float:
+    """Wetland CH4 emissions [ppb/step] from warm, wet tropical and boreal soils.
+
+    Baseline global flux ~150 Tg CH4/yr → ~1.5e-3 ppb/day global mean increment.
+    """
+    T_C = T_sst - 273.15
+    T_factor = np.clip(T_C / 30.0, 0.0, 1.0).astype(np.float32, copy=False)
+
+    if soil_moisture is not None:
+        wet_factor = np.clip(soil_moisture * 2.0 - 0.5, 0.0, 1.0).astype(np.float32, copy=False)
+    else:
+        wet_factor = np.where(T_C > 5.0, 0.5, 0.0).astype(np.float32, copy=False)
+
+    # Only land cells emit
+    emission_density = 1.5e-3 * T_factor * wet_factor  # ppb/day per cell
+    global_emission = float(np.mean(np.where(land_mask, emission_density, 0.0)))
+
+    return global_emission * float(dt_days)
+
+
+def ch4_oxidation_step(ch4_ppb: float, dt_days: float) -> float:
+    """Atmospheric CH4 decay via OH oxidation.
+
+    τ_CH4 = 9 yr = 3287 days  (IPCC AR6).
+    """
+    tau = 3287.0
+    return float(ch4_ppb * np.exp(-dt_days / tau))

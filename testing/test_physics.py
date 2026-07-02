@@ -217,8 +217,8 @@ def test_ocean_transport():
     ice0   = np.zeros((H, W), dtype=np.float32)
     ice1   = np.ones((H, W),  dtype=np.float32)
 
-    ice_cold, _ = update_sea_ice(T_cold, elev, ice0, dt_days=1.0)
-    ice_warm, _ = update_sea_ice(T_warm, elev, ice1, dt_days=1.0)
+    ice_cold, _, _hc = update_sea_ice(T_cold, elev, ice0, dt_days=1.0)
+    ice_warm, _, _hw = update_sea_ice(T_warm, elev, ice1, dt_days=1.0)
 
     sea_mask = elev < 0.02  # approximate ocean mask
     _check("Ice forms where ocean T < freeze_temp",
