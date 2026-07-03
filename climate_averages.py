@@ -297,6 +297,7 @@ def classify_koppen(
     monthly_precip: np.ndarray,    # (12, H, W) monthly precip [mm/day]
     land_mask: np.ndarray,         # (H, W) boolean or float
     elevation: np.ndarray | None = None,  # (H, W) normalized elevation [0-1]
+    elevation_baseline: np.ndarray | None = None,  # (H, W) coarse elevation the input temps already reflect
 ) -> np.ndarray:
     """Classify Köppen climate type for each grid cell.
 
@@ -314,6 +315,16 @@ def classify_koppen(
         monthly_precip: (12, H, W) monthly mean precipitation [mm/day]
         land_mask: (H, W) land mask (1=land, 0=ocean)
         elevation: (H, W) normalized elevation [0-1], optional
+        elevation_baseline: (H, W) normalized elevation, optional. When the
+            physics simulation already applies orographic lapse-rate cooling
+            using a coarse (block-averaged) elevation, pass that same coarse
+            field here (upsampled back to (H, W)) so only the *delta* between
+            each pixel's real elevation and its block's average is applied on
+            top — this avoids double-counting the lapse rate and lets real
+            sub-grid terrain (e.g. valleys vs. peaks within one mountain
+            range) produce a mix of climate zones instead of one uniform
+            block. If omitted, `elevation` is treated as the full lapse-rate
+            baseline (legacy behaviour).
 
     Returns:
         (H, W) int32 array of Köppen codes (0-19)
@@ -329,13 +340,25 @@ def classify_koppen(
     # Terrain-based temperature adjustments
     # ==========================================================================
     if elevation is not None:
-        # Convert normalized elevation [0-1] to meters (assume max ~8848m)
-        elev_meters = elevation * 8848.0
-
-        # Lapse rate correction: -6.5°C per 1000m elevation
-        # Only apply to land (elevation > sea level threshold)
         land = land_mask > 0.5
-        lapse_correction = np.where(land, -6.5 * elev_meters / 1000.0, 0.0)
+
+        if elevation_baseline is not None:
+            # `monthly_temp` was produced by physics that already cooled it with
+            # a lapse rate based on the *coarse* (block-averaged) elevation — see
+            # _evolve_temperature's own -6.5 K/km orographic term. Applying the
+            # full lapse rate again here on the fine elevation would double-count
+            # that cooling and flatten an entire mountain block into one uniform
+            # temperature/climate zone. Instead, apply only the delta between
+            # this pixel's real elevation and the block average the physics used,
+            # so peaks read colder and valleys read warmer than their neighbors.
+            elev_delta_meters = (elevation - elevation_baseline) * 8848.0
+            lapse_correction = np.where(land, -6.5 * elev_delta_meters / 1000.0, 0.0)
+        else:
+            # No coarse baseline supplied - treat `elevation` as the full
+            # lapse-rate baseline (legacy behaviour for standalone/offline use).
+            elev_meters = elevation * 8848.0
+            lapse_correction = np.where(land, -6.5 * elev_meters / 1000.0, 0.0)
+
         lapse_correction = lapse_correction.astype(np.float32)
 
         # Apply lapse rate to all months

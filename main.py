@@ -179,6 +179,10 @@ def main() -> None:
 
     # Simulation state
     sim_state: PlanetState | None = None
+    # Currently active save file (File>Open / File>Save As changes this).
+    # Restored from the last session so the app picks up the same planet
+    # it was last working on; falls back to the legacy autosave path.
+    _current_state_path: Path = Path(settings.get("last_state_path", str(AUTOSAVE_PATH)))
     sim_thread: SimulationThread | None = None
     sim_running = False
     sim_paused = False
@@ -194,29 +198,64 @@ def main() -> None:
     terrain_mode = "procedural"
     loaded_heightmap_path = None
     
+    # --- Main layout scaffold ---
+    # A persistent bottom status bar (packed first so it keeps its slice of
+    # the window), a resizable horizontal split between a tabbed sidebar
+    # (Terrain / Simulation / View controls) and the map/globe area. The
+    # menu bar itself is assembled near the end of main(), once every
+    # command callback it references has been defined.
+    status_bar = ttk.Frame(root, relief="sunken", padding=(4, 2))
+    status_bar.pack(side="bottom", fill="x")
+
+    body = ttk.Panedwindow(root, orient="horizontal")
+    body.pack(side="top", fill="both", expand=True)
+
+    sidebar = ttk.Frame(body)
+    body.add(sidebar, weight=0)
+
+    notebook = ttk.Notebook(sidebar)
+    notebook.pack(fill="both", expand=True)
+
+    terrain_tab = ttk.Frame(notebook, padding=6)
+    sim_tab = ttk.Frame(notebook, padding=6)
+    view_tab = ttk.Frame(notebook, padding=6)
+    notebook.add(sim_tab, text="Simulation")
+    notebook.add(view_tab, text="View")
+    notebook.add(terrain_tab, text="Terrain")
+    notebook.select(sim_tab)
+
     # Controls
     mode_var = tk.StringVar(value="map")
     view_var = tk.StringVar(value="Terrain")
     latlon_var = tk.StringVar(value="")
-    controls = tk.Frame(root)
-    controls.pack(fill="x")
-    tk.Radiobutton(controls, text="Globe", variable=mode_var, value="globe").pack(side="left")
-    tk.Radiobutton(controls, text="Map", variable=mode_var, value="map").pack(side="left")
-    tk.Label(controls, text="View").pack(side="left", padx=(8,0))
-    tk.OptionMenu(
-        controls,
-        view_var,
-        "Terrain",
-        "Temperature",
-        "Ocean Temperature",
-        "Precipitation",
-        "Biomes",
-        "Wind Arrows",
-        "Ocean Currents",
-        "Wind Particles",
-        "Cloud Cover",
-    ).pack(side="left")
-    
+
+    mode_row = ttk.Frame(view_tab)
+    mode_row.pack(fill="x", pady=2)
+    ttk.Radiobutton(mode_row, text="Globe", variable=mode_var, value="globe").pack(side="left")
+    ttk.Radiobutton(mode_row, text="Map", variable=mode_var, value="map").pack(side="left")
+
+    view_row = ttk.Frame(view_tab)
+    view_row.pack(fill="x", pady=2)
+    ttk.Label(view_row, text="View:").pack(side="left")
+    view_combo = ttk.Combobox(
+        view_row,
+        textvariable=view_var,
+        state="readonly",
+        width=16,
+        values=(
+            "Terrain",
+            "Temperature",
+            "Ocean Temperature",
+            "Precipitation",
+            "Biomes",
+            "Wind Arrows",
+            "Ocean Currents",
+            "Wind Particles",
+            "Cloud Cover",
+        ),
+    )
+    view_combo.pack(side="left", padx=(4, 0))
+
     # Diagnostics
     diagnostics = ClimateDiagnostics(track_history=True)
     graphs_enabled_var = tk.BooleanVar(value=False)
@@ -726,44 +765,68 @@ def main() -> None:
         
         sim_status_var.set("Stopped")
 
-    tk.Button(controls, text="Export Data", command=export_data).pack(side="right", padx=10)
-    tk.Button(controls, text="Benchmark", command=run_benchmark).pack(side="right", padx=10)
+    # Export Data / Benchmark are exposed via the Simulation menu (see menu
+    # setup near the end of main()) rather than as always-visible buttons.
 
-    # --- State save/load controls ---
+    # --- State save/load controls (File menu is the primary entry point; see
+    # menu setup near the end of main() for Open/Save/Save As/Exit) ---
     auto_save_var = tk.BooleanVar(value=_auto_save_enabled)
     save_info_var = tk.StringVar(value="")
 
     def _refresh_save_info() -> None:
-        if AUTOSAVE_PATH.exists():
-            size_kb = AUTOSAVE_PATH.stat().st_size / 1024
-            save_info_var.set(f"Save: {size_kb:.0f} KB")
+        if _current_state_path.exists():
+            size_kb = _current_state_path.stat().st_size / 1024
+            save_info_var.set(f"{_current_state_path.name} ({size_kb:.0f} KB)")
         else:
-            save_info_var.set("No save")
+            save_info_var.set(f"{_current_state_path.name} (not saved yet)")
 
     def _do_save_state() -> None:
+        """Save to the currently active file (File>Open / File>Save As target)."""
         nonlocal sim_state
         if sim_state is None:
             messagebox.showinfo("Save State", "No simulation state to save. Start the simulation first.")
             return
         try:
-            save_state(sim_state, AUTOSAVE_PATH)
+            save_state(sim_state, _current_state_path)
             _refresh_save_info()
             total_years = sim_state.total_days / 365.2422
-            messagebox.showinfo("Save State", f"State saved.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+            messagebox.showinfo("Save State", f"State saved to {_current_state_path.name}.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 
-    def _do_clear_save() -> None:
-        if AUTOSAVE_PATH.exists():
-            AUTOSAVE_PATH.unlink()
-        _refresh_save_info()
-        messagebox.showinfo("Clear Save", "Saved state cleared. Next start will use fresh initial conditions.")
+    def _do_save_state_as() -> None:
+        """Prompt for a new file path and save the current state there."""
+        nonlocal sim_state, _current_state_path
+        if sim_state is None:
+            messagebox.showinfo("Save State As", "No simulation state to save. Start the simulation first.")
+            return
+        saves_dir = Path("saves")
+        saves_dir.mkdir(parents=True, exist_ok=True)
+        path_str = filedialog.asksaveasfilename(
+            title="Save State As",
+            initialdir=str(saves_dir),
+            initialfile=_current_state_path.name,
+            defaultextension=".pkl",
+            filetypes=[("Planet State", "*.pkl"), ("All files", "*.*")],
+        )
+        if not path_str:
+            return
+        _current_state_path = Path(path_str)
+        _do_save_state()
 
     def _do_load_state() -> None:
-        nonlocal sim_state, sim_running, sim_paused, sim_thread
-        if not AUTOSAVE_PATH.exists():
-            messagebox.showinfo("Load State", "No saved state found.\nUse 'Save State Now' to create one first.")
+        """Prompt for a state file to open and load it."""
+        nonlocal sim_state, sim_running, sim_paused, sim_thread, _current_state_path
+        saves_dir = Path("saves")
+        saves_dir.mkdir(parents=True, exist_ok=True)
+        path_str = filedialog.askopenfilename(
+            title="Open State",
+            initialdir=str(saves_dir),
+            filetypes=[("Planet State", "*.pkl"), ("All files", "*.*")],
+        )
+        if not path_str:
             return
+        chosen_path = Path(path_str)
         # Stop and discard the thread so Start recreates it from the loaded state
         if sim_thread and sim_thread.is_alive():
             sim_thread.stop()
@@ -771,15 +834,17 @@ def main() -> None:
         sim_running = False
         sim_paused = False
         try:
-            sim_state = load_state(AUTOSAVE_PATH)
+            sim_state = load_state(chosen_path)
+            _current_state_path = chosen_path
             total_years = sim_state.total_days / 365.2422
             sim_status_var.set("Stopped")
             year = int(sim_state.total_days // 365.2422) + 1
             month = int((sim_state.day_of_year / 365.2422) * 12) + 1
             sim_cycle_var.set(f"Y{year} M{month}")
             _refresh_save_info()
+            root.title(f"Sphere {size}x{size} - {chosen_path.name}")
             render()
-            messagebox.showinfo("Load State", f"State loaded.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+            messagebox.showinfo("Open State", f"State loaded from {chosen_path.name}.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
 
@@ -787,13 +852,9 @@ def main() -> None:
         nonlocal _auto_save_enabled
         _auto_save_enabled = auto_save_var.get()
 
-    save_row = tk.Frame(root)
-    save_row.pack(fill="x")
-    tk.Checkbutton(save_row, text="Auto-save/load state", variable=auto_save_var, command=_on_auto_save_toggle).pack(side="left", padx=4)
-    tk.Button(save_row, text="Save State Now", command=_do_save_state).pack(side="left", padx=4)
-    tk.Button(save_row, text="Load State", command=_do_load_state).pack(side="left", padx=4)
-    tk.Button(save_row, text="Clear Saved State", command=_do_clear_save).pack(side="left", padx=4)
-    tk.Label(save_row, textvariable=save_info_var, anchor="w", fg="gray").pack(side="left", padx=8)
+    ttk.Checkbutton(sim_tab, text="Auto-save/load current file", variable=auto_save_var, command=_on_auto_save_toggle).pack(fill="x", pady=2)
+    ttk.Label(status_bar, text="File:", foreground="gray").pack(side="left", padx=(8, 2))
+    ttk.Label(status_bar, textvariable=save_info_var, foreground="gray").pack(side="left", padx=2)
     _refresh_save_info()
 
     def _init_sim_state_from_elevation(elev: np.ndarray) -> None:
@@ -813,23 +874,21 @@ def main() -> None:
         sim_cycle_var.set("Y1 M1")
         graphs_controller.reset()
     
-    # Simulation controls
-    sim_controls = tk.Frame(root)
-    sim_controls.pack(fill="x")
+    # Simulation controls (Simulation tab)
     sim_status_var = tk.StringVar(value="Stopped")
     sim_cycle_var = tk.StringVar(value="Year: 1")
-    tk.Label(sim_controls, text="Simulation:").pack(side="left", padx=(4,0))
-    sim_status_label = tk.Label(sim_controls, textvariable=sim_status_var, width=12, anchor="w")
-    sim_status_label.pack(side="left", padx=4)
-    sim_cycle_label = tk.Label(sim_controls, textvariable=sim_cycle_var, width=12, anchor="w")
-    sim_cycle_label.pack(side="left", padx=8)
-    tk.Button(sim_controls, text="Start", command=lambda: start_simulation()).pack(side="left", padx=2)
-    tk.Button(sim_controls, text="Stop", command=lambda: stop_simulation()).pack(side="left", padx=2)
-    tk.Button(sim_controls, text="Pause", command=lambda: pause_simulation()).pack(side="left", padx=2)
-    tk.Button(sim_controls, text="Reset", command=lambda: reset_simulation()).pack(side="left", padx=2)
+    sim_buttons_row = ttk.Frame(sim_tab)
+    sim_buttons_row.pack(fill="x", pady=2)
+    ttk.Button(sim_buttons_row, text="Start", command=lambda: start_simulation()).grid(row=0, column=0, sticky="ew", padx=1, pady=1)
+    ttk.Button(sim_buttons_row, text="Stop", command=lambda: stop_simulation()).grid(row=0, column=1, sticky="ew", padx=1, pady=1)
+    ttk.Button(sim_buttons_row, text="Pause", command=lambda: pause_simulation()).grid(row=1, column=0, sticky="ew", padx=1, pady=1)
+    ttk.Button(sim_buttons_row, text="Reset", command=lambda: reset_simulation()).grid(row=1, column=1, sticky="ew", padx=1, pady=1)
+    sim_buttons_row.columnconfigure(0, weight=1)
+    sim_buttons_row.columnconfigure(1, weight=1)
+
     def on_graphs_toggle():
         graphs_controller.set_enabled(graphs_enabled_var.get())
-    tk.Checkbutton(sim_controls, text="Graphs", variable=graphs_enabled_var, command=on_graphs_toggle).pack(side="left", padx=6)
+    ttk.Checkbutton(sim_tab, text="Graphs", variable=graphs_enabled_var, command=on_graphs_toggle).pack(fill="x", pady=2)
 
     # Time scale dropdown — each option maps to a TimeScaleMode
     time_scale_options = {
@@ -849,41 +908,51 @@ def main() -> None:
         if sim_thread is not None and sim_thread.is_alive():
             sim_thread.update_time_scale(mode)
     time_scale_var.trace_add("write", on_time_scale_change)
-    tk.Label(sim_controls, text="Speed:").pack(side="left", padx=(12, 0))
-    tk.OptionMenu(sim_controls, time_scale_var, *time_scale_options.keys()).pack(side="left", padx=2)
+    speed_row = ttk.Frame(sim_tab)
+    speed_row.pack(fill="x", pady=2)
+    ttk.Label(speed_row, text="Speed:").pack(side="left")
+    ttk.Combobox(
+        speed_row, textvariable=time_scale_var, state="readonly", width=8,
+        values=list(time_scale_options.keys()),
+    ).pack(side="left", padx=(4, 0))
 
-    # Year-cycle progress bar
+    # Status bar: sim status/cycle + year-progress bar (always visible regardless
+    # of which sidebar tab is open)
     _MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
     cycle_progress_var = tk.DoubleVar(value=0.0)
     cycle_detail_var = tk.StringVar(value="")
-    progress_row = tk.Frame(root)
-    progress_row.pack(fill="x", padx=4, pady=(0, 2))
-    tk.Label(progress_row, text="Year:", width=6, anchor="e").pack(side="left")
+    ttk.Label(status_bar, text="Sim:").pack(side="left", padx=(0, 2))
+    sim_status_label = ttk.Label(status_bar, textvariable=sim_status_var, width=12, anchor="w")
+    sim_status_label.pack(side="left")
+    sim_cycle_label = ttk.Label(status_bar, textvariable=sim_cycle_var, width=10, anchor="w")
+    sim_cycle_label.pack(side="left", padx=(4, 8))
     cycle_progress_bar = ttk.Progressbar(
-        progress_row, variable=cycle_progress_var,
-        maximum=100.0, mode="determinate",
+        status_bar, variable=cycle_progress_var,
+        maximum=100.0, mode="determinate", length=120,
     )
-    cycle_progress_bar.pack(side="left", fill="x", expand=True, padx=(4, 8))
-    tk.Label(progress_row, textvariable=cycle_detail_var, width=26, anchor="w",
-             font=("Courier", 8)).pack(side="left")
+    cycle_progress_bar.pack(side="left", padx=(0, 8))
+    ttk.Label(status_bar, textvariable=cycle_detail_var, width=26, anchor="w",
+              font=("Courier", 8)).pack(side="left")
 
-    # Wind controls
+    # Wind controls (View tab — they affect wind/particle rendering)
     wind_arrows_var = tk.IntVar(value=int(settings.get("wind_arrows", default_settings["wind_arrows"])))
     wind_scale_var = tk.DoubleVar(value=float(settings.get("wind_scale", default_settings["wind_scale"])))
     wind_block_size_var = tk.IntVar(value=int(settings.get("wind_block_size", default_settings["wind_block_size"])))
     # Precipitation simulation removed.
-    def add_wind_controls():
-        frm = tk.Frame(root)
-        frm.pack(fill="x")
-        def add(parent, label, var, width=6):
-            f = tk.Frame(parent); f.pack(side="left", padx=4); tk.Label(f, text=label).pack(side="left"); tk.Entry(f, textvariable=var, width=width).pack(side="left")
+    def add_wind_controls(parent):
+        frm = ttk.Frame(parent)
+        frm.pack(fill="x", pady=2)
+        def add(sub_parent, label, var, width=6):
+            f = ttk.Frame(sub_parent); f.pack(side="left", padx=4)
+            ttk.Label(f, text=label).pack(side="left")
+            ttk.Entry(f, textvariable=var, width=width).pack(side="left")
         add(frm, "Arrows", wind_arrows_var)
         add(frm, "Scale", wind_scale_var)
         add(frm, "WindBS", wind_block_size_var, width=4)
         return frm
-    wind_controls = add_wind_controls()
+    wind_controls = add_wind_controls(view_tab)
 
-    # Terrain parameter inputs
+    # Terrain parameter inputs (Terrain tab)
     seed_var = tk.IntVar(value=int(settings["seed"]))
     octaves_var = tk.IntVar(value=int(settings["octaves"]))
     freq_var = tk.DoubleVar(value=float(settings["freq"]))
@@ -891,18 +960,18 @@ def main() -> None:
     gain_var = tk.DoubleVar(value=float(settings["gain"]))
 
     def add_labeled_entry(parent, label, var, width=6):
-        frm = tk.Frame(parent)
-        frm.pack(side="left", padx=4)
-        tk.Label(frm, text=label).pack(side="left")
-        entry = tk.Entry(frm, textvariable=var, width=width)
+        frm = ttk.Frame(parent)
+        frm.pack(fill="x", pady=1)
+        ttk.Label(frm, text=label, width=6).pack(side="left")
+        entry = ttk.Entry(frm, textvariable=var, width=width)
         entry.pack(side="left")
         return entry
 
-    seed_entry = add_labeled_entry(controls, "Seed", seed_var)
-    octaves_entry = add_labeled_entry(controls, "Oct", octaves_var)
-    freq_entry = add_labeled_entry(controls, "Freq", freq_var)
-    lac_entry = add_labeled_entry(controls, "Lac", lac_var)
-    gain_entry = add_labeled_entry(controls, "Gain", gain_var)
+    seed_entry = add_labeled_entry(terrain_tab, "Seed", seed_var)
+    octaves_entry = add_labeled_entry(terrain_tab, "Oct", octaves_var)
+    freq_entry = add_labeled_entry(terrain_tab, "Freq", freq_var)
+    lac_entry = add_labeled_entry(terrain_tab, "Lac", lac_var)
+    gain_entry = add_labeled_entry(terrain_tab, "Gain", gain_var)
 
     def load_heightmap():
         """Load a heightmap from a .TIF file."""
@@ -1006,15 +1075,9 @@ def main() -> None:
         LOG.info("Switched to procedural terrain generation")
         render()
     
-    # File menu
-    menubar = tk.Menu(root)
-    root.config(menu=menubar)
-    file_menu = tk.Menu(menubar, tearoff=0)
-    menubar.add_cascade(label="File", menu=file_menu)
-    file_menu.add_command(label="Open Heightmap...", command=load_heightmap)
-    file_menu.add_command(label="Use Procedural Terrain", command=use_procedural_terrain)
-    file_menu.add_separator()
-    file_menu.add_command(label="Exit", command=root.quit)
+    # Menu bar is assembled near the end of main(), once load_heightmap,
+    # use_procedural_terrain, do_regen, export_data, run_benchmark, and the
+    # state save/load + on_close callbacks all exist.
 
     def do_regen():
         nonlocal tk_img, terrain_mode, display_scale_x, display_scale_y, oc_anim_running, _last_render_arr
@@ -1087,8 +1150,8 @@ def main() -> None:
         tk_img = ImageTk.PhotoImage(new_img)
         canvas.itemconfig(img_id, image=tk_img)
 
-    tk.Button(controls, text="Regenerate", command=do_regen).pack(side="left", padx=6)
-    latlon_label = tk.Label(controls, textvariable=latlon_var, width=70, anchor="e")
+    ttk.Button(terrain_tab, text="Regenerate", command=do_regen).pack(fill="x", pady=(6, 2))
+    latlon_label = ttk.Label(status_bar, textvariable=latlon_var, width=60, anchor="e")
     latlon_label.pack(side="right")
 
     # Profile initial generation once at startup
@@ -1169,9 +1232,11 @@ def main() -> None:
     LOG.info("Startup profile (top 20):")
     stats.print_stats(20)
     tk_img = ImageTk.PhotoImage(img)
-    # Map area: canvas on the left, legend panel on the right (unused window space)
-    map_row = tk.Frame(root)
-    map_row.pack(side="top", fill="both", expand=True)
+    # Map area: canvas on the left, legend panel on the right (unused window space).
+    # Lives in the right pane of `body` so users can drag the sash to resize
+    # the sidebar vs. the map.
+    map_row = tk.Frame(body)
+    body.add(map_row, weight=1)
     canvas = tk.Canvas(map_row, width=tex0.shape[1], height=tex0.shape[0], highlightthickness=0, bg="black")
     canvas.pack(side="left", fill="both", expand=True)
     img_id = canvas.create_image(0, 0, image=tk_img, anchor="nw")
@@ -1499,10 +1564,10 @@ def main() -> None:
     def start_simulation():
         nonlocal sim_state, sim_thread, sim_running, sim_paused, _sim_ever_started
         if not _sim_ever_started:
-            # On first Start: load autosave if enabled and available
-            if _auto_save_enabled and AUTOSAVE_PATH.exists():
+            # On first Start: load the active file's autosave if enabled and available
+            if _auto_save_enabled and _current_state_path.exists():
                 try:
-                    sim_state = load_state(AUTOSAVE_PATH)
+                    sim_state = load_state(_current_state_path)
                     total_years = sim_state.total_days / 365.2422
                     sim_status_var.set(f"Loaded Y{total_years:.1f}")
                     LOG.info(f"Autosave loaded: day {sim_state.total_days:.0f} ({total_years:.2f} years)")
@@ -1863,11 +1928,11 @@ def main() -> None:
             sim_thread.stop()
             sim_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
         # Persist current UI parameters to settings.json
-        # Autosave simulation state if enabled
+        # Autosave simulation state (to the active file) if enabled
         if _auto_save_enabled and sim_state is not None:
             try:
-                save_state(sim_state, AUTOSAVE_PATH)
-                LOG.info(f"Autosave written: day {sim_state.total_days:.0f}")
+                save_state(sim_state, _current_state_path)
+                LOG.info(f"Autosave written to {_current_state_path.name}: day {sim_state.total_days:.0f}")
             except Exception as e:
                 LOG.warning(f"Autosave failed: {e}")
 
@@ -1881,10 +1946,39 @@ def main() -> None:
             "wind_scale": float(wind_scale_var.get()),
             "wind_block_size": int(wind_block_size_var.get()),
             "auto_save_state": bool(_auto_save_enabled),
+            "last_state_path": str(_current_state_path),
         }
         save_settings(s)
         graphs_controller.close()
         root.destroy()
+
+    # --- Unified menu bar (built last, once every command it references exists) ---
+    menubar = tk.Menu(root)
+
+    file_menu = tk.Menu(menubar, tearoff=0)
+    file_menu.add_command(label="Open Heightmap...", command=load_heightmap)
+    file_menu.add_command(label="Use Procedural Terrain", command=use_procedural_terrain)
+    file_menu.add_separator()
+    file_menu.add_command(label="Open State...", command=_do_load_state, accelerator="Ctrl+O")
+    file_menu.add_command(label="Save State", command=_do_save_state, accelerator="Ctrl+S")
+    file_menu.add_command(label="Save State As...", command=_do_save_state_as, accelerator="Ctrl+Shift+S")
+    file_menu.add_separator()
+    file_menu.add_command(label="Exit", command=on_close)
+    menubar.add_cascade(label="File", menu=file_menu)
+
+    simulation_menu = tk.Menu(menubar, tearoff=0)
+    simulation_menu.add_command(label="Export Data...", command=export_data)
+    simulation_menu.add_command(label="Run Benchmark", command=run_benchmark)
+    menubar.add_cascade(label="Simulation", menu=simulation_menu)
+
+    terrain_menu = tk.Menu(menubar, tearoff=0)
+    terrain_menu.add_command(label="Regenerate Terrain", command=do_regen)
+    menubar.add_cascade(label="Terrain", menu=terrain_menu)
+
+    root.config(menu=menubar)
+    root.bind("<Control-o>", lambda e: _do_load_state())
+    root.bind("<Control-s>", lambda e: _do_save_state())
+    root.bind("<Control-Shift-S>", lambda e: _do_save_state_as())
 
     def _on_window_resize(event):
         nonlocal _resize_job
