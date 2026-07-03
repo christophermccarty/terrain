@@ -1412,10 +1412,16 @@ def generate_precipitation(
     div_pos = np.clip(div, 0.0, None)
     subsidence_norm = div_pos / (np.mean(div_pos) + 1e-6)
     subsidence_norm = np.clip(subsidence_norm, 0.0, 2.5)
-    # Reduce precipitation by up to ~65% in strong-subsidence regions.
+    # Reduce precipitation in strong-subsidence / dry-belt regions.
+    # Coefficients deepened and floor lowered (2026-07): real subtropical deserts
+    # (Sahara, Arabian Peninsula, Kalahari) were coming out 3-10x too wet — most
+    # drybelt cells sat around subsidence_suppression~0.5 (52% cut), nowhere near
+    # the floor, because the drybelt_window term alone (0.18 coeff) was too weak to
+    # reach the floor except at extreme subsidence_norm. Deepened so a typical
+    # drybelt-center cell reaches ~0.2 (80% cut) even at average local subsidence.
     subsidence_suppression = np.clip(
-        1.0 - 0.34 * subsidence_norm - 0.18 * drybelt_window[:, None],
-        0.22,
+        1.0 - 0.34 * subsidence_norm - 0.45 * drybelt_window[:, None],
+        0.08,
         1.0,
     ).astype(np.float32, copy=False)
 
@@ -1427,6 +1433,19 @@ def generate_precipitation(
     orog = land_f * orog
     orog = orog / (np.percentile(orog, 90.0) + 1e-6)
     orog = np.clip(orog + 0.15 * _lap(orog.astype(np.float32)), 0.0, 2.0)
+
+    # Rain-shadow drying: the mirror image of orographic uplift. Descending air on
+    # the lee side of a range compresses and warms, lowering RH — this is why the
+    # Atacama (lee of the Andes), Patagonia, the Great Basin, and the Gobi (lee of
+    # the Himalaya/Tibetan Plateau) are deserts in reality. Previously `orog` only
+    # ever added rain (windward term clipped to >=0) with no leeward counterpart, so
+    # these regions had no mechanism to dry out relative to the surrounding potential
+    # field (observed: Atacama sample came out ~780 mm/yr vs Earth's near-zero).
+    downslope = np.clip(-(gx * u + gy * v), 0.0, None)
+    downslope = land_f * downslope
+    downslope = downslope / (np.percentile(downslope, 90.0) + 1e-6)
+    downslope = np.clip(downslope, 0.0, 2.0)
+    rain_shadow_suppression = np.clip(1.0 - 0.40 * downslope, 0.35, 1.0).astype(np.float32, copy=False)
 
     # Phase 2: Enhanced convective precipitation with CAPE-like triggering
     # This significantly improves tropical rainfall (ITCZ) realism
@@ -1473,7 +1492,7 @@ def generate_precipitation(
         0.20 * convective +
         0.22 * ascent_driver +
         0.06 * stratiform
-    ) * subsidence_suppression
+    ) * subsidence_suppression * rain_shadow_suppression
     lat_shape = np.clip(0.78 + 0.62 * itcz_window[:, None] + 0.02 * storm_window[:, None], 0.60, 1.40)
     precip_potential = precip_potential * lat_shape
 
