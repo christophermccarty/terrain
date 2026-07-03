@@ -1537,7 +1537,19 @@ def generate_precipitation(
     # Update humidity and soil moisture reservoirs
     humidity_next = np.clip(q - dq, 0.0, qsat)
 
-    soil += (P * land_f) * 0.0006 - (land_evap * dt) * 0.4
+    # Both terms must scale with the *same* elapsed-time basis. The precip
+    # replenishment previously didn't scale with dt at all (a no-op bug at dt=1
+    # DAILY mode, but under-replenishing ~30x at dt~30 MONTHLY mode). The drain
+    # term scaled with the full dt, but land_evap itself only actually reached the
+    # humidity reservoir up to dt_evap (<=1.5d, capped above to avoid saturating q
+    # in one step) -- so draining soil by the *uncapped* dt double-charged it for
+    # evaporation that never actually left the soil into the air. Together these
+    # drove continental-interior soil moisture to its 0.05 floor within a few
+    # decades of MONTHLY-mode spinup, which then throttles land_evap itself
+    # (0.35+0.65*soil factor) in a self-reinforcing desiccation spiral that
+    # collapsed precip to ~12 mm/yr (Earth: 350-450 mm/yr for e.g. the Canadian
+    # Prairies).
+    soil += (P * land_f) * 0.0006 * dt - (land_evap * dt_evap) * 0.4
     soil = np.where(land_mask, np.clip(soil, 0.05, 1.0), 0.0)
 
     return (

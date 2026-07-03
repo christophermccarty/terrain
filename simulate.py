@@ -99,6 +99,48 @@ def _coarsen_many(fields: dict[str, np.ndarray], Hc: int, Wc: int, bs: int) -> d
     return {k: out[i] for i, k in enumerate(keys)}
 
 
+# A single generate_precipitation() call can only "rain out" the moisture
+# reservoir once, regardless of how many days `dt_days` spans. At DAILY dt=1
+# that's fine (365 independent calls/year, each free to evaporate-then-rain).
+# At MONTHLY dt~30 a single call applies one snapshot of wind/humidity as if
+# constant for the whole month and rains it out once, so precipitation doesn't
+# scale up the way a real month's worth of independent weather events would --
+# while the soil-moisture drain term (evaporation * dt) scales linearly with
+# dt with no such ceiling. That mismatch was driving continental-interior soil
+# moisture to its floor within a few decades of MONTHLY-mode spinup (observed:
+# Canadian-Prairies-latitude precip collapsing to ~12 mm/yr vs Earth's
+# 350-450 mm/yr), even though the underlying replenish/drain calibration is
+# sound at dt=1. Sub-stepping in ~1-week chunks lets humidity evaporate and
+# rain out multiple times per outer call, closing the gap without touching
+# per-call physics or DAILY/WEEKLY-mode behavior (n_sub=1 there, so this is a
+# no-op below the threshold).
+_PRECIP_SUBSTEP_DAYS = 8.0
+
+
+def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
+                                        humidity, soil_moisture, cloud_fraction,
+                                        day_of_year, dt_days):
+    dt_days = float(dt_days)
+    if dt_days <= _PRECIP_SUBSTEP_DAYS:
+        return generate_precipitation(
+            H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
+            humidity=humidity, soil_moisture=soil_moisture,
+            cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
+        )
+    n_sub = max(1, int(round(dt_days / _PRECIP_SUBSTEP_DAYS)))
+    sub_dt = dt_days / n_sub
+    hum, soil = humidity, soil_moisture
+    P_accum = None
+    for _ in range(n_sub):
+        P_i, hum, soil = generate_precipitation(
+            H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
+            humidity=hum, soil_moisture=soil, cloud_fraction=cloud_fraction,
+            day_of_year=day_of_year, dt_days=sub_dt,
+        )
+        P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
+    return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil
+
+
 # Cache for coarsened elevation. Elevation is static terrain — the same array
 # object is threaded unchanged through every simulate_step call for the life
 # of a run (see `new_state = PlanetState(..., elevation=state.elevation, ...)`
@@ -512,9 +554,21 @@ def simulate_step(
         if days_since_biome_update >= BIOME_UPDATE_INTERVAL or state.koppen_type is None:
             # Time to update Köppen classification
             _, land_mask_for_biomes = get_masks(state.elevation)
+            # Coarse (block-averaged) elevation, upsampled back to full resolution -
+            # this is the elevation baseline the temperature physics already used for
+            # its own orographic lapse-rate cooling (_evolve_temperature). Passing it
+            # lets classify_koppen apply only the *additional* fine-grained delta
+            # (peaks colder / valleys warmer than their block average) instead of
+            # double-applying the full lapse rate on an already-cooled input.
+            elev_c_for_biomes = _coarsen_elevation_cached(state.elevation, Hc, Wc, block_size)
+            elev_baseline_for_biomes = (
+                _upsample_bilinear_many({"elev": elev_c_for_biomes}, H, W, block_size)["elev"]
+                if block_size > 1 else elev_c_for_biomes
+            )
             koppen_new = classify_koppen(
                 monthly_temp, monthly_precip, land_mask_for_biomes,
-                elevation=state.elevation
+                elevation=state.elevation,
+                elevation_baseline=elev_baseline_for_biomes,
             )
             # Convert Köppen to legacy biome for backward compatibility
             biome_new = koppen_to_legacy_biome(koppen_new)
@@ -1200,7 +1254,7 @@ def simulate_step(
             _hum_p = _group_p_out.get("hum")
             _soil_p = _group_p_out.get("soil")
             _cloud_p = _group_p_out.get("cloud")
-            P_p, hum_p_next, soil_p_next = generate_precipitation(
+            P_p, hum_p_next, soil_p_next = _generate_precipitation_substepped(
                 _Hcp, _Wcp, _elev_p,
                 temperature=_T_p, wind_u=_u_p, wind_v=_v_p,
                 humidity=_hum_p, soil_moisture=_soil_p,
@@ -1214,7 +1268,7 @@ def simulate_step(
             humidity_next: np.ndarray | None = _up["q"]
             soil_next: np.ndarray | None = _up["soil"]
         else:
-            P_full, humidity_next, soil_next = generate_precipitation(
+            P_full, humidity_next, soil_next = _generate_precipitation_substepped(
                 H, W, state.elevation,
                 temperature=T_full, wind_u=u_full, wind_v=v_full,
                 humidity=state.humidity, soil_moisture=state.soil_moisture,
