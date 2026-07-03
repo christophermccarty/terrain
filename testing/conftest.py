@@ -85,3 +85,24 @@ def earth_spinup_state(mixed_elev):
     for _ in range(730):   # 2 years
         state, _ = simulate_step(state, days=1.0, block_size=4, wind_block_size=4)
     return state
+
+
+@pytest.fixture(scope="session")
+def earth_long_spinup_state(mixed_elev):
+    """Earth-like state after a 60-year MONTHLY spinup at coarse resolution.
+
+    Some biases (e.g. mid-latitude winter land temperature collapsing well below
+    Koppen's Dwd threshold, or dry-belt precipitation not settling into a desert
+    range) only emerge after decades of simulated time -- ice-sheet-age hysteresis
+    and other slow reservoirs need tens of years to reach their own equilibrium.
+    The 2-year earth_spinup_state fixture above is too short to see this class of
+    bug. ~60s wall time; session-scoped and slow-marked like earth_spinup_state.
+    """
+    from simulate import create_initial_state, simulate_step, TimeScaleMode
+    state = create_initial_state(mixed_elev, day_of_year=80.0)
+    for _ in range(60 * 12):   # 60 years, monthly steps
+        state, _ = simulate_step(
+            state, days=30.44, block_size=4, wind_block_size=4,
+            time_scale=TimeScaleMode.MONTHLY,
+        )
+    return state

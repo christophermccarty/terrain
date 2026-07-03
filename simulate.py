@@ -659,7 +659,20 @@ def simulate_step(
     _atm_land_transport_1d = (
         0.65 * 34.0 * np.clip((_abs_lat_deg_land - 42.0) / 28.0, 0.0, 1.0) ** 1.5
     )
-    T_base_land = T_base_land + _atm_land_transport_1d[:, None].astype(np.float32, copy=False)
+    # Mid-latitude storm-track heat transport (22-50°): winter cyclones and frontal
+    # systems deliver substantial poleward heat well before the 42° ramp above kicks
+    # in. Without this, zonal-mean land coldest-month temperatures at 30-55° come out
+    # 15-30K too cold (observed: -37 to -40°C at 45-55°N vs Earth's -5 to -15°C),
+    # which spuriously classifies most of Canada/Siberia/Central Asia as Dwd (extreme
+    # continental, requires coldest month < -38°C) instead of Dfb. Modeled as a
+    # trapezoid (ramps 22°→42°, flat to 42°, decays 42°→50° handing off to the ramp
+    # above) rather than a Gaussian so it doesn't reopen the 60°+ balance already
+    # tuned by the ramp above. Cuts off by 50° (not 60°) so it doesn't dampen the
+    # sea-ice/CO2 sensitivity signal at ice-forming latitudes (test_2x_co2_less_ice).
+    _midlat_rise = np.clip((_abs_lat_deg_land - 22.0) / 20.0, 0.0, 1.0)
+    _midlat_fall = np.clip((50.0 - _abs_lat_deg_land) / 8.0, 0.0, 1.0)
+    _midlat_storm_bonus_1d = 27.0 * _midlat_rise * _midlat_fall
+    T_base_land = T_base_land + (_atm_land_transport_1d + _midlat_storm_bonus_1d)[:, None].astype(np.float32, copy=False)
     # Re-apply summer cap: atmospheric transport can only raise winter/polar-night
     # temperatures; it must not push summer land above observed peak means.
     T_base_land = np.minimum(T_base_land, _land_cap_1d[:, None].astype(np.float32, copy=False))
