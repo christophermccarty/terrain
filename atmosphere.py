@@ -609,6 +609,7 @@ def compute_convective_precipitation(
     trigger_temp_c: float = 20.0,
     trigger_rh: float = 0.8,
     max_rate_mm_day: float = 10.0,
+    surface_pressure_hpa: float = 1013.25,
 ) -> np.ndarray:
     """Enhanced convective precipitation with CAPE-like triggering (Phase 2).
 
@@ -635,7 +636,7 @@ def compute_convective_precipitation(
     # Saturation humidity (Clausius-Clapeyron)
     T_c_clipped = np.clip(T_celsius, -60.0, 60.0)
     es = 6.112 * np.exp(17.67 * T_c_clipped / (T_c_clipped + 243.5))  # hPa
-    qsat = np.clip(0.622 * es / 1013.25, 1e-6, 0.035)  # kg/kg
+    qsat = np.clip(0.622 * es / surface_pressure_hpa, 1e-6, 0.035)  # kg/kg
 
     # Relative humidity
     rh = np.clip(humidity / (qsat + 1e-9), 0.0, 1.5)
@@ -989,7 +990,7 @@ def evolve_wind(
     dp_dx = _ddx_periodic(p_anom) / (dx + 1e-3)
     # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
     dp_dy = -np.gradient(p_anom, axis=0) / dy
-    
+
     pgf_u = -1.0/rho * dp_dx
     pgf_v = -1.0/rho * dp_dy
 
@@ -1247,7 +1248,7 @@ def generate_wind_field(
     else:
         T_used = T
     # Warmer = lower pressure (thermal low), colder = higher pressure (thermal high)
-    p_thermal = 1013.25 * (T_ref / (T_used + 1e-6)) ** 2.2  # hPa
+    p_thermal = (pp.surface_pressure_pa / 100.0) * (T_ref / (T_used + 1e-6)) ** 2.2  # hPa
     
     # Add terrain pressure anomalies (mountains create blocking highs)
     tp = float(np.clip(terrain_pressure_amp, 0.0, 1.0))
@@ -1671,6 +1672,7 @@ def generate_precipitation(
     rain_efficiency: float = 0.7,
     target_mean_mm_day: float = 2.7,
     max_precip_mm_day: float = 120.0,
+    surface_pressure_hpa: float = 1013.25,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (precip_mm_day, humidity, soil_moisture).
 
@@ -1726,7 +1728,7 @@ def generate_precipitation(
 
     Tc = np.clip(temperature - 273.15, -60.0, 60.0)
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
-    qsat = np.clip(0.622 * es / 1013.25, 0.0, 0.035).astype(np.float32, copy=False)
+    qsat = np.clip(0.622 * es / surface_pressure_hpa, 0.0, 0.035).astype(np.float32, copy=False)
 
     if humidity is None:
         base_q = np.where(sea_mask, 0.013, 0.009).astype(np.float32, copy=False)
@@ -1865,6 +1867,7 @@ def generate_precipitation(
         trigger_temp_c=20.0,  # Tropical threshold
         trigger_rh=0.8,        # High humidity requirement
         max_rate_mm_day=10.0,  # Realistic tropical thunderstorm rate
+        surface_pressure_hpa=surface_pressure_hpa,
     )
     # Normalize convective contribution to blend with other terms
     conv_norm = np.clip(conv, 0.0, 1.5) / 1.5

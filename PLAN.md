@@ -432,6 +432,89 @@ mid-latitude band — expected, not a bug). Full suite after this change: **fast
 
 ---
 
+## Tooling/test hardening + scoped perf-pass follow-up (2026-07-04)
+
+Follow-up to the 2026-07-03 audit pass: that pass found a recurring bug shape (a flag silently
+ignored, a cache key that never matched, a parameter the optimizer thought it was sweeping but
+wasn't wired, a meridional sign error masked for months by a compensating constant) that existing
+tests couldn't catch because they check aggregate climate metrics, not "did this code path run" or
+"does this parameter do anything." This session added five bounded regression/tooling items
+targeting exactly that bug class, plus investigated (but did not land) a scoped performance pass.
+Full plan and rationale: `C:\Users\Trunk\.claude\plans\joyful-zooming-flask.md`. The 1.5-layer
+atmosphere redesign from the same review is intentionally deferred — see ROADMAP.md Theme 1 — as
+its own future effort (large structural change, not a bounded addition).
+
+**1. Earth-constant audit test + fixes** (`testing/test_no_hardcoded_earth_constants.py`, new):
+regex-scans atmosphere.py/ocean.py/carbon_cycle.py/temperature.py/simulate.py for hardcoded
+`6371`/`1013.25`/`288.15`/`365`-modulo/`9.81` outside `planet_params.py`, with an explicit,
+justified allowlist for the two remaining legitimate cases (function-default kwargs always
+overridden by the caller). Fixed the 5 confirmed remaining `1013.25` hPa references (Clausius-
+Clapeyron saturation-mixing-ratio calls in `atmosphere.py`'s `compute_convective_precipitation`/
+`generate_precipitation`/`generate_wind_field` and `simulate.py`'s `_evolve_temperature`, both
+qsat and qsat_sst) — all now source `pp.surface_pressure_pa / 100.0`, which also makes the
+Clausius-Clapeyron reference pressure correct for Mars. Also fixed a hardcoded
+`3.0 * 365.25` ice-sheet-maturity threshold in simulate.py to scale by `pp.orbital_period_days`
+instead (same bug class as the already-fixed `% 365` temperature cache key, just not one of the
+originally counted 5).
+
+**2. Directional/sign regression tests** (`testing/test_derivative_signs.py`, new, 5 tests): unit
+tests independent of any tuning constant — the exact gap that let the meridional-sign bug survive
+for months. Covers `_moisture_convergence_numba` (convergence registers positive, the mirror-image
+divergent pattern doesn't), an orographic windward-vs-leeward precipitation check via
+`generate_precipitation` on a synthetic meridional elevation ramp, and a parametrized
+meridional-vs-zonal terrain-deflection check via `generate_wind_field` (regression for the
+`gx, gy = np.gradient(elev_c)` axis-swap bug — asserts a north-south-only elevation ramp deflects
+wind meridionally, not zonally).
+
+**3. Dead-parameter/wiring linter** (`testing/test_param_wiring.py`, new, 14 tests): runs a short
+(15-day) simulation at a parameter's default vs. a substantially perturbed value and asserts the
+resulting `PlanetState` differs in at least one field beyond a noise floor — modeled on
+`test_feedback_flags.py`'s pattern but generalized and applied to both `simulate_step` kwargs and
+`PlanetParams` fields. **Found a genuine new dead parameter on first run**:
+`simulate_step`'s `latent_cooling_coeff` is accepted but read nowhere else in the codebase.
+Documented in place (simulate.py) as a deprecated no-op rather than newly wired, matching the
+existing `ocean_exchange_floor`/`ocean_exchange_span` convention — wiring in new physics without
+calibration was out of scope for a tooling pass. Also confirmed `create_initial_state` correctly
+seeds `co2_atmosphere`/`ch4_atmosphere` from `PlanetParams` (the 2026-07-03 fix).
+
+**4. Golden-state regression test** (`scripts/generate_golden_state.py` +
+`testing/test_golden_state.py`, new): pickles a `PlanetState` from a small deterministic
+`optimizer.headless.run_simulation` config (32×64, 0.1yr MONTHLY spinup + 0.05yr DAILY eval) as a
+committed fixture (`testing/fixtures/golden_state_reference.pkl`); future runs must match within
+`atol=1e-4`, or the fixture must be deliberately regenerated. **Already proved its value in the
+same session** — see item 6 below.
+
+**5. Conservation/energy-budget dashboard** (`diagnostics.py` +
+`testing/test_conservation.py`, extended): added `area_weighted_global_mean()` and
+`compute_radiation_balance()` to diagnostics.py, consuming the `S_absorbed`/`L_out`/`net_radiation`
+fields already computed in `_evolve_temperature` (now also exposed via `track_components=True`,
+previously only `net_radiation` was). Two new tests in the pre-existing `test_conservation.py`:
+`test_radiation_budget_near_equilibrium` (area-weighted TOA net radiation stays within ±20 W/m²
+after a 2-year spinup — would have caught the ~30x Ekman over-application bug directly) and
+`test_ch4_equilibrium_holds_baseline` (CH4 natural-source/oxidation balance holds within 1 ppb
+over 5 simulated years — the exact mechanism added to fix the pre-2026-07-03 CH4 decay bug).
+
+**6. Scoped performance pass — investigated, not applied.** Wrapped the `np.gradient` call sites
+flagged by profiling (6 sites across `evolve_wind`, `generate_wind_field`, and
+`_evolve_temperature`'s cloud-fraction/orographic terms) in explicit float32 casts, plus dropped an
+unnecessary float64 promotion on a jet-index diagnostic mean. Reverted all of it after two findings:
+(a) the new golden-state test caught a real ~0.1%-magnitude drift in `co2_ocean` after 0.15
+simulated years, meaning at least one of these arrays actually was float64 before the cast (a real,
+if tiny, behavior change, not a true no-op); (b) three separate `scripts/benchmark_headless.py`
+measurements of the *same unchanged code* varied 150–190s/year at 512×1024 DAILY — the
+environment's own run-to-run noise is far larger than this change's theoretical few-ms/step
+benefit, so no improvement could be honestly claimed either way. Rather than keep an unproven
+numeric-behavior change for a benefit that can't be measured above the noise floor, reverted
+cleanly (confirmed golden-state test returns to exact bit-match). Left as a documented ROADMAP.md
+Theme 5 item for whoever revisits this with steadier benchmarking conditions.
+
+**Verification:** all 5 new/extended test files pass individually; full fast suite green; full
+slow suite (including the new `test_conservation.py` energy/CH4 tests, ~7min) green;
+`testing/test_golden_state.py` confirmed to both catch a real regression (the reverted perf-pass
+edits) and pass cleanly on the final, reverted code.
+
+---
+
 ## Phase 0 — Code Audit & Cleanup ✅ COMPLETE (2026-06-20)
 
 All tasks done: `heat_transport_coeff` dead parameter removed, `co2_climate_feedback` wiring

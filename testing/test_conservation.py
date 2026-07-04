@@ -150,3 +150,55 @@ def test_no_ice_runaway(flat_ocean_state):
             f"Ice runaway detected: {global_ice * 100:.1f}% global ice cover "
             f"(threshold: 60%)"
         )
+
+
+# ---------------------------------------------------------------------------
+# TOA energy / CH4 mass budget (2026-07-04)
+#
+# The tests above catch drift over long runs; these two catch a budget that
+# doesn't balance more directly -- exactly the shape of two bugs that long-run
+# drift tests alone were slow to expose: an Ekman ocean-heat term scaled for a
+# 30-day window but (due to a cache key that never matched) applied in full
+# every day (~30x too strong per step), and CH4 decaying toward its floor
+# because modeled sources supplied ~5000x less than the oxidation sink needed
+# at equilibrium (spurious ~-1 W/m^2 forcing drift over decades).
+# ---------------------------------------------------------------------------
+
+def test_radiation_budget_near_equilibrium(earth_spinup_state):
+    """Area-weighted global net radiation (S_absorbed - L_out) after a 2-year
+    spinup should be within a generous but discriminating bound of zero. A
+    term silently applied ~30x too strong (the Ekman bug's shape) would blow
+    well past this; the residual few-W/m^2 transient expected at only 2 years
+    of spinup stays comfortably inside it."""
+    from simulate import simulate_step
+    import diagnostics
+
+    _state, components = simulate_step(
+        earth_spinup_state, days=1.0, block_size=4, wind_block_size=4,
+        track_components=True,
+    )
+    budget = diagnostics.compute_radiation_balance(components)
+    assert abs(budget["r_net_mean_w_m2"]) < 20.0, (
+        f"global mean net radiation {budget['r_net_mean_w_m2']:.2f} W/m^2 is "
+        "far outside the range expected at near-equilibrium -- check for an "
+        "energy term being applied with the wrong scaling/cadence"
+    )
+
+
+def test_ch4_equilibrium_holds_baseline():
+    """Starting exactly at baseline, the natural-source term must balance the
+    OH-oxidation sink closely enough that CH4 doesn't drift away over
+    multi-year runs (the mechanism added to fix the pre-2026-07-03 decay bug).
+    Pure mass-balance check on the two primitives, independent of
+    simulate_step's slow-update caching."""
+    from carbon_cycle import ch4_oxidation_step, ch4_natural_source
+
+    baseline_ppb = 1900.0
+    ch4 = baseline_ppb
+    for _ in range(365 * 5):  # 5 simulated years, daily steps
+        ch4 = ch4_oxidation_step(ch4, 1.0) + ch4_natural_source(baseline_ppb, 1.0)
+    drift = abs(ch4 - baseline_ppb)
+    assert drift < 1.0, (
+        f"CH4 drifted {drift:.3f} ppb from baseline over 5 years with no other "
+        "sources/sinks active -- natural_source/oxidation balance may be broken"
+    )
