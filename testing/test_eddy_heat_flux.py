@@ -72,9 +72,18 @@ def test_eddy_flux_reduces_gradient():
     Uses eddy_coeff=0.05 (8× default) to produce a detectable signal over 2 years.
     The correct physical observable is gradient *reduction*, not mid-lat warming,
     because Laplacian diffusion moves heat from high-T to low-T regions.
+
+    ocean_transport/ice_albedo are disabled to isolate the eddy term: the
+    differential being measured is small (~0.2 K std) and has twice now been
+    flipped negative by *unrelated* changes re-phasing ocean-transport noise
+    (first the eddy sub-stepping fix's interaction with ocean noise — see
+    module history — then the 2026-07-03 western-boundary/thermal-diffusion
+    fixes). With those feedbacks off, the probe measures the eddy diffusion
+    itself: verified +0.19 K std reduction vs a spurious −0.16 with them on.
     """
-    state_no   = _run_steps(720, eddy_coeff=0.0,  H=32, W=64)
-    state_with = _run_steps(720, eddy_coeff=0.05, H=32, W=64)
+    _iso = {"ocean_transport": False, "ice_albedo": False}
+    state_no   = _run_steps(720, eddy_coeff=0.0,  H=32, W=64, feedback_flags=_iso)
+    state_with = _run_steps(720, eddy_coeff=0.05, H=32, W=64, feedback_flags=_iso)
 
     std_no   = _zonal_mean_std(state_no)
     std_with = _zonal_mean_std(state_with)
