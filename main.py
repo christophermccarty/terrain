@@ -659,6 +659,10 @@ def main() -> None:
             messagebox.showerror("Export Error", f"Failed to export data:\n{str(e)}")
     
     def run_benchmark():
+        # Without the nonlocal, `sim_running = False` bound a LOCAL variable and
+        # the simulation thread kept stepping while the benchmark ran on the
+        # same state (race + double-stepping).
+        nonlocal sim_running
         if sim_state is None:
             messagebox.showinfo("Info", "Please start or initialize simulation first.")
             return

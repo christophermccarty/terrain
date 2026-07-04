@@ -315,7 +315,11 @@ def temperature_kelvin_for_lat(
     pp = planet_params or EARTH
     cache_key = None
     if cache:
-        day_int = int(day_of_year) % 365
+        # Wrap by the planet's own orbital period: a hardcoded % 365 aliased
+        # e.g. Mars day 400 onto day 35 — two different seasons — silently
+        # returning the wrong cached seasonal profile for any planet with a
+        # non-Earth year length.
+        day_int = int(day_of_year) % max(1, int(round(float(pp.orbital_period_days))))
         pp_key = (
             round(float(pp.solar_constant), 4),
             round(float(pp.obliquity_deg), 4),
