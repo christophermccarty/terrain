@@ -123,13 +123,15 @@ _PRECIP_SUBSTEP_DAYS = 8.0
 
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
                                         humidity, soil_moisture, cloud_fraction,
-                                        day_of_year, dt_days):
+                                        day_of_year, dt_days,
+                                        surface_pressure_hpa=1013.25):
     dt_days = float(dt_days)
     if dt_days <= _PRECIP_SUBSTEP_DAYS:
         return generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=humidity, soil_moisture=soil_moisture,
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
+            surface_pressure_hpa=surface_pressure_hpa,
         )
     n_sub = max(1, int(round(dt_days / _PRECIP_SUBSTEP_DAYS)))
     sub_dt = dt_days / n_sub
@@ -140,6 +142,7 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=hum, soil_moisture=soil, cloud_fraction=cloud_fraction,
             day_of_year=day_of_year, dt_days=sub_dt,
+            surface_pressure_hpa=surface_pressure_hpa,
         )
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
     return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil
@@ -420,7 +423,7 @@ def simulate_step(
     ice_melt_rate: float = 0.19,
     ice_albedo_strength: float | None = None,  # None → pp.ice_albedo_strength
     thermal_diffusion: float | None = None,    # None → pp.thermal_diffusivity
-    latent_cooling_coeff: float = 0.015,
+    latent_cooling_coeff: float = 0.015,  # Deprecated no-op (found by test_param_wiring.py, 2026-07-04): accepted but never read anywhere in the codebase; kept for config compatibility
     enable_carbon_cycle: bool = True,
     co2_climate_feedback: float | None = None,  # None → pp.co2_climate_feedback
     debug_log: bool = False,
@@ -647,7 +650,7 @@ def simulate_step(
     #
     # Seeded Antarctic cells start with age = threshold (already mature at t=0).
     # All other cells start at age = 0 and must grow naturally.
-    ICE_SHEET_THRESHOLD_DAYS = 3.0 * 365.25  # 3 years of sustained EF conditions
+    ICE_SHEET_THRESHOLD_DAYS = 3.0 * pp.orbital_period_days  # 3 years of sustained EF conditions
 
     if _is_first_init:
         ice_sheet_age_new = np.zeros((H, W), dtype=np.float32)
@@ -1366,6 +1369,7 @@ def simulate_step(
                 humidity=_hum_p, soil_moisture=_soil_p,
                 cloud_fraction=_cloud_p,
                 day_of_year=int(new_day), dt_days=float(days),
+                surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
             )
             _up = _upsample_bilinear_many(
                 {"P": P_p, "q": hum_p_next, "soil": soil_p_next}, H, W, _pbs
@@ -1380,6 +1384,7 @@ def simulate_step(
                 humidity=state.humidity, soil_moisture=state.soil_moisture,
                 cloud_fraction=cloud_full,
                 day_of_year=int(new_day), dt_days=float(days),
+                surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
             )
     else:
         P_full = None
@@ -1895,7 +1900,7 @@ def _evolve_temperature(
     # Cloud cover — humidity lives in the atmosphere, so use T_air for Clausius-Clapeyron
     Tc = np.clip(T_air - 273.15, -60.0, 60.0)
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
-    qsat = np.clip(0.622 * es / 1013.25, 1e-6, 0.035).astype(np.float32, copy=False)
+    qsat = np.clip(0.622 * es / (_pp.surface_pressure_pa / 100.0), 1e-6, 0.035).astype(np.float32, copy=False)
     if humidity is not None:
         q = np.clip(humidity.astype(np.float32, copy=False), 0.0, qsat)
     else:
@@ -2109,7 +2114,7 @@ def _evolve_temperature(
         # Saturation humidity at SST (the surface provides moisture to the air)
         T_c_sst = np.clip(T_sst - 273.15, -60.0, 60.0)
         es_sst = 6.112 * np.exp(17.67 * T_c_sst / (T_c_sst + 243.5))
-        qsat_sst = np.clip(0.622 * es_sst / 1013.25, 1e-6, 0.035)
+        qsat_sst = np.clip(0.622 * es_sst / (_pp.surface_pressure_pa / 100.0), 1e-6, 0.035)
         deficit = np.maximum(0.0, qsat_sst - humidity)
         C_D = np.where(sea_mask, 1.5e-3, 0.5e-3)
         E = C_D * wind_speed * deficit * 1000.0
@@ -2287,6 +2292,8 @@ def _evolve_temperature(
         components['subsidence'] = subsidence
         components['equilibrium_temp'] = T_eq
         components['net_radiation'] = R_net
+        components['S_absorbed'] = S_absorbed
+        components['L_out'] = L_out
         def _summ(field: np.ndarray) -> dict:
             return {"mean": float(np.mean(field)), "min": float(np.min(field)), "max": float(np.max(field))}
         components["toa"] = {
