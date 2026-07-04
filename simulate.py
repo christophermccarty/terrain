@@ -31,6 +31,7 @@ import pickle
 from atmosphere import (
     generate_wind_field, generate_precipitation,
     evolve_wind, _upsample_bilinear_many,
+    _update_jet_index, _update_jet_blocking,
 )
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
 from ocean import calculate_ocean_heat_transport, update_sea_ice, compute_ekman_transport
@@ -358,6 +359,15 @@ class PlanetState(NamedTuple):
     T_deep_ocean: np.ndarray | None = None  # (H, W) abyssal ocean temperature [K]
     # Feature 6: sea ice thickness
     ice_thickness: np.ndarray | None = None  # (H, W) sea ice thickness [m]; 0 on land/open ocean
+    # Feature 7: jet stream dynamics (persistent meander index + blocking events)
+    jet_index_nh: float = 0.0   # NH persistent meander/waviness index, roughly [-2, 2]
+    jet_index_sh: float = 0.0   # SH persistent meander/waviness index
+    jet_block_lon_nh: float = -1.0        # active NH blocking ridge longitude [deg]; -1 = inactive
+    jet_block_days_left_nh: float = 0.0   # days remaining in the active NH block
+    jet_block_total_days_nh: float = 0.0  # total drawn duration of the active NH block (for ramp envelope)
+    jet_block_lon_sh: float = -1.0
+    jet_block_days_left_sh: float = 0.0
+    jet_block_total_days_sh: float = 0.0
 
 
 def simulate_step(
@@ -936,6 +946,48 @@ def simulate_step(
     ice_thick_prev_coarse = _group_a_out.get("ice_thick")
     
     # ------------------------------------------------------
+    # Jet stream dynamics: persistent meander index + blocking events
+    # (see atmosphere._update_jet_index / _update_jet_blocking). Computed once
+    # per step from the actual simulated temperature field -- weaker
+    # pole-equator gradient nudges the index toward "wavy" -- then fed into
+    # whichever evolve_wind() call below executes.
+    # ------------------------------------------------------
+    lat_c_deg_1d = np.rad2deg((0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi)
+    T_zm = np.mean(T_prev_coarse, axis=1).astype(np.float64, copy=False)
+
+    def _pole_eq_gradient(hemi_sign: float) -> float:
+        trop_mask = (lat_c_deg_1d * hemi_sign >= 0.0) & (np.abs(lat_c_deg_1d) <= 30.0)
+        polar_mask = (lat_c_deg_1d * hemi_sign >= 0.0) & (np.abs(lat_c_deg_1d) >= 60.0)
+        if not np.any(trop_mask) or not np.any(polar_mask):
+            return float(pp.jet_gradient_ref_k)
+        return float(np.mean(T_zm[trop_mask]) - np.mean(T_zm[polar_mask]))
+
+    jet_index_nh_new = _update_jet_index(
+        state.jet_index_nh, _pole_eq_gradient(1.0), days, new_total_days, hemisphere_seed=1,
+        tau_days=float(pp.jet_meander_tau_days), noise_amp=float(pp.jet_meander_noise_amp),
+        gradient_ref_k=float(pp.jet_gradient_ref_k),
+    )
+    jet_index_sh_new = _update_jet_index(
+        state.jet_index_sh, _pole_eq_gradient(-1.0), days, new_total_days, hemisphere_seed=2,
+        tau_days=float(pp.jet_meander_tau_days), noise_amp=float(pp.jet_meander_noise_amp),
+        gradient_ref_k=float(pp.jet_gradient_ref_k),
+    )
+    jet_block_lon_nh_new, jet_block_days_left_nh_new, jet_block_total_nh_new = _update_jet_blocking(
+        state.jet_block_lon_nh, state.jet_block_days_left_nh, state.jet_block_total_days_nh,
+        jet_index_nh_new, days, new_total_days, hemisphere_seed=1,
+        trigger_rate_per_day=float(pp.jet_block_trigger_rate_per_day),
+        duration_range_days=pp.jet_block_duration_range_days,
+    )
+    jet_block_lon_sh_new, jet_block_days_left_sh_new, jet_block_total_sh_new = _update_jet_blocking(
+        state.jet_block_lon_sh, state.jet_block_days_left_sh, state.jet_block_total_days_sh,
+        jet_index_sh_new, days, new_total_days, hemisphere_seed=2,
+        trigger_rate_per_day=float(pp.jet_block_trigger_rate_per_day),
+        duration_range_days=pp.jet_block_duration_range_days,
+    )
+    _jet_block_nh = (jet_block_lon_nh_new, jet_block_days_left_nh_new, jet_block_total_nh_new)
+    _jet_block_sh = (jet_block_lon_sh_new, jet_block_days_left_sh_new, jet_block_total_sh_new)
+
+    # ------------------------------------------------------
     # NEW: Prognostic Wind Evolution (Physics Items 16-33)
     # ------------------------------------------------------
     # If wind is None, initialize it near-rest (small noise) so circulation spins up
@@ -1029,6 +1081,10 @@ def simulate_step(
             time_days=float(new_total_days),
             planet_params=pp,
             ice_cover=ice_c_w,
+            jet_index_nh=jet_index_nh_new,
+            jet_index_sh=jet_index_sh_new,
+            jet_block_nh=_jet_block_nh,
+            jet_block_sh=_jet_block_sh,
         )
 
         # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
@@ -1078,6 +1134,10 @@ def simulate_step(
             time_days=float(new_total_days),
             planet_params=pp,
             ice_cover=state.ice_cover,
+            jet_index_nh=jet_index_nh_new,
+            jet_index_sh=jet_index_sh_new,
+            jet_block_nh=_jet_block_nh,
+            jet_block_sh=_jet_block_sh,
         )
         if wind_relax > 0.0:
             T_for_wind = T_wind_full
@@ -1525,8 +1585,17 @@ def simulate_step(
         T_deep_ocean=T_deep_full,
         # Feature 6: sea ice thickness
         ice_thickness=ice_thick_full,
+        # Feature 7: jet stream dynamics
+        jet_index_nh=jet_index_nh_new,
+        jet_index_sh=jet_index_sh_new,
+        jet_block_lon_nh=jet_block_lon_nh_new,
+        jet_block_days_left_nh=jet_block_days_left_nh_new,
+        jet_block_total_days_nh=jet_block_total_nh_new,
+        jet_block_lon_sh=jet_block_lon_sh_new,
+        jet_block_days_left_sh=jet_block_days_left_sh_new,
+        jet_block_total_days_sh=jet_block_total_sh_new,
     )
-    
+
     # Return state and components (empty dict if not tracking)
     return new_state, temp_components if temp_components else {}
 

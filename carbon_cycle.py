@@ -190,6 +190,18 @@ def ocean_co2_flux(
     --------
     Gas exchange rate proportional to wind speed and (C_eq - C_actual).
     Piston velocity: k = 0.31 * u² (Wanninkhof 1992)
+
+    KNOWN SIMPLIFICATION: Wanninkhof's k∝u² is calibrated for time-averaged
+    (monthly-ish) wind speed, but the caller (carbon_cycle_step) passes the
+    instantaneous per-step wind_speed. Because of the quadratic term, added
+    high-frequency wind variance raises mean(k) via Jensen's inequality even
+    at unchanged mean wind -- e.g. the atmosphere.py jet-stream/storm-track
+    variability speeds up convergence toward this model's ocean-atmosphere
+    CO2 quasi-equilibrium (see testing/test_conservation.py's
+    test_co2_budget_near_steady_state, which had to widen its tolerance
+    because of this). A more correct fix would time-average wind_speed
+    (e.g. a 30-day rolling mean carried in PlanetState) before it reaches
+    this function; not yet implemented.
     """
     # Gas transfer velocity (piston velocity) [m/day]
     # k ∝ u² (quadratic wind speed dependence)

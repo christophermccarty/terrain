@@ -120,6 +120,8 @@ def _storm_pressure_anomaly(
     lat_drift_range: tuple[float, float] = STORM_LAT_DRIFT_DEG_PER_DAY,
     radius_km_range: tuple[float, float] = STORM_RADIUS_KM,
     population_id: int = 0,
+    lat_shift_nh_deg: float = 0.0,
+    lat_shift_sh_deg: float = 0.0,
 ) -> np.ndarray:
     """Deterministic, stateless pressure anomaly from a population of moving storm/wave systems.
 
@@ -135,6 +137,10 @@ def _storm_pressure_anomaly(
     same (hemisphere, slot, generation) key (e.g. mid-latitude storms vs.
     trade-wind waves called with the same slot count).
 
+    `lat_shift_{nh,sh}_deg` bias the genesis latitude per hemisphere (used to
+    make storm genesis track a meandering jet, atmosphere._update_jet_index);
+    both default to 0.0, matching the original behaviour.
+
     Returns a (H, W) float32 Pa anomaly to be added to the caller's `p_anom`.
     """
     H, W = lat_2d.shape
@@ -143,6 +149,7 @@ def _storm_pressure_anomaly(
         return out
     t = float(time_days)
     for hemi in (1.0, -1.0):
+        lat_shift = lat_shift_nh_deg if hemi > 0 else lat_shift_sh_deg
         for slot_i in range(n_slots):
             slot_offset = slot_i * lifecycle_days / n_slots
             gen_i = math.floor((t - slot_offset) / lifecycle_days)
@@ -154,7 +161,7 @@ def _storm_pressure_anomaly(
             key = population_id * 10_000_000 + int(hemi > 0) * 1_000_003 + slot_i * 97 + gen_i * 131
             rng = np.random.default_rng(abs(int(key)))
             birth_lon_deg = rng.uniform(-180.0, 180.0)
-            birth_lat_deg = hemi * (lat_center_deg + rng.uniform(-lat_jitter_deg, lat_jitter_deg))
+            birth_lat_deg = hemi * (lat_center_deg + lat_shift + rng.uniform(-lat_jitter_deg, lat_jitter_deg))
             dlon_dt = rng.uniform(*lon_drift_range)
             dlat_dt = hemi * rng.uniform(*lat_drift_range)
             radius_km = rng.uniform(*radius_km_range)
@@ -172,6 +179,147 @@ def _storm_pressure_anomaly(
             d2 = dx_km * dx_km + dy_km * dy_km
             out -= (envelope * peak_pa) * np.exp(-d2 / (radius_km * radius_km)).astype(np.float32, copy=False)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Jet stream dynamics: persistent meander index + blocking events
+#
+# Unlike ROSSBY_MODES and _storm_pressure_anomaly above (both pure, stateless
+# functions of time_days), a meandering/blocking jet genuinely needs memory:
+# a blocking ridge holds a fixed longitude for weeks regardless of what the
+# pressure field would otherwise do. These two "_update_*" functions are the
+# only pieces of real prognostic state in the jet-stream feature (persisted
+# in PlanetState); everything downstream (evolve_wind's use of the resulting
+# index/block values) stays a pure function of its inputs, and the noise/
+# trigger draws are seeded from time_days -- not a stored RNG -- so a given
+# (state, total_days) pair always produces the same next state.
+# ---------------------------------------------------------------------------
+
+def _update_jet_index(
+    index_prev: float,
+    gradient_k: float,
+    dt_days: float,
+    total_days: float,
+    hemisphere_seed: int,
+    tau_days: float = 10.0,
+    noise_amp: float = 0.35,
+    gradient_ref_k: float = 40.0,
+) -> float:
+    """AR1 update of the persistent jet meander/waviness index.
+
+    Mean-reverts toward a target derived from the actual simulated
+    pole-equator temperature gradient: gradients weaker than `gradient_ref_k`
+    push the target positive (wavier, more-easily-blocked jet); stronger
+    gradients push it negative (fast, zonal jet). This is a simplified
+    stand-in for the Arctic-amplification-weakens-the-jet hypothesis, tied to
+    physics the model already simulates (ice cover / polar cooling change the
+    gradient) rather than an independent decorative signal.
+
+    Stochastic forcing is a deterministic hashed draw seeded from
+    `total_days` (not a stored RNG), matching the reproducibility contract of
+    ROSSBY_MODES / _storm_pressure_anomaly: identical (total_days, inputs)
+    always yields identical output.
+    """
+    ref = max(float(gradient_ref_k), 1e-6)
+    target = float(np.clip((ref - float(gradient_k)) / ref, -1.0, 1.0))
+    tau = max(float(tau_days), 1e-6)
+    dt = float(dt_days)
+    a = 1.0 - math.exp(-dt / tau)
+
+    seed_key = int(round(float(total_days) * 1000.0)) * 100 + int(hemisphere_seed)
+    rng = np.random.default_rng(abs(seed_key))
+    noise = float(rng.normal(0.0, float(noise_amp) * math.sqrt(max(dt, 1e-6))))
+
+    index_new = float(index_prev) + a * (target - float(index_prev)) + noise
+    return float(np.clip(index_new, -2.0, 2.0))
+
+
+def _update_jet_blocking(
+    block_lon_prev: float,
+    days_left_prev: float,
+    total_duration_prev: float,
+    jet_index: float,
+    dt_days: float,
+    total_days: float,
+    hemisphere_seed: int,
+    trigger_rate_per_day: float = 0.015,
+    duration_range_days: tuple[float, float] = (10.0, 40.0),
+) -> tuple[float, float, float]:
+    """Two-state blocking-ridge machine.
+
+    Active: holds a fixed longitude for the remainder of a drawn duration
+    (a real block is quasi-stationary once established -- it doesn't drift
+    like a storm). Inactive: rolls a deterministic hashed trigger each step,
+    scaled up when the jet index is already elevated (wavier flow is more
+    prone to amplifying into a cutoff/blocking pattern).
+
+    Returns (block_lon_deg, days_left, total_duration) -- block_lon_deg is
+    -1.0 and the other two are 0.0 when inactive. `total_duration` is carried
+    alongside `days_left` (rather than only decrementing a countdown) purely
+    so the caller can compute a smooth ramp-up/ramp-down envelope without
+    needing to know how long ago the block started from `days_left` alone.
+    """
+    dt = float(dt_days)
+    if days_left_prev > 0.0:
+        days_left_new = days_left_prev - dt
+        if days_left_new > 0.0:
+            return float(block_lon_prev), float(days_left_new), float(total_duration_prev)
+        return -1.0, 0.0, 0.0
+
+    seed_key = int(round(float(total_days) * 1000.0)) * 100 + int(hemisphere_seed) + 50
+    rng = np.random.default_rng(abs(seed_key))
+    # Sigmoid centered at index=0.5: near-baseline flow rarely blocks, wavy flow often does.
+    waviness = 1.0 / (1.0 + math.exp(-3.0 * (float(jet_index) - 0.5)))
+    p_trigger = float(trigger_rate_per_day) * waviness * dt
+    if rng.random() < p_trigger:
+        lon = float(rng.uniform(-180.0, 180.0))
+        duration = float(rng.uniform(*duration_range_days))
+        return lon, duration, duration
+    return -1.0, 0.0, 0.0
+
+
+def _blocking_ridge_pressure_anomaly(
+    lat_2d: np.ndarray,
+    lon_1d: np.ndarray,
+    lat_center_deg: float,
+    lon_center_deg: float,
+    days_left: float,
+    total_duration_days: float,
+    amp_pa: float,
+    radius_km: float,
+    ramp_days: float = 2.0,
+) -> np.ndarray:
+    """Stationary high-pressure blob for an active blocking ridge.
+
+    Unlike _storm_pressure_anomaly (a moving low with a sin(pi*frac)
+    lifecycle envelope), a block is a persistent, quasi-stationary high:
+    fixed lat/lon for its whole lifetime, with a short ramp-up/ramp-down
+    (both ends, `ramp_days` each) instead of a full spin-up/decay lifecycle,
+    since a real block's onset/decay is slower/smoother than a storm's --
+    and a hard on/off step risked exactly the kind of discontinuous-forcing
+    runaway already noted (and avoided) elsewhere in this module's PGF
+    terms.
+    """
+    H, W = lat_2d.shape
+    if amp_pa == 0.0 or days_left <= 0.0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    elapsed = float(total_duration_days) - float(days_left)
+    ramp = max(float(ramp_days), 1e-6)
+    envelope = min(elapsed / ramp, float(days_left) / ramp, 1.0)
+    envelope = float(np.clip(envelope, 0.0, 1.0))
+    if envelope <= 1e-4:
+        return np.zeros((H, W), dtype=np.float32)
+
+    lat_c = math.radians(float(lat_center_deg))
+    lon_c = math.radians(((float(lon_center_deg) + 180.0) % 360.0) - 180.0)
+    dlat = lat_2d - lat_c
+    dlon = (lon_1d - lon_c + np.pi) % (2 * np.pi) - np.pi
+    dx_km = dlon * np.cos(lat_2d) * 6371.0
+    dy_km = dlat * 6371.0
+    d2 = dx_km * dx_km + dy_km * dy_km
+    r = float(radius_km)
+    return (envelope * float(amp_pa) * np.exp(-d2 / (r * r))).astype(np.float32, copy=False)
 
 
 def _coarse_shape(H: int, W: int, block_size: int) -> tuple[int, int]:
@@ -620,6 +768,10 @@ def evolve_wind(
     planet_params: PlanetParams | None = None,
     ice_cover: np.ndarray | None = None,
     ice_pressure_scale: float = 40.0,
+    jet_index_nh: float = 0.0,
+    jet_index_sh: float = 0.0,
+    jet_block_nh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
+    jet_block_sh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -633,6 +785,13 @@ def evolve_wind(
     - Pressure Gradient Force (thermal + dynamic)
     - Friction (surface drag)
     - Jet stream dynamics (thermal wind balance)
+
+    `jet_index_{nh,sh}` are the persistent per-hemisphere meander/waviness
+    indices (atmosphere._update_jet_index): they shift the mid-lat jet's
+    relaxation-target latitude/speed and the Rossby-wave amplitude below.
+    `jet_block_{nh,sh}` are `(lon_deg, days_left, total_duration_days)`
+    tuples describing an active blocking ridge (atmosphere._update_jet_blocking
+    / _blocking_ridge_pressure_anomaly); `lon_deg == -1.0` means inactive.
     """
     H, W = u.shape
     dt_total = dt_days * 86400.0  # seconds
@@ -697,7 +856,14 @@ def evolve_wind(
     if time_days is not None:
         lon_1d = np.linspace(-np.pi, np.pi, W, endpoint=False, dtype=np.float32)
         abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32, copy=False)  # (H,)
-        storm_w = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32, copy=False)  # (H,) mid-lat window
+        sign_lat_1d = np.sign(lat_2d[:, 0]).astype(np.float32, copy=False)  # (H,) +N, -S
+        # Split the mid-lat storm-track window by hemisphere so a wavier jet
+        # (jet_index > 0) can independently amplify Rossby-wave meander in one
+        # hemisphere without affecting the other.
+        storm_w_base = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32, copy=False)  # (H,)
+        wave_scale_nh = 1.0 + float(pp.jet_wave_amp_scale_per_index) * float(jet_index_nh)
+        wave_scale_sh = 1.0 + float(pp.jet_wave_amp_scale_per_index) * float(jet_index_sh)
+        storm_w = np.where(sign_lat_1d >= 0.0, storm_w_base * wave_scale_nh, storm_w_base * wave_scale_sh).astype(np.float32, copy=False)
         t = float(time_days)
         wave = np.zeros((H, W), dtype=np.float32)
         # Wavenumbers 3-7, periods 20-45 days: slow Rossby-like propagation.
@@ -713,11 +879,15 @@ def evolve_wind(
         # lifecycle. This is what turns the "faint ripple" the Rossby waves alone
         # produce into organic, moving, blob-shaped storm precipitation via the
         # existing convergence/ascent-driven precipitation machinery downstream —
-        # no changes needed on the precipitation side.
+        # no changes needed on the precipitation side. The genesis latitude is
+        # biased by the jet meander index so storms track along the (shifted)
+        # jet rather than a fixed climatological latitude.
         storm_amp = float(pp.storm_pressure_amp_pa)
         if storm_amp != 0.0:
             p_anom = p_anom + _storm_pressure_anomaly(
                 lat_2d, lon_1d[None, :], t, storm_amp, population_id=0,
+                lat_shift_nh_deg=float(pp.jet_lat_shift_per_index) * float(jet_index_nh),
+                lat_shift_sh_deg=float(pp.jet_lat_shift_per_index) * float(jet_index_sh),
             )
 
         # Trade-wind/subtropical waves (see the module-level comment above
@@ -737,6 +907,26 @@ def evolve_wind(
                 lat_drift_range=TRADE_WAVE_LAT_DRIFT_DEG_PER_DAY,
                 radius_km_range=TRADE_WAVE_RADIUS_KM,
                 population_id=1,
+            )
+
+        # Blocking ridges: a persistent, quasi-stationary high (weeks-long,
+        # not translating) that steers storms around it and locks in
+        # multi-week wet/dry anomalies -- the mechanism plain Rossby waves
+        # and the storm populations above (both memoryless) cannot produce.
+        block_amp = float(pp.jet_block_pressure_amp_pa)
+        block_radius = float(pp.jet_block_radius_km)
+        if block_amp != 0.0:
+            jet_lat_nh = MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_nh)
+            jet_lat_sh = -(MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_sh))
+            block_lon_nh, block_days_left_nh, block_total_nh = jet_block_nh
+            block_lon_sh, block_days_left_sh, block_total_sh = jet_block_sh
+            p_anom = p_anom + _blocking_ridge_pressure_anomaly(
+                lat_2d, lon_1d[None, :], jet_lat_nh, block_lon_nh,
+                block_days_left_nh, block_total_nh, block_amp, block_radius,
+            )
+            p_anom = p_anom + _blocking_ridge_pressure_anomaly(
+                lat_2d, lon_1d[None, :], jet_lat_sh, block_lon_sh,
+                block_days_left_sh, block_total_sh, block_amp, block_radius,
             )
 
     # NOTE: A constant land-sea pressure contrast was tried here but removed.
@@ -780,14 +970,34 @@ def evolve_wind(
         sign_lat = np.sign(lat_2d[:, 0]).astype(np.float32, copy=False)  # +N, -S
         # Broaden the windows + reduce amplitudes to avoid razor-thin zonal bands.
         w_trade = np.exp(-((abs_deg_1d - HADLEY_CELL_CENTER_DEG) / HADLEY_CELL_WIDTH_DEG) ** 2).astype(np.float32, copy=False)
-        w_mid = np.exp(-((abs_deg_1d - MID_LAT_JET_CENTER_DEG) / MID_LAT_JET_WIDTH_DEG) ** 2).astype(np.float32, copy=False)
+        # Mid-lat jet window is split per hemisphere so the persistent meander index
+        # (atmosphere._update_jet_index) can shift each hemisphere's jet core
+        # latitude/speed independently -- this is what makes the relaxation target
+        # itself meander over time instead of sitting at a fixed 48 degrees forever.
+        jet_center_nh = MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_nh)
+        jet_center_sh = MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_sh)
+        w_mid_nh = np.where(
+            sign_lat >= 0.0,
+            np.exp(-((abs_deg_1d - jet_center_nh) / MID_LAT_JET_WIDTH_DEG) ** 2),
+            0.0,
+        ).astype(np.float32, copy=False)
+        w_mid_sh = np.where(
+            sign_lat < 0.0,
+            np.exp(-((abs_deg_1d - jet_center_sh) / MID_LAT_JET_WIDTH_DEG) ** 2),
+            0.0,
+        ).astype(np.float32, copy=False)
+        w_mid = w_mid_nh + w_mid_sh
         w_polar = np.exp(-((abs_deg_1d - POLAR_CELL_CENTER_DEG) / POLAR_CELL_WIDTH_DEG) ** 2).astype(np.float32, copy=False)
+        speed_nh = 1.0 + float(pp.jet_speed_scale_per_index) * float(jet_index_nh)
+        speed_sh = 1.0 + float(pp.jet_speed_scale_per_index) * float(jet_index_sh)
+        u_mid = U_TARGET_MIDLAT * (speed_nh * w_mid_nh + speed_sh * w_mid_sh)
         # Optimized circulation targets for realistic Earth-like winds with sub-stepping
         # Trade winds (easterlies), stronger mid-lat westerlies, weaker polar easterlies.
-        u_target = (U_TARGET_TRADE * w_trade + U_TARGET_MIDLAT * w_mid + U_TARGET_POLAR * w_polar).astype(np.float32, copy=False)
+        u_target = (U_TARGET_TRADE * w_trade + u_mid + U_TARGET_POLAR * w_polar).astype(np.float32, copy=False)
         # v_target: Hadley (equatorward), Ferrel (poleward), Polar (equatorward), by hemisphere.
         # Strengthen Ferrel return flow while reducing polar leakage into the 30-60° band.
-        v_target = (V_TARGET_TRADE * w_trade + V_TARGET_MIDLAT * w_mid + V_TARGET_POLAR * w_polar).astype(np.float32, copy=False) * sign_lat
+        v_mid = V_TARGET_MIDLAT * (speed_nh * w_mid_nh + speed_sh * w_mid_sh)
+        v_target = (V_TARGET_TRADE * w_trade + v_mid + V_TARGET_POLAR * w_polar).astype(np.float32, copy=False) * sign_lat
         # Remove the equator sign ambiguity (sign(0)=0) so the equator stays calm.
         v_target = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target).astype(np.float32, copy=False)
         k_cell = 1.0 / (tau_cell * 86400.0)
