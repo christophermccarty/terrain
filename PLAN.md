@@ -1,6 +1,6 @@
 # PlanetSim — Development Plan
 
-> Last updated: 2026-07-01
+> Last updated: 2026-07-03
 > Branch: main
 
 Two related planning docs exist alongside this one, both now historical/archived —
@@ -30,7 +30,7 @@ This file (PLAN.md) is the live source of truth going forward.
 |--------|--------|
 | main.py | Mature GUI; TimeScaleMode-driven speed dropdown wired; runs at 512×1024 by default |
 | simulate.py | Core engine; TimeScaleMode dispatch, planet-generalized AMOC/ACC/Ekman transport, cloud↔precip coupling, cached elevation coarsening, cached slow carbon-cycle sub-processes (2026-07) |
-| atmosphere.py | Numba-accelerated wind + precipitation; cloud_fraction now feeds precipitation potential; `.astype(copy=False)`-audited hot paths |
+| atmosphere.py | Numba-accelerated wind + precipitation; cloud_fraction now feeds precipitation potential; discrete moving mid-latitude storm systems (2026-07); `.astype(copy=False)`-audited hot paths |
 | temperature.py | LUT-based baseline; obliquity-scaled seasonal cap |
 | ocean.py | 1D zonal transport; AMOC/ACC scaled by rotation rate + ocean fraction (not hardcoded); Ekman wiring live |
 | carbon_cycle.py | CO2/CH4 feedback, permafrost thaw, wetland CH4 — all wired; wildfire moved to caller (simulate.py) so it can be cache-gated with the other slow processes (2026-07) |
@@ -90,12 +90,11 @@ Ranked by leverage-to-risk, pulling together everything still open across all ph
    - Note: `test_mars_params_colder_than_earth` (testing/test_planet_params.py) was never actually
      the xfailed one — that name refers to a different, already-passing hard-asserted test; the
      originally documented xfail here (mis-attributed to that name) was actually `test_mars_below_230k`.
-4. ✅ **INVESTIGATED (2026-07-01)**, not fixed — ~~eddy-flux/AMOC test tension mediating mechanism~~.
-   Ice-albedo (the original suspect) ruled out. Systematically tested all `feedback_flags`; the
-   dynamic `calculate_ocean_heat_transport` function is the clear mediator (disabling it cuts the
-   anomalous delta by 78%). Not fixed — disabling that function outright isn't viable — see "Known
-   test tension" below for the narrowed-down next step (cache interval / gradient-response gain).
-   Still left `xfail`-free-but-failing per the standing user decision.
+4. ✅ **DONE (2026-07-03)** — ~~eddy-flux/AMOC test tension~~. Root cause turned out to be a
+   numerical instability, not a physics conflict: the eddy-heat-flux Laplacian term used explicit
+   Euler with no CFL-style stability bound, and `test_eddy_heat_flux.py`'s coeff=0.05 stress-test
+   pushed it well past the stability limit at dt=30. Fixed via sub-stepping (same pattern as the
+   precip/wind substeps elsewhere in this codebase). See "RESOLVED" section below for full detail.
 5. ✅ **DONE (2026-07-01)** — ~~`--profile` flag on `optimizer/runner.py`~~ + ~~formal headless
    benchmark script with a recorded baseline~~.
    - `optimizer/runner.py --mode single --profile [--profile-top N] [--profile-out FILE.prof]`
@@ -182,6 +181,132 @@ Ranked by leverage-to-risk, pulling together everything still open across all ph
    future cleanup, not fixed here (out of scope for this task). Both Open Questions turned out to
    already be resolved in existing code (see below) — just needed confirming/documenting, not new
    implementation.
+9. ✅ **DONE (2026-07-03)** — ~~DAILY-mode precipitation looks like a static climatological band,
+   not a weather-radar map~~. See "Discrete moving storm systems" below for full detail.
+
+---
+
+## Discrete moving storm systems (2026-07-03)
+
+**Problem**: the DAILY-mode Precipitation view showed a smooth, zonally-banded field (ITCZ band,
+storm-track bands, dry belts) with only a faint diagonal ripple from the existing `ROSSBY_MODES`
+mechanism — nothing like a real weather-radar map's organic, moving storm cells and fronts. User
+explicitly asked for a real-physics fix (not a cosmetic rendering overlay), and for
+faster-than-DAILY speeds to show averaged precipitation instead of an instantaneous snapshot.
+
+**Fix — storm physics** (`atmosphere.py`): added `_storm_pressure_anomaly()`, injected into
+`evolve_wind()`'s `p_anom` field right alongside the existing Rossby waves. Unlike Rossby waves
+(a standing sinusoid that never spawns/dies), this generates discrete, moving, finite-lifetime
+low-pressure storm cells — 4 concurrent "slots" per hemisphere (`N_STORM_SLOTS`), each cycling
+through ~9-day (`STORM_LIFECYCLE_DAYS`) birth→spin-up→mature→decay→death lifecycles, confined to
+the mid-latitude storm-track band (35-55°, matching the existing `storm_w`/`eddy_heat_flux_coeff`
+window). Each storm's genesis position/track/strength/radius is drawn from a fresh
+`np.random.default_rng` seeded purely from its `(hemisphere, slot, generation)` identity — the
+whole mechanism is a **pure, stateless function of `time_days`** (same reproducibility contract
+as `ROSSBY_MODES`: identical `time_days` always yields identical output, no new `PlanetState`
+fields, no stored RNG state, save/load unaffected). New `PlanetParams.storm_pressure_amp_pa`
+(default 110 Pa — 2-3x the Rossby-wave amplitude, well under the ~450-900 Pa thermal/terrain PGF
+range so storms read as embedded transients; 0.0 disables; `MARS` override 40.0). Precipitation
+needed **zero changes** — it was already fully reactive to wind convergence/ascent, so the moving
+low-pressure cells organically produce moving, blob-shaped storm precipitation through the
+existing mechanism.
+
+Scope: extratropical-only for v1 (real tropical cyclones need genesis physics — SST threshold,
+warm-core instability — this single-layer model has no hooks for; flagged as a future follow-up,
+not attempted).
+
+**Fix — view switch** (`main.py`): the Precipitation view (render + hover tooltip) now shows
+`sim_state.climate_precip_avg` (an existing 1-year rolling average, already updated every step
+regardless of time-scale mode) whenever the active mode is WEEKLY/MONTHLY/ANNUAL, falling back to
+instantaneous `sim_state.precipitation` early in a run before the average has accumulated.
+`MONTHLY`/`ANNUAL` never call `evolve_wind` at all (`update_wind=False`), so storms are already
+naturally absent there — this pairs cleanly with the view switch.
+
+**Verification**:
+- `testing/test_storm_systems.py` (8 new tests, all passing): determinism, zero-amplitude
+  no-op, mid-latitude-band confinement, `evolve_wind`-level integration, and — the key behavioral
+  check — mid-latitude precipitation day-to-day variance is measurably higher with storms enabled
+  than disabled over a 12-day run.
+- Manual motion check: tracked the single strongest storm cell's position across consecutive
+  simulated days — confirmed steady eastward translation (e.g. 160.3°→168.7° over 1 day, within
+  the configured 5-11°/day drift range) and poleward drift, i.e. genuine moving systems, not a
+  static or merely-flickering pattern.
+- Full suite: **229 passed, 20 xfailed, 2 xpassed** (up from 221/20/2 pre-change — the 8 new
+  tests; zero regressions in existing tests, confirming the transient/zero-mean-ish storm
+  perturbation doesn't bias any multi-year climatological calibration test).
+- Performance: `scripts/benchmark_headless.py` at 512×1024 (production resolution) — DAILY
+  137.73s/year (**+1.0%** vs. the 136.43s recorded baseline), WEEKLY 136.18s/year (**+2.5%** vs.
+  132.85s). Both remain over the pre-existing 90s/year target (a documented gap predating this
+  change — see Phase 5), but the storm mechanism itself adds only ~1-2.5%, matching the
+  low-overhead design (8 cheap Gaussian-blob evaluations per `evolve_wind` call vs. the dominant
+  8-substep advection/Coriolis/friction loop). Note: an initial benchmark run showed a misleading
+  ~20% regression because it ran concurrently with the full test suite (CPU contention) — a clean
+  re-run confirmed the true, negligible overhead.
+
+### Follow-up: cloud+precipitation composite rendering (2026-07-03)
+
+User showed a real weather-radar/satellite reference image and asked the Precipitation view to
+look like it: a gray/white cloud-texture base layer with precipitation intensity color on top,
+rather than raw precip color painted directly over terrain.
+
+- `terrain.py`: new `cloud_cover_to_rgb()` — satellite-style gray/white overlay from
+  `cloud_fraction`, with a **display-only** gamma boost (`fraction**0.4`) since this model's mean
+  cloud fraction (~0.15-0.25) is well below Earth's real ~0.6-0.7 average; without the boost the
+  cloud layer was too faint to read. Does not touch the physics field. `precipitation_to_rgb()`'s
+  color ramp changed from green→yellow→orange→red→magenta→purple to a blue-dominant
+  blue→cyan→indigo→purple→magenta→red radar palette (matches common precip-rate map apps; red
+  reserved for the most intense/convective end only).
+- `main.py`: both Map-mode and Globe-mode Precipitation views now composite cloud layer first,
+  precipitation color on top — applied consistently to the standalone Cloud Cover view too.
+  Also fixed: Globe-mode's Precipitation view previously didn't use live simulation data at all
+  (always regenerated a snapshot from `day_of_year` alone via `generate_precipitation`, ignoring
+  `sim_state`) — now matches Map-mode's behavior (live wind/precip, DAILY-vs-avg switching).
+  Hover tooltip now also reports cloud %.
+- Rendering-only change (no physics touched, no tests affected — confirmed no test file
+  references `precipitation_to_rgb`). Visual result is a real improvement (clouds now visibly
+  cover most of the map, rain bands stand out within them) but not as richly turbulent/swirly as
+  the satellite reference yet — that would need actual fine-grained cloud texture synthesis
+  (not just a brightness curve on the existing coarse cloud field), left as a future follow-up.
+
+### Follow-up: View tab consolidated into Simulation tab (2026-07-03)
+
+User asked to merge the sidebar's separate "View" tab (Globe/Map mode, View-type dropdown, wind
+arrow controls) into the "Simulation" tab. `main.py`: removed the `view_tab` notebook tab;
+`mode_row`/`view_row`/`add_wind_controls(...)` now parent to `sim_tab` instead, in their existing
+order (so they land at the top of the Simulation tab, above Start/Stop/Pause/Reset etc., since
+that's where they were defined in the code already). Sidebar now has two tabs (Simulation,
+Terrain) instead of three. Verified visually via a throwaway app launch + window screenshot
+(`PrintWindow`, since the user had their own live instance already open and a screen-coordinate
+capture risked grabbing that window instead — see note below).
+
+### Follow-up: precipitation pattern "repeats in a small loop" (2026-07-03)
+
+User fed back that at DAILY speed, most of the map still looks static/repetitive over time —
+correctly identified as a real gap, not a false impression. Root cause: the `ROSSBY_MODES`
+standing-wave mechanism (3 fixed sine waves, unchanging wavenumber/amplitude, only ever
+*translating*) visually dominates most latitudes, and it looks mechanically repetitive no matter
+how long you watch it, because nothing about its *shape* ever changes — only its phase slides.
+The new mid-latitude storms (above) do have genuine birth/growth/decay, but were confined to
+35-55°, leaving the tropics/subtropics/trade-wind belt (exactly the band the user's screenshot
+showed the ripple most clearly in) with no transient mechanism at all.
+
+**Fix**: generalized `_storm_pressure_anomaly()` to accept a full parameter set (genesis
+lat/jitter, lon/lat drift ranges, radius range, lifecycle, `population_id` for RNG-key
+disambiguation) instead of hardcoded mid-latitude-only constants, then added a **second
+population** — trade-wind/subtropical waves (`N_TRADE_WAVE_SLOTS=5` per hemisphere,
+`TRADE_WAVE_LIFECYCLE_DAYS=5.0`, genesis 12-32°, **westward**-translating (`-6` to `-13°/day`,
+matching the trade easterlies — opposite direction from the eastward mid-latitude storms, which
+match the westerly jet), weaker (new `PlanetParams.trade_wave_pressure_amp_pa`, default 65 Pa vs.
+storms' 110 Pa) and shorter-lived, modeling the real-world analogue of easterly waves. Covers the
+band the mid-latitude storms don't reach. `MARS` override 25.0 (scaled with its
+`storm_pressure_amp_pa=40.0`).
+
+Verification: 4 new tests in `testing/test_storm_systems.py` (12 total now) — zero-amplitude
+no-op, westward translation, `evolve_wind`-level integration, and band-confinement (checking the
+strongest wave's actual peak position rather than a raw magnitude threshold, since a wave born at
+the 32° edge with a ~9°-radius Gaussian tail naturally bleeds some amplitude toward the adjacent
+mid-latitude band — expected, not a bug). Full suite after this change: **fast 157 passed** (was
+153), **slow 76 passed, 11 xfailed, 1 xpassed** — zero regressions.
 
 ---
 
@@ -337,11 +462,41 @@ PLAN_PHYSICS.md and IMPLEMENTATION_PLAN.md for the (now-archived) plans that pro
 - **Ice → wind (pressure) feedback** — not modeled (see Phase 2 table); low priority
 - **Ice-age proof-of-concept scenario** (PLAN_PHYSICS.md Effort 2E) — stretch goal, never run; `experiments/` directory doesn't exist yet
 
-### Known test tension: NH gradient fix vs. eddy heat flux (2026-07)
+### RESOLVED (2026-07-03): NH gradient fix vs. eddy heat flux test tension
 
-`test_eddy_flux_reduces_gradient` (testing/test_eddy_heat_flux.py) fails by a small margin
-(delta ≈ −0.4 K vs. required `0 < delta < 20`) after the AMOC NH-gradient fix below. Root cause,
-confirmed empirically (not a guess):
+`test_eddy_flux_reduces_gradient` (testing/test_eddy_heat_flux.py) used to fail by a small
+margin (delta ≈ −0.4 K vs. required `0 < delta < 20`) after the AMOC NH-gradient fix below, and
+had been left failing/documented per a 2026-07-01 user decision after investigation narrowed the
+"mediating mechanism" down to `calculate_ocean_heat_transport` (see prior investigation notes,
+still below) without finding a fix. A follow-up session (2026-07-03) found the actual root cause
+and fixed it:
+
+- The eddy-heat-flux term (`simulate.py`, Feature 7) applies explicit-Euler Laplacian diffusion
+  directly to `T_sst`: `T_sst += eddy_k * Laplacian(T_sst) * eddy_lat * dt`. This scheme is only
+  numerically stable for `r = eddy_k * dt <~ 0.5` (the standard forward-difference diffusion CFL
+  bound) — beyond that a single big step overshoots and amplifies grid-scale noise instead of
+  smoothing the gradient, exactly the large-dt failure mode already fixed elsewhere in this
+  codebase via sub-stepping (`atmosphere.py`'s 8-substep wind integration,
+  `_generate_precipitation_substepped`).
+- At the *default* `eddy_heat_flux_coeff` (0.006), `r` stays under 0.5 even at MONTHLY-mode
+  dt=30 (r=0.18) — stable, which is why this went unnoticed. But
+  `test_eddy_heat_flux.py::test_eddy_flux_reduces_gradient` deliberately stress-tests with
+  `eddy_coeff=0.05` (8× default, to get a detectable 2-year signal), which pushes `r` to 1.5 at
+  the test's dt=30 substeps — well past the stability bound. The resulting grid-scale numerical
+  noise, not a genuine physics conflict with `calculate_ocean_heat_transport`, was the actual
+  cause of the small negative delta (the ocean-transport mediation found in the prior
+  investigation below was real, but it was *amplifying* numerical noise into a measurable signal,
+  not itself the root cause).
+- Fix: sub-step the eddy Laplacian internally whenever `eddy_k * dt` would exceed `r_limit=0.4`,
+  same pattern as the precipitation/wind substeps referenced above. No-op at the default
+  coefficient for DAILY/WEEKLY/MONTHLY modes (still `n_sub=1`); only kicks in for
+  large-coefficient stress tests or ANNUAL-mode dt=365 runs (previously silently unstable there
+  too, `r=2.19` at the default coefficient).
+- Verified: `test_eddy_heat_flux.py` (all 3 tests) now passes; full test suite (221 passed, 20
+  xfailed, 2 xpassed) shows no regressions elsewhere.
+
+<details>
+<summary>Prior investigation notes (2026-07-01, superseded by the fix above)</summary>
 
 - `_transport_base` (simulate.py, the generic ~34K poleward ocean-transport baseline feeding
   `T_base_ocean`) previously stayed flat at max magnitude all the way to the exact pole, unlike
@@ -353,33 +508,12 @@ confirmed empirically (not a guess):
 - Fix: taper `_transport_base`'s NH share too (own 5°-wide taper, 75-85°N, kept outside the
   eddy-heat-flux mechanism's 20-70° operating band to minimize interaction). Verified at 60×120/3yr
   spinup: `gradient_nh` 28.2K → 31.0K, `global_mean_t` and ice fractions unchanged, no NaN.
-- The eddy test still fails narrowly: taper width was swept (5°/10°/20°) and narrower is
-  monotonically better (−0.38K at 5° vs. −0.78K at 20°) but never crosses zero, and restricting the
-  test's std measurement to the eddy's own 20-70° band (a more "correct" metric) made it *worse*
-  (−1.76K), not better — so this isn't a proxy-metric artifact, it's a genuine nonlinear interaction
-  between two polar/sub-polar feedback mechanisms over a 2-year coupled run. The test's `0 < delta`
-  bound is tight enough that most legitimate polar-climate tuning will risk tripping it.
-- Left failing and documented per user decision (2026-07) rather than loosening the bound or
-  reverting the gradient fix.
-- **Mediating-mechanism investigation (2026-07-01):** tested every `feedback_flags` toggle with
-  eddy_coeff=0.0 vs 0.05, comparing the resulting delta to baseline (−0.40K):
-  - `ice_albedo=False` → −0.42K (the originally-suspected mechanism; ruled out, no effect)
-  - `amoc_acc=False` → −0.27K, `cloud_feedback=False` → −0.26K, `snow_albedo=False` → −0.33K,
-    `vegetation_albedo=False` → −0.50K, `water_vapor_feedback=False` → −0.39K (all minor/no effect)
-  - **`ocean_transport=False` → −0.09K** (78% reduction from baseline) — clearly the dominant
-    mediator. This flag disables `calculate_ocean_heat_transport`, the *explicit*, dynamic,
-    temperature-gradient-responsive ocean transport function (distinct from the `_transport_base`/
-    `amoc_bonus` terms baked into `T_base_ocean` that the gradient fix itself touches). It's cached
-    and recomputed only every 30 days, and responds to the local gradient it measures — plausible
-    that it "chases" a gradient perturbed by both the AMOC taper (equilibrium-level) and the daily
-    eddy-flux Laplacian (transient-level) in a way that adds variance instead of damping it.
-  - Not a full fix — disabling `ocean_transport` isn't viable (it's real, load-bearing physics) —
-    but this narrows "genuine nonlinear interaction between two mechanisms" down to a specific
-    function pair (`calculate_ocean_heat_transport` × the eddy-flux Laplacian) rather than a vague
-    "somewhere in the polar physics." Next step, if picked up: check whether widening
-    `calculate_ocean_heat_transport`'s 30-day cache interval, or damping its gradient-response gain
-    specifically within the eddy-flux's 20-70° band, resolves it without the earlier taper-width
-    side effects.
+- **Mediating-mechanism investigation:** tested every `feedback_flags` toggle with eddy_coeff=0.0
+  vs 0.05, comparing the resulting delta to baseline (−0.40K): `ocean_transport=False` → −0.09K
+  (78% reduction from baseline) — the clear mediator, though (per the fix above) it turned out to
+  be amplifying eddy-term numerical instability rather than being the root cause itself.
+
+</details>
 
 ---
 

@@ -2029,12 +2029,28 @@ def _evolve_temperature(
     if _eddy_k > 0.0 and _fb_t.get('eddy_heat_flux', True):
         _abs_lat_1d = np.abs(np.rad2deg(lat_1d))
         _eddy_lat = np.clip(1.0 - ((_abs_lat_1d - 45.0) / 25.0) ** 2, 0.0, 1.0).astype(np.float32, copy=False)
-        _T_lap_y = np.zeros_like(T_sst)
-        _T_lap_y[1:-1, :] = T_sst[:-2, :] - 2.0 * T_sst[1:-1, :] + T_sst[2:, :]
-        _T_lap_y[0, :]     = T_sst[1, :]  - T_sst[0, :]
-        _T_lap_y[-1, :]    = T_sst[-2, :] - T_sst[-1, :]
-        _T_lap_y = np.clip(_T_lap_y, -20.0, 20.0).astype(np.float32, copy=False)
-        T_sst = (T_sst + _eddy_k * _T_lap_y * _eddy_lat[:, None] * float(days)).astype(np.float32, copy=False)
+        # Explicit-Euler Laplacian diffusion is only stable for r = eddy_k * dt_sub
+        # below ~0.5 (standard forward-difference diffusion CFL bound); beyond that
+        # a single big step overshoots and amplifies grid-scale noise instead of
+        # smoothing the gradient -- the same large-dt failure mode fixed elsewhere
+        # via sub-stepping (atmosphere.py's 8-substep wind integration,
+        # _generate_precipitation_substepped). At the default coeff (0.006) this
+        # was already stable even at MONTHLY dt=30 (r=0.18), which is why it went
+        # unnoticed; test_eddy_heat_flux.py's coeff=0.05 stress-test (used to get
+        # a detectable 2-year signal) pushes r to 1.5 at dt=30 and was the actual
+        # cause of test_eddy_flux_reduces_gradient's small negative delta -- not a
+        # genuine physics conflict with ocean_transport, despite ocean_transport
+        # amplifying the resulting grid-scale noise into a measurable signal.
+        _eddy_r_limit = 0.4
+        _n_eddy_sub = max(1, int(np.ceil(_eddy_k * float(days) / _eddy_r_limit)))
+        _dt_eddy_sub = float(days) / _n_eddy_sub
+        for _ in range(_n_eddy_sub):
+            _T_lap_y = np.zeros_like(T_sst)
+            _T_lap_y[1:-1, :] = T_sst[:-2, :] - 2.0 * T_sst[1:-1, :] + T_sst[2:, :]
+            _T_lap_y[0, :]     = T_sst[1, :]  - T_sst[0, :]
+            _T_lap_y[-1, :]    = T_sst[-2, :] - T_sst[-1, :]
+            _T_lap_y = np.clip(_T_lap_y, -20.0, 20.0).astype(np.float32, copy=False)
+            T_sst = (T_sst + _eddy_k * _T_lap_y * _eddy_lat[:, None] * _dt_eddy_sub).astype(np.float32, copy=False)
 
     # --- Ocean Transport (temporally sub-sampled for performance) ---
     # Ocean circulation has a decorrelation time of ~30 days, so we recompute

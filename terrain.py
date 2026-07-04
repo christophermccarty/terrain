@@ -237,36 +237,53 @@ def colorize(elev: np.ndarray) -> np.ndarray:
     return result
 
 
+def cloud_cover_to_rgb(cloud_fraction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (rgb, alpha) satellite-style gray/white cloud overlay from cloud_fraction [0-1].
+
+    Applies a display-only gamma boost (fraction**0.4) so the cloud layer reads as a
+    dense, satellite-imagery-like texture even though this model's mean cloud
+    fraction (~0.15-0.25) is well below Earth's real ~0.6-0.7 average -- without this,
+    the cloud layer is too faint to see the storm/frontal structure it actually
+    contains. Does not modify the underlying physics field, purely a rendering curve.
+    """
+    C_raw = np.clip(cloud_fraction.astype(np.float32), 0.0, 1.0)
+    alpha = C_raw ** 0.4
+    gray = 0.35 + 0.65 * alpha
+    rgb = np.stack([gray, gray, gray], axis=-1)
+    return rgb, alpha
+
+
 def precipitation_to_rgb(precip_mm_day: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return (rgb, alpha) precipitation overlay from mm/day.
 
-    Uses weather radar color scheme:
-    - Light green: trace precipitation (~0-2 mm/day)
-    - Green: light rain (~2-8 mm/day)
-    - Yellow: moderate rain (~8-20 mm/day)
-    - Orange: heavy rain (~20-50 mm/day)
-    - Red: very heavy rain (~50-100 mm/day)
-    - Magenta: extreme precipitation (>100 mm/day)
+    Blue-dominant satellite/radar color scheme (matches common precipitation-rate
+    map apps): mostly shades of blue for the bulk of stratiform rain, with
+    purple/magenta/red reserved for the most intense (usually convective) cores.
+    - Light blue: trace/light precipitation (~0-3 mm/day)
+    - Blue: light-moderate rain (~3-15 mm/day)
+    - Deep blue/indigo: moderate-heavy rain (~15-35 mm/day)
+    - Purple: heavy rain (~35-60 mm/day)
+    - Magenta/pink: very heavy rain (~60-100 mm/day)
+    - Red: extreme/convective precipitation (>100 mm/day)
     """
     p = np.clip(precip_mm_day.astype(np.float32), 0.0, 150.0)
     norm = np.log1p(p) / np.log1p(150.0)
-    # Weather radar style stops (6 colors for finer gradation)
     stops = np.array([0.0, 0.15, 0.35, 0.55, 0.75, 0.90, 1.0], dtype=np.float32)
     colors = np.array([
-        [0.60, 0.85, 0.60],  # 0.0: Light green (trace)
-        [0.20, 0.75, 0.20],  # 0.15: Green (light rain ~2 mm/day)
-        [1.00, 1.00, 0.00],  # 0.35: Yellow (moderate ~8 mm/day)
-        [1.00, 0.65, 0.00],  # 0.55: Orange (heavy ~20 mm/day)
-        [1.00, 0.00, 0.00],  # 0.75: Red (very heavy ~50 mm/day)
-        [0.85, 0.00, 0.50],  # 0.90: Magenta (extreme ~100 mm/day)
-        [0.60, 0.00, 0.60],  # 1.0: Purple (max ~150 mm/day)
+        [0.75, 0.88, 0.98],  # 0.0:  Very light blue (trace)
+        [0.45, 0.70, 0.95],  # 0.15: Light blue (light rain ~3 mm/day)
+        [0.15, 0.45, 0.90],  # 0.35: Blue (light-moderate ~10 mm/day)
+        [0.20, 0.20, 0.80],  # 0.55: Deep blue/indigo (moderate-heavy ~25 mm/day)
+        [0.55, 0.10, 0.75],  # 0.75: Purple (heavy ~50 mm/day)
+        [0.85, 0.15, 0.55],  # 0.90: Magenta/pink (very heavy ~90 mm/day)
+        [0.90, 0.10, 0.15],  # 1.0:  Red (extreme/convective ~150 mm/day)
     ], dtype=np.float32)
     idx = np.clip(np.searchsorted(stops, norm, side="right") - 1, 0, len(stops) - 2)
     t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx] + 1e-9)
     c0 = colors[idx]
     c1 = colors[idx + 1]
     rgb = c0 + (c1 - c0) * t[..., None]
-    alpha = np.clip(norm ** 0.5 * 0.85, 0.0, 0.9)
+    alpha = np.clip(norm ** 0.6 * 0.88, 0.0, 0.92)
     return rgb, alpha
 
 

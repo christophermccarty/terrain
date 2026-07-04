@@ -32,28 +32,42 @@ Prairies-latitude precip collapsing to ~12 mm/yr vs Earth's 350-450 mm/yr).
 Fixed by matching both terms to the same dt basis, plus sub-stepping
 generate_precipitation in ~8-day chunks at dt>8 (simulate.py
 _generate_precipitation_substepped) so a month isn't rained out as a single
-snapshot event. mm/yr in this band is now ~85-165 (real Earth: 350-450) --
-much improved but still below Earth-realistic, because a separate,
-pre-existing bug (regional wind-speed roughly doubling over decades in this
-band, unrelated to soil/precip) remains the dominant residual constraint and
-was not fixed in this pass.
+snapshot event.
 
-KNOWN TRADE-OFF: fixing the soil-moisture floor globally also raised
-dry-belt desert precip back up from the ~40 mm/yr the drybelt/rain-shadow
-fix (above) had achieved to ~250-400 mm/yr, because deserts also stopped
-being soil-floor-limited and could sustain more evaporation-fed humidity.
-An attempted counter-fix (suppressing evaporation itself in subsidence/
-rain-shadow zones, mirroring the precipitation suppression) was tried and
-reverted: it didn't recover much of the lost dryness (evidently moisture
-*advection* from now-wetter neighboring regions dominates over local
-evaporation there) and it introduced a new regression in
-test_earth_benchmark.py::test_midlat_precip_quantity (SH mid-lat ocean
-precip pushed to 4.08 mm/day via the shared target_mean_mm_day global
-rescale). Net effect accepted as the better trade-off: deserts at
-~250-400 mm/yr are still a large improvement over the original 700-1200
-mm/yr bug, even though they're no longer as dry as the ~40 mm/yr
-intermediate result. The dry-belt bounds below were widened to [5, 700]
-to reflect this.
+A follow-up investigation retracted the "regional wind-speed roughly doubling
+over decades" claim that used to appear here: it was a measurement artifact
+from comparing two single-month snapshots 55 years apart, not a real trend
+(decade-mean wind speed in that band is flat across 6 decades). See
+test_circulation_strength.py for the correct zonal-mean wind metric.
+
+KNOWN TRADE-OFF: fixing the soil-moisture floor globally overshot into the
+opposite bug -- soil now saturated to its 1.0 *ceiling* almost everywhere on
+land except near the poles (measured 0.96-1.00 in every non-polar latitude
+band), losing essentially all spatial discrimination between wet and dry
+regions and re-inflating dry-belt desert precip to ~250-460 mm/yr (vs. the
+original 700-1200 mm/yr bug, still an improvement, but well short of true
+desert). An attempted counter-fix (suppressing evaporation itself in
+subsidence/rain-shadow zones, mirroring the precipitation suppression) was
+tried and reverted at the time: it didn't recover much of the lost dryness
+and it introduced a regression in test_earth_benchmark.py::
+test_midlat_precip_quantity (SH mid-lat ocean precip pushed to 4.08 mm/day
+via the shared target_mean_mm_day global rescale).
+
+FIXED (2026-07, later pass): the soil gain coefficient in
+`atmosphere.generate_precipitation` (0.0006 -> 0.00015) was found to sit on
+one side of a sharp bifurcation in the gain/drain balance (via land_evap's
+soil feedback) -- values above ~0.00025 leave soil pinned at its ceiling
+with no desert improvement, values at/below 0.00015 let it properly
+de-saturate and differentiate by region (drybelt land precip now ~210-460
+mm/yr depending on terrain/resolution, continental-interior soil moisture
+0.05-0.4 rather than uniformly ~1.0). This reproduces the same SH mid-lat
+ocean rescale regression as the reverted evap-suppression attempt above, via
+a different mechanism -- accepted this time as a worthwhile trade (see
+test_earth_benchmark.py::test_midlat_precip_quantity's updated 4.2 mm/day
+cap) given the substantial realism gain and because the underlying dynamics
+are apparently genuinely bistable, not a simple tuning target. The dry-belt
+bounds below stay at [5, 700] (comfortably covers the new, lower typical
+values too).
 """
 from __future__ import annotations
 
@@ -186,9 +200,11 @@ def test_nh_midlat_land_precip_not_collapsed(earth_long_spinup_state, mixed_elev
     """45-65°N land-only precip must exceed 30 mm/yr after 60yr spinup.
 
     Regression guard against the desiccation-spiral collapse (observed:
-    ~12-13 mm/yr). Not asserting Earth-realism (~350-450 mm/yr) here since a
-    separate, unfixed wind-speed bug still constrains this band below that
-    -- see module docstring.
+    ~12-13 mm/yr). Not asserting Earth-realism (~350-450 mm/yr) here -- the
+    2026-07 soil-ceiling-saturation fix (see module docstring) improved this
+    but a real gap to Earth-realistic continental-interior precip remains,
+    of unidentified origin (the "wind-speed doubling" theory once suspected
+    here was investigated and retracted as a measurement artifact).
     """
     p = _land_annual_precip_mm_yr(earth_long_spinup_state, mixed_elev, 65, 45)
     if p is None:
