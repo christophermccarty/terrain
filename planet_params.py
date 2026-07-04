@@ -276,6 +276,31 @@ class PlanetParams:
     Set 0.0 to disable."""
 
     # ------------------------------------------------------------------ #
+    # Discrete moving storm systems
+    # ------------------------------------------------------------------ #
+    storm_pressure_amp_pa: float = 110.0
+    """Peak pressure-anomaly amplitude of discrete moving mid-latitude storm
+    cyclones [Pa], a deterministic function of simulated time
+    (evolve_wind's storm-track parameterisation, atmosphere._storm_pressure_anomaly).
+    Individual storms vary ±30% around this value, spin up/mature/decay over
+    ~9 days, and translate eastward-and-poleward through the 35–55° storm-
+    track band in both hemispheres. Comparable to 2-3x the existing Rossby-
+    wave term (30–60 Pa) but well below the thermal (~450 Pa) and terrain
+    (~900 Pa) PGF terms, so storms read as embedded transients rather than a
+    dominant/discontinuous signal. Set 0.0 to disable."""
+
+    trade_wave_pressure_amp_pa: float = 65.0
+    """Peak pressure-anomaly amplitude of discrete moving trade-wind/subtropical
+    wave disturbances [Pa] (real-world analogue: easterly waves), a deterministic
+    function of simulated time (atmosphere._storm_pressure_anomaly, second
+    population). Individual waves vary ±30% around this value, spin up/mature/
+    decay over ~5 days, and translate westward through the 12–32° band in both
+    hemispheres, matching the trade easterlies. Weaker and shorter-lived than
+    storm_pressure_amp_pa's mid-latitude cyclones, matching real easterly waves'
+    smaller/faster character, and covers the latitude band those storms don't
+    reach. Set 0.0 to disable."""
+
+    # ------------------------------------------------------------------ #
     # Derived convenience properties
     # ------------------------------------------------------------------ #
 
@@ -417,4 +442,6 @@ MARS = PlanetParams(
     cloud_greenhouse_factor=0.0,  # No liquid water clouds
     ch4_baseline_ppb=0.0,
     ch4_initial_ppb=0.0,
+    storm_pressure_amp_pa=40.0,  # Much thinner atmosphere plausibly weakens baroclinic transients
+    trade_wave_pressure_amp_pa=25.0,  # Same reasoning, scaled with storm_pressure_amp_pa
 )

@@ -34,7 +34,7 @@ from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rg
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from ocean import generate_ocean_currents
 from masks import get_masks
-from terrain import precipitation_to_rgb
+from terrain import precipitation_to_rgb, cloud_cover_to_rgb
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps, save_state, load_state, TimeScaleMode
 from diagnostics import ClimateDiagnostics
 import graphs
@@ -201,9 +201,9 @@ def main() -> None:
     # --- Main layout scaffold ---
     # A persistent bottom status bar (packed first so it keeps its slice of
     # the window), a resizable horizontal split between a tabbed sidebar
-    # (Terrain / Simulation / View controls) and the map/globe area. The
-    # menu bar itself is assembled near the end of main(), once every
-    # command callback it references has been defined.
+    # (Terrain / Simulation, the latter also holding view-mode/type controls)
+    # and the map/globe area. The menu bar itself is assembled near the end
+    # of main(), once every command callback it references has been defined.
     status_bar = ttk.Frame(root, relief="sunken", padding=(4, 2))
     status_bar.pack(side="bottom", fill="x")
 
@@ -218,9 +218,7 @@ def main() -> None:
 
     terrain_tab = ttk.Frame(notebook, padding=6)
     sim_tab = ttk.Frame(notebook, padding=6)
-    view_tab = ttk.Frame(notebook, padding=6)
     notebook.add(sim_tab, text="Simulation")
-    notebook.add(view_tab, text="View")
     notebook.add(terrain_tab, text="Terrain")
     notebook.select(sim_tab)
 
@@ -229,12 +227,12 @@ def main() -> None:
     view_var = tk.StringVar(value="Terrain")
     latlon_var = tk.StringVar(value="")
 
-    mode_row = ttk.Frame(view_tab)
+    mode_row = ttk.Frame(sim_tab)
     mode_row.pack(fill="x", pady=2)
     ttk.Radiobutton(mode_row, text="Globe", variable=mode_var, value="globe").pack(side="left")
     ttk.Radiobutton(mode_row, text="Map", variable=mode_var, value="map").pack(side="left")
 
-    view_row = ttk.Frame(view_tab)
+    view_row = ttk.Frame(sim_tab)
     view_row.pack(fill="x", pady=2)
     ttk.Label(view_row, text="View:").pack(side="left")
     view_combo = ttk.Combobox(
@@ -950,7 +948,7 @@ def main() -> None:
         add(frm, "Scale", wind_scale_var)
         add(frm, "WindBS", wind_block_size_var, width=4)
         return frm
-    wind_controls = add_wind_controls(view_tab)
+    wind_controls = add_wind_controls(sim_tab)
 
     # Terrain parameter inputs (Terrain tab)
     seed_var = tk.IntVar(value=int(settings["seed"]))
@@ -1319,7 +1317,7 @@ def main() -> None:
                     _update_wind_particles()
                 return
             with log_time("Render globe"):
-                if view_name in ("Biomes", "Cloud Cover"):
+                if view_name in ("Biomes", "Cloud Cover", "Precipitation"):
                     # Compute equirectangular composite then project onto sphere
                     if use_sim_data and sim_state is not None and sim_state.elevation is not None:
                         tex = sim_state.elevation
@@ -1350,14 +1348,29 @@ def main() -> None:
                             comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * biome_rgb
                         else:
                             comb = base_rgb
-                    else:  # Cloud Cover
+                    elif view_name == "Cloud Cover":
                         if use_sim_data and sim_state is not None and sim_state.cloud_cover is not None:
-                            C = np.clip(sim_state.cloud_cover.astype(np.float32), 0.0, 1.0)
-                            gray = 0.25 + 0.75 * C
-                            overlay = np.stack([gray, gray, gray], axis=-1)
-                            comb = (1.0 - C[..., None]) * base_rgb + C[..., None] * overlay
+                            overlay, alpha = cloud_cover_to_rgb(sim_state.cloud_cover)
+                            comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                         else:
                             comb = base_rgb
+                    else:  # Precipitation -- cloud layer, then precip color on top (see map-mode
+                           # branch above for the same treatment/rationale)
+                        if use_sim_data and sim_state is not None and sim_state.cloud_cover is not None:
+                            cloud_overlay, cloud_alpha = cloud_cover_to_rgb(sim_state.cloud_cover)
+                            comb = (1.0 - cloud_alpha[..., None]) * base_rgb + cloud_alpha[..., None] * cloud_overlay
+                        else:
+                            comb = base_rgb
+                        _precip_mode = time_scale_options.get(time_scale_var.get(), TimeScaleMode.DAILY)
+                        _precip_use_avg = _precip_mode != TimeScaleMode.DAILY
+                        if use_sim_data and sim_state is not None and _precip_use_avg and sim_state.climate_precip_avg is not None:
+                            P = sim_state.climate_precip_avg.astype(np.float32)
+                        elif use_sim_data and sim_state is not None and sim_state.precipitation is not None:
+                            P = sim_state.precipitation.astype(np.float32)
+                        else:
+                            P, _, _ = generate_precipitation(*tex.shape, tex, day_of_year=int(day))
+                        p_overlay, p_alpha = precipitation_to_rgb(P)
+                        comb = (1.0 - p_alpha[..., None]) * comb + p_alpha[..., None] * p_overlay
                     # Match the horizontal flip that generate_sphere_image applies for loaded heightmaps
                     _, elev_key = get_elevation_cache()
                     if elev_key is not None and isinstance(elev_key, tuple) and len(elev_key) >= 1 and elev_key[0] == "loaded":
@@ -1433,7 +1446,14 @@ def main() -> None:
             elif view_var.get() == "Precipitation":
                 h, w = tex.shape
                 day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
-                if use_sim_data and sim_state.precipitation is not None:
+                _precip_mode = time_scale_options.get(time_scale_var.get(), TimeScaleMode.DAILY)
+                _precip_use_avg = _precip_mode != TimeScaleMode.DAILY
+                if use_sim_data and _precip_use_avg and sim_state.climate_precip_avg is not None:
+                    # Faster-than-DAILY speeds show the tracked climatological average
+                    # rather than a single instantaneous (and, with storms enabled,
+                    # noisy) snapshot.
+                    P = sim_state.climate_precip_avg.astype(np.float32)
+                elif use_sim_data and sim_state.precipitation is not None:
                     P = sim_state.precipitation.astype(np.float32)
                 else:
                     T = sim_state.temperature if (use_sim_data and sim_state is not None) else None
@@ -1453,8 +1473,17 @@ def main() -> None:
                         _PRECIP_VIEW_CACHE.update({"key": pkey, "P": P})
                     else:
                         P = _PRECIP_VIEW_CACHE["P"]
+                # Cloud layer first (satellite-style gray/white texture), then precipitation
+                # color on top where it's actually raining -- matches a real weather-radar
+                # composite (clouds show the broader storm structure; precip color highlights
+                # only the actively-precipitating cores within/around it).
+                if use_sim_data and sim_state.cloud_cover is not None:
+                    cloud_overlay, cloud_alpha = cloud_cover_to_rgb(sim_state.cloud_cover)
+                    comb = (1.0 - cloud_alpha[..., None]) * base_rgb + cloud_alpha[..., None] * cloud_overlay
+                else:
+                    comb = base_rgb
                 overlay, alpha = precipitation_to_rgb(P)
-                comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
+                comb = (1.0 - alpha[..., None]) * comb + alpha[..., None] * overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Biomes":
                 # Biome visualization - prefer Köppen classification for detailed climate zones
@@ -1501,12 +1530,7 @@ def main() -> None:
                     arr = (base_rgb * 255).astype(np.uint8)
             elif view_var.get() == "Cloud Cover":
                 if use_sim_data and sim_state.cloud_cover is not None:
-                    C = sim_state.cloud_cover
-                    # Grayscale cloud opacity: dark gray (thin) → white (dense)
-                    C = np.clip(C.astype(np.float32), 0.0, 1.0)
-                    gray = 0.25 + 0.75 * C
-                    overlay = np.stack([gray, gray, gray], axis=-1)
-                    alpha = C
+                    overlay, alpha = cloud_cover_to_rgb(sim_state.cloud_cover)
                     comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
                     arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
                 else:
@@ -1770,17 +1794,26 @@ def main() -> None:
                         tt_lines.append(f"Ice:     {ice * 100:.0f}%")
 
             elif view == "Precipitation":
-                if use_sim_data and sim_state.precipitation is not None:
+                _tt_precip_mode = time_scale_options.get(time_scale_var.get(), TimeScaleMode.DAILY)
+                _tt_precip_use_avg = _tt_precip_mode != TimeScaleMode.DAILY
+                if use_sim_data and _tt_precip_use_avg and sim_state.climate_precip_avg is not None:
+                    precip = float(sim_state.climate_precip_avg[int(y), int(x)])
+                elif use_sim_data and sim_state.precipitation is not None:
                     precip = float(sim_state.precipitation[int(y), int(x)])
                 else:
                     precip = 0.0
+                    _tt_precip_use_avg = False
                 if use_sim_data and sim_state.temperature is not None:
                     _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
                     T_celsius = float(_T_disp[int(y), int(x)]) - 273.15
                 else:
                     T_celsius = temperature_kelvin_for_lat(np.deg2rad(lat)) - 273.15
                 latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, elev {alt_m:5.0f}m, T {T_celsius:.1f}°C")
-                tt_lines = [hdr, f"Precip:  {precip:.3f} mm/day", f"Air T:   {T_celsius:.1f}°C"]
+                _precip_label = "Precip (avg):" if _tt_precip_use_avg else "Precip:"
+                tt_lines = [hdr, f"{_precip_label} {precip:.3f} mm/day", f"Air T:   {T_celsius:.1f}°C"]
+                if use_sim_data and sim_state.cloud_cover is not None:
+                    cloud = float(sim_state.cloud_cover[int(y), int(x)])
+                    tt_lines.append(f"Cloud:   {cloud * 100:.0f}%")
 
             elif view == "Biomes":
                 biome_name = "Ocean" if is_ocean else "Land"

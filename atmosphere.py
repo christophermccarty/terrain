@@ -10,6 +10,7 @@ vector field and a pre-rendered arrow RGB overlay for display.
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 import numpy as np
 from temperature import temperature_kelvin_for_lat
@@ -72,6 +73,105 @@ ROSSBY_MODES: list[tuple[float, float, float, float]] = [
 ITCZ_HALF_WIDTH_DEG:   float = 10.0   # ITCZ Gaussian half-width (σ) — narrowed 14→10° to reduce ITCZ over-precipitation
 STORM_TRACK_CENTER_DEG: float = 48.0  # Mid-latitude storm track centre
 DRYBELT_CENTER_DEG:     float = 28.0  # Subtropical dry belt centre
+
+# Discrete moving storm/wave systems. Unlike ROSSBY_MODES (a standing sinusoid
+# that only ever translates -- same wavenumber and amplitude forever, which is
+# what makes it look mechanically repetitive no matter how long you watch it),
+# these are individual pressure cells with a birth/track/death lifecycle,
+# deterministically generated from `time_days` alone (see _storm_pressure_anomaly).
+#
+# Two populations, matching this model's own wind climatology:
+# - Mid-latitude storms (35-55 deg): eastward-translating cyclones, matching the
+#   westerly jet (U_TARGET_MIDLAT is positive/eastward).
+# - Trade-wind/subtropical waves (12-32 deg): westward-translating disturbances
+#   (real-world analogue: easterly waves), matching the trade easterlies
+#   (U_TARGET_TRADE is negative/westward) -- this band is where the "faint
+#   ripple" from Rossby waves alone is most visually dominant/static, since it
+#   previously had no birth/death transient mechanism at all (v1 storm scope
+#   was mid-latitude-only). Weaker amplitude and shorter lifecycle than the
+#   mid-latitude storms, matching real easterly waves' smaller/faster character.
+N_STORM_SLOTS: int = 4                # concurrent storm slots per hemisphere
+STORM_LIFECYCLE_DAYS: float = 9.0     # spin-up + mature + decay, per storm
+STORM_LAT_CENTER_DEG: float = 45.0    # genesis latitude (matches Rossby storm_w window)
+STORM_LAT_JITTER_DEG: float = 10.0
+STORM_LON_DRIFT_DEG_PER_DAY: tuple[float, float] = (5.0, 11.0)   # eastward translation range
+STORM_LAT_DRIFT_DEG_PER_DAY: tuple[float, float] = (0.15, 0.55)  # poleward drift range
+STORM_RADIUS_KM: tuple[float, float] = (900.0, 1600.0)
+
+N_TRADE_WAVE_SLOTS: int = 5                 # concurrent wave slots per hemisphere
+TRADE_WAVE_LIFECYCLE_DAYS: float = 5.0      # faster life cycle than mid-lat storms
+TRADE_WAVE_LAT_CENTER_DEG: float = 22.0     # genesis latitude (trade-wind/subtropical belt)
+TRADE_WAVE_LAT_JITTER_DEG: float = 10.0
+TRADE_WAVE_LON_DRIFT_DEG_PER_DAY: tuple[float, float] = (-13.0, -6.0)  # westward (easterly flow)
+TRADE_WAVE_LAT_DRIFT_DEG_PER_DAY: tuple[float, float] = (-0.20, 0.20)  # weak/mixed drift
+TRADE_WAVE_RADIUS_KM: tuple[float, float] = (500.0, 1000.0)
+
+
+def _storm_pressure_anomaly(
+    lat_2d: np.ndarray,
+    lon_1d: np.ndarray,
+    time_days: float,
+    amp_pa: float,
+    n_slots: int = N_STORM_SLOTS,
+    lifecycle_days: float = STORM_LIFECYCLE_DAYS,
+    lat_center_deg: float = STORM_LAT_CENTER_DEG,
+    lat_jitter_deg: float = STORM_LAT_JITTER_DEG,
+    lon_drift_range: tuple[float, float] = STORM_LON_DRIFT_DEG_PER_DAY,
+    lat_drift_range: tuple[float, float] = STORM_LAT_DRIFT_DEG_PER_DAY,
+    radius_km_range: tuple[float, float] = STORM_RADIUS_KM,
+    population_id: int = 0,
+) -> np.ndarray:
+    """Deterministic, stateless pressure anomaly from a population of moving storm/wave systems.
+
+    A pure function of `time_days`: identical `time_days` always yields
+    identical output (no global RNG state touched, no persistent storm
+    identity stored anywhere), matching the same reproducibility contract as
+    ROSSBY_MODES. Each of `n_slots` slots per hemisphere cycles through births
+    spaced `lifecycle_days` apart; each instance's genesis position/track/
+    strength is drawn from a fresh RNG seeded purely from its (population,
+    hemisphere, slot, generation) identity, so a given storm/wave's entire
+    life history is fully determined by when it was born. `population_id`
+    only needs to differ between calls that could otherwise collide on the
+    same (hemisphere, slot, generation) key (e.g. mid-latitude storms vs.
+    trade-wind waves called with the same slot count).
+
+    Returns a (H, W) float32 Pa anomaly to be added to the caller's `p_anom`.
+    """
+    H, W = lat_2d.shape
+    out = np.zeros((H, W), dtype=np.float32)
+    if amp_pa == 0.0:
+        return out
+    t = float(time_days)
+    for hemi in (1.0, -1.0):
+        for slot_i in range(n_slots):
+            slot_offset = slot_i * lifecycle_days / n_slots
+            gen_i = math.floor((t - slot_offset) / lifecycle_days)
+            t_local = (t - slot_offset) - gen_i * lifecycle_days
+            frac = t_local / lifecycle_days
+            envelope = math.sin(math.pi * frac) ** 0.7 if 0.0 < frac < 1.0 else 0.0
+            if envelope <= 1e-4:
+                continue
+            key = population_id * 10_000_000 + int(hemi > 0) * 1_000_003 + slot_i * 97 + gen_i * 131
+            rng = np.random.default_rng(abs(int(key)))
+            birth_lon_deg = rng.uniform(-180.0, 180.0)
+            birth_lat_deg = hemi * (lat_center_deg + rng.uniform(-lat_jitter_deg, lat_jitter_deg))
+            dlon_dt = rng.uniform(*lon_drift_range)
+            dlat_dt = hemi * rng.uniform(*lat_drift_range)
+            radius_km = rng.uniform(*radius_km_range)
+            peak_pa = amp_pa * rng.uniform(0.7, 1.3)
+
+            lon_now_deg = birth_lon_deg + dlon_dt * t_local
+            lat_now_deg = birth_lat_deg + dlat_dt * t_local
+            lon_now = math.radians(((lon_now_deg + 180.0) % 360.0) - 180.0)
+            lat_now = math.radians(float(np.clip(lat_now_deg, -85.0, 85.0)))
+
+            dlat = lat_2d - lat_now
+            dlon = (lon_1d - lon_now + np.pi) % (2 * np.pi) - np.pi
+            dx_km = dlon * np.cos(lat_2d) * 6371.0
+            dy_km = dlat * 6371.0
+            d2 = dx_km * dx_km + dy_km * dy_km
+            out -= (envelope * peak_pa) * np.exp(-d2 / (radius_km * radius_km)).astype(np.float32, copy=False)
+    return out
 
 
 def _coarse_shape(H: int, W: int, block_size: int) -> tuple[int, int]:
@@ -606,6 +706,38 @@ def evolve_wind(
         for k, per, ph, amp_hpa in ROSSBY_MODES:
             wave += (amp_hpa * 100.0) * np.cos(k * lon_1d[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32, copy=False)
         p_anom = p_anom + storm_w[:, None] * wave
+
+        # Discrete moving extratropical storm systems (see _storm_pressure_anomaly):
+        # unlike the Rossby waves above (a standing sinusoid, never spawns/dies),
+        # these are individual low-pressure cells with a birth/track/death
+        # lifecycle. This is what turns the "faint ripple" the Rossby waves alone
+        # produce into organic, moving, blob-shaped storm precipitation via the
+        # existing convergence/ascent-driven precipitation machinery downstream —
+        # no changes needed on the precipitation side.
+        storm_amp = float(pp.storm_pressure_amp_pa)
+        if storm_amp != 0.0:
+            p_anom = p_anom + _storm_pressure_anomaly(
+                lat_2d, lon_1d[None, :], t, storm_amp, population_id=0,
+            )
+
+        # Trade-wind/subtropical waves (see the module-level comment above
+        # N_TRADE_WAVE_SLOTS): westward-translating, shorter-lived, weaker
+        # disturbances covering the 12-32 deg band the mid-latitude storms
+        # above don't reach -- this is the band where the Rossby-wave ripple
+        # alone looked the most static/repetitive (2026-07 user feedback).
+        trade_wave_amp = float(pp.trade_wave_pressure_amp_pa)
+        if trade_wave_amp != 0.0:
+            p_anom = p_anom + _storm_pressure_anomaly(
+                lat_2d, lon_1d[None, :], t, trade_wave_amp,
+                n_slots=N_TRADE_WAVE_SLOTS,
+                lifecycle_days=TRADE_WAVE_LIFECYCLE_DAYS,
+                lat_center_deg=TRADE_WAVE_LAT_CENTER_DEG,
+                lat_jitter_deg=TRADE_WAVE_LAT_JITTER_DEG,
+                lon_drift_range=TRADE_WAVE_LON_DRIFT_DEG_PER_DAY,
+                lat_drift_range=TRADE_WAVE_LAT_DRIFT_DEG_PER_DAY,
+                radius_km_range=TRADE_WAVE_RADIUS_KM,
+                population_id=1,
+            )
 
     # NOTE: A constant land-sea pressure contrast was tried here but removed.
     # Antarctica (~all land) got a permanent +150 Pa high, driving persistent cold-air
@@ -1549,7 +1681,29 @@ def generate_precipitation(
     # (0.35+0.65*soil factor) in a self-reinforcing desiccation spiral that
     # collapsed precip to ~12 mm/yr (Earth: 350-450 mm/yr for e.g. the Canadian
     # Prairies).
-    soil += (P * land_f) * 0.0006 * dt - (land_evap * dt_evap) * 0.4
+    #
+    # FOLLOW-UP FIX (2026-07): soil was saturating to its 1.0 ceiling almost
+    # everywhere on land except near the poles (measured 0.96-1.00 in every
+    # non-polar latitude band, real downsampled Earth terrain and synthetic
+    # terrain alike) -- the desiccation-spiral fix above swapped a floor-collapse
+    # bug for an equally-uninformative ceiling-saturation one, and the soil
+    # bucket had lost essentially all spatial discriminating power between wet
+    # and dry regions. The gain/drain balance here is a genuinely bistable
+    # system (via land_evap's 0.35+0.65*soil feedback): sweeping the gain
+    # coefficient from 0.0006 down to 0.00015 found a sharp bifurcation between
+    # 0.00025 (soil stays pinned ~0.96-0.99, no desert improvement) and 0.00015
+    # (soil properly de-saturates and differentiates, drybelt land precip drops
+    # ~40%, e.g. 350->214 mm/yr on the synthetic 60yr fixture), with no stable
+    # middle ground. The de-saturated regime pushes SH mid-lat *ocean* precip to
+    # ~4.0-4.07 mm/day via the shared target_mean_mm_day rescale -- reproducing
+    # the same regression a prior evap_suppression attempt hit (see
+    # test_climate_drift.py's module docstring), just via a different mechanism.
+    # Accepted this time (2026-07 decision) as a worthwhile trade: the desert/
+    # continental-interior realism gain is substantial and the SH mid-lat ocean
+    # band's cap was widened accordingly (test_earth_benchmark.py,
+    # test_midlat_precip_quantity) rather than leaving the ceiling-saturation
+    # bug in place.
+    soil += (P * land_f) * 0.00015 * dt - (land_evap * dt_evap) * 0.4
     soil = np.where(land_mask, np.clip(soil, 0.05, 1.0), 0.0)
 
     return (
