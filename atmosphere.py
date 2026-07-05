@@ -1663,6 +1663,100 @@ def render_wind_arrows(height: int, width: int, u: np.ndarray, v: np.ndarray, *,
     return img
 
 
+def _smooth_circular(arr: np.ndarray, window: int) -> np.ndarray:
+    """Circular (wraparound) moving average -- longitude is periodic, so a plain
+    moving average would falsely dim/shift the line near the +/-180 deg seam."""
+    w = int(window)
+    if w <= 1:
+        return arr
+    pad = w // 2
+    padded = np.concatenate([arr[-pad:], arr, arr[:pad]])
+    kernel = np.ones(2 * pad + 1, dtype=np.float32) / (2 * pad + 1)
+    return np.convolve(padded, kernel, mode="valid").astype(np.float32)
+
+
+def render_jet_stream_overlay(
+    height: int,
+    width: int,
+    u_aloft: np.ndarray,
+    v_aloft: np.ndarray,
+    *,
+    lat_band_deg: tuple[float, float] = (20.0, 60.0),
+    speed_low: float = 8.0,
+    speed_high: float = 30.0,
+    alpha_range: tuple[float, float] = (0.35, 0.95),
+    smooth_columns: int = 21,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Trace the jet-stream core (peak upper-level wind band per column) as a colored ribbon.
+
+    `lat_band_deg` is deliberately narrower than "all mid+high latitudes": this model's
+    upper-level wind (evolve_wind_aloft) develops a second, even faster wind maximum near
+    the poles (a polar-vortex-like feature, not the tropospheric jet), separated from the
+    actual mid-latitude jet by a real minimum around 55-65 deg. A wider band would have the
+    traced line snap to that poleward feature instead of the jet whenever it's locally
+    stronger. The default (20, 60) brackets the jet's climatological core (MID_LAT_JET_CENTER_DEG
+    = 48 deg) plus its full meander range (+/- jet_lat_shift_per_index * 2) while staying clear
+    of that valley.
+
+    For each hemisphere and column, the traced latitude is a speed-weighted (speed**3, to
+    favor the true core over the band's tails) centroid row rather than a hard argmax -- a
+    single noisy column's argmax can jump between comparable local peaks, which drew a
+    jagged, right-angled line before this was added. `smooth_columns` (must stay odd-ish;
+    halved and re-doubled internally) applies a circular longitude moving average on top,
+    since the physical meander wavelength (Rossby wavenumbers 3-7, see ROSSBY_MODES) spans
+    tens of degrees -- far wider than single-column sensor noise -- so smoothing at this
+    scale cleans up noise without erasing the actual meander/blocking shape.
+    Color/opacity fade continuously from pale yellow (near `speed_low`) to red
+    (>= `speed_high`) rather than a hard on/off cutoff, so locally weak stretches of the jet
+    stay faintly visible instead of leaving a misleading gap.
+
+    Returns (overlay_rgb (H,W,3) float, alpha (H,W) float) for standard
+    "(1-alpha)*base + alpha*overlay" compositing.
+    """
+    H, W = int(height), int(width)
+    overlay = np.zeros((H, W, 3), dtype=np.float32)
+    alpha = np.zeros((H, W), dtype=np.float32)
+    speed = np.hypot(u_aloft, v_aloft).astype(np.float32)
+    lat_deg = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
+
+    color_slow = np.array([0.95, 0.85, 0.25], dtype=np.float32)  # pale yellow
+    color_fast = np.array([0.95, 0.10, 0.05], dtype=np.float32)  # red
+    lo_speed, hi_speed = float(speed_low), float(speed_high)
+    a_lo, a_hi = alpha_range
+    lat_lo, lat_hi = lat_band_deg
+
+    def _trace(row_mask: np.ndarray) -> None:
+        rows = np.where(row_mask)[0]
+        if rows.size == 0:
+            return
+        band = speed[rows, :]                       # (Rb, W)
+        peak_speed = _smooth_circular(band.max(axis=0), smooth_columns)
+        weight = band.astype(np.float64) ** 3
+        centroid_row = (rows[:, None] * weight).sum(axis=0) / np.maximum(weight.sum(axis=0), 1e-9)
+        centroid_row = _smooth_circular(centroid_row.astype(np.float32), smooth_columns)
+        prev_x = prev_y = None
+        for x in range(W):
+            y = int(round(float(centroid_row[x])))
+            y = max(0, min(H - 1, y))
+            t = float(np.clip((float(peak_speed[x]) - lo_speed) / max(hi_speed - lo_speed, 1e-6), 0.0, 1.0))
+            col = color_slow + (color_fast - color_slow) * t
+            a = a_lo + (a_hi - a_lo) * t
+            if prev_x is not None:
+                _draw_line(overlay, prev_x, prev_y, x, y, col)
+            overlay[y, x, :] = np.maximum(overlay[y, x, :], col)
+            alpha[y, x] = max(alpha[y, x], a)
+            prev_x, prev_y = x, y
+
+    _trace((lat_deg >= lat_lo) & (lat_deg <= lat_hi))
+    _trace((lat_deg <= -lat_lo) & (lat_deg >= -lat_hi))
+
+    # Connecting-line pixels between per-column peaks got a color from _draw_line's
+    # max-blend but not necessarily an alpha entry; backfill those to the floor alpha.
+    touched = overlay.any(axis=-1) & (alpha <= 0.0)
+    alpha[touched] = a_lo
+    return overlay, alpha
+
+
 def wind_speed_to_rgb(
     speed: np.ndarray,
     *,
