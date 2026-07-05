@@ -7,6 +7,7 @@
   "wind_arrows": 250,
   "wind_scale": 0.75,
   "wind_block_size": 8,
+  "show_jet_stream": true,
   "auto_save_state": false,
   "last_state_path": "D:\\dev\\planetsim\\saves\\earth.pkl"
 }
