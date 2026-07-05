@@ -6,11 +6,14 @@ with configurable time scales. Default unit is one day.
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 from typing import NamedTuple
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
+
+LOG = logging.getLogger("planetsim")
 
 
 class TimeScaleMode(Enum):
@@ -30,7 +33,8 @@ class TimeScaleMode(Enum):
 import pickle
 from atmosphere import (
     generate_wind_field, generate_precipitation,
-    evolve_wind, _upsample_bilinear_many,
+    evolve_wind, evolve_wind_aloft, _upsample_bilinear_many,
+    _update_jet_index, _update_jet_blocking,
 )
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
 from ocean import calculate_ocean_heat_transport, update_sea_ice, compute_ekman_transport
@@ -119,13 +123,15 @@ _PRECIP_SUBSTEP_DAYS = 8.0
 
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
                                         humidity, soil_moisture, cloud_fraction,
-                                        day_of_year, dt_days):
+                                        day_of_year, dt_days,
+                                        surface_pressure_hpa=1013.25):
     dt_days = float(dt_days)
     if dt_days <= _PRECIP_SUBSTEP_DAYS:
         return generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=humidity, soil_moisture=soil_moisture,
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
+            surface_pressure_hpa=surface_pressure_hpa,
         )
     n_sub = max(1, int(round(dt_days / _PRECIP_SUBSTEP_DAYS)))
     sub_dt = dt_days / n_sub
@@ -136,6 +142,7 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=hum, soil_moisture=soil, cloud_fraction=cloud_fraction,
             day_of_year=day_of_year, dt_days=sub_dt,
+            surface_pressure_hpa=surface_pressure_hpa,
         )
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
     return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil
@@ -358,6 +365,18 @@ class PlanetState(NamedTuple):
     T_deep_ocean: np.ndarray | None = None  # (H, W) abyssal ocean temperature [K]
     # Feature 6: sea ice thickness
     ice_thickness: np.ndarray | None = None  # (H, W) sea ice thickness [m]; 0 on land/open ocean
+    # Feature 7: jet stream dynamics (persistent meander index + blocking events)
+    jet_index_nh: float = 0.0   # NH persistent meander/waviness index, roughly [-2, 2]
+    jet_index_sh: float = 0.0   # SH persistent meander/waviness index
+    jet_block_lon_nh: float = -1.0        # active NH blocking ridge longitude [deg]; -1 = inactive
+    jet_block_days_left_nh: float = 0.0   # days remaining in the active NH block
+    jet_block_total_days_nh: float = 0.0  # total drawn duration of the active NH block (for ramp envelope)
+    jet_block_lon_sh: float = -1.0
+    jet_block_days_left_sh: float = 0.0
+    jet_block_total_days_sh: float = 0.0
+    # Feature 8: 1.5-layer atmosphere (real prognostic upper-level wind)
+    wind_u_aloft: np.ndarray | None = None  # (H, W) upper-level eastward wind (m/s)
+    wind_v_aloft: np.ndarray | None = None  # (H, W) upper-level northward wind (m/s)
 
 
 def simulate_step(
@@ -380,17 +399,27 @@ def simulate_step(
     wind_drag_elev_scale: float = 6.0e-7,
     wind_damping: float = 0.50,  # PGF scaling: 0.25 halved PGF causing 3-7× weak winds; 0.5 is better
     wind_vmax_clip: float = 50.0,  # Phase 4 fix: Realistic maximum wind speed (strong jet stream)
-    # Baroclinic eddy / thermal-wind proxy. The previous default (3e7) tends to produce
-    # unrealistically strong, planet-wide surface jets. Keep conservative by default.
-    # Lower default to avoid razor-thin zonal jets at the surface.
-    wind_baroclinic_jet_amp: float = 1.0e6,
+    # Baroclinic eddy / vertical momentum coupling to the upper-level (1.5-layer)
+    # wind (evolve_wind_aloft). Dimensionless coupling-strength multiplier
+    # (1.0 = nominal full-strength coupling on the wind_baroclinic_mix-day
+    # relaxation timescale) -- NOTE: prior to the 1.5-layer atmosphere upgrade
+    # this parameter scaled a magnitude-only `|dT/dy|` proxy directly (hence
+    # the old ~1e6 default); its meaning changed with the real upper layer,
+    # so the default was recalibrated rather than reused.
+    wind_baroclinic_jet_amp: float = 1.0,
     wind_baroclinic_mix: float = 2.0,
     # Increased to 3.0 days to prevent oscillations from over-relaxation
     wind_cell_relax_days: float = 3.0,
     ocean_transport_coeff: float | None = None,  # None → pp.ocean_transport_coeff
+    # Deprecated no-ops (kept for config compatibility): these were never read
+    # by ocean.calculate_ocean_heat_transport.
     ocean_exchange_floor: float = 0.65,
     ocean_exchange_span: float = 0.35,
-    ocean_exchange_coeff: float = 0.08,
+    # Ocean-atmosphere restoring rate [K/day]. Default matches the value that
+    # was previously hardcoded inside ocean.py (0.03) — the old default here
+    # (0.08) was silently ignored, so 0.03 preserves actual behavior now that
+    # the parameter is wired through.
+    ocean_exchange_coeff: float = 0.03,
     ocean_exchange_inertia: float = 0.35,
     epsilon_equator: float | None = None,
     epsilon_pole: float | None = None,
@@ -401,7 +430,7 @@ def simulate_step(
     ice_melt_rate: float = 0.19,
     ice_albedo_strength: float | None = None,  # None → pp.ice_albedo_strength
     thermal_diffusion: float | None = None,    # None → pp.thermal_diffusivity
-    latent_cooling_coeff: float = 0.015,
+    latent_cooling_coeff: float = 0.015,  # Deprecated no-op (found by test_param_wiring.py, 2026-07-04): accepted but never read anywhere in the codebase; kept for config compatibility
     enable_carbon_cycle: bool = True,
     co2_climate_feedback: float | None = None,  # None → pp.co2_climate_feedback
     debug_log: bool = False,
@@ -574,7 +603,6 @@ def simulate_step(
             biome_new = koppen_to_legacy_biome(koppen_new)
             biome_last_update = new_total_days
             if debug_log:
-                from terrain import LOG
                 LOG.info(f"[Köppen Update] Day {new_total_days:.0f} - Climate zones reclassified from monthly data")
         else:
             # Keep existing classification
@@ -629,7 +657,7 @@ def simulate_step(
     #
     # Seeded Antarctic cells start with age = threshold (already mature at t=0).
     # All other cells start at age = 0 and must grow naturally.
-    ICE_SHEET_THRESHOLD_DAYS = 3.0 * 365.25  # 3 years of sustained EF conditions
+    ICE_SHEET_THRESHOLD_DAYS = 3.0 * pp.orbital_period_days  # 3 years of sustained EF conditions
 
     if _is_first_init:
         ice_sheet_age_new = np.zeros((H, W), dtype=np.float32)
@@ -853,52 +881,61 @@ def simulate_step(
                    + ocean_seasonal_frac * (T_lat_ocean_lagged - T_lat_annual_mean))
 
     T_base_ocean = np.repeat(T_lat_ocean[:, None], Wc, axis=1).astype(np.float32, copy=False) + co2_temp_offset
-    # Full-resolution fallback base temperature (used when wind evolves at full resolution
-    # before `state.temperature` is initialized).
-    lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
-    T_lat_ocean_full_lagged = temperature_kelvin_for_lat(
-        lat_full,
-        day_of_year=int(lagged_day),
-        polar_cooling_scale=polar_cooling_scale,
-        planet_params=pp,
-    )
-    T_lat_annual_mean_full = temperature_kelvin_for_lat(
-        lat_full,
-        day_of_year=(80.0 / 365.2422) * float(pp.orbital_period_days),
-        polar_cooling_scale=polar_cooling_scale,
-        planet_params=pp,
-    )
-    lat_deg_full = np.abs(np.rad2deg(lat_full))
-    _transport_base_full = _acc_scale * 34.0 * np.clip((lat_deg_full - 42.0) / 28.0, 0.0, 1.0) ** 1.5
-    _amoc_taper_full = np.clip((pp.amoc_cutoff_lat - lat_deg_full) / 10.0, 0.0, 1.0)
-    _amoc_bonus_full = _amoc_scale * amoc_factor * _amoc_taper_full * np.where(
-        lat_full > 0,
-        pp.amoc_bonus_near * np.clip((lat_deg_full - 42.0) / 23.0, 0.0, 1.0)
-        + pp.amoc_bonus_far * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
-        0.0,
-    )
-    _acc_bonus_full = _acc_scale * acc_factor * np.where(
-        lat_full < 0,
-        pp.acc_bonus_near * np.clip((lat_deg_full - 55.0) / 10.0, 0.0, 1.0)
-        + pp.acc_bonus_far * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
-        0.0,
-    )
-    _sh_factor_full = np.where(lat_full > 0, 1.0, 0.58)
-    _nh_transport_taper_full = np.clip((pp.amoc_cutoff_lat - lat_deg_full) / 5.0, 0.0, 1.0)
-    _nh_transport_taper_full = np.where(lat_full > 0, _nh_transport_taper_full, 1.0)
-    transport_warming_full = (
-        _transport_base_full * _sh_factor_full * _nh_transport_taper_full
-        + _amoc_bonus_full + _acc_bonus_full
-    )
-    polar_lat_boost_full = np.sin(np.deg2rad(lat_deg_full)) ** 2
-    ocean_seasonal_frac_full = (
-        (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_full))) * obliq_factor
-        + 0.60 * high_obliq_boost * polar_lat_boost_full
-    )
-    ocean_seasonal_frac_full = np.clip(ocean_seasonal_frac_full, 0.03, _seasonal_cap)
-    T_lat_ocean_full = (T_lat_annual_mean_full + transport_warming_full
-                        + ocean_seasonal_frac_full * (T_lat_ocean_full_lagged - T_lat_annual_mean_full))
-    T_base_ocean_full = np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32, copy=False) + co2_temp_offset
+
+    def _compute_T_base_ocean_full() -> np.ndarray:
+        """Full-resolution fallback base temperature.
+
+        Only needed when wind evolves at full resolution (wind_bs <= 1) before
+        `state.temperature` is initialized — computed lazily because the
+        production path (wind_bs > 1 with initialized temperature) never uses
+        it, and this block costs three full-resolution
+        temperature_kelvin_for_lat calls plus the transport math per step.
+        """
+        lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
+        T_lat_ocean_full_lagged = temperature_kelvin_for_lat(
+            lat_full,
+            day_of_year=int(lagged_day),
+            polar_cooling_scale=polar_cooling_scale,
+            planet_params=pp,
+        )
+        T_lat_annual_mean_full = temperature_kelvin_for_lat(
+            lat_full,
+            day_of_year=(80.0 / 365.2422) * float(pp.orbital_period_days),
+            polar_cooling_scale=polar_cooling_scale,
+            planet_params=pp,
+        )
+        lat_deg_full = np.abs(np.rad2deg(lat_full))
+        _transport_base_full = _acc_scale * 34.0 * np.clip((lat_deg_full - 42.0) / 28.0, 0.0, 1.0) ** 1.5
+        _amoc_taper_full = np.clip((pp.amoc_cutoff_lat - lat_deg_full) / 10.0, 0.0, 1.0)
+        _amoc_bonus_full = _amoc_scale * amoc_factor * _amoc_taper_full * np.where(
+            lat_full > 0,
+            pp.amoc_bonus_near * np.clip((lat_deg_full - 42.0) / 23.0, 0.0, 1.0)
+            + pp.amoc_bonus_far * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
+            0.0,
+        )
+        _acc_bonus_full = _acc_scale * acc_factor * np.where(
+            lat_full < 0,
+            pp.acc_bonus_near * np.clip((lat_deg_full - 55.0) / 10.0, 0.0, 1.0)
+            + pp.acc_bonus_far * np.clip((lat_deg_full - 65.0) / 10.0, 0.0, 1.0),
+            0.0,
+        )
+        _sh_factor_full = np.where(lat_full > 0, 1.0, 0.58)
+        _nh_transport_taper_full = np.clip((pp.amoc_cutoff_lat - lat_deg_full) / 5.0, 0.0, 1.0)
+        _nh_transport_taper_full = np.where(lat_full > 0, _nh_transport_taper_full, 1.0)
+        transport_warming_full = (
+            _transport_base_full * _sh_factor_full * _nh_transport_taper_full
+            + _amoc_bonus_full + _acc_bonus_full
+        )
+        polar_lat_boost_full = np.sin(np.deg2rad(lat_deg_full)) ** 2
+        ocean_seasonal_frac_full = (
+            (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_full))) * obliq_factor
+            + 0.60 * high_obliq_boost * polar_lat_boost_full
+        )
+        ocean_seasonal_frac_full = np.clip(ocean_seasonal_frac_full, 0.03, _seasonal_cap)
+        T_lat_ocean_full = (T_lat_annual_mean_full + transport_warming_full
+                            + ocean_seasonal_frac_full * (T_lat_ocean_full_lagged - T_lat_annual_mean_full))
+        return np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32, copy=False) + co2_temp_offset
+
     
     # Blend based on land fraction (will be calculated in _evolve_temperature)
     # Use ocean-lagged temperature as base; _evolve_temperature will handle land/ocean mixing
@@ -936,6 +973,48 @@ def simulate_step(
     ice_thick_prev_coarse = _group_a_out.get("ice_thick")
     
     # ------------------------------------------------------
+    # Jet stream dynamics: persistent meander index + blocking events
+    # (see atmosphere._update_jet_index / _update_jet_blocking). Computed once
+    # per step from the actual simulated temperature field -- weaker
+    # pole-equator gradient nudges the index toward "wavy" -- then fed into
+    # whichever evolve_wind() call below executes.
+    # ------------------------------------------------------
+    lat_c_deg_1d = np.rad2deg((0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi)
+    T_zm = np.mean(T_prev_coarse, axis=1).astype(np.float64, copy=False)
+
+    def _pole_eq_gradient(hemi_sign: float) -> float:
+        trop_mask = (lat_c_deg_1d * hemi_sign >= 0.0) & (np.abs(lat_c_deg_1d) <= 30.0)
+        polar_mask = (lat_c_deg_1d * hemi_sign >= 0.0) & (np.abs(lat_c_deg_1d) >= 60.0)
+        if not np.any(trop_mask) or not np.any(polar_mask):
+            return float(pp.jet_gradient_ref_k)
+        return float(np.mean(T_zm[trop_mask]) - np.mean(T_zm[polar_mask]))
+
+    jet_index_nh_new = _update_jet_index(
+        state.jet_index_nh, _pole_eq_gradient(1.0), days, new_total_days, hemisphere_seed=1,
+        tau_days=float(pp.jet_meander_tau_days), noise_amp=float(pp.jet_meander_noise_amp),
+        gradient_ref_k=float(pp.jet_gradient_ref_k),
+    )
+    jet_index_sh_new = _update_jet_index(
+        state.jet_index_sh, _pole_eq_gradient(-1.0), days, new_total_days, hemisphere_seed=2,
+        tau_days=float(pp.jet_meander_tau_days), noise_amp=float(pp.jet_meander_noise_amp),
+        gradient_ref_k=float(pp.jet_gradient_ref_k),
+    )
+    jet_block_lon_nh_new, jet_block_days_left_nh_new, jet_block_total_nh_new = _update_jet_blocking(
+        state.jet_block_lon_nh, state.jet_block_days_left_nh, state.jet_block_total_days_nh,
+        jet_index_nh_new, days, new_total_days, hemisphere_seed=1,
+        trigger_rate_per_day=float(pp.jet_block_trigger_rate_per_day),
+        duration_range_days=pp.jet_block_duration_range_days,
+    )
+    jet_block_lon_sh_new, jet_block_days_left_sh_new, jet_block_total_sh_new = _update_jet_blocking(
+        state.jet_block_lon_sh, state.jet_block_days_left_sh, state.jet_block_total_days_sh,
+        jet_index_sh_new, days, new_total_days, hemisphere_seed=2,
+        trigger_rate_per_day=float(pp.jet_block_trigger_rate_per_day),
+        duration_range_days=pp.jet_block_duration_range_days,
+    )
+    _jet_block_nh = (jet_block_lon_nh_new, jet_block_days_left_nh_new, jet_block_total_nh_new)
+    _jet_block_sh = (jet_block_lon_sh_new, jet_block_days_left_sh_new, jet_block_total_sh_new)
+
+    # ------------------------------------------------------
     # NEW: Prognostic Wind Evolution (Physics Items 16-33)
     # ------------------------------------------------------
     # If wind is None, initialize it near-rest (small noise) so circulation spins up
@@ -946,7 +1025,15 @@ def simulate_step(
         v_full = rng.normal(0.0, 0.15, size=(H, W)).astype(np.float32, copy=False)
     else:
         u_full, v_full = state.wind_u, state.wind_v
-        
+
+    # 1.5-layer atmosphere: upper-level prognostic wind (Feature 8). Lazy-init
+    # as a copy of the surface wind (a physically-reasonable warm start) if
+    # this is the first step or an old save predates this field.
+    if state.wind_u_aloft is None or state.wind_v_aloft is None:
+        u2_full, v2_full = u_full.copy(), v_full.copy()
+    else:
+        u2_full, v2_full = state.wind_u_aloft, state.wind_v_aloft
+
     # Evolve wind at `wind_block_size` resolution (can differ from temperature/precip `block_size`)
     # Then upsample to full resolution for precipitation
     # Cached diagnostic wind for relaxation (once per day/shape/params).
@@ -984,9 +1071,38 @@ def simulate_step(
         cache.update({"key": key, "u": u_diag, "v": v_diag})
         return u_diag, v_diag
 
-    if wind_bs > 1:
+    # Honor `update_wind`: MONTHLY/ANNUAL substeps pass update_wind=False by
+    # design (PLAN.md Open Question 1: "cached relaxation target, chosen for
+    # speed"). This flag was silently ignored — wind (including storm systems
+    # and jet dynamics) evolved prognostically every step in every mode,
+    # costing the exact work those modes were designed to skip. When
+    # update_wind=False, wind now follows the cached *diagnostic* wind
+    # (generate_wind_field's seasonal climatology, refreshed once per
+    # simulated day via _RELAX_CACHE) instead of either full prognostic
+    # evolution (old behavior, expensive) or a permanently frozen field
+    # (which would lose the seasonal wind cycle entirely on long
+    # MONTHLY/ANNUAL runs). Wind still evolves prognostically when no wind
+    # exists yet (first step).
+    _do_evolve_wind = bool(update_wind) or state.wind_u is None or state.wind_v is None
+
+    if not _do_evolve_wind:
+        # Diagnostic/climatological wind on the wind grid, upsampled to full res.
+        if wind_bs > 1:
+            _elev_c_w = _coarsen_elevation_cached(state.elevation, Hcw, Wcw, wind_bs)
+            if state.temperature is not None:
+                _T_w = _coarsen(state.temperature, Hcw, Wcw, wind_bs)
+            else:
+                _T_w = None
+            u_diag, v_diag = _diag_wind_cached(Hcw, Wcw, _T_w, _elev_c_w)
+            uv = _upsample_bilinear_many({"u": u_diag, "v": v_diag}, H, W, wind_bs)
+            u_full, v_full = uv["u"], uv["v"]
+        else:
+            u_full, v_full = _diag_wind_cached(H, W, state.temperature, state.elevation)
+    elif wind_bs > 1:
         # Downsample wind/temperature/elevation/ice for evolution on the wind grid (batched).
-        _group_b_in: dict[str, np.ndarray] = {"u": u_full, "v": v_full}
+        _group_b_in: dict[str, np.ndarray] = {
+            "u": u_full, "v": v_full, "u2": u2_full, "v2": v2_full,
+        }
         if state.temperature is not None:
             _group_b_in["T"] = state.temperature
         if state.ice_cover is not None:
@@ -994,6 +1110,8 @@ def simulate_step(
         _group_b_out = _coarsen_many(_group_b_in, Hcw, Wcw, wind_bs)
         u_coarse_evol = _group_b_out["u"]
         v_coarse_evol = _group_b_out["v"]
+        u2_coarse_evol = _group_b_out["u2"]
+        v2_coarse_evol = _group_b_out["v2"]
         ice_c_w = _group_b_out.get("ice")
         elev_c_w = _coarsen_elevation_cached(state.elevation, Hcw, Wcw, wind_bs)
 
@@ -1009,6 +1127,20 @@ def simulate_step(
                 planet_params=pp,
             )
             T_for_wind = np.repeat(T_lat_ocean_w[:, None], Wcw, axis=1).astype(np.float32, copy=False)
+
+        # 1.5-layer atmosphere: evolve the upper-level wind first, at the same
+        # wind-grid resolution, so evolve_wind's baroclinic mixing term below
+        # can relax the surface toward this step's freshly-updated aloft wind.
+        u2_coarse_evol, v2_coarse_evol = evolve_wind_aloft(
+            u2_coarse_evol, v2_coarse_evol,
+            temperature=T_for_wind,
+            dt_days=days,
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
+            damping_rate=float(pp.wind_upper_damping),
+            vmax_clip=float(wind_vmax_clip),
+            planet_params=pp,
+        )
 
         # Evolve at wind-grid resolution.
         u_coarse_evol, v_coarse_evol = evolve_wind(
@@ -1029,6 +1161,12 @@ def simulate_step(
             time_days=float(new_total_days),
             planet_params=pp,
             ice_cover=ice_c_w,
+            jet_index_nh=jet_index_nh_new,
+            jet_index_sh=jet_index_sh_new,
+            jet_block_nh=_jet_block_nh,
+            jet_block_sh=_jet_block_sh,
+            u_aloft=u2_coarse_evol,
+            v_aloft=v2_coarse_evol,
         )
 
         # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
@@ -1038,17 +1176,21 @@ def simulate_step(
             a = float(np.clip(wind_relax, 0.0, 1.0))
             u_coarse_evol = (1.0 - a) * u_coarse_evol + a * u_diag
             v_coarse_evol = (1.0 - a) * v_coarse_evol + a * v_diag
-        
+
         # Upsample back to full resolution using bilinear interpolation
-        uv = _upsample_bilinear_many({"u": u_coarse_evol, "v": v_coarse_evol}, H, W, wind_bs)
+        uv = _upsample_bilinear_many(
+            {"u": u_coarse_evol, "v": v_coarse_evol, "u2": u2_coarse_evol, "v2": v2_coarse_evol},
+            H, W, wind_bs,
+        )
         u_full, v_full = uv["u"], uv["v"]
+        u2_full, v2_full = uv["u2"], uv["v2"]
     else:
         # Full resolution evolution
         # If wind evolves at higher resolution than the temperature solver, drive it with the
         # coarse temperature field upsampled to full resolution. This avoids injecting
         # grid-scale temperature noise into the wind solver (which can blow up speeds),
         # while still allowing the wind numerics to run on the fine grid.
-        T_wind_full = state.temperature if state.temperature is not None else T_base_ocean_full
+        T_wind_full = state.temperature if state.temperature is not None else _compute_T_base_ocean_full()
         elev_wind_full = state.elevation
         if wind_bs < block_size and block_size > 1:
             to_up = {}
@@ -1059,6 +1201,20 @@ def simulate_step(
             T_wind_full = up["T"]
             if "elev" in up:
                 elev_wind_full = up["elev"]
+
+        # 1.5-layer atmosphere: evolve the upper-level wind first (same
+        # full-resolution grid), so evolve_wind's baroclinic mixing term below
+        # can relax the surface toward this step's freshly-updated aloft wind.
+        u2_full, v2_full = evolve_wind_aloft(
+            u2_full, v2_full,
+            temperature=T_wind_full,
+            dt_days=days,
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
+            damping_rate=float(pp.wind_upper_damping),
+            vmax_clip=float(wind_vmax_clip),
+            planet_params=pp,
+        )
 
         u_full, v_full = evolve_wind(
             u_full, v_full,
@@ -1078,6 +1234,12 @@ def simulate_step(
             time_days=float(new_total_days),
             planet_params=pp,
             ice_cover=state.ice_cover,
+            jet_index_nh=jet_index_nh_new,
+            jet_index_sh=jet_index_sh_new,
+            jet_block_nh=_jet_block_nh,
+            jet_block_sh=_jet_block_sh,
+            u_aloft=u2_full,
+            v_aloft=v2_full,
         )
         if wind_relax > 0.0:
             T_for_wind = T_wind_full
@@ -1088,8 +1250,9 @@ def simulate_step(
 
     # Winds to couple into temperature evolution operate on the temperature grid (Hc,Wc).
     if block_size > 1:
-        u_coarse = _coarsen(u_full, Hc, Wc, block_size)
-        v_coarse = _coarsen(v_full, Hc, Wc, block_size)
+        _uv_c = _coarsen_many({"u": u_full, "v": v_full}, Hc, Wc, block_size)
+        u_coarse = _uv_c["u"]
+        v_coarse = _uv_c["v"]
     else:
         u_coarse = u_full
         v_coarse = v_full
@@ -1184,7 +1347,11 @@ def simulate_step(
         planet_params=pp,
         elev_c=elev_c,
         snow_depth=snow_depth_coarse,
-        feedback_flags=feedback_flags,
+        # Pass the resolved flags (_fb), not the raw caller dict: _fb includes
+        # planet-level auto-disables (e.g. ocean_transport/ice_albedo off for
+        # worlds without a liquid ocean) that were previously dropped here.
+        feedback_flags=_fb,
+        total_days=new_total_days,
         prev_cloud_cover=cloud_cover_coarse,  # Feature 1: cloud persistence
         T_deep_ocean=T_deep_coarse,            # Feature 5: deep ocean layer
         ice_thickness=ice_thick_prev_coarse,   # Feature 6: thickness-dependent albedo
@@ -1224,9 +1391,6 @@ def simulate_step(
     if T_deep_full is None and pp.has_liquid_water_ocean and T_full is not None:
         T_deep_full = np.clip(T_full - 15.0, 271.0, 285.0).astype(np.float32, copy=False)
 
-    # Update wind from temperature gradients (if requested)
-    # Already evolved above
-    # if update_wind... removed legacy block
     
     if state.elevation is not None:
         # Run precipitation at half resolution (block_size=2) for large grids where
@@ -1260,6 +1424,7 @@ def simulate_step(
                 humidity=_hum_p, soil_moisture=_soil_p,
                 cloud_fraction=_cloud_p,
                 day_of_year=int(new_day), dt_days=float(days),
+                surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
             )
             _up = _upsample_bilinear_many(
                 {"P": P_p, "q": hum_p_next, "soil": soil_p_next}, H, W, _pbs
@@ -1274,6 +1439,7 @@ def simulate_step(
                 humidity=state.humidity, soil_moisture=state.soil_moisture,
                 cloud_fraction=cloud_full,
                 day_of_year=int(new_day), dt_days=float(days),
+                surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
             )
     else:
         P_full = None
@@ -1347,8 +1513,6 @@ def simulate_step(
 
     # Debug logging if requested
     if debug_log:
-        import logging
-        LOG = logging.getLogger("planetsim")
         if T_full is not None:
             T_stats = {
                 'min': float(np.min(T_full)),
@@ -1474,6 +1638,14 @@ def simulate_step(
             if T_full is not None:
                 ch4_ppb += _wetland_ch4(T_full, state.soil_moisture, _land_cc, _carbon_dt)
 
+        # Background natural CH4 source balancing OH oxidation at the planetary
+        # baseline (see carbon_cycle.ch4_natural_source): without it CH4 decayed
+        # from 1900 ppb toward zero over multi-decade runs (τ=9yr), injecting a
+        # spurious ~-1 W/m² forcing drift no modeled source could offset.
+        if pp.ch4_baseline_ppb > 0.0:
+            from carbon_cycle import ch4_natural_source as _ch4_source
+            ch4_ppb += _ch4_source(pp.ch4_baseline_ppb, float(days))
+
         # Atmospheric oxidation (9-yr lifetime) — cheap scalar op, stays per-step.
         ch4_atm_new = float(np.clip(_ch4_oxidize(ch4_ppb, float(days)), 100.0, 50_000.0))
 
@@ -1525,8 +1697,20 @@ def simulate_step(
         T_deep_ocean=T_deep_full,
         # Feature 6: sea ice thickness
         ice_thickness=ice_thick_full,
+        # Feature 7: jet stream dynamics
+        jet_index_nh=jet_index_nh_new,
+        jet_index_sh=jet_index_sh_new,
+        jet_block_lon_nh=jet_block_lon_nh_new,
+        jet_block_days_left_nh=jet_block_days_left_nh_new,
+        jet_block_total_days_nh=jet_block_total_nh_new,
+        jet_block_lon_sh=jet_block_lon_sh_new,
+        jet_block_days_left_sh=jet_block_days_left_sh_new,
+        jet_block_total_days_sh=jet_block_total_sh_new,
+        # Feature 8: 1.5-layer atmosphere upper-level wind
+        wind_u_aloft=u2_full,
+        wind_v_aloft=v2_full,
     )
-    
+
     # Return state and components (empty dict if not tracking)
     return new_state, temp_components if temp_components else {}
 
@@ -1577,6 +1761,11 @@ def create_initial_state(
     Returns:
         Initialized state with all fields computed
     """
+    # Seed atmospheric composition from the planet's parameters. Previously
+    # only the optimizer's headless runner applied co2_initial_ppm, so GUI and
+    # test runs silently started every planet at the PlanetState defaults
+    # (Earth-2020 values) regardless of PlanetParams.
+    _pp_init = kwargs.get("planet_params") or EARTH
     state = PlanetState(
         day_of_year=day_of_year,
         total_days=0.0,
@@ -1586,6 +1775,8 @@ def create_initial_state(
         wind_v=None,
         precipitation=None,
         humidity=None,
+        co2_atmosphere=float(_pp_init.co2_initial_ppm),
+        ch4_atmosphere=float(_pp_init.ch4_initial_ppb),
     )
     new_state, _ = simulate_step(state, days=0.0, **kwargs)
     return new_state
@@ -1611,9 +1802,9 @@ def _evolve_temperature(
     T_base_land: np.ndarray | None = None,
     ice_cover: np.ndarray | None = None,
     ocean_transport_coeff: float = 0.5,
-    ocean_exchange_floor: float = 0.65,
-    ocean_exchange_span: float = 0.35,
-    ocean_exchange_coeff: float = 0.05,
+    ocean_exchange_floor: float = 0.65,   # deprecated no-op (never read downstream)
+    ocean_exchange_span: float = 0.35,    # deprecated no-op (never read downstream)
+    ocean_exchange_coeff: float = 0.03,
     ocean_exchange_inertia: float = 0.0,
     epsilon_equator: float = 0.72,
     epsilon_pole: float = 0.50,
@@ -1628,6 +1819,7 @@ def _evolve_temperature(
     elev_c: np.ndarray | None = None,
     snow_depth: np.ndarray | None = None,
     feedback_flags: dict[str, bool] | None = None,
+    total_days: float | None = None,  # monotonic sim time for the ocean-update cache
     prev_cloud_cover: np.ndarray | None = None,  # Feature 1: cloud persistence
     T_deep_ocean: np.ndarray | None = None,       # Feature 5: deep ocean layer
     ice_thickness: np.ndarray | None = None,      # Feature 6: thickness-dependent albedo
@@ -1654,6 +1846,8 @@ def _evolve_temperature(
     sea_mask, land_mask = get_masks(elev_c, use_cache=False)
     land_fraction = land_mask.astype(np.float32) # Simplified for now
     
+    _pp = planet_params if planet_params is not None else EARTH
+
     # 2. Wind Field (Prognostic or Diagnostic)
     if wind_u is None or wind_v is None:
         u, v = generate_wind_field(
@@ -1679,7 +1873,6 @@ def _evolve_temperature(
     T_air = (T_air_prev.copy() if T_air_prev is not None else T_prev.copy()).astype(np.float32, copy=False)
 
     # === PASS 1: T_air dynamics — advection, diffusion, surface exchange ===
-    _pp = planet_params if planet_params is not None else EARTH
     lat_1d = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
     cos_lat = np.cos(lat_1d).clip(0.05, 1.0)
     dx_lat = (2.0 * np.pi * _pp.radius_m * cos_lat / Wc).astype(np.float32, copy=False)
@@ -1704,20 +1897,28 @@ def _evolve_temperature(
         T_y = np.where(v >= 0, T_south, T_north)
         T_air = T_air + v_cfl * (T_y - T_air)
 
-    # Diffuse T_air (atmospheric mixing)
+    # Diffuse T_air (atmospheric mixing).
+    # Explicit Laplacian diffusion is only stable for r = coeff*1.2*days below
+    # ~0.5 per application (same forward-difference CFL bound handled for the
+    # ocean eddy flux below); production substeps (days ≤ 7) are fine at the
+    # 0.04 default, but direct calls with large `days` need sub-stepping.
     T_before_diffusion = T_air.copy() if track_components else None
-    if NUMBA_AVAILABLE:
-        T_air = _apply_diffusion_numba(T_air, float(thermal_diffusion), float(days), iterations=2)
-    else:
-        for _ in range(2):
-            T_pad = np.pad(T_air, ((1, 1), (0, 0)), mode="edge")
-            c = T_pad[1:-1, :]
-            n = T_pad[0:-2, :]
-            s = T_pad[2:, :]
-            e = np.roll(c, -1, axis=1)
-            w = np.roll(c, 1, axis=1)
-            T_lap = n + s + e + w - 4.0 * c
-            T_air = T_air + thermal_diffusion * 1.2 * np.clip(T_lap, -30.0, 30.0) * days
+    _r_diff = float(thermal_diffusion) * 1.2 * float(days)
+    _n_diff_sub = max(1, int(np.ceil(_r_diff / 0.4)))
+    _days_diff_sub = float(days) / _n_diff_sub
+    for _ in range(_n_diff_sub):
+        if NUMBA_AVAILABLE:
+            T_air = _apply_diffusion_numba(T_air, float(thermal_diffusion), _days_diff_sub, iterations=2)
+        else:
+            for _ in range(2):
+                T_pad = np.pad(T_air, ((1, 1), (0, 0)), mode="edge")
+                c = T_pad[1:-1, :]
+                n = T_pad[0:-2, :]
+                s = T_pad[2:, :]
+                e = np.roll(c, -1, axis=1)
+                w = np.roll(c, 1, axis=1)
+                T_lap = n + s + e + w - 4.0 * c
+                T_air = T_air + thermal_diffusion * 1.2 * np.clip(T_lap, -30.0, 30.0) * _days_diff_sub
 
     # T_air relaxes toward surface temperature (T_sst).
     # Over ocean: ~4-day time constant (efficient sensible heat flux at ocean surface).
@@ -1757,7 +1958,7 @@ def _evolve_temperature(
     # Cloud cover — humidity lives in the atmosphere, so use T_air for Clausius-Clapeyron
     Tc = np.clip(T_air - 273.15, -60.0, 60.0)
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
-    qsat = np.clip(0.622 * es / 1013.25, 1e-6, 0.035).astype(np.float32, copy=False)
+    qsat = np.clip(0.622 * es / (_pp.surface_pressure_pa / 100.0), 1e-6, 0.035).astype(np.float32, copy=False)
     if humidity is not None:
         q = np.clip(humidity.astype(np.float32, copy=False), 0.0, qsat)
     else:
@@ -1971,7 +2172,7 @@ def _evolve_temperature(
         # Saturation humidity at SST (the surface provides moisture to the air)
         T_c_sst = np.clip(T_sst - 273.15, -60.0, 60.0)
         es_sst = 6.112 * np.exp(17.67 * T_c_sst / (T_c_sst + 243.5))
-        qsat_sst = np.clip(0.622 * es_sst / 1013.25, 1e-6, 0.035)
+        qsat_sst = np.clip(0.622 * es_sst / (_pp.surface_pressure_pa / 100.0), 1e-6, 0.035)
         deficit = np.maximum(0.0, qsat_sst - humidity)
         C_D = np.where(sea_mask, 1.5e-3, 0.5e-3)
         E = C_D * wind_speed * deficit * 1000.0
@@ -2052,32 +2253,36 @@ def _evolve_temperature(
             _T_lap_y = np.clip(_T_lap_y, -20.0, 20.0).astype(np.float32, copy=False)
             T_sst = (T_sst + _eddy_k * _T_lap_y * _eddy_lat[:, None] * _dt_eddy_sub).astype(np.float32, copy=False)
 
-    # --- Ocean Transport (temporally sub-sampled for performance) ---
-    # Ocean circulation has a decorrelation time of ~30 days, so we recompute
-    # the heat-transport adjustment only once per OCEAN_UPDATE_INTERVAL_DAYS and
-    # reuse the cached ΔT array in between.  The cache key includes the grid
-    # shape and day-of-year so it resets automatically on resolution changes or
-    # simulation restarts.
-    OCEAN_UPDATE_INTERVAL_DAYS = 30.0
+    # --- Ocean Transport ---
+    # NOTE (2026-07-03): this block was originally written as a 30-day cache
+    # ("ocean decorrelation time"), but the cache key included round(day_of_year)
+    # so it never actually hit — the transport recomputed every step for the
+    # entire calibrated life of the model. Honoring the 30-day reuse turned out
+    # to change climate measurably (a stale ΔT applied for 30 days weakens the
+    # seasonal response; the high-obliquity seasonal-range gate fails at 1.07x
+    # vs its 1.1x bar) while the measured saving is only ~1 ms/step at
+    # production resolution (Numba-free NumPy path). Per-step recompute is
+    # therefore the intended, calibrated behavior; the "cache" is kept solely
+    # as a state carrier for feedback-flag zeroing and mode bookkeeping.
+    OCEAN_UPDATE_INTERVAL_DAYS = 0.0  # recompute every step (see NOTE above)
     _oc = _OCEAN_ADJ_CACHE
-    _oc_key = (Hc, Wc, round(day_of_year))
-    _total = float(np.sum(T_sst))  # cheap proxy to detect if grid changed
-    days_since_ocean = float(day_of_year) - float(_oc.get("last_update_day", -9999.0))
+    _oc_key = (Hc, Wc, round(float(days), 3))
+    _t_now = float(total_days) if total_days is not None else float(day_of_year)
+    days_since_ocean = _t_now - float(_oc.get("last_update_day", -9999.0))
     if not _fb_t.get('ocean_transport', True):
         T_ocean_adj = np.zeros((Hc, Wc), dtype=np.float32)
         _oc["adj"] = T_ocean_adj
         _oc["key"] = _oc_key
-        _oc["last_update_day"] = float(day_of_year)
+        _oc["last_update_day"] = _t_now
     elif (
         _oc.get("adj") is None
         or _oc.get("key") != _oc_key
-        or abs(days_since_ocean) >= OCEAN_UPDATE_INTERVAL_DAYS
+        or days_since_ocean < 0.0  # time went backwards → new run/loaded save
+        or days_since_ocean >= OCEAN_UPDATE_INTERVAL_DAYS
     ):
         T_ocean_adj = calculate_ocean_heat_transport(
             T_sst, elev_c, Hc, Wc, day_of_year, days,
             transport_coefficient=float(ocean_transport_coeff),
-            exchange_strength_floor=float(ocean_exchange_floor),
-            exchange_strength_span=float(ocean_exchange_span),
             exchange_coefficient=float(ocean_exchange_coeff),
             exchange_inertia=float(ocean_exchange_inertia),
             prev_T=T_prev,
@@ -2087,33 +2292,38 @@ def _evolve_temperature(
         T_ocean_adj = np.clip(T_ocean_adj, -10.0, 10.0)
 
         # Ekman wind-driven advection: shifts surface water 90° from wind (Coriolis).
-        # Applied once per 30-day ocean update to avoid redundant computation.
+        # The increment is scaled to ONE `days`-long step (like the transport
+        # term above) because the cached T_ocean_adj is re-applied every step
+        # until the next 30-day refresh. The old code scaled it to the full
+        # 30-day window AND (with the broken cache) re-applied it every day —
+        # a ~30x amplification of the intended Ekman heat shift.
         if _pp.has_liquid_water_ocean and _pp.ekman_strength > 0.0:
             u_ek, v_ek = compute_ekman_transport(
                 u, v, elev_c,
                 ekman_coefficient=0.03 * float(_pp.ekman_strength),
+                rotation_direction=float(getattr(_pp, "rotation_direction", 1.0)),
             )
-            # Upwind advection of T_sst by Ekman currents over the 30-day window.
-            # Scale velocities from m/s to grid-cells/day then apply for 30 days.
-            dx_deg = 360.0 / Wc
-            dy_deg = 180.0 / Hc
-            dx_m = dx_deg * (np.pi / 180.0) * float(_pp.radius_m)
-            dy_m = dy_deg * (np.pi / 180.0) * float(_pp.radius_m)
-            dt_ek = OCEAN_UPDATE_INTERVAL_DAYS
+            # Upwind advection of T_sst by Ekman currents over one step.
+            # Zonal grid spacing shrinks with cos(lat) on an equirectangular
+            # grid; using the equatorial dx everywhere under-shifted zonal
+            # Ekman advection at mid/high latitudes.
+            dy_m = (np.pi / Hc) * float(_pp.radius_m)
+            dx_m = (2.0 * np.pi / Wc) * float(_pp.radius_m) * cos_lat[:, None]
+            dt_ek = float(days)
             shift_x = np.clip(u_ek * dt_ek * 86400.0 / dx_m, -0.5, 0.5)
             shift_y = np.clip(v_ek * dt_ek * 86400.0 / dy_m, -0.5, 0.5)
-            T_ek = T_sst.copy()
+            T_ek = T_sst
             # Simple upwind: dT ≈ -u·∂T/∂x − v·∂T/∂y (finite difference)
-            dT_dx = np.roll(T_ek, -1, axis=1) - np.roll(T_ek, 1, axis=1)  # central diff, periodic x
+            dT_dx = 0.5 * (np.roll(T_ek, -1, axis=1) - np.roll(T_ek, 1, axis=1))  # central diff, periodic x
             dT_dy = np.zeros_like(T_ek)
-            dT_dy[1:-1, :] = T_ek[:-2, :] - T_ek[2:, :]  # central diff y, zero at poles
+            dT_dy[1:-1, :] = 0.5 * (T_ek[:-2, :] - T_ek[2:, :])  # northward derivative (row 0 = north pole)
             ekman_adj = np.clip(-(shift_x * dT_dx + shift_y * dT_dy), -1.5, 1.5)
             _ocean_mask, _ = get_masks(elev_c)
             T_ocean_adj = T_ocean_adj + ekman_adj * _ocean_mask.astype(np.float32)
 
         _oc["adj"] = T_ocean_adj
         _oc["key"] = _oc_key
-        _oc["last_update_day"] = float(day_of_year)
+        _oc["last_update_day"] = _t_now
     else:
         T_ocean_adj = _oc["adj"]
     T_sst = (T_sst + T_ocean_adj).astype(np.float32, copy=False)
@@ -2140,6 +2350,8 @@ def _evolve_temperature(
         components['subsidence'] = subsidence
         components['equilibrium_temp'] = T_eq
         components['net_radiation'] = R_net
+        components['S_absorbed'] = S_absorbed
+        components['L_out'] = L_out
         def _summ(field: np.ndarray) -> dict:
             return {"mean": float(np.mean(field)), "min": float(np.min(field)), "max": float(np.max(field))}
         components["toa"] = {

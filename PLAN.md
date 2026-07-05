@@ -186,6 +186,128 @@ Ranked by leverage-to-risk, pulling together everything still open across all ph
 
 ---
 
+## Bug-fix / realism / performance audit pass (2026-07-03)
+
+Full-codebase review (three parallel deep reviews over simulate.py, atmosphere.py, and the
+ocean/carbon/temperature group, each claim re-verified against the code before fixing).
+Roadmap ideas that came out of this pass live in **ROADMAP.md** (new). All fixes below verified
+by the full fast suite (172 passed, 9 xfailed, **1 xpassed** — `test_slow_rotator_colder_nh_pole`
+now genuinely passes) plus targeted slow calibration tests.
+
+**Physics/correctness fixes:**
+- **Precipitation meridional signs** (atmosphere.py): on this grid row 0 = north pole (index
+  increases southward) while v is northward-positive, so every meridional derivative in
+  `generate_precipitation` needed negation and didn't have it. The ITCZ's convergence registered
+  as *divergence* (and horse-latitude divergence as convergence) in the ascent/subsidence terms,
+  and orographic uplift/rain-shadow had the same inversion in their meridional half. Fixed in:
+  `div` (ascent + subsidence driver), `_moisture_convergence_numba`, the NumPy convergence
+  fallback, and the `gy` slope terms. Also fixed `generate_wind_field`'s `gx, gy =
+  np.gradient(elev_c)` unpacking (axes were swapped AND unnegated).
+  - **Required retune**: the prescribed itcz_window boosts in the precipitation drivers were
+    calibrated against the inverted signal (compensating for the ITCZ convergence the model
+    couldn't see). With the physics fixed, both signals stacked and the tropical band hit
+    9.6 mm/day (gate: <8.0) / +2264 mm/yr band bias (gate: <1400). Reduced the ITCZ-window
+    weights (rh_release 0.68→0.22, conv_driver 0.74→0.22, ascent_driver 0.69→0.20, convective
+    window 0.90→0.40, lat_shape 0.62→0.20) so the ITCZ is now carried substantially by the
+    *dynamical* convergence signal rather than the prescribed latitude mask — tropics 7.7 mm/day,
+    max band bias 1282 mm/yr, subtropics/mid-lats all within gates, ITCZ peak still on the
+    equator. This is a realism win beyond the numbers: tropical rain now responds to where the
+    wind field actually converges.
+- **Quadratic wind friction uses |V|** (atmosphere.py): both the Numba kernel and the fallback
+  applied `-drag·u·|u|` and `-drag·v·|v|` per-component instead of `-drag·|V|·(u,v)`.
+- **`update_wind` honored** (simulate.py): the flag was silently ignored — MONTHLY/ANNUAL
+  substeps (which pass `update_wind=False` by design, per Open Question 1's "cached relaxation
+  target, chosen for speed" resolution) were running the full prognostic wind evolution, storms,
+  and jet dynamics every step. `update_wind=False` now swaps in the cached diagnostic wind
+  (`generate_wind_field` seasonal climatology via `_RELAX_CACHE`, refreshed once per simulated
+  day) — cheaper than prognostic evolution while preserving the seasonal wind cycle that a
+  simply-frozen field would lose on long MONTHLY/ANNUAL runs.
+- **Ekman heat shift ~30x too strong** (simulate.py): the Ekman increment was scaled to a 30-day
+  window but (because the ocean cache never hit — see below) recomputed and applied every single
+  day. Now scaled per-step; also fixed missing cos(lat) in zonal grid spacing, missing 0.5 in the
+  central differences, and wired `rotation_direction` through `compute_ekman_transport` for
+  retrograde planets.
+- **Ocean transport "30-day cache" decision** (simulate.py): the cache key included
+  `round(day_of_year)` so it NEVER hit — per-step recompute was the de facto calibrated behavior.
+  Honoring the 30-day reuse measurably weakened the seasonal response (high-obliquity gate fell to
+  1.07x vs its 1.1x bar) while saving only ~1 ms/step, so per-step recompute is now the *explicit*
+  behavior (interval set to 0 with a NOTE documenting the finding).
+- **Western boundary current enhancement** (ocean.py): was keyed to map column 0 (the dateline —
+  mid-Pacific on a loaded Earth DEM) tapering across the whole map; now derived from basin
+  topology (ocean cells with land to their west, mid-latitude band, decaying 2 cells east) —
+  same rule `get_major_ocean_currents` already used.
+- **`ocean_exchange_coeff` wired** (ocean.py/simulate.py): `calculate_ocean_heat_transport`
+  hardcoded `exchange_rate = 0.03` and ignored the parameter (the optimizer thought it was tuning
+  0.08). Now wired; defaults and `earth_params.json` set to 0.03 to preserve calibrated behavior.
+  `exchange_strength_floor/span` were never read anywhere — removed from ocean.py, kept as
+  documented no-ops in `simulate_step`'s signature for config compatibility.
+- **CH4 budget closes** (carbon_cycle.py/simulate.py): wetland+permafrost sources supply ~5000x
+  less than the ~0.58 ppb/day needed to hold 1900 ppb against the 9-yr OH sink, so CH4 decayed
+  toward the 100 ppb clip over multi-decade runs — a spurious ~−1 W/m² forcing drift. Added
+  `ch4_natural_source()` (baseline/τ per day, representing unmodeled steady-state emissions);
+  equilibrium is now exactly `ch4_baseline_ppb` + perturbations decaying at τ=9yr.
+- **Carbon global means area-weighted** (carbon_cycle.py): permafrost thaw and wetland CH4 global
+  means now use cos(lat) weighting (`_global_area_mean`) — plain `np.mean` overweighted polar rows
+  2-3x for permafrost. (The toy ppm/kgC conversion constants themselves were left alone —
+  recalibrating them is a ROADMAP item, not a bug fix.)
+- **`co2_initial_ppm`/`ch4_initial_ppb` applied** (simulate.py): `create_initial_state` now seeds
+  atmospheric composition from `planet_params`; previously only the optimizer's headless runner
+  did, so GUI/test runs started every planet at Earth-2020 PlanetState defaults.
+- **`feedback_flags` planet auto-disables forwarded** (simulate.py): `_evolve_temperature` got the
+  raw caller dict, dropping the planet-level auto-off flags (ocean_transport/ice_albedo for
+  worlds without liquid oceans).
+- **Non-Earth year lengths** (temperature.py): `_TEMP_BASE_CACHE` keyed day with a hardcoded
+  `% 365`, aliasing e.g. Mars day 400 onto day 35 (different season) and returning the wrong
+  cached seasonal profile. Now wraps by `pp.orbital_period_days`.
+- **Earth-radius literals removed from storm geometry** (atmosphere.py): storm/trade-wave/blocking
+  distance metrics used a hardcoded 6371 km; now take `planet_radius_km` from PlanetParams.
+- **`debug_log=True` crash** (simulate.py): referenced `LOG` before any definition (NameError at
+  the CO2 debug line). Module-level `LOG = logging.getLogger("planetsim")` added; local
+  re-imports removed.
+- **`_pp` used before assignment** (simulate.py): `_evolve_temperature`'s diagnostic-wind fallback
+  path referenced `_pp` ~20 lines before it was assigned.
+- **NumPy humidity-advection fallback** (atmosphere.py): `_advect_scalar` wrapped over the poles
+  via `np.roll(axis=0)` (connecting the two poles) *and* picked the wrong upwind donor for the
+  meridional direction vs the Numba kernel. Both fixed (edge-clamped, donor matches Numba).
+- **Thermal diffusion CFL guard** (simulate.py): explicit-Euler air diffusion now sub-steps when
+  `coeff·1.2·days` exceeds the ~0.5 stability bound (same failure mode as the eddy-flux fix from
+  earlier this week; production substeps were fine, direct large-`days` calls were not).
+- **GUI benchmark race** (main.py): `run_benchmark` set `sim_running = False` without `nonlocal`,
+  binding a local — the sim thread kept stepping the same state the benchmark was using.
+- **Review claims rejected after verification** (for the record): the "in-place soil_moisture
+  mutation" claim (`.astype(np.float32)` copies by default — no aliasing) and the
+  "thermal-wind sign bug" (`np.abs(dT_dy)` makes the sign irrelevant).
+
+**Performance (512×1024 production grid):**
+- Static wind grids (lat/dx/f/eq-window/lon) cached per (shape, planet) in `evolve_wind` — were
+  rebuilt every call; scipy `map_coordinates` import hoisted out of the 8-per-call hot loop;
+  `np.mgrid` cached per shape.
+- Full-resolution ocean-base temperature block in `simulate_step` (3 full-res
+  `temperature_kelvin_for_lat` calls + transport math per step) made lazy — production
+  (wind_bs>1 with initialized temperature) never needed it.
+- u/v coarsening onto the temperature grid batched via `_coarsen_many`.
+- MONTHLY/ANNUAL modes now genuinely skip prognostic wind evolution (`update_wind` fix above).
+- **Measured** (scripts/benchmark_headless.py, recorded in benchmark_results.json, vs the
+  2026-07-01 baseline): 512×1024 MONTHLY 25.84→22.41 s/year (−13%), ANNUAL 22.18→19.36 s/year
+  (−13%); 60×120 MONTHLY 0.76→0.64, ANNUAL 0.72→0.56 s/year (−16-22%). DAILY statistically
+  unchanged (136→141 s/year, within machine noise) — its budget is dominated by
+  precipitation/temperature, already batched in earlier passes; the wind-grid caches saved
+  only a few ms there.
+
+**Verification:** fast suite green (172 passed, 9 xfailed, 1 xpassed — the slow-rotator AMOC
+directional test now passes for real); `debug_log` exercised, CO2 confirmed seeding at 415 ppm
+from EARTH params; slow calibration tier (earth benchmark, latitude bands, circulation strength,
+storm systems, climate drift, polar balance: 70 passed, 10 xfailed, 1 xpassed —
+`test_hemispheric_temperature_symmetry_target` also newly xpasses); full combined suite
+(fast+slow, 270 tests): 249 passed, 20 xfailed, 2 xpassed, with one casualty —
+`test_eddy_flux_reduces_gradient` — whose ~0.2 K std differential was flipped negative by
+unrelated ocean-transport re-phasing for the *second* time in its history (first was the eddy
+sub-stepping fix, see its module docstring). Fixed by isolating the measurement
+(`feedback_flags={'ocean_transport': False, 'ice_albedo': False}`): the eddy term itself
+verifies a clean +0.19 K std gradient reduction.
+
+---
+
 ## Discrete moving storm systems (2026-07-03)
 
 **Problem**: the DAILY-mode Precipitation view showed a smooth, zonally-banded field (ITCZ band,
@@ -307,6 +429,182 @@ strongest wave's actual peak position rather than a raw magnitude threshold, sin
 the 32° edge with a ~9°-radius Gaussian tail naturally bleeds some amplitude toward the adjacent
 mid-latitude band — expected, not a bug). Full suite after this change: **fast 157 passed** (was
 153), **slow 76 passed, 11 xfailed, 1 xpassed** — zero regressions.
+
+---
+
+## Tooling/test hardening + scoped perf-pass follow-up (2026-07-04)
+
+Follow-up to the 2026-07-03 audit pass: that pass found a recurring bug shape (a flag silently
+ignored, a cache key that never matched, a parameter the optimizer thought it was sweeping but
+wasn't wired, a meridional sign error masked for months by a compensating constant) that existing
+tests couldn't catch because they check aggregate climate metrics, not "did this code path run" or
+"does this parameter do anything." This session added five bounded regression/tooling items
+targeting exactly that bug class, plus investigated (but did not land) a scoped performance pass.
+Full plan and rationale: `C:\Users\Trunk\.claude\plans\joyful-zooming-flask.md`. The 1.5-layer
+atmosphere redesign from the same review is intentionally deferred — see ROADMAP.md Theme 1 — as
+its own future effort (large structural change, not a bounded addition).
+
+**1. Earth-constant audit test + fixes** (`testing/test_no_hardcoded_earth_constants.py`, new):
+regex-scans atmosphere.py/ocean.py/carbon_cycle.py/temperature.py/simulate.py for hardcoded
+`6371`/`1013.25`/`288.15`/`365`-modulo/`9.81` outside `planet_params.py`, with an explicit,
+justified allowlist for the two remaining legitimate cases (function-default kwargs always
+overridden by the caller). Fixed the 5 confirmed remaining `1013.25` hPa references (Clausius-
+Clapeyron saturation-mixing-ratio calls in `atmosphere.py`'s `compute_convective_precipitation`/
+`generate_precipitation`/`generate_wind_field` and `simulate.py`'s `_evolve_temperature`, both
+qsat and qsat_sst) — all now source `pp.surface_pressure_pa / 100.0`, which also makes the
+Clausius-Clapeyron reference pressure correct for Mars. Also fixed a hardcoded
+`3.0 * 365.25` ice-sheet-maturity threshold in simulate.py to scale by `pp.orbital_period_days`
+instead (same bug class as the already-fixed `% 365` temperature cache key, just not one of the
+originally counted 5).
+
+**2. Directional/sign regression tests** (`testing/test_derivative_signs.py`, new, 5 tests): unit
+tests independent of any tuning constant — the exact gap that let the meridional-sign bug survive
+for months. Covers `_moisture_convergence_numba` (convergence registers positive, the mirror-image
+divergent pattern doesn't), an orographic windward-vs-leeward precipitation check via
+`generate_precipitation` on a synthetic meridional elevation ramp, and a parametrized
+meridional-vs-zonal terrain-deflection check via `generate_wind_field` (regression for the
+`gx, gy = np.gradient(elev_c)` axis-swap bug — asserts a north-south-only elevation ramp deflects
+wind meridionally, not zonally).
+
+**3. Dead-parameter/wiring linter** (`testing/test_param_wiring.py`, new, 14 tests): runs a short
+(15-day) simulation at a parameter's default vs. a substantially perturbed value and asserts the
+resulting `PlanetState` differs in at least one field beyond a noise floor — modeled on
+`test_feedback_flags.py`'s pattern but generalized and applied to both `simulate_step` kwargs and
+`PlanetParams` fields. **Found a genuine new dead parameter on first run**:
+`simulate_step`'s `latent_cooling_coeff` is accepted but read nowhere else in the codebase.
+Documented in place (simulate.py) as a deprecated no-op rather than newly wired, matching the
+existing `ocean_exchange_floor`/`ocean_exchange_span` convention — wiring in new physics without
+calibration was out of scope for a tooling pass. Also confirmed `create_initial_state` correctly
+seeds `co2_atmosphere`/`ch4_atmosphere` from `PlanetParams` (the 2026-07-03 fix).
+
+**4. Golden-state regression test** (`scripts/generate_golden_state.py` +
+`testing/test_golden_state.py`, new): pickles a `PlanetState` from a small deterministic
+`optimizer.headless.run_simulation` config (32×64, 0.1yr MONTHLY spinup + 0.05yr DAILY eval) as a
+committed fixture (`testing/fixtures/golden_state_reference.pkl`); future runs must match within
+`atol=1e-4`, or the fixture must be deliberately regenerated. **Already proved its value in the
+same session** — see item 6 below.
+
+**5. Conservation/energy-budget dashboard** (`diagnostics.py` +
+`testing/test_conservation.py`, extended): added `area_weighted_global_mean()` and
+`compute_radiation_balance()` to diagnostics.py, consuming the `S_absorbed`/`L_out`/`net_radiation`
+fields already computed in `_evolve_temperature` (now also exposed via `track_components=True`,
+previously only `net_radiation` was). Two new tests in the pre-existing `test_conservation.py`:
+`test_radiation_budget_near_equilibrium` (area-weighted TOA net radiation stays within ±20 W/m²
+after a 2-year spinup — would have caught the ~30x Ekman over-application bug directly) and
+`test_ch4_equilibrium_holds_baseline` (CH4 natural-source/oxidation balance holds within 1 ppb
+over 5 simulated years — the exact mechanism added to fix the pre-2026-07-03 CH4 decay bug).
+
+**6. Scoped performance pass — investigated, not applied.** Wrapped the `np.gradient` call sites
+flagged by profiling (6 sites across `evolve_wind`, `generate_wind_field`, and
+`_evolve_temperature`'s cloud-fraction/orographic terms) in explicit float32 casts, plus dropped an
+unnecessary float64 promotion on a jet-index diagnostic mean. Reverted all of it after two findings:
+(a) the new golden-state test caught a real ~0.1%-magnitude drift in `co2_ocean` after 0.15
+simulated years, meaning at least one of these arrays actually was float64 before the cast (a real,
+if tiny, behavior change, not a true no-op); (b) three separate `scripts/benchmark_headless.py`
+measurements of the *same unchanged code* varied 150–190s/year at 512×1024 DAILY — the
+environment's own run-to-run noise is far larger than this change's theoretical few-ms/step
+benefit, so no improvement could be honestly claimed either way. Rather than keep an unproven
+numeric-behavior change for a benefit that can't be measured above the noise floor, reverted
+cleanly (confirmed golden-state test returns to exact bit-match). Left as a documented ROADMAP.md
+Theme 5 item for whoever revisits this with steadier benchmarking conditions.
+
+**Verification:** all 5 new/extended test files pass individually; full fast suite green; full
+slow suite (including the new `test_conservation.py` energy/CH4 tests, ~7min) green;
+`testing/test_golden_state.py` confirmed to both catch a real regression (the reverted perf-pass
+edits) and pass cleanly on the final, reverted code.
+
+---
+
+## 1.5-layer atmosphere: real prognostic upper-level wind (2026-07-04)
+
+ROADMAP.md Theme 1's top item. Full plan:
+`C:\Users\Trunk\.claude\plans\joyful-zooming-flask.md`. Gives the atmosphere a second,
+independent, prognostic wind layer (`wind_u_aloft`/`wind_v_aloft`) with its own momentum budget —
+advected, Coriolis-rotated, pressure-driven — replacing the old magnitude-only
+`baroclinic_jet_amp * jet_window * |dT/dy|` surface-jet hack (no sign/direction, no feedback) with
+a real, direction-sensitive coupling. Deliberately **additive**: Rossby waves, discrete
+storms/trade waves, the meander-index/blocking state machine, and the 3-cell surface relaxation
+all stay unchanged for this pass — retiring/weakening any of them is deferred to a follow-up,
+validation-driven pass (see ROADMAP.md).
+
+**Architecture:**
+- New `atmosphere.evolve_wind_aloft()`: mirrors `evolve_wind()`'s core numerics (semi-Lagrangian
+  advection, exact-rotation-matrix Coriolis) but simpler — no terrain blocking/channeling, no
+  ice-pressure feedback, no Rossby/storm/blocking pressure terms (those stay surface-only for
+  now), weak Rayleigh friction instead of the surface's quadratic/terrain-enhanced drag, 4
+  substeps instead of 8.
+- `evolve_wind()`'s baroclinic-mixing term now takes `u_aloft`/`v_aloft` arrays and relaxes the
+  surface toward them per-cell (`du = wind_baroclinic_jet_amp * jet_window * (u_aloft - u) / (wind_baroclinic_mix days)`)
+  instead of computing an internal `|dT/dy|`-based magnitude target. `wind_baroclinic_jet_amp`'s
+  *meaning* changed (dimensionless coupling-strength multiplier, not a ~1e6-scale coefficient
+  calibrated against `|dT/dy|`'s tiny K/m magnitude) — default recalibrated from `1.0e6` to `1.0`.
+- New `PlanetState` fields `wind_u_aloft`/`wind_v_aloft` (`None`-default, lazy-initialized as a
+  copy of the surface wind on first use — same NamedTuple-default migration pattern as every
+  other feature added this way; old saves load and step correctly, verified by a dedicated test).
+- New `PlanetParams` fields: `wind_upper_pgf_amp` (default 8.0, Mars 4.8) and `wind_upper_damping`
+  (default 0.05/day, Mars 0.08). Not added to `optimizer/configs/sweep_wind.json` — confirmed
+  other recent PlanetParams-only physics knobs (`storm_pressure_amp_pa`, `eddy_heat_flux_coeff`,
+  `ekman_strength`) aren't in any sweep config either, since that file's `param_space` entries are
+  `simulate_step` kwargs, not PlanetParams fields (no PlanetParams-to-kwargs sweep path exists in
+  `optimizer/sweep.py`); consistent with existing precedent rather than inventing a new one.
+- Performance: `evolve_wind_aloft` only runs when `update_wind=True` (same DAILY/WEEKLY-only gate
+  the surface layer already uses); MONTHLY/ANNUAL simply carry the aloft field forward unchanged
+  (cheapest possible "diagnostic" — consistent with those modes already skipping all prognostic
+  wind physics, including the surface's baroclinic mixing).
+
+**Important mid-implementation finding — sign convention.** The original plan called for
+computing the upper layer's pressure anomaly as the surface's thermal PGF term
+(`-pgf_temp_scale*(T-273.15)/30`), just amplified. Empirically this produced **easterlies**, not
+westerlies, at mid-latitudes. Root cause, confirmed by testing the *surface*'s own `evolve_wind`
+with the 3-cell relaxation and baroclinic mixing both disabled: the model's pure
+PGF+Coriolis+friction dynamics do not organically produce realistic westerlies at all — the
+existing surface jet is realistic *only* because the 3-cell relaxation target forces it there.
+This is a direct, concrete confirmation of the ROADMAP.md Theme 1 framing ("nothing is truly
+emergent from instability or baroclinic dynamics"). Since the upper layer was deliberately built
+*without* a relaxation crutch (the whole point was emergent behavior), amplifying the surface's
+formula just made the wrong-signed response stronger. Fix: the upper layer uses the **opposite**
+sign (`+pgf_temp_scale*upper_pgf_amp*(T-273.15)/30`) — physically, a warm column is thicker, so
+upper-level pressure is relatively *higher* over warm regions, inverted from the surface's naive
+"cold = high" pattern. Verified this produces a correctly-signed, correctly-shaped jet profile
+(peaking at 45-50°, symmetric, near-zero at pole/equator) and that reversing the temperature
+gradient reverses the jet's sign (the exact property the old `|dT/dy|` hack could never have).
+`wind_upper_pgf_amp` was then calibrated (120-day mixed-terrain spinup) so the upper layer's
+jet-band wind speed comes out visibly stronger than the surface's, matching real tropospheric
+jets — default 8.0.
+
+**Testing:** new `testing/test_upper_layer_wind.py` (6 tests): directional sign correctness
+(normal gradient → westerly, reversed gradient → easterly — not just weaker), zero-amplitude
+no-op, aloft-stronger-than-surface-at-jet-band on a 2-year spinup, on/off coupling check (mixing
+disabled → measurably weaker surface westerlies), and an old-format (missing-field) save/load
+round-trip. All existing wind/circulation/jet-stream/storm/planet-generalization tests (61 tests
+across 5 files) re-run with **zero regressions** — the only pre-existing xfails are unrelated
+stretch-goal thresholds, unaffected by this change.
+
+**Collateral fix — `test_eddy_heat_flux.py`.** The new coupling flipped this test's tiny (~0.1-0.2
+K std) differential negative for the **third** time in its history (previously: the eddy
+sub-stepping fix's interaction with ocean noise, then the 2026-07-03 western-boundary/thermal-
+diffusion fixes). Confirmed via direct isolation (`wind_baroclinic_jet_amp=0.0` restores the
+expected +0.18 K delta vs -0.10 K at the new default) that the *new coupling*, not the eddy-flux
+mechanism itself, was responsible. Fixed the same way the prior two occurrences were: added
+`wind_baroclinic_jet_amp=0.0` to the test's existing `ocean_transport`/`ice_albedo` isolation set,
+since it's real physics but not what this test measures, and its own noise is large enough at
+this small differential to flip the sign.
+
+**Performance:** `evolve_wind_aloft` adds ~4 cheap substeps (no terrain/storm/blocking terms) only
+in DAILY/WEEKLY mode. Benchmark after the change: 512×1024 DAILY 155.94s/year, WEEKLY
+154.21s/year, MONTHLY 23.29s/year, ANNUAL 18.73s/year. Given this same environment's demonstrated
+150-190s/year run-to-run noise on *unchanged* code (see the perf-pass entry above), no
+attributable regression can honestly be claimed from these numbers — they fall within the
+established noise band. MONTHLY/ANNUAL are unaffected as designed (aloft evolution is skipped
+there).
+
+**Verification:** full fast + slow suite green (281 passed, 20 xfailed, 2 xpassed, 0 failed) after
+the golden-state fixture regeneration (expected — this is a deliberate physics change) and the
+eddy-heat-flux isolation fix.
+
+**Deferred follow-up (next ROADMAP Theme 1 item):** once this layer is validated further, revisit
+whether the Rossby waves, discrete storms/trade waves, and/or 3-cell relaxation can be weakened
+now that a real vertical-shear mechanism exists, per the additive-first scope decision above.
 
 ---
 

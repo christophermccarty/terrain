@@ -54,6 +54,25 @@ OCEAN_ATM_TRANSFER = 3.5e-3            # dimensionless scale factor
 # Ocean area fraction for normalization (weighted average over Earth)
 OCEAN_AREA_FRACTION = 0.71
 
+# Atmospheric CH4 lifetime vs OH oxidation [days] (τ = 9 yr, IPCC AR6).
+# Shared by ch4_oxidation_step and the baseline natural source that balances
+# it at the planetary background concentration.
+CH4_LIFETIME_DAYS = 3287.0
+
+
+def _global_area_mean(field: np.ndarray) -> float:
+    """cos(lat)-weighted global mean of a per-m² surface density field.
+
+    On an equirectangular grid every row has the same cell count but true
+    cell area ∝ cos(lat); a plain np.mean() over-represents polar rows.
+    For latitude-uniform fields this reduces exactly to np.mean().
+    """
+    H = field.shape[0]
+    lat_rad = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
+    w = np.cos(lat_rad)
+    row_means = np.mean(field, axis=1)
+    return float(np.sum(row_means * w) / (np.sum(w) + 1e-12))
+
 # Try to import Numba for acceleration
 try:
     from numba import jit, prange
@@ -190,6 +209,18 @@ def ocean_co2_flux(
     --------
     Gas exchange rate proportional to wind speed and (C_eq - C_actual).
     Piston velocity: k = 0.31 * u² (Wanninkhof 1992)
+
+    KNOWN SIMPLIFICATION: Wanninkhof's k∝u² is calibrated for time-averaged
+    (monthly-ish) wind speed, but the caller (carbon_cycle_step) passes the
+    instantaneous per-step wind_speed. Because of the quadratic term, added
+    high-frequency wind variance raises mean(k) via Jensen's inequality even
+    at unchanged mean wind -- e.g. the atmosphere.py jet-stream/storm-track
+    variability speeds up convergence toward this model's ocean-atmosphere
+    CO2 quasi-equilibrium (see testing/test_conservation.py's
+    test_co2_budget_near_steady_state, which had to widen its tolerance
+    because of this). A more correct fix would time-average wind_speed
+    (e.g. a 30-day rolling mean carried in PlanetState) before it reaches
+    this function; not yet implemented.
     """
     # Gas transfer velocity (piston velocity) [m/day]
     # k ∝ u² (quadratic wind speed dependence)
@@ -812,7 +843,10 @@ def permafrost_thaw_step(
     PPM_PER_KGC_PER_M2 = 1.02e-3  # ppm CO2 per (kgC/m²) averaged over globe
     PPB_CH4_PER_KGC_PER_M2 = 2.27e-4  # ppb CH4 per (kgC/m²) — 20% of C as CH4 (molar corrected)
 
-    total_released = float(np.mean(released_kgc_m2))  # global mean kgC/m²/step
+    # Area-weighted global mean: on an equirectangular grid each row's true
+    # area ∝ cos(lat). Permafrost lives almost entirely in high-latitude rows,
+    # which an unweighted np.mean() overweights by 2-3x.
+    total_released = _global_area_mean(released_kgc_m2)  # global mean kgC/m²/step
     d_co2 = total_released * 0.80 * PPM_PER_KGC_PER_M2
     d_ch4 = total_released * 0.20 * PPB_CH4_PER_KGC_PER_M2
 
@@ -837,9 +871,10 @@ def wetland_ch4_emissions(
     else:
         wet_factor = np.where(T_C > 5.0, 0.5, 0.0).astype(np.float32, copy=False)
 
-    # Only land cells emit
+    # Only land cells emit. Area-weighted global mean (see permafrost_thaw_step):
+    # unweighted np.mean() over-represents polar rows relative to their true area.
     emission_density = 1.5e-3 * T_factor * wet_factor  # ppb/day per cell
-    global_emission = float(np.mean(np.where(land_mask, emission_density, 0.0)))
+    global_emission = _global_area_mean(np.where(land_mask, emission_density, 0.0))
 
     return global_emission * float(dt_days)
 
@@ -849,5 +884,17 @@ def ch4_oxidation_step(ch4_ppb: float, dt_days: float) -> float:
 
     τ_CH4 = 9 yr = 3287 days  (IPCC AR6).
     """
-    tau = 3287.0
-    return float(ch4_ppb * np.exp(-dt_days / tau))
+    return float(ch4_ppb * np.exp(-dt_days / CH4_LIFETIME_DAYS))
+
+
+def ch4_natural_source(baseline_ppb: float, dt_days: float) -> float:
+    """Background natural CH4 source [ppb/step] balancing oxidation at baseline.
+
+    The modeled sources (wetland + permafrost, both toy-calibrated) supply far
+    less than the ~0.58 ppb/day needed to hold Earth's ~1900 ppb against the
+    9-year OH sink, so without this term CH4 decayed toward zero over multi-
+    decade runs, dragging in a spurious ~-1 W/m² forcing drift. This constant
+    source represents all unmodeled steady-state emissions; equilibrium is
+    exactly `baseline_ppb` plus perturbations decaying with τ_CH4.
+    """
+    return float(max(baseline_ppb, 0.0) * dt_days / CH4_LIFETIME_DAYS)
