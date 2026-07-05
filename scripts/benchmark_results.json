@@ -334,5 +334,67 @@
         "status": "OVER"
       }
     ]
+  },
+  {
+    "timestamp": "2026-07-05T03:17:38.079939+00:00",
+    "target_s_per_year": 90.0,
+    "results": [
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "DAILY",
+        "seconds_per_year": 5.659712400054559,
+        "status": "OK"
+      },
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "WEEKLY",
+        "seconds_per_year": 5.332292799954303,
+        "status": "OK"
+      },
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "MONTHLY",
+        "seconds_per_year": 0.6549941999837756,
+        "status": "OK"
+      },
+      {
+        "H": 60,
+        "W": 120,
+        "mode": "ANNUAL",
+        "seconds_per_year": 0.5743739000754431,
+        "status": "OK"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "DAILY",
+        "seconds_per_year": 155.93830839998554,
+        "status": "OVER"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "WEEKLY",
+        "seconds_per_year": 154.20502180000767,
+        "status": "OVER"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "MONTHLY",
+        "seconds_per_year": 23.286657099961303,
+        "status": "OK"
+      },
+      {
+        "H": 512,
+        "W": 1024,
+        "mode": "ANNUAL",
+        "seconds_per_year": 18.72656039998401,
+        "status": "OK"
+      }
+    ]
   }
 ]

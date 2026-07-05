@@ -355,6 +355,28 @@ class PlanetParams:
     real blocking high."""
 
     # ------------------------------------------------------------------ #
+    # 1.5-layer atmosphere: prognostic upper-level wind (atmosphere.evolve_wind_aloft)
+    # ------------------------------------------------------------------ #
+    wind_upper_pgf_amp: float = 8.0
+    """Amplitude of the upper-level thermal pressure-gradient term
+    (atmosphere.evolve_wind_aloft) -- opposite sign convention from the
+    surface's thermal PGF (see evolve_wind_aloft's docstring: a warm column
+    is thicker, so upper-level pressure is relatively higher over warm
+    regions, inverted from the surface's "cold = high" pattern), and a
+    larger amplitude than the surface term since real meridional
+    temperature/pressure gradients strengthen with altitude up to jet
+    level. Calibrated (120-day mixed-terrain spinup at 32x64) so the
+    upper-level jet-band wind speed comes out visibly stronger than the
+    surface layer's, matching real tropospheric jets being stronger aloft,
+    without requiring a separate upper-level temperature field."""
+
+    wind_upper_damping: float = 0.05
+    """Rayleigh-friction rate [1/day] for the upper-level wind layer — much
+    weaker than the surface's quadratic/terrain-enhanced drag
+    (wind_drag_base/wind_drag_elev_scale), since the upper troposphere is
+    nearly frictionless compared to the boundary layer."""
+
+    # ------------------------------------------------------------------ #
     # Derived convenience properties
     # ------------------------------------------------------------------ #
 
@@ -500,4 +522,6 @@ MARS = PlanetParams(
     trade_wave_pressure_amp_pa=25.0,  # Same reasoning, scaled with storm_pressure_amp_pa
     jet_meander_noise_amp=0.15,  # Weaker baroclinicity on a thin, dry atmosphere
     jet_block_pressure_amp_pa=60.0,  # Same reasoning, scaled with storm_pressure_amp_pa
+    wind_upper_pgf_amp=4.8,  # Thin CO2 atmosphere: weaker vertical strengthening of gradients (scaled with Earth's default)
+    wind_upper_damping=0.08,  # Slightly more damped: thinner atmosphere, less inertia aloft
 )

@@ -515,6 +515,99 @@ edits) and pass cleanly on the final, reverted code.
 
 ---
 
+## 1.5-layer atmosphere: real prognostic upper-level wind (2026-07-04)
+
+ROADMAP.md Theme 1's top item. Full plan:
+`C:\Users\Trunk\.claude\plans\joyful-zooming-flask.md`. Gives the atmosphere a second,
+independent, prognostic wind layer (`wind_u_aloft`/`wind_v_aloft`) with its own momentum budget —
+advected, Coriolis-rotated, pressure-driven — replacing the old magnitude-only
+`baroclinic_jet_amp * jet_window * |dT/dy|` surface-jet hack (no sign/direction, no feedback) with
+a real, direction-sensitive coupling. Deliberately **additive**: Rossby waves, discrete
+storms/trade waves, the meander-index/blocking state machine, and the 3-cell surface relaxation
+all stay unchanged for this pass — retiring/weakening any of them is deferred to a follow-up,
+validation-driven pass (see ROADMAP.md).
+
+**Architecture:**
+- New `atmosphere.evolve_wind_aloft()`: mirrors `evolve_wind()`'s core numerics (semi-Lagrangian
+  advection, exact-rotation-matrix Coriolis) but simpler — no terrain blocking/channeling, no
+  ice-pressure feedback, no Rossby/storm/blocking pressure terms (those stay surface-only for
+  now), weak Rayleigh friction instead of the surface's quadratic/terrain-enhanced drag, 4
+  substeps instead of 8.
+- `evolve_wind()`'s baroclinic-mixing term now takes `u_aloft`/`v_aloft` arrays and relaxes the
+  surface toward them per-cell (`du = wind_baroclinic_jet_amp * jet_window * (u_aloft - u) / (wind_baroclinic_mix days)`)
+  instead of computing an internal `|dT/dy|`-based magnitude target. `wind_baroclinic_jet_amp`'s
+  *meaning* changed (dimensionless coupling-strength multiplier, not a ~1e6-scale coefficient
+  calibrated against `|dT/dy|`'s tiny K/m magnitude) — default recalibrated from `1.0e6` to `1.0`.
+- New `PlanetState` fields `wind_u_aloft`/`wind_v_aloft` (`None`-default, lazy-initialized as a
+  copy of the surface wind on first use — same NamedTuple-default migration pattern as every
+  other feature added this way; old saves load and step correctly, verified by a dedicated test).
+- New `PlanetParams` fields: `wind_upper_pgf_amp` (default 8.0, Mars 4.8) and `wind_upper_damping`
+  (default 0.05/day, Mars 0.08). Not added to `optimizer/configs/sweep_wind.json` — confirmed
+  other recent PlanetParams-only physics knobs (`storm_pressure_amp_pa`, `eddy_heat_flux_coeff`,
+  `ekman_strength`) aren't in any sweep config either, since that file's `param_space` entries are
+  `simulate_step` kwargs, not PlanetParams fields (no PlanetParams-to-kwargs sweep path exists in
+  `optimizer/sweep.py`); consistent with existing precedent rather than inventing a new one.
+- Performance: `evolve_wind_aloft` only runs when `update_wind=True` (same DAILY/WEEKLY-only gate
+  the surface layer already uses); MONTHLY/ANNUAL simply carry the aloft field forward unchanged
+  (cheapest possible "diagnostic" — consistent with those modes already skipping all prognostic
+  wind physics, including the surface's baroclinic mixing).
+
+**Important mid-implementation finding — sign convention.** The original plan called for
+computing the upper layer's pressure anomaly as the surface's thermal PGF term
+(`-pgf_temp_scale*(T-273.15)/30`), just amplified. Empirically this produced **easterlies**, not
+westerlies, at mid-latitudes. Root cause, confirmed by testing the *surface*'s own `evolve_wind`
+with the 3-cell relaxation and baroclinic mixing both disabled: the model's pure
+PGF+Coriolis+friction dynamics do not organically produce realistic westerlies at all — the
+existing surface jet is realistic *only* because the 3-cell relaxation target forces it there.
+This is a direct, concrete confirmation of the ROADMAP.md Theme 1 framing ("nothing is truly
+emergent from instability or baroclinic dynamics"). Since the upper layer was deliberately built
+*without* a relaxation crutch (the whole point was emergent behavior), amplifying the surface's
+formula just made the wrong-signed response stronger. Fix: the upper layer uses the **opposite**
+sign (`+pgf_temp_scale*upper_pgf_amp*(T-273.15)/30`) — physically, a warm column is thicker, so
+upper-level pressure is relatively *higher* over warm regions, inverted from the surface's naive
+"cold = high" pattern. Verified this produces a correctly-signed, correctly-shaped jet profile
+(peaking at 45-50°, symmetric, near-zero at pole/equator) and that reversing the temperature
+gradient reverses the jet's sign (the exact property the old `|dT/dy|` hack could never have).
+`wind_upper_pgf_amp` was then calibrated (120-day mixed-terrain spinup) so the upper layer's
+jet-band wind speed comes out visibly stronger than the surface's, matching real tropospheric
+jets — default 8.0.
+
+**Testing:** new `testing/test_upper_layer_wind.py` (6 tests): directional sign correctness
+(normal gradient → westerly, reversed gradient → easterly — not just weaker), zero-amplitude
+no-op, aloft-stronger-than-surface-at-jet-band on a 2-year spinup, on/off coupling check (mixing
+disabled → measurably weaker surface westerlies), and an old-format (missing-field) save/load
+round-trip. All existing wind/circulation/jet-stream/storm/planet-generalization tests (61 tests
+across 5 files) re-run with **zero regressions** — the only pre-existing xfails are unrelated
+stretch-goal thresholds, unaffected by this change.
+
+**Collateral fix — `test_eddy_heat_flux.py`.** The new coupling flipped this test's tiny (~0.1-0.2
+K std) differential negative for the **third** time in its history (previously: the eddy
+sub-stepping fix's interaction with ocean noise, then the 2026-07-03 western-boundary/thermal-
+diffusion fixes). Confirmed via direct isolation (`wind_baroclinic_jet_amp=0.0` restores the
+expected +0.18 K delta vs -0.10 K at the new default) that the *new coupling*, not the eddy-flux
+mechanism itself, was responsible. Fixed the same way the prior two occurrences were: added
+`wind_baroclinic_jet_amp=0.0` to the test's existing `ocean_transport`/`ice_albedo` isolation set,
+since it's real physics but not what this test measures, and its own noise is large enough at
+this small differential to flip the sign.
+
+**Performance:** `evolve_wind_aloft` adds ~4 cheap substeps (no terrain/storm/blocking terms) only
+in DAILY/WEEKLY mode. Benchmark after the change: 512×1024 DAILY 155.94s/year, WEEKLY
+154.21s/year, MONTHLY 23.29s/year, ANNUAL 18.73s/year. Given this same environment's demonstrated
+150-190s/year run-to-run noise on *unchanged* code (see the perf-pass entry above), no
+attributable regression can honestly be claimed from these numbers — they fall within the
+established noise band. MONTHLY/ANNUAL are unaffected as designed (aloft evolution is skipped
+there).
+
+**Verification:** full fast + slow suite green (281 passed, 20 xfailed, 2 xpassed, 0 failed) after
+the golden-state fixture regeneration (expected — this is a deliberate physics change) and the
+eddy-heat-flux isolation fix.
+
+**Deferred follow-up (next ROADMAP Theme 1 item):** once this layer is validated further, revisit
+whether the Rossby waves, discrete storms/trade waves, and/or 3-cell relaxation can be weakened
+now that a real vertical-shear mechanism exists, per the additive-first scope decision above.
+
+---
+
 ## Phase 0 — Code Audit & Cleanup ✅ COMPLETE (2026-06-20)
 
 All tasks done: `heat_transport_coeff` dead parameter removed, `co2_climate_feedback` wiring

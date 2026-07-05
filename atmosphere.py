@@ -824,6 +824,8 @@ def evolve_wind(
     jet_index_sh: float = 0.0,
     jet_block_nh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
     jet_block_sh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
+    u_aloft: np.ndarray | None = None,
+    v_aloft: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -844,6 +846,12 @@ def evolve_wind(
     `jet_block_{nh,sh}` are `(lon_deg, days_left, total_duration_days)`
     tuples describing an active blocking ridge (atmosphere._update_jet_blocking
     / _blocking_ridge_pressure_anomaly); `lon_deg == -1.0` means inactive.
+
+    `u_aloft`/`v_aloft`, if provided, are the current upper-level (1.5-layer)
+    prognostic wind field (see `evolve_wind_aloft`). When present, the
+    baroclinic mixing term relaxes the surface wind toward this field on a
+    per-cell, direction-sensitive basis instead of the old magnitude-only
+    `|dT/dy|` proxy.
     """
     H, W = u.shape
     dt_total = dt_days * 86400.0  # seconds
@@ -994,22 +1002,21 @@ def evolve_wind(
     pgf_u = -1.0/rho * dp_dx
     pgf_v = -1.0/rho * dp_dy
 
-    # --- Baroclinic / eddy-driven mid-lat westerly tendency (parameterized) ---
-    # In the real atmosphere, mid-lat westerlies are maintained by baroclinic eddies and
-    # their momentum flux convergence. We approximate the net effect by mixing a
-    # thermal-wind-like westerly target down toward the surface, based on |dT/dy|.
+    # --- Baroclinic / eddy-driven mid-lat westerly tendency ---
+    # Real per-cell vertical momentum mixing toward the upper-level (1.5-layer)
+    # wind field (evolve_wind_aloft), replacing the old magnitude-only
+    # `baroclinic_jet_amp * jet_window * |dT/dy|` proxy. Direction-sensitive
+    # (carries the actual sign of the aloft-surface wind difference) where the
+    # old hack wasn't -- `|dT/dy|` discarded sign entirely, so it could never
+    # distinguish a cold-to-warm gradient from a warm-to-cold one.
     b_amp = float(baroclinic_jet_amp)
     b_mix = float(baroclinic_mix)
-    if b_amp != 0.0 and b_mix > 0.0:
-        # Use zonal-mean temperature gradient so the tendency acts on the zonal-mean jet,
-        # matching the climatological effect of baroclinic eddies.
+    mix_active = b_amp != 0.0 and b_mix > 0.0 and u_aloft is not None and v_aloft is not None
+    if mix_active:
         abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32, copy=False)  # (H,)
-        w_mid_1d = np.exp(-((abs_deg_1d - 45.0) / 12.0) ** 2).astype(np.float32, copy=False)  # (H,)
-        ztemp = np.mean(temperature.astype(np.float32), axis=1, keepdims=True)  # (H,1)
-        dT_dy = -np.gradient(ztemp, axis=0) / dy  # (H,1) physical K/m; negate for north→south axis
-        u_jet = (b_amp * w_mid_1d[:, None] * np.abs(dT_dy)).astype(np.float32, copy=False)  # (H,1)
-        # Safety clamp: keep the parameterization from generating unrealistic surface jets.
-        u_jet = np.clip(u_jet, 0.0, 70.0).astype(np.float32, copy=False)
+        jet_window_mix = np.exp(-((abs_deg_1d - 45.0) / 12.0) ** 2).astype(np.float32, copy=False)[:, None]  # (H,1)
+        u_aloft_arr = u_aloft.astype(np.float32, copy=False)
+        v_aloft_arr = v_aloft.astype(np.float32, copy=False)
 
     # --- 3-cell surface tendency (Hadley/Ferrel/Polar) ---
     # A single-layer model won't spontaneously generate the full overturning circulation.
@@ -1089,11 +1096,12 @@ def evolve_wind(
             du = (pgf_u + friction_u) * dt_sub
             dv = (pgf_v + friction_v) * dt_sub
 
-        # 4. Baroclinic jet mixing
-        if b_amp != 0.0 and b_mix > 0.0:
-            k = 1.0 / (b_mix * 86400.0)
-            u_zm = np.mean(u_rot, axis=1, keepdims=True)  # (H,1)
-            du = du + (u_jet - u_zm) * k * dt_sub
+        # 4. Baroclinic jet mixing: per-cell relaxation toward the upper-level
+        # wind (vertical momentum coupling), not a zonal-mean-only nudge.
+        if mix_active:
+            k = b_amp / (b_mix * 86400.0)
+            du = du + (u_aloft_arr - u_rot) * jet_window_mix * k * dt_sub
+            dv = dv + (v_aloft_arr - v_rot) * jet_window_mix * k * dt_sub
 
         u_curr = u_rot + du * damping
         v_curr = v_rot + dv * damping
@@ -1128,6 +1136,111 @@ def evolve_wind(
         u_curr[mask_high] *= scale[mask_high]
         v_curr[mask_high] *= scale[mask_high]
     
+    return u_curr.astype(np.float32), v_curr.astype(np.float32)
+
+
+def evolve_wind_aloft(
+    u2: np.ndarray,
+    v2: np.ndarray,
+    temperature: np.ndarray,
+    dt_days: float = 1.0,
+    pgf_temp_scale: float = 450.0,
+    upper_pgf_amp: float = 2.5,
+    damping_rate: float = 0.05,
+    vmax_clip: float = 150.0,
+    planet_params: PlanetParams | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evolve the upper-level (1.5-layer) prognostic wind field.
+
+    This is the real, independent momentum budget behind the "1.5-layer
+    atmosphere": the upper level has its own advected, Coriolis-rotated,
+    pressure-driven wind (u2, v2) rather than being a per-step diagnostic
+    slaved to the surface -- what actually lets vertical shear and
+    baroclinic-style jet behavior emerge from the temperature field, instead
+    of the old magnitude-only `baroclinic_jet_amp * jet_window * |dT/dy|`
+    proxy this replaces (see evolve_wind's baroclinic-mixing term, which now
+    relaxes the surface wind toward this layer's output instead).
+
+    Deliberately simpler than `evolve_wind`: no terrain blocking/channeling,
+    no ice-pressure feedback, no Rossby/storm/blocking pressure terms --
+    those are surface/boundary-layer phenomena, kept there for this pass
+    (see ROADMAP.md Theme 1's deferred-retirement note). Friction is a weak
+    Rayleigh damping rather than the surface's quadratic/terrain-enhanced
+    drag, since the upper troposphere is nearly frictionless compared to the
+    boundary layer. The coupling back to the surface (in evolve_wind) is
+    one-way (surface relaxes toward this layer) rather than a fully
+    momentum-conserving exchange -- a deliberate simplification for this
+    first pass, consistent with how real boundary-layer schemes already
+    treat the near-surface layer asymmetrically relative to the free
+    troposphere.
+    """
+    H, W = u2.shape
+    dt_total = dt_days * 86400.0  # seconds
+    pp = planet_params or EARTH
+
+    lat_2d, dx, dy, f, eq_window, _lon_1d_cached = _wind_static_grids(H, W, pp)
+
+    # Weaker friction than the surface layer means a longer stability
+    # timescale; 4 sub-steps (half the surface's 8) keeps this affordable.
+    n_steps = 4
+    dt_sub = dt_total / n_steps
+    rho = RHO_AIR
+
+    u_curr, v_curr = u2.copy(), v2.copy()
+
+    # Pressure anomaly: OPPOSITE sign convention from the surface's thermal
+    # PGF term (`-pgf_temp_scale * (T-273.15)/30`), not just an amplified
+    # copy of it -- confirmed empirically (see the calibration notes in
+    # PLAN.md) that copying the surface's sign produces easterlies, not
+    # westerlies, at mid-latitudes once actually integrated through the
+    # Coriolis/PGF dynamics without the surface's 3-cell relaxation crutch.
+    # This matches the real hypsometric relationship: a warm column is
+    # thicker, so upper-level geopotential/pressure is relatively HIGHER over
+    # warm regions and LOWER over cold ones -- inverted from the naive
+    # surface "cold air = surface high" pattern. With this sign, a
+    # poleward-decreasing temperature genuinely produces a poleward-directed
+    # pressure gradient whose geostrophic response is westerly in both
+    # hemispheres (f flips sign together with the gradient's effective
+    # direction), which is what makes real thermal-wind-driven jets emerge
+    # here instead of needing a relaxation target.
+    p_anom = float(pgf_temp_scale) * float(upper_pgf_amp) * ((temperature - 273.15) / 30.0)
+
+    dp_dx = _ddx_periodic(p_anom) / (dx + 1e-3)
+    dp_dy = -np.gradient(p_anom, axis=0) / dy
+    pgf_u = -1.0 / rho * dp_dx
+    pgf_v = -1.0 / rho * dp_dy
+
+    k_damp = float(damping_rate) / 86400.0  # 1/day -> 1/s
+
+    for _ in range(n_steps):
+        # 1. Semi-Lagrangian advection (unconditionally stable) -- same scheme
+        # as the surface layer.
+        u_adv, v_adv = _advect_wind_semi_lagrangian(u_curr, v_curr, dt_sub, dx, dy)
+
+        # 2. Coriolis -- exact rotation matrix, same as the surface layer.
+        theta = f * dt_sub
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        u_rot = cos_t * u_adv + sin_t * v_adv
+        v_rot = -sin_t * u_adv + cos_t * v_adv
+
+        # 3. PGF + weak Rayleigh friction (no terrain/quadratic drag aloft).
+        friction_u = -k_damp * u_rot
+        friction_v = -k_damp * v_rot
+        du = (pgf_u + friction_u) * dt_sub
+        dv = (pgf_v + friction_v) * dt_sub
+
+        u_curr = u_rot + du
+        v_curr = v_rot + dv
+
+        # Soft clamp to prevent explosion (same pattern as evolve_wind).
+        total_v = np.hypot(u_curr, v_curr)
+        vmax = float(vmax_clip)
+        mask_high = total_v > vmax
+        scale = vmax / (total_v + 1e-6)
+        u_curr[mask_high] *= scale[mask_high]
+        v_curr[mask_high] *= scale[mask_high]
+
     return u_curr.astype(np.float32), v_curr.astype(np.float32)
 
 

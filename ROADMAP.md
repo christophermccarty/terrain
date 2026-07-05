@@ -26,12 +26,25 @@
 The single-layer atmosphere is now well-tuned but fundamentally limits what
 can emerge on its own (jets, monsoons, real storm dynamics).
 
-- **1.5-layer atmosphere.** Add a single "upper" wind layer (or a prescribed
-  baroclinic shear profile) so thermal wind, jet streams, and storm steering
-  emerge from the temperature field instead of the 3-cell relaxation targets.
-  This is the highest-value structural upgrade; most of the current
-  parameterizations (cell relaxation, baroclinic jet mixing, Rossby modes)
-  could then be weakened or retired.
+- ~~**1.5-layer atmosphere.**~~ **Done 2026-07-04.** `atmosphere.evolve_wind_aloft()`
+  gives the atmosphere a real, independent prognostic upper-level wind layer
+  (own advection/Coriolis/PGF momentum budget, weak Rayleigh friction, no
+  terrain/storm/Rossby terms), coupled back to the surface via a real
+  per-cell, direction-sensitive relaxation term (replacing the old
+  magnitude-only `|dT/dy|` hack). Deliberately additive: Rossby waves,
+  discrete storms/trade waves, the meander-index/blocking state machine, and
+  the 3-cell surface relaxation are all unchanged for this pass. **Follow-up
+  (next item here):** now that a real vertical-shear mechanism exists,
+  revisit whether any of those prescribed mechanisms can be weakened or
+  retired — this is the validation-driven reassessment the original bullet
+  called for, deferred until the new layer has more runtime/calibration
+  behind it. See PLAN.md's 2026-07-04 entry for the full implementation
+  writeup, including a real physics finding along the way: the model's pure
+  PGF+Coriolis+friction dynamics don't organically produce realistic surface
+  westerlies at all (confirmed by disabling the 3-cell relaxation) — the
+  upper layer needed the *opposite* sign convention from the surface's
+  thermal PGF term (warm column = higher upper-level pressure, not lower) to
+  produce a correctly-signed jet.
 - **Prognostic cloud water.** `cloud_water` exists in state but is never
   updated; clouds are re-diagnosed from RH each step. A simple
   condensation/precipitation/evaporation budget would give clouds memory and

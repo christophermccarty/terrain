@@ -33,7 +33,7 @@ class TimeScaleMode(Enum):
 import pickle
 from atmosphere import (
     generate_wind_field, generate_precipitation,
-    evolve_wind, _upsample_bilinear_many,
+    evolve_wind, evolve_wind_aloft, _upsample_bilinear_many,
     _update_jet_index, _update_jet_blocking,
 )
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
@@ -374,6 +374,9 @@ class PlanetState(NamedTuple):
     jet_block_lon_sh: float = -1.0
     jet_block_days_left_sh: float = 0.0
     jet_block_total_days_sh: float = 0.0
+    # Feature 8: 1.5-layer atmosphere (real prognostic upper-level wind)
+    wind_u_aloft: np.ndarray | None = None  # (H, W) upper-level eastward wind (m/s)
+    wind_v_aloft: np.ndarray | None = None  # (H, W) upper-level northward wind (m/s)
 
 
 def simulate_step(
@@ -396,10 +399,14 @@ def simulate_step(
     wind_drag_elev_scale: float = 6.0e-7,
     wind_damping: float = 0.50,  # PGF scaling: 0.25 halved PGF causing 3-7× weak winds; 0.5 is better
     wind_vmax_clip: float = 50.0,  # Phase 4 fix: Realistic maximum wind speed (strong jet stream)
-    # Baroclinic eddy / thermal-wind proxy. The previous default (3e7) tends to produce
-    # unrealistically strong, planet-wide surface jets. Keep conservative by default.
-    # Lower default to avoid razor-thin zonal jets at the surface.
-    wind_baroclinic_jet_amp: float = 1.0e6,
+    # Baroclinic eddy / vertical momentum coupling to the upper-level (1.5-layer)
+    # wind (evolve_wind_aloft). Dimensionless coupling-strength multiplier
+    # (1.0 = nominal full-strength coupling on the wind_baroclinic_mix-day
+    # relaxation timescale) -- NOTE: prior to the 1.5-layer atmosphere upgrade
+    # this parameter scaled a magnitude-only `|dT/dy|` proxy directly (hence
+    # the old ~1e6 default); its meaning changed with the real upper layer,
+    # so the default was recalibrated rather than reused.
+    wind_baroclinic_jet_amp: float = 1.0,
     wind_baroclinic_mix: float = 2.0,
     # Increased to 3.0 days to prevent oscillations from over-relaxation
     wind_cell_relax_days: float = 3.0,
@@ -1018,7 +1025,15 @@ def simulate_step(
         v_full = rng.normal(0.0, 0.15, size=(H, W)).astype(np.float32, copy=False)
     else:
         u_full, v_full = state.wind_u, state.wind_v
-        
+
+    # 1.5-layer atmosphere: upper-level prognostic wind (Feature 8). Lazy-init
+    # as a copy of the surface wind (a physically-reasonable warm start) if
+    # this is the first step or an old save predates this field.
+    if state.wind_u_aloft is None or state.wind_v_aloft is None:
+        u2_full, v2_full = u_full.copy(), v_full.copy()
+    else:
+        u2_full, v2_full = state.wind_u_aloft, state.wind_v_aloft
+
     # Evolve wind at `wind_block_size` resolution (can differ from temperature/precip `block_size`)
     # Then upsample to full resolution for precipitation
     # Cached diagnostic wind for relaxation (once per day/shape/params).
@@ -1085,7 +1100,9 @@ def simulate_step(
             u_full, v_full = _diag_wind_cached(H, W, state.temperature, state.elevation)
     elif wind_bs > 1:
         # Downsample wind/temperature/elevation/ice for evolution on the wind grid (batched).
-        _group_b_in: dict[str, np.ndarray] = {"u": u_full, "v": v_full}
+        _group_b_in: dict[str, np.ndarray] = {
+            "u": u_full, "v": v_full, "u2": u2_full, "v2": v2_full,
+        }
         if state.temperature is not None:
             _group_b_in["T"] = state.temperature
         if state.ice_cover is not None:
@@ -1093,6 +1110,8 @@ def simulate_step(
         _group_b_out = _coarsen_many(_group_b_in, Hcw, Wcw, wind_bs)
         u_coarse_evol = _group_b_out["u"]
         v_coarse_evol = _group_b_out["v"]
+        u2_coarse_evol = _group_b_out["u2"]
+        v2_coarse_evol = _group_b_out["v2"]
         ice_c_w = _group_b_out.get("ice")
         elev_c_w = _coarsen_elevation_cached(state.elevation, Hcw, Wcw, wind_bs)
 
@@ -1108,6 +1127,20 @@ def simulate_step(
                 planet_params=pp,
             )
             T_for_wind = np.repeat(T_lat_ocean_w[:, None], Wcw, axis=1).astype(np.float32, copy=False)
+
+        # 1.5-layer atmosphere: evolve the upper-level wind first, at the same
+        # wind-grid resolution, so evolve_wind's baroclinic mixing term below
+        # can relax the surface toward this step's freshly-updated aloft wind.
+        u2_coarse_evol, v2_coarse_evol = evolve_wind_aloft(
+            u2_coarse_evol, v2_coarse_evol,
+            temperature=T_for_wind,
+            dt_days=days,
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
+            damping_rate=float(pp.wind_upper_damping),
+            vmax_clip=float(wind_vmax_clip),
+            planet_params=pp,
+        )
 
         # Evolve at wind-grid resolution.
         u_coarse_evol, v_coarse_evol = evolve_wind(
@@ -1132,6 +1165,8 @@ def simulate_step(
             jet_index_sh=jet_index_sh_new,
             jet_block_nh=_jet_block_nh,
             jet_block_sh=_jet_block_sh,
+            u_aloft=u2_coarse_evol,
+            v_aloft=v2_coarse_evol,
         )
 
         # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
@@ -1141,10 +1176,14 @@ def simulate_step(
             a = float(np.clip(wind_relax, 0.0, 1.0))
             u_coarse_evol = (1.0 - a) * u_coarse_evol + a * u_diag
             v_coarse_evol = (1.0 - a) * v_coarse_evol + a * v_diag
-        
+
         # Upsample back to full resolution using bilinear interpolation
-        uv = _upsample_bilinear_many({"u": u_coarse_evol, "v": v_coarse_evol}, H, W, wind_bs)
+        uv = _upsample_bilinear_many(
+            {"u": u_coarse_evol, "v": v_coarse_evol, "u2": u2_coarse_evol, "v2": v2_coarse_evol},
+            H, W, wind_bs,
+        )
         u_full, v_full = uv["u"], uv["v"]
+        u2_full, v2_full = uv["u2"], uv["v2"]
     else:
         # Full resolution evolution
         # If wind evolves at higher resolution than the temperature solver, drive it with the
@@ -1162,6 +1201,20 @@ def simulate_step(
             T_wind_full = up["T"]
             if "elev" in up:
                 elev_wind_full = up["elev"]
+
+        # 1.5-layer atmosphere: evolve the upper-level wind first (same
+        # full-resolution grid), so evolve_wind's baroclinic mixing term below
+        # can relax the surface toward this step's freshly-updated aloft wind.
+        u2_full, v2_full = evolve_wind_aloft(
+            u2_full, v2_full,
+            temperature=T_wind_full,
+            dt_days=days,
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
+            damping_rate=float(pp.wind_upper_damping),
+            vmax_clip=float(wind_vmax_clip),
+            planet_params=pp,
+        )
 
         u_full, v_full = evolve_wind(
             u_full, v_full,
@@ -1185,6 +1238,8 @@ def simulate_step(
             jet_index_sh=jet_index_sh_new,
             jet_block_nh=_jet_block_nh,
             jet_block_sh=_jet_block_sh,
+            u_aloft=u2_full,
+            v_aloft=v2_full,
         )
         if wind_relax > 0.0:
             T_for_wind = T_wind_full
@@ -1651,6 +1706,9 @@ def simulate_step(
         jet_block_lon_sh=jet_block_lon_sh_new,
         jet_block_days_left_sh=jet_block_days_left_sh_new,
         jet_block_total_days_sh=jet_block_total_sh_new,
+        # Feature 8: 1.5-layer atmosphere upper-level wind
+        wind_u_aloft=u2_full,
+        wind_v_aloft=v2_full,
     )
 
     # Return state and components (empty dict if not tracking)
