@@ -1175,3 +1175,51 @@ def print_koppen_report(stats: dict) -> None:
     print("-" * 52)
     print(f"Total land cells: {stats.get('total_land_cells', 'N/A')}")
     print("-----------------------------------\n")
+
+
+# ============================================================================
+# Conservation / energy-budget diagnostics
+#
+# Added 2026-07-04 in response to two bugs that aggregate climate-metric
+# tests couldn't catch: an Ekman ocean-heat term scaled for a 30-day window
+# but applied every day (~30x too strong), and CH4 decaying toward zero over
+# multi-decade runs because sources were ~5000x smaller than the OH sink.
+# Both would show up immediately here as a budget that doesn't balance.
+# ============================================================================
+
+def area_weighted_global_mean(field: np.ndarray) -> float:
+    """cos(lat)-weighted global mean of a per-cell field on an equirectangular
+    grid, where a plain np.mean() would over-represent polar rows relative to
+    their true surface area. For latitude-uniform fields this is exactly
+    np.mean()."""
+    field = np.asarray(field)
+    H = field.shape[0]
+    lat_rad = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * np.pi
+    w = np.cos(lat_rad)
+    row_means = np.mean(field, axis=1)
+    return float(np.sum(row_means * w) / (np.sum(w) + 1e-12))
+
+
+def compute_radiation_balance(components: dict) -> dict:
+    """Global top-of-atmosphere energy budget from a `simulate_step(...,
+    track_components=True)` components dict.
+
+    `net_radiation` is per-step S_absorbed - L_out [W/m^2]; its area-weighted
+    global mean should stay near zero at climate equilibrium and should not
+    show a large, persistent one-directional drift (that drift is exactly
+    the symptom an unbalanced energy term -- like the Ekman over-application
+    bug -- produces).
+    """
+    if "net_radiation" not in components:
+        raise ValueError(
+            "components dict has no 'net_radiation' entry -- call simulate_step "
+            "with track_components=True"
+        )
+    result = {
+        "r_net_mean_w_m2": area_weighted_global_mean(components["net_radiation"]),
+    }
+    if "S_absorbed" in components:
+        result["s_absorbed_mean_w_m2"] = area_weighted_global_mean(components["S_absorbed"])
+    if "L_out" in components:
+        result["l_out_mean_w_m2"] = area_weighted_global_mean(components["L_out"])
+    return result

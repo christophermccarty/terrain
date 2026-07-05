@@ -301,6 +301,82 @@ class PlanetParams:
     reach. Set 0.0 to disable."""
 
     # ------------------------------------------------------------------ #
+    # Jet stream dynamics: persistent meander index + blocking events
+    # ------------------------------------------------------------------ #
+    jet_meander_tau_days: float = 10.0
+    """AR1 relaxation timescale [days] for the per-hemisphere jet meander/
+    waviness index (atmosphere._update_jet_index). Shorter = index tracks its
+    thermal-gradient-derived target more tightly; longer = more inertia."""
+
+    jet_meander_noise_amp: float = 0.35
+    """Stochastic forcing scale (per sqrt(day)) on the jet meander index. Drawn
+    from a deterministic hashed RNG seeded by simulated time, so identical
+    time_days always reproduces identical noise (same reproducibility contract
+    as ROSSBY_MODES/_storm_pressure_anomaly)."""
+
+    jet_gradient_ref_k: float = 40.0
+    """Reference pole-equator temperature gradient [K] used to compute the jet
+    index's target: gradients weaker than this push the index positive
+    (wavier/more blocked jet), stronger gradients push it negative (fast,
+    zonal jet) — a simplified Arctic-amplification-weakens-the-jet coupling to
+    the model's existing ice/polar-cooling physics."""
+
+    jet_lat_shift_per_index: float = 6.0
+    """Degrees of latitude the jet core (MID_LAT_JET_CENTER_DEG) shifts per
+    unit of jet index, independently per hemisphere."""
+
+    jet_speed_scale_per_index: float = 0.25
+    """Fractional change to U_TARGET_MIDLAT per unit of jet index (positive
+    index = wavier/slower jet, so this is typically applied as a reduction)."""
+
+    jet_wave_amp_scale_per_index: float = 0.5
+    """Fractional boost to the Rossby-wave (ROSSBY_MODES) amplitude per unit of
+    positive jet index — a wavier jet state should produce larger-amplitude
+    meanders, not just a latitude shift."""
+
+    jet_block_trigger_rate_per_day: float = 0.015
+    """Base daily probability of a new blocking-ridge event when the jet index
+    is elevated (atmosphere._update_jet_blocking). Scaled up by how far the
+    index sits above its trigger threshold."""
+
+    jet_block_duration_range_days: tuple[float, float] = (10.0, 40.0)
+    """Range of durations [days] drawn for a triggered blocking event —
+    matches real-world persistent ridge/trough lifetimes (weeks, not days)."""
+
+    jet_block_pressure_amp_pa: float = 180.0
+    """Peak pressure amplitude [Pa] of an active blocking ridge
+    (atmosphere._blocking_ridge_pressure_anomaly). Positive (a ridge is a
+    high), larger than storm_pressure_amp_pa since a block is a single
+    persistent quasi-stationary feature rather than an embedded transient."""
+
+    jet_block_radius_km: float = 3200.0
+    """Spatial footprint [km] of an active blocking ridge — much larger than
+    an individual storm (STORM_RADIUS_KM), matching the synoptic scale of a
+    real blocking high."""
+
+    # ------------------------------------------------------------------ #
+    # 1.5-layer atmosphere: prognostic upper-level wind (atmosphere.evolve_wind_aloft)
+    # ------------------------------------------------------------------ #
+    wind_upper_pgf_amp: float = 8.0
+    """Amplitude of the upper-level thermal pressure-gradient term
+    (atmosphere.evolve_wind_aloft) -- opposite sign convention from the
+    surface's thermal PGF (see evolve_wind_aloft's docstring: a warm column
+    is thicker, so upper-level pressure is relatively higher over warm
+    regions, inverted from the surface's "cold = high" pattern), and a
+    larger amplitude than the surface term since real meridional
+    temperature/pressure gradients strengthen with altitude up to jet
+    level. Calibrated (120-day mixed-terrain spinup at 32x64) so the
+    upper-level jet-band wind speed comes out visibly stronger than the
+    surface layer's, matching real tropospheric jets being stronger aloft,
+    without requiring a separate upper-level temperature field."""
+
+    wind_upper_damping: float = 0.05
+    """Rayleigh-friction rate [1/day] for the upper-level wind layer — much
+    weaker than the surface's quadratic/terrain-enhanced drag
+    (wind_drag_base/wind_drag_elev_scale), since the upper troposphere is
+    nearly frictionless compared to the boundary layer."""
+
+    # ------------------------------------------------------------------ #
     # Derived convenience properties
     # ------------------------------------------------------------------ #
 
@@ -444,4 +520,8 @@ MARS = PlanetParams(
     ch4_initial_ppb=0.0,
     storm_pressure_amp_pa=40.0,  # Much thinner atmosphere plausibly weakens baroclinic transients
     trade_wave_pressure_amp_pa=25.0,  # Same reasoning, scaled with storm_pressure_amp_pa
+    jet_meander_noise_amp=0.15,  # Weaker baroclinicity on a thin, dry atmosphere
+    jet_block_pressure_amp_pa=60.0,  # Same reasoning, scaled with storm_pressure_amp_pa
+    wind_upper_pgf_amp=4.8,  # Thin CO2 atmosphere: weaker vertical strengthening of gradients (scaled with Earth's default)
+    wind_upper_damping=0.08,  # Slightly more damped: thinner atmosphere, less inertia aloft
 )

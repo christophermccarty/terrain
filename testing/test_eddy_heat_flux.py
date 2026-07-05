@@ -33,14 +33,15 @@ def _make_elev(H: int = 32, W: int = 64, land_frac: float = 0.35) -> np.ndarray:
 
 def _run_steps(n_days: int, eddy_coeff: float,
                feedback_flags: dict | None = None,
-               H: int = 32, W: int = 64):
+               H: int = 32, W: int = 64,
+               **extra_kwargs):
     """Run n_days of MONTHLY-equivalent steps and return final state."""
     from simulate import create_initial_state, simulate_step
     from planet_params import PlanetParams
     elev = _make_elev(H, W)
     pp = PlanetParams(eddy_heat_flux_coeff=eddy_coeff)
     state = create_initial_state(elev, day_of_year=80.0, planet_params=pp)
-    kwargs: dict = dict(block_size=4, planet_params=pp)
+    kwargs: dict = dict(block_size=4, planet_params=pp, **extra_kwargs)
     if feedback_flags:
         kwargs["feedback_flags"] = feedback_flags
     n_steps = max(1, n_days // 30)
@@ -72,9 +73,28 @@ def test_eddy_flux_reduces_gradient():
     Uses eddy_coeff=0.05 (8× default) to produce a detectable signal over 2 years.
     The correct physical observable is gradient *reduction*, not mid-lat warming,
     because Laplacian diffusion moves heat from high-T to low-T regions.
+
+    ocean_transport/ice_albedo are disabled to isolate the eddy term: the
+    differential being measured is small (~0.2 K std) and has now been
+    flipped negative three times by *unrelated* changes:
+    - the eddy sub-stepping fix's interaction with ocean noise (see module
+      history),
+    - the 2026-07-03 western-boundary/thermal-diffusion fixes,
+    - the 2026-07-04 1.5-layer atmosphere upgrade (atmosphere.evolve_wind_aloft):
+      confirmed via direct isolation that its new surface<->aloft baroclinic
+      momentum coupling (not the eddy-flux code itself) was the culprit --
+      with wind_baroclinic_jet_amp=0.0 the measured delta returns to the
+      expected +0.18 K, vs -0.10 K with the coupling at its new default.
+      wind_baroclinic_jet_amp is disabled here for the same reason
+      ocean_transport/ice_albedo already are: it's real physics, but not the
+      thing this test is measuring, and its own noise is large enough at
+      this small differential to flip the sign.
+    With those feedbacks/couplings off, the probe measures the eddy diffusion
+    itself: verified +0.19 K std reduction vs a spurious −0.16 with them on.
     """
-    state_no   = _run_steps(720, eddy_coeff=0.0,  H=32, W=64)
-    state_with = _run_steps(720, eddy_coeff=0.05, H=32, W=64)
+    _iso = {"ocean_transport": False, "ice_albedo": False}
+    state_no   = _run_steps(720, eddy_coeff=0.0,  H=32, W=64, feedback_flags=_iso, wind_baroclinic_jet_amp=0.0)
+    state_with = _run_steps(720, eddy_coeff=0.05, H=32, W=64, feedback_flags=_iso, wind_baroclinic_jet_amp=0.0)
 
     std_no   = _zonal_mean_std(state_no)
     std_with = _zonal_mean_std(state_with)

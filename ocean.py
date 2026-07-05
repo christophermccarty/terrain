@@ -96,9 +96,7 @@ def calculate_ocean_heat_transport(
     day_of_year: int,
     dt_days: float,
     transport_coefficient: float = 0.3,
-    exchange_strength_floor: float = 0.65,
-    exchange_strength_span: float = 0.35,
-    exchange_coefficient: float = 0.05,
+    exchange_coefficient: float = 0.03,
     exchange_inertia: float = 0.0,
     prev_T: np.ndarray | None = None,
     ice_cover: np.ndarray | None = None,
@@ -234,12 +232,24 @@ def calculate_ocean_heat_transport(
     # due to Coriolis effect and continental boundaries
     # This creates stronger heat transport on western coasts
     
-    # Create east-west gradient: western side = higher transport
-    x_positions = np.arange(Wc, dtype=np.float32) / Wc  # 0 (west) to 1 (east)
-    western_enhancement = 1.0 + 0.5 * (1.0 - x_positions)  # 1.5 at west, 1.0 at east
-    
-    # Apply western boundary enhancement
-    T_adjustment = T_adjustment * western_enhancement[np.newaxis, :]
+    # Western boundary currents form on the western side of each OCEAN BASIN
+    # (ocean cells with land immediately to their west), not the western edge
+    # of the map. The previous formulation (`1.5 at map column 0 tapering to
+    # 1.0 at column W-1`) boosted transport along the dateline mid-Pacific and
+    # gave the actual Gulf Stream/Kuroshio positions no enhancement at all,
+    # while injecting a spurious net-heat zonal gradient across every basin.
+    # Same topology rule as get_major_ocean_currents' WBC mask; the boost
+    # decays over the two cells downstream (east) of the boundary.
+    land_west = np.roll(~is_ocean, 1, axis=1)
+    midlat_band = (np.abs(lat_rows) >= 15.0) & (np.abs(lat_rows) <= 65.0)
+    wbc_core = (is_ocean & land_west & midlat_band[:, np.newaxis]).astype(np.float32)
+    western_enhancement = (
+        1.0
+        + 0.5 * wbc_core
+        + 0.35 * np.roll(wbc_core, 1, axis=1)   # 1 cell east of the boundary
+        + 0.2 * np.roll(wbc_core, 2, axis=1)    # 2 cells east
+    )
+    T_adjustment = T_adjustment * np.clip(western_enhancement, 1.0, 1.5)
     
     # ============================================================================
     # OCEAN-ATMOSPHERE HEAT EXCHANGE
@@ -266,7 +276,11 @@ def calculate_ocean_heat_transport(
         else:
             T_eff = T
         T_ref = np.asarray(T_equilibrium, dtype=np.float32)
-        exchange_rate = 0.03  # K/day
+        # K/day restoring rate toward radiative equilibrium (~30-day skin layer
+        # at the 0.03 default). Now actually wired to the tunable parameter —
+        # it was previously hardcoded to 0.03 while callers/optimizer configs
+        # believed they were tuning it.
+        exchange_rate = float(exchange_coefficient)
         heat_exchange = -exchange_rate * (T_eff - T_ref) * dt_days
         # Latitude factor: slightly stronger coupling at high latitudes where
         # ocean-atmosphere temperature contrast drives the largest heat flux.
@@ -287,6 +301,7 @@ def compute_ekman_transport(
     wind_v: np.ndarray,
     elevation: np.ndarray,
     ekman_coefficient: float = 0.03,
+    rotation_direction: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute wind-driven Ekman transport (Phase 3: Ocean-Wind Coupling).
 
@@ -317,9 +332,11 @@ def compute_ekman_transport(
     lat = _lat_rad(H)
     lat_2d = np.repeat(lat[:, None], W, axis=1)
 
-    # Coriolis deflection angle (45° to the right in NH, left in SH)
+    # Coriolis deflection angle (45° to the right in NH, left in SH for a
+    # prograde rotator; mirrored for retrograde planets, whose Coriolis
+    # deflection flips sign — matches planet_params.coriolis_parameter).
     # Simplified from full 90° Ekman spiral to represent surface layer average
-    deflection = np.sign(lat_2d) * (np.pi / 4.0)  # ±45°
+    deflection = np.sign(lat_2d) * np.sign(float(rotation_direction) or 1.0) * (np.pi / 4.0)
 
     # Wind speed and direction
     wind_speed = np.sqrt(wind_u**2 + wind_v**2)

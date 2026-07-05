@@ -30,7 +30,7 @@ from terrain import (
     set_elevation_cache,
     LOG,
 )
-from atmosphere import generate_wind_field, render_wind_arrows, wind_speed_to_rgb, generate_precipitation
+from atmosphere import generate_wind_field, render_wind_arrows, render_jet_stream_overlay, wind_speed_to_rgb, generate_precipitation
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from ocean import generate_ocean_currents
 from masks import get_masks
@@ -43,7 +43,11 @@ AUTOSAVE_PATH = Path("saves/autosave.pkl")
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
-_OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None}
+_OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None, "computed_at": 0.0}
+# Ocean currents evolve slowly; regenerating the field on every simulation step
+# (uncapped while running) is far more often than needed and dominates frame
+# time. Throttle regeneration to wall-clock cadence instead of sim-day cadence.
+_OCEAN_CURRENT_REFRESH_SEC = 2.0
 _PRECIP_VIEW_CACHE = {"key": None, "P": None}
 
 
@@ -171,6 +175,7 @@ def main() -> None:
         # Wind model resolution decoupled from temp/precip resolution.
         # Larger => fewer wind cells => faster, but more approximate.
         "wind_block_size": 8,
+        "show_jet_stream": True,
     }
 
     root = tk.Tk()
@@ -226,6 +231,7 @@ def main() -> None:
     mode_var = tk.StringVar(value="map")
     view_var = tk.StringVar(value="Terrain")
     latlon_var = tk.StringVar(value="")
+    show_jet_stream_var = tk.BooleanVar(value=bool(settings.get("show_jet_stream", default_settings["show_jet_stream"])))
 
     mode_row = ttk.Frame(sim_tab)
     mode_row.pack(fill="x", pady=2)
@@ -253,6 +259,7 @@ def main() -> None:
         ),
     )
     view_combo.pack(side="left", padx=(4, 0))
+    ttk.Checkbutton(view_row, text="Jet Stream", variable=show_jet_stream_var).pack(side="left", padx=(8, 0))
 
     # Diagnostics
     diagnostics = ClimateDiagnostics(track_history=True)
@@ -526,10 +533,13 @@ def main() -> None:
         tdays = float(sim_state.total_days) if sim_state is not None else float(day)
         wu = sim_state.wind_u if use_sim_data else None
         wv = sim_state.wind_v if use_sim_data else None
-        ckey = (tex.shape, "oc_particles", int(tdays))
-        if _OCEAN_CURRENT_CACHE["key"] != ckey:
+        ckey = (tex.shape, "oc_particles")
+        _now_field_t = time.perf_counter()
+        _stale = (_OCEAN_CURRENT_CACHE["key"] != ckey
+                  or _now_field_t - _OCEAN_CURRENT_CACHE["computed_at"] >= _OCEAN_CURRENT_REFRESH_SEC)
+        if _stale:
             u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
-            _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
+            _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v, "computed_at": _now_field_t})
         else:
             u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
 
@@ -659,6 +669,10 @@ def main() -> None:
             messagebox.showerror("Export Error", f"Failed to export data:\n{str(e)}")
     
     def run_benchmark():
+        # Without the nonlocal, `sim_running = False` bound a LOCAL variable and
+        # the simulation thread kept stepping while the benchmark ran on the
+        # same state (race + double-stepping).
+        nonlocal sim_running
         if sim_state is None:
             messagebox.showinfo("Info", "Please start or initialize simulation first.")
             return
@@ -1371,6 +1385,10 @@ def main() -> None:
                             P, _, _ = generate_precipitation(*tex.shape, tex, day_of_year=int(day))
                         p_overlay, p_alpha = precipitation_to_rgb(P)
                         comb = (1.0 - p_alpha[..., None]) * comb + p_alpha[..., None] * p_overlay
+                        if (show_jet_stream_var.get() and use_sim_data and sim_state is not None
+                                and sim_state.wind_u_aloft is not None and sim_state.wind_v_aloft is not None):
+                            jet_overlay, jet_alpha = render_jet_stream_overlay(*tex.shape, sim_state.wind_u_aloft, sim_state.wind_v_aloft)
+                            comb = (1.0 - jet_alpha[..., None]) * comb + jet_alpha[..., None] * jet_overlay
                     # Match the horizontal flip that generate_sphere_image applies for loaded heightmaps
                     _, elev_key = get_elevation_cache()
                     if elev_key is not None and isinstance(elev_key, tuple) and len(elev_key) >= 1 and elev_key[0] == "loaded":
@@ -1411,8 +1429,13 @@ def main() -> None:
                     particle_anim_running = True
                     _update_wind_particles()
                 return
+            if view_var.get() == "Ocean Currents":
+                if not oc_anim_running:
+                    oc_anim_running = True
+                    _update_ocean_particles()
+                return
             base_rgb = colorize(tex)
-            
+
             if view_var.get() == "Temperature":
                 if use_sim_data and sim_state.temperature is not None:
                     from temperature import temperature_to_rgb
@@ -1484,6 +1507,10 @@ def main() -> None:
                     comb = base_rgb
                 overlay, alpha = precipitation_to_rgb(P)
                 comb = (1.0 - alpha[..., None]) * comb + alpha[..., None] * overlay
+                if (show_jet_stream_var.get() and use_sim_data and sim_state is not None
+                        and sim_state.wind_u_aloft is not None and sim_state.wind_v_aloft is not None):
+                    jet_overlay, jet_alpha = render_jet_stream_overlay(*tex.shape, sim_state.wind_u_aloft, sim_state.wind_v_aloft)
+                    comb = (1.0 - jet_alpha[..., None]) * comb + jet_alpha[..., None] * jet_overlay
                 arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
             elif view_var.get() == "Biomes":
                 # Biome visualization - prefer Köppen classification for detailed climate zones
@@ -1550,11 +1577,6 @@ def main() -> None:
                 base_rgb = np.clip(0.60 * colorize(tex) + 0.40 * wind_speed_to_rgb(speed), 0.0, 1.0)
                 arrows = render_wind_arrows(*tex.shape, u, v, target_arrows=int(wind_arrows_var.get()), scale=float(wind_scale_var.get()))
                 arr = (np.clip(base_rgb + arrows, 0.0, 1.0) * 255).astype(np.uint8)
-            elif view_var.get() == "Ocean Currents":
-                if not oc_anim_running:
-                    oc_anim_running = True
-                    _update_ocean_particles()
-                return
             else:
                 arr = (np.clip(base_rgb, 0.0, 1.0) * 255).astype(np.uint8)
             _last_render_arr = arr
@@ -1756,12 +1778,15 @@ def main() -> None:
             elif view == "Ocean Currents":
                 day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
                 tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
-                ckey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "ocean_currents", int(tdays))
-                if _OCEAN_CURRENT_CACHE["key"] != ckey:
+                ckey = (tex.shape, "oc_particles")
+                _now_field_t = time.perf_counter()
+                _stale = (_OCEAN_CURRENT_CACHE["key"] != ckey
+                          or _now_field_t - _OCEAN_CURRENT_CACHE["computed_at"] >= _OCEAN_CURRENT_REFRESH_SEC)
+                if _stale:
                     wu = sim_state.wind_u if (use_sim_data and sim_state is not None) else None
                     wv = sim_state.wind_v if (use_sim_data and sim_state is not None) else None
                     u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
-                    _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v})
+                    _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v, "computed_at": _now_field_t})
                 else:
                     u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
                 speed = float(np.hypot(u[int(y), int(x)], v[int(y), int(x)]))
@@ -1978,6 +2003,7 @@ def main() -> None:
             "wind_arrows": int(wind_arrows_var.get()),
             "wind_scale": float(wind_scale_var.get()),
             "wind_block_size": int(wind_block_size_var.get()),
+            "show_jet_stream": bool(show_jet_stream_var.get()),
             "auto_save_state": bool(_auto_save_enabled),
             "last_state_path": str(_current_state_path),
         }
