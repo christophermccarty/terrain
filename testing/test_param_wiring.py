@@ -68,7 +68,7 @@ STEP_KWARG_CASES = [
     ("ocean_exchange_coeff", 0.30),
     ("ocean_exchange_inertia", 0.0),
     ("wind_damping", 0.15),
-    ("wind_baroclinic_jet_amp", 5.0e6),
+    ("wind_baroclinic_jet_amp", 0.0),  # value re-scaled 2026-07-04 (1.5-layer atmosphere): now a dimensionless coupling-strength multiplier, not a ~1e6 magnitude-hack coefficient
     ("ice_freeze_rate", 0.20),
     ("ice_melt_rate", 0.60),
     # NOT included: latent_cooling_coeff. This test found it to be a genuine
