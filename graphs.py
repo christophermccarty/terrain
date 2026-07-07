@@ -15,6 +15,22 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from masks import get_masks
+from carbon_cycle import atmosphere_composition
+from planet_params import EARTH
+
+# Approx conversion from specific humidity [kg water / kg moist air] to a
+# water-vapor mole fraction, for the composition pie only (display purposes,
+# not fed back into any physics): x_h2o ~= q * M_dry/M_h2o for small q.
+_M_DRY_OVER_M_H2O = 28.97 / 18.015
+
+_COMPOSITION_COLORS = {
+    "N2": "tab:blue",
+    "O2": "tab:cyan",
+    "Ar": "tab:gray",
+    "CO2": "tab:red",
+    "CH4": "tab:orange",
+    "H2O": "tab:green",
+}
 
 
 class LiveGraphsWindow:
@@ -26,10 +42,12 @@ class LiveGraphsWindow:
         *,
         history_days: float = 365.0,
         on_close: Optional[Callable[[], None]] = None,
+        planet_params: object = None,
     ) -> None:
         self.history_days = float(history_days)
         self._on_close_cb = on_close
         self._last_total_days: Optional[float] = None
+        self.planet_params = planet_params if planet_params is not None else EARTH
 
         self.top = tk.Toplevel(root)
         self.top.title("Simulation Graphs")
@@ -55,8 +73,6 @@ class LiveGraphsWindow:
             "ice_cover_fraction": deque(),
             "cloud_mean": deque(),
             "albedo_mean": deque(),
-            "wind_div_rms": deque(),
-            "co2_ppm": deque(),
             "temp_min": deque(),
             "temp_max": deque(),
             "temp_equator": deque(),
@@ -134,9 +150,8 @@ class LiveGraphsWindow:
         self._lines["albedo_mean"] = ax13.plot([], [], color="tab:pink", label="Albedo")[0]
         ax13.legend(loc="upper right", fontsize=8)
 
-        ax20.set_title("CO2 (ppm)")
-        self._lines["wind_div_rms"] = ax20.plot([], [], color="tab:brown", alpha=0.0)[0]  # hidden, kept for compat
-        self._lines["co2_ppm"] = ax20.plot([], [], color="tab:green")[0]
+        self._comp_ax = ax20
+        self._draw_composition(ax20, {"N2": 0.7808, "O2": 0.2095, "Ar": 0.0093, "CO2": 0.0, "CH4": 0.0, "H2O": 0.0})
 
         ax21.set_title("Temperature Min/Max (K)")
         self._lines["temp_min"] = ax21.plot([], [], color="tab:gray", label="Min")[0]
@@ -178,6 +193,40 @@ class LiveGraphsWindow:
         self._lines["soil_max"] = ax33.plot([], [], color="tab:olive", label="Max")[0]
         ax33.legend(loc="upper right", fontsize=8)
 
+    def _draw_composition(self, ax, fractions: dict[str, float]) -> None:
+        """Redraw the atmospheric-composition pie chart in-place.
+
+        Unlike the other 15 panels (time-series lines updated via
+        `line.set_data`), a pie chart has no persistent artist to update --
+        `ax.pie` is called fresh each tick, so the axis is cleared and
+        restyled every time (matplotlib has no in-place pie-update API).
+
+        Trace gases (CO2/CH4) are visually a sliver next to N2/O2/Ar -- inline
+        pie labels/autopct text for them overlap into an unreadable clump, so
+        this uses a side legend with adaptive precision instead of on-wedge
+        labels.
+        """
+        ax.clear()
+        ax.set_title("Atmospheric Composition")
+        labels = [k for k, v in fractions.items() if v > 1e-9]
+        values = [fractions[k] for k in labels]
+        colors = [_COMPOSITION_COLORS.get(k, "tab:gray") for k in labels]
+        if not values:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            return
+
+        wedges, _ = ax.pie(values, colors=colors, startangle=90)
+
+        def _fmt(pct: float) -> str:
+            if pct < 0.01:
+                return f"{pct:.4f}%"
+            if pct < 1.0:
+                return f"{pct:.3f}%"
+            return f"{pct:.1f}%"
+
+        legend_labels = [f"{name} {_fmt(frac * 100.0)}" for name, frac in zip(labels, values)]
+        ax.legend(wedges, legend_labels, loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=7, frameon=False)
+
     def reset(self) -> None:
         self._times.clear()
         for series in self._series.values():
@@ -188,6 +237,7 @@ class LiveGraphsWindow:
         for ax in self.axes.ravel():
             ax.relim()
             ax.autoscale_view()
+        self._draw_composition(self._comp_ax, {"N2": 0.7808, "O2": 0.2095, "Ar": 0.0093, "CO2": 0.0, "CH4": 0.0, "H2O": 0.0})
         self.canvas.draw_idle()
 
     def _position_right_of_root(self, root: tk.Tk) -> None:
@@ -233,8 +283,8 @@ class LiveGraphsWindow:
         ice_cover_fraction = float(stats.get("ice_cover_fraction", 0.0))
         cloud_mean = float(stats.get("cloud_mean", 0.0))
         albedo_mean = float(stats.get("albedo_mean", 0.3))
-        wind_div_rms = float(stats.get("wind_div_rms", 0.0))
         co2_ppm = float(stats.get("co2_ppm", getattr(state, "co2_atmosphere", 400.0)))
+        ch4_ppb = float(getattr(state, "ch4_atmosphere", 1900.0))
         temp_min = float(stats.get("T_min", np.min(state.temperature)))
         temp_max = float(stats.get("T_max", np.max(state.temperature)))
         temp_equator = float(stats.get("T_equator", 0.0))
@@ -266,8 +316,6 @@ class LiveGraphsWindow:
         self._series["ice_cover_fraction"].append(ice_cover_fraction)
         self._series["cloud_mean"].append(cloud_mean)
         self._series["albedo_mean"].append(albedo_mean)
-        self._series["wind_div_rms"].append(wind_div_rms)
-        self._series["co2_ppm"].append(co2_ppm)
         self._series["temp_min"].append(temp_min)
         self._series["temp_max"].append(temp_max)
         self._series["temp_equator"].append(temp_equator)
@@ -287,6 +335,10 @@ class LiveGraphsWindow:
         self._series["soil_mean"].append(soil_mean)
         self._series["soil_min"].append(soil_min)
         self._series["soil_max"].append(soil_max)
+
+        h2o_frac = humidity_mean * _M_DRY_OVER_M_H2O
+        composition = atmosphere_composition(self.planet_params, co2_ppm, ch4_ppb, h2o_frac)
+        self._draw_composition(self._comp_ax, composition)
 
         self._trim_history(total_days)
         self._redraw()
@@ -356,6 +408,7 @@ class GraphsController:
         history_days: float = 365.0,
         update_ms: int = 1000,
         toggle_var: Optional[tk.BooleanVar] = None,
+        planet_params: object = None,
     ) -> None:
         self.root = root
         self.get_state = get_state
@@ -363,6 +416,7 @@ class GraphsController:
         self.history_days = float(history_days)
         self.update_ms = int(update_ms)
         self.toggle_var = toggle_var
+        self.planet_params = planet_params
         self.window: Optional[LiveGraphsWindow] = None
         self._after_id: Optional[str] = None
         self._enabled = False
@@ -376,6 +430,7 @@ class GraphsController:
                     self.root,
                     history_days=self.history_days,
                     on_close=self._handle_window_close,
+                    planet_params=self.planet_params,
                 )
             self._schedule()
         elif not enabled and self._enabled:

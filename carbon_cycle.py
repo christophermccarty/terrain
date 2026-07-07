@@ -792,6 +792,54 @@ def ch4_radiative_forcing(ch4_ppb: float, ch4_ref_ppb: float = 700.0) -> float:
     return float(0.036 * (np.sqrt(m) - np.sqrt(m0)))
 
 
+def atmosphere_composition(
+    planet_params,
+    co2_ppm: float,
+    ch4_ppb: float,
+    water_vapor_frac: float = 0.0,
+) -> dict[str, float]:
+    """Return current bulk atmospheric composition as volume fractions.
+
+    N2/O2/Ar are not prognostic in this model -- only CO2, CH4, and water
+    vapor are tracked as evolving state. `planet_params.bg_{n2,o2,ar}_frac`
+    supply the fixed background; which gas is treated as "the remainder that
+    fills out 1.0" depends on whether the background is N2-dominated
+    (Earth-like: CO2/CH4 are trace, background split N2/O2/Ar) or the
+    background itself is trace (Mars: background is real N2/O2/Ar trace
+    levels, CO2 fills the rest) -- using `co2_ppm` directly as Mars's CO2
+    fraction would be wrong, since Mars's `co2_baseline_ppm`/`co2_initial_ppm`
+    are placeholders for the (inapplicable) Earth radiative-forcing formula,
+    not real composition numbers.
+
+    Returns a dict with keys "N2", "O2", "Ar", "CO2", "CH4", "H2O", values
+    summing to 1.0 (volume/mole fraction).
+    """
+    pp = planet_params
+    co2_frac_trace = max(float(co2_ppm), 0.0) * 1e-6
+    ch4_frac = max(float(ch4_ppb), 0.0) * 1e-9
+    h2o_frac = max(float(water_vapor_frac), 0.0)
+
+    bg_n2 = float(pp.bg_n2_frac)
+    bg_o2 = float(pp.bg_o2_frac)
+    bg_ar = float(pp.bg_ar_frac)
+    bg_sum = bg_n2 + bg_o2 + bg_ar
+
+    if bg_sum > 0.5:
+        # Earth-like: N2/O2/Ar are the dominant background; CO2/CH4/H2O are trace.
+        bulk_remaining = max(0.0, 1.0 - co2_frac_trace - ch4_frac - h2o_frac)
+        n2 = bulk_remaining * bg_n2 / bg_sum
+        o2 = bulk_remaining * bg_o2 / bg_sum
+        ar = bulk_remaining * bg_ar / bg_sum
+        co2 = co2_frac_trace
+    else:
+        # CO2-dominated (Mars-like): background fractions ARE the real trace
+        # levels; CO2 fills whatever's left.
+        n2, o2, ar = bg_n2, bg_o2, bg_ar
+        co2 = max(0.0, 1.0 - h2o_frac - n2 - o2 - ar - ch4_frac)
+
+    return {"N2": n2, "O2": o2, "Ar": ar, "CO2": co2, "CH4": ch4_frac, "H2O": h2o_frac}
+
+
 def permafrost_init(elevation: np.ndarray, T_sst: np.ndarray) -> np.ndarray:
     """Initialise permafrost carbon field [kgC/m²].
 

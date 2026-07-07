@@ -3,3 +3,4 @@
 /__pycache__
 /testing/results/**/*.json
 settings.json
+/saves/**

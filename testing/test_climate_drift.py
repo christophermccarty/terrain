@@ -19,6 +19,21 @@ simulate.py (_midlat_storm_bonus_1d), and deepened subsidence/rain-shadow
 precipitation suppression in atmosphere.py (subsidence_suppression,
 rain_shadow_suppression).
 
+UPDATE (2026-07, moisture-transport-fix session): re-measured the cold-bias
+guard directly on this exact fixture and found it fully resolved -- NH -15.4°C,
+SH -16.6°C, both within Earth's real range. An intervening, undocumented
+session apparently closed the remaining ~10-14K gap noted in an earlier
+biome-map-audit note; tightened the guard below from -35°C to -25°C to match.
+The desert/continental-interior precipitation gap, by contrast, is NOT
+resolved -- see known-physics-gaps.md's moisture-transport investigation
+(same session): a genuine attempt at a CFL-linked transport fix, plus a
+precip-formula reweight toward moisture convergence, both failed to help
+(the model's precip trigger depends on local RH, and land moisture is
+soil-bucket-limited, so more transport exports it away faster than it can be
+captured -- fixing this likely needs the wind model to have genuine
+convergence over continental interior, which it may not, a larger
+undertaking than a moisture or precip-formula change alone).
+
 Also fixed (same audit, follow-up pass): continental-interior soil moisture
 was collapsing to its 0.05 floor within a few decades of MONTHLY-mode
 spinup, because `atmosphere.generate_precipitation`'s soil-moisture bucket
@@ -115,24 +130,34 @@ def _land_annual_precip_mm_yr(state, elevation, lat_n, lat_s):
 # ---------------------------------------------------------------------------
 
 def test_nh_midlat_land_winter_not_extreme_continental(earth_long_spinup_state, mixed_elev):
-    """45-65°N land coldest-month mean must stay above -35°C after a 60yr spinup.
+    """45-65°N land coldest-month mean must stay above -25°C after a 60yr spinup.
 
     -38°C is Koppen's Dwd (extreme continental) threshold; in reality only
-    interior Siberia gets that cold. -35°C leaves margin while still catching
-    the observed collapse to -37..-40°C.
+    interior Siberia gets that cold. This guard was originally -35°C, sized
+    just to catch the original -37..-40°C bug. Tightened 2026-07 (moisture-
+    transport-fix session) after directly re-measuring this exact fixture and
+    finding the bias had already been fully closed by an earlier, undocumented
+    session -- current value is -15.4°C (NH) / -16.6°C (SH), both comfortably
+    within Earth's real range (-5 to -20°C). -25°C leaves ~10K margin below
+    the measured value while being a much more meaningful regression guard
+    than the old -35°C (which only ever caught total collapse).
     """
     t = _land_coldest_month_c(earth_long_spinup_state, mixed_elev, 65, 45)
     if t is None:
         pytest.skip("No land in band")
-    assert t > -35.0, f"NH mid-lat land coldest month = {t:.1f}C (expected > -35C)"
+    assert t > -25.0, f"NH mid-lat land coldest month = {t:.1f}C (expected > -25C)"
 
 
 def test_sh_midlat_land_winter_not_extreme_continental(earth_long_spinup_state, mixed_elev):
-    """45-65°S land coldest-month mean must stay above -35°C after a 60yr spinup."""
+    """45-65°S land coldest-month mean must stay above -25°C after a 60yr spinup.
+
+    See test_nh_midlat_land_winter_not_extreme_continental's docstring --
+    same tightening, measured -16.6°C on this fixture.
+    """
     t = _land_coldest_month_c(earth_long_spinup_state, mixed_elev, -45, -65)
     if t is None:
         pytest.skip("No land in band")
-    assert t > -35.0, f"SH mid-lat land coldest month = {t:.1f}C (expected > -35C)"
+    assert t > -25.0, f"SH mid-lat land coldest month = {t:.1f}C (expected > -25C)"
 
 
 # ---------------------------------------------------------------------------
