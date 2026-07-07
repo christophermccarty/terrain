@@ -124,14 +124,15 @@ _PRECIP_SUBSTEP_DAYS = 8.0
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
                                         humidity, soil_moisture, cloud_fraction,
                                         day_of_year, dt_days,
-                                        surface_pressure_hpa=1013.25):
+                                        surface_pressure_hpa=1013.25,
+                                        planet_params=None):
     dt_days = float(dt_days)
     if dt_days <= _PRECIP_SUBSTEP_DAYS:
         return generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=humidity, soil_moisture=soil_moisture,
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
-            surface_pressure_hpa=surface_pressure_hpa,
+            surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
         )
     n_sub = max(1, int(round(dt_days / _PRECIP_SUBSTEP_DAYS)))
     sub_dt = dt_days / n_sub
@@ -142,7 +143,7 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=hum, soil_moisture=soil, cloud_fraction=cloud_fraction,
             day_of_year=day_of_year, dt_days=sub_dt,
-            surface_pressure_hpa=surface_pressure_hpa,
+            surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
         )
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
     return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil
@@ -719,10 +720,25 @@ def simulate_step(
     # capacity, and turbulent exchange all limit summer temperatures.
     # At 55-65°N the formula returns ~305 K (32°C) in summer — unrealistically hot —
     # pulling the simulation 12-13°C above Earth via the land_blend.
-    # Cap: 301 K (~28°C) at the equator, tapering linearly to 286 K (13°C) at 60°+.
+    # Cap: 301 K (~28°C) held through 0-45°, tapering linearly to 286 K (13°C) at 60°+.
     # This matches observed mid-latitude summer maxima for mean daily temperatures.
+    #
+    # Taper start moved from 0deg to 45deg (2026-07, wind/precip-model revisit): the old
+    # linear-from-the-equator taper capped land at only ~290.6K (17.5C) at ~41.5N in
+    # summer -- measured directly on real terrain to be *below* the ocean's own summer
+    # temperature at the same latitude (~296-298K) year-round, including at the summer
+    # peak. Real land is warmer than adjacent ocean in summer (lower heat capacity, faster
+    # response) -- that's the thermal-low mechanism that drives monsoon-style onshore
+    # moisture inflow into continental interiors. With the cap capping land *colder* than
+    # the ocean even at peak summer, that sign was backwards, and wind divergence over
+    # continental-interior boxes measured persistently positive (divergent, not
+    # convergent) with no seasonal signal at all -- see moisture-transport-investigation
+    # memory. Holding 301K through 45deg (same ceiling already accepted at the equator,
+    # just extended) restores the correct summer land > ocean sign at mid-latitudes while
+    # leaving the original 55-65N fix (this taper's whole reason for existing) untouched:
+    # the endpoint is still 286K at 60deg+.
     _abs_lat_deg_land = np.abs(np.rad2deg(lat))  # (Hc,)
-    _land_cap_1d = 301.0 - 15.0 * np.clip(_abs_lat_deg_land / 60.0, 0.0, 1.0)
+    _land_cap_1d = 301.0 - 15.0 * np.clip((_abs_lat_deg_land - 45.0) / 15.0, 0.0, 1.0)
     # Atmospheric meridional heat transport warms high-latitude land.
     # The Ferrel cell and synoptic eddies carry ~60% of the ocean transport value
     # poleward even over the Antarctic continent.  Without this, Antarctic winter
@@ -755,8 +771,53 @@ def simulate_step(
     _midlat_fall = np.clip((50.0 - _abs_lat_deg_land) / 8.0, 0.0, 1.0)
     _midlat_storm_bonus_1d = 27.0 * _midlat_rise * _midlat_fall
     T_base_land = T_base_land + (_atm_land_transport_1d + _midlat_storm_bonus_1d)[:, None].astype(np.float32, copy=False)
+
+    # Evapotranspiration/convective cooling (2026-07, root-cause fix for the summer
+    # overheating _land_cap_1d above only ever patched post-hoc): real land loses
+    # substantial absorbed energy evaporating soil/plant moisture rather than raising
+    # sensible temperature, especially at high summer insolation -- and critically,
+    # this depends on how much moisture is actually *available*, not just latitude.
+    # Measured directly: temperature_kelvin_for_lat's own radiative-equilibrium calc
+    # reaches ~305-314K (33-41C) essentially UNIFORMLY across 20-70N at NH summer
+    # solstice (no evapotranspiration physics at all below that function's own
+    # is_polar>55deg threshold, and even above it the mechanism is tuned very weak
+    # via polar_cooling_scale) -- a flat, moisture-blind profile that _land_cap_1d
+    # was reshaping into a realistic latitude-dependent ceiling via a hard, seasonally
+    # -discontinuous, moisture-blind clamp. This adds the missing physical mechanism
+    # instead: cooling scales with (a) how far the pre-cooling temperature exceeds a
+    # reference (more excess energy = more evaporative demand), (b) local soil
+    # moisture (deserts get little cooling and stay realistically hot -- e.g. Sahara
+    # summer means are genuinely very high -- while moist continental interior/boreal
+    # land gets strong cooling), and (c) the local hemisphere's own seasonal cycle via
+    # solar declination (near-zero in winter, peaking at the local summer solstice) so
+    # the transition is smooth in time rather than an instant on/off clamp.
+    # _land_cap_1d is kept below as a safety-net backstop for any remaining extreme
+    # case, not the primary mechanism.
+    if state.soil_moisture is not None:
+        _soil_2d = _coarsen_many({"soil": state.soil_moisture}, Hc, Wc, block_size)["soil"]
+    else:
+        _soil_2d = np.full((Hc, Wc), 0.55, dtype=np.float32)
+    if state.elevation is not None:
+        _elev_c_early = _coarsen_elevation_cached(state.elevation, Hc, Wc, block_size)
+        _, _land_mask_early = get_masks(_elev_c_early)
+    else:
+        _land_mask_early = np.zeros((Hc, Wc), dtype=bool)
+    _gamma_season = 2.0 * np.pi * (float(new_day) - 80.0) / float(pp.orbital_period_days)
+    _delta_season = float(np.arcsin(np.clip(np.sin(pp.obliquity_rad) * np.sin(_gamma_season), -1.0, 1.0)))
+    _summer_signal_1d = np.sign(lat) * (_delta_season / max(pp.obliquity_rad, 1e-6))
+    _summer_factor_1d = np.clip(_summer_signal_1d, 0.0, 1.0).astype(np.float32)  # 0 in winter, 1 at local summer peak
+    _EVAP_COOL_THRESHOLD_K = 290.0
+    _EVAP_COOL_COEFF_MAX = 0.85
+    _evap_excess_2d = np.maximum(T_base_land - _EVAP_COOL_THRESHOLD_K, 0.0)
+    _evap_cooling_2d = (
+        _summer_factor_1d[:, None] * _EVAP_COOL_COEFF_MAX * np.clip(_soil_2d, 0.0, 1.0) * _evap_excess_2d
+    ) * _land_mask_early.astype(np.float32)
+    T_base_land = (T_base_land - _evap_cooling_2d).astype(np.float32, copy=False)
+
     # Re-apply summer cap: atmospheric transport can only raise winter/polar-night
     # temperatures; it must not push summer land above observed peak means.
+    # Now a rarely-binding safety net (see evapotranspiration cooling above), not the
+    # primary mechanism.
     T_base_land = np.minimum(T_base_land, _land_cap_1d[:, None].astype(np.float32, copy=False))
 
     # Calculate temperature for lagged day (ocean response with 1.5 month delay)
@@ -1041,11 +1102,22 @@ def simulate_step(
         key = (
             h,
             w,
-            int(new_day),  # only vary daily
+            # `new_day` wraps every orbital period (0..~365), so keying on it
+            # alone made this cache reuse year-1's storm/Rossby-wave snapshot
+            # for every later year's same calendar day at MONTHLY/ANNUAL speed
+            # -- freezing the diagnostic wind's weather into a single repeating
+            # year instead of continuing to evolve with `new_total_days`. Key
+            # on the monotonic day count instead; still only varies once per
+            # simulated day, which was the actual perf intent.
+            int(new_total_days),
             float(wind_target_weather_amp),
             float(wind_target_zonal_pressure),
             float(wind_target_terrain_pressure_amp),
             float(wind_target_terrain_flow_amp),
+            round(float(jet_index_nh_new), 3),
+            round(float(jet_index_sh_new), 3),
+            tuple(round(float(x), 2) for x in _jet_block_nh),
+            tuple(round(float(x), 2) for x in _jet_block_sh),
             round(float(pp.solar_constant), 4),
             round(float(pp.obliquity_deg), 4),
             round(float(pp.sidereal_day_hours), 4),
@@ -1067,6 +1139,10 @@ def simulate_step(
             terrain_flow_amp=float(wind_target_terrain_flow_amp),
             time_days=new_total_days,
             planet_params=pp,
+            jet_index_nh=jet_index_nh_new,
+            jet_index_sh=jet_index_sh_new,
+            jet_block_nh=_jet_block_nh,
+            jet_block_sh=_jet_block_sh,
         )
         cache.update({"key": key, "u": u_diag, "v": v_diag})
         return u_diag, v_diag
@@ -1140,6 +1216,7 @@ def simulate_step(
             damping_rate=float(pp.wind_upper_damping),
             vmax_clip=float(wind_vmax_clip),
             planet_params=pp,
+            hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
         )
 
         # Evolve at wind-grid resolution.
@@ -1214,6 +1291,7 @@ def simulate_step(
             damping_rate=float(pp.wind_upper_damping),
             vmax_clip=float(wind_vmax_clip),
             planet_params=pp,
+            hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
         )
 
         u_full, v_full = evolve_wind(
@@ -1425,6 +1503,7 @@ def simulate_step(
                 cloud_fraction=_cloud_p,
                 day_of_year=int(new_day), dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
+                planet_params=pp,
             )
             _up = _upsample_bilinear_many(
                 {"P": P_p, "q": hum_p_next, "soil": soil_p_next}, H, W, _pbs
@@ -1440,6 +1519,7 @@ def simulate_step(
                 cloud_fraction=cloud_full,
                 day_of_year=int(new_day), dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
+                planet_params=pp,
             )
     else:
         P_full = None

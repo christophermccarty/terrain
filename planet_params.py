@@ -133,6 +133,21 @@ class PlanetParams:
     co2_initial_ppm: float = 415.0
     """Initial atmospheric CO2 concentration at simulation start [ppm]."""
 
+    bg_n2_frac: float = 0.7808
+    """Background N2 volume fraction of the *dry, non-CO2/CH4* atmosphere.
+    Fixed (not simulated) -- this model tracks CO2/CH4 as prognostic trace
+    gases but treats N2/O2/Ar as an inert bulk background. Earth values are
+    real dry-air composition; Mars is CO2-dominated so its bulk background
+    is instead almost entirely CO2 (see MARS override below and
+    `atmosphere_composition()`, which handles the two cases differently
+    rather than trying to force one formula to cover both)."""
+
+    bg_o2_frac: float = 0.2095
+    """Background O2 volume fraction (dry, non-CO2/CH4 air).  See bg_n2_frac."""
+
+    bg_ar_frac: float = 0.0093
+    """Background Ar volume fraction (dry, non-CO2/CH4 air).  See bg_n2_frac."""
+
     # ------------------------------------------------------------------ #
     # Climate feedback / tunable physics
     # These constants can be swept by the optimizer or varied per-planet.
@@ -213,6 +228,22 @@ class PlanetParams:
     0 = Ekman transport disabled; 1 = full wind-to-current scaling (3% of wind speed).
     At 0.3, coastal upwelling introduces realistic SST gradients at continental margins.
     Gated by has_liquid_water_ocean."""
+
+    moisture_advection_scale: float = 0.0
+    """Blend weight [0-1] for an additional longer-range semi-Lagrangian moisture
+    transport term in `atmosphere.generate_precipitation`, layered on top of (not
+    replacing) the existing short-range donor-cell blend -- 0.0 = original behavior
+    exactly. Default kept at 0.0: measured directly (2026-07 moisture-transport
+    investigation, see known-physics-gaps.md) that ANY positive blend monotonically
+    *dries out* mid-latitude continental-interior land instead of the intended fix,
+    across three different transport implementations (full-distance single jump,
+    smaller sequential jumps, and this additive blend) -- the model's precip trigger
+    depends on *local* RH, which rewards moisture staying near where it evaporated
+    over moisture arriving via long-range transport. Left as a knob for future work
+    (a genuine fix likely needs the precip-trigger formula itself reweighted toward
+    convergence/arrival rather than static local RH, not just a transport-distance
+    change) rather than removed, since the underlying mechanism may still be useful
+    once that larger redesign happens."""
 
     # ------------------------------------------------------------------ #
     # Cloud radiative feedback (Feature 1)
@@ -357,7 +388,7 @@ class PlanetParams:
     # ------------------------------------------------------------------ #
     # 1.5-layer atmosphere: prognostic upper-level wind (atmosphere.evolve_wind_aloft)
     # ------------------------------------------------------------------ #
-    wind_upper_pgf_amp: float = 8.0
+    wind_upper_pgf_amp: float = 90.0
     """Amplitude of the upper-level thermal pressure-gradient term
     (atmosphere.evolve_wind_aloft) -- opposite sign convention from the
     surface's thermal PGF (see evolve_wind_aloft's docstring: a warm column
@@ -365,10 +396,47 @@ class PlanetParams:
     regions, inverted from the surface's "cold = high" pattern), and a
     larger amplitude than the surface term since real meridional
     temperature/pressure gradients strengthen with altitude up to jet
-    level. Calibrated (120-day mixed-terrain spinup at 32x64) so the
-    upper-level jet-band wind speed comes out visibly stronger than the
-    surface layer's, matching real tropospheric jets being stronger aloft,
-    without requiring a separate upper-level temperature field."""
+    level. Originally calibrated to just 8.0 (120-day mixed-terrain spinup
+    at 32x64) so the layer merely came out "stronger than the surface" --
+    but a real-world jet-stream diagnostic comparison (weekly zonal-mean
+    profile over a full year, see jet-stream-vs-real-world memory) found
+    that value produced only a ~2-8 m/s subtropical ridge, 5-10x weaker
+    than Earth's actual 30-50 m/s jet cores; recalibrated to 40.0 at the
+    time, bringing the NH jet-band core to ~24-29 m/s. A follow-up session
+    (see jet-latitude-fix memory) found the jet was sitting ~10-15 deg
+    equatorward of Earth's real position because of `wind_upper_pgf_amp`
+    alone -- fixing that required widening `wind_upper_hadley_edge_deg`
+    (below), which reduces the achievable core magnitude for a given amp
+    (a wider suppression footprint means less domain-wide momentum builds
+    up anywhere). Recalibrated again to 90.0 to restore a ~21-22 m/s core
+    at the new, better-positioned latitude -- the ceiling is now ~21.7 m/s
+    (amp beyond ~100 gives no further gain, per a direct sweep) rather than
+    the old 24-29 m/s target, a real trade-off of position for magnitude."""
+
+    wind_upper_hadley_edge_deg: float = 24.0
+    """Gaussian half-width [deg] of the extra equatorial-suppression window
+    applied only in atmosphere.evolve_wind_aloft (kept separate from the
+    surface layer's `eq_window`, sigma=12 deg, tuned for a different reason:
+    surface Ekman/frictional damping in the deep tropics). Real subtropical
+    jets sit at the Hadley cell's poleward edge (~25-30 deg) because within
+    the cell's footprint, direct meridional overturning -- not modeled by
+    this layer's pure thermal-wind balance -- dominates over geostrophic
+    dynamics; only beyond the cell edge does the free thermal-wind response
+    this layer actually simulates take over. A full-year weekly-sampled
+    zonal-mean diagnostic (see jet-latitude-fix memory) found the emergent
+    jet peaking at ~18 deg in both hemispheres with the old, narrow (12 deg)
+    window -- not because dT/dy itself peaked there (in the SH it actually
+    peaked at a realistic ~46 deg), but because the thermal-wind response is
+    dominated by the model's meridional temperature profile's ratio to the
+    Coriolis parameter (which grows with latitude), and that profile is too
+    gently-sloped across the whole subtropical band for the response to beat
+    a 1/f decay -- so the emergent peak just tracked wherever the (too
+    narrow) equatorial damping stopped suppressing it. Widening to 24 deg
+    reshapes the response into a broad ~15-30 deg plateau (SH argmax moves
+    cleanly to ~29.5 deg; NH is a near-flat tie across the same band) --
+    much closer to Earth's real subtropical/polar-front jet position.
+    Widening further (36+) over-suppresses and just clips the same
+    monotonic-decay curve at a later point without adding real structure."""
 
     wind_upper_damping: float = 0.05
     """Rayleigh-friction rate [1/day] for the upper-level wind layer — much
@@ -515,6 +583,12 @@ MARS = PlanetParams(
     co2_initial_ppm=1.0,
     co2_climate_feedback=0.8,   # No water-vapour amplification on dry Mars
     wv_greenhouse_factor=0.0,   # Negligible water vapour on Mars
+    # Real Mars trace-gas composition (bulk is CO2, ~95.3%, filled in as the
+    # remainder by atmosphere_composition() -- co2_baseline_ppm/co2_initial_ppm
+    # above are greenhouse-formula placeholders, not real composition numbers).
+    bg_n2_frac=0.0189,
+    bg_o2_frac=0.00145,
+    bg_ar_frac=0.0193,
     cloud_greenhouse_factor=0.0,  # No liquid water clouds
     ch4_baseline_ppb=0.0,
     ch4_initial_ppb=0.0,
@@ -522,6 +596,9 @@ MARS = PlanetParams(
     trade_wave_pressure_amp_pa=25.0,  # Same reasoning, scaled with storm_pressure_amp_pa
     jet_meander_noise_amp=0.15,  # Weaker baroclinicity on a thin, dry atmosphere
     jet_block_pressure_amp_pa=60.0,  # Same reasoning, scaled with storm_pressure_amp_pa
-    wind_upper_pgf_amp=4.8,  # Thin CO2 atmosphere: weaker vertical strengthening of gradients (scaled with Earth's default)
+    wind_upper_pgf_amp=54.0,  # Thin CO2 atmosphere: weaker vertical strengthening of gradients (kept at 0.6x Earth's default through both recalibrations)
     wind_upper_damping=0.08,  # Slightly more damped: thinner atmosphere, less inertia aloft
+    # wind_upper_hadley_edge_deg left at the Earth default (24.0): no Mars-specific
+    # jet-latitude diagnostic has been run, and the Hadley-cell-edge reasoning behind
+    # the value isn't obviously Earth-specific.
 )

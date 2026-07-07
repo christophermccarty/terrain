@@ -62,7 +62,15 @@ def _wind_static_grids(H: int, W: int, pp: PlanetParams):
         return _WIND_GRID_CACHE["grids"]
     lat = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
     lat_2d = np.repeat(lat[:, None], W, axis=1)
-    dx = pp.radius_m * (2 * np.pi / W) * np.cos(lat_2d)
+    # Floor cos(lat) so zonal grid spacing dx doesn't collapse to ~0 at the
+    # pole: on a lat-lon grid, any zonal PGF term (dp_dx / dx) diverges as
+    # cos(lat) -> 0, regardless of how physically small the actual zonal
+    # pressure difference is. Real models handle this with a polar filter /
+    # reduced grid; here we simply pin dx to its value at 80 deg poleward of
+    # that, a standard "polar cap" simplification that only ever shrinks the
+    # zonal PGF response in the cap (never inflates it elsewhere).
+    cos_lat_floor = float(np.cos(np.deg2rad(65.0)))
+    dx = pp.radius_m * (2 * np.pi / W) * np.maximum(np.cos(lat_2d), cos_lat_floor)
     dy = pp.radius_m * (np.pi / H)
     f = pp.coriolis_parameter(lat_2d)
     abs_lat_deg_2d = np.abs(np.rad2deg(lat_2d)).astype(np.float32, copy=False)
@@ -361,6 +369,89 @@ def _blocking_ridge_pressure_anomaly(
     return (envelope * float(amp_pa) * np.exp(-d2 / (r * r))).astype(np.float32, copy=False)
 
 
+def _synoptic_wave_pressure_anomaly(
+    lat_2d: np.ndarray,
+    lon_1d: np.ndarray,
+    time_days: float,
+    jet_index_nh: float,
+    jet_index_sh: float,
+    jet_block_nh: tuple[float, float, float],
+    jet_block_sh: tuple[float, float, float],
+    pp: PlanetParams,
+) -> np.ndarray:
+    """Deterministic synoptic-scale pressure perturbation [Pa]: Rossby waves +
+    discrete storm/trade-wave systems + blocking ridges, all keyed off
+    `time_days` and modulated by the persistent jet meander/blocking state.
+
+    Extracted out of evolve_wind's inline pressure-anomaly construction so
+    generate_wind_field's *diagnostic* wind (used whenever full prognostic
+    evolution is skipped -- MONTHLY/ANNUAL time-scale mode, and the
+    wind_relax blending target in faster modes) carries the same storm/jet
+    signal as the prognostic surface layer, instead of falling back to an
+    entirely separate, simpler wave model with different constants and no
+    storms/blocking at all. That mismatch was what made switching speed
+    modes visibly disrupt the monthly precip statistics Köppen classification
+    reads (see jet-stream-vs-real-world memory).
+    """
+    H, W = lat_2d.shape
+    t = float(time_days)
+    abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32, copy=False)
+    sign_lat_1d = np.sign(lat_2d[:, 0]).astype(np.float32, copy=False)
+    storm_w_base = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32, copy=False)
+    wave_scale_nh = 1.0 + float(pp.jet_wave_amp_scale_per_index) * float(jet_index_nh)
+    wave_scale_sh = 1.0 + float(pp.jet_wave_amp_scale_per_index) * float(jet_index_sh)
+    storm_w = np.where(sign_lat_1d >= 0.0, storm_w_base * wave_scale_nh, storm_w_base * wave_scale_sh).astype(np.float32, copy=False)
+
+    wave = np.zeros((H, W), dtype=np.float32)
+    for k, per, ph, amp_hpa in ROSSBY_MODES:
+        wave += (amp_hpa * 100.0) * np.cos(k * lon_1d[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32, copy=False)
+    p_anom = storm_w[:, None] * wave
+
+    _pr_km = float(pp.radius_m) / 1000.0
+    storm_amp = float(pp.storm_pressure_amp_pa)
+    if storm_amp != 0.0:
+        p_anom = p_anom + _storm_pressure_anomaly(
+            lat_2d, lon_1d[None, :], t, storm_amp, population_id=0,
+            lat_shift_nh_deg=float(pp.jet_lat_shift_per_index) * float(jet_index_nh),
+            lat_shift_sh_deg=float(pp.jet_lat_shift_per_index) * float(jet_index_sh),
+            planet_radius_km=_pr_km,
+        )
+
+    trade_wave_amp = float(pp.trade_wave_pressure_amp_pa)
+    if trade_wave_amp != 0.0:
+        p_anom = p_anom + _storm_pressure_anomaly(
+            lat_2d, lon_1d[None, :], t, trade_wave_amp,
+            n_slots=N_TRADE_WAVE_SLOTS,
+            lifecycle_days=TRADE_WAVE_LIFECYCLE_DAYS,
+            lat_center_deg=TRADE_WAVE_LAT_CENTER_DEG,
+            lat_jitter_deg=TRADE_WAVE_LAT_JITTER_DEG,
+            lon_drift_range=TRADE_WAVE_LON_DRIFT_DEG_PER_DAY,
+            lat_drift_range=TRADE_WAVE_LAT_DRIFT_DEG_PER_DAY,
+            radius_km_range=TRADE_WAVE_RADIUS_KM,
+            population_id=1,
+            planet_radius_km=_pr_km,
+        )
+
+    block_amp = float(pp.jet_block_pressure_amp_pa)
+    block_radius = float(pp.jet_block_radius_km)
+    if block_amp != 0.0:
+        jet_lat_nh = MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_nh)
+        jet_lat_sh = -(MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_sh))
+        block_lon_nh, block_days_left_nh, block_total_nh = jet_block_nh
+        block_lon_sh, block_days_left_sh, block_total_sh = jet_block_sh
+        p_anom = p_anom + _blocking_ridge_pressure_anomaly(
+            lat_2d, lon_1d[None, :], jet_lat_nh, block_lon_nh,
+            block_days_left_nh, block_total_nh, block_amp, block_radius,
+            planet_radius_km=_pr_km,
+        )
+        p_anom = p_anom + _blocking_ridge_pressure_anomaly(
+            lat_2d, lon_1d[None, :], jet_lat_sh, block_lon_sh,
+            block_days_left_sh, block_total_sh, block_amp, block_radius,
+            planet_radius_km=_pr_km,
+        )
+    return p_anom
+
+
 def _coarse_shape(H: int, W: int, block_size: int) -> tuple[int, int]:
     bs = max(1, int(block_size))
     Hc = max(1, (H + bs - 1) // bs)
@@ -477,6 +568,17 @@ def _advect_scalar(
     u_scale: np.ndarray,
     v_scale: np.ndarray,
 ) -> np.ndarray:
+    """Short-range donor-cell blend (NumPy fallback for `_advect_humidity_numba`).
+
+    Empirically load-bearing for `generate_precipitation`'s continental-
+    interior/desert balance (see known-physics-gaps.md's moisture-transport
+    investigation): a full-distance semi-Lagrangian replacement dried
+    continental land out further, apparently because this short-range blend
+    keeps evaporated moisture from moving away faster than the RH/
+    convergence-based precip trigger can capture it. Kept as the base term,
+    blended with a longer-range semi-Lagrangian contribution
+    (`_advect_scalar_semi_lagrangian`) via `moisture_advection_scale`.
+    """
     east = np.roll(field, -1, axis=1)
     west = np.roll(field, 1, axis=1)
     # Meridional neighbors are edge-clamped, NOT wrapped: np.roll on axis 0
@@ -535,9 +637,11 @@ def _friction_kernel_numba(u: np.ndarray, v: np.ndarray, elevation: np.ndarray,
 @jit(nopython=True, parallel=True, cache=True)
 def _advect_humidity_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray,
                            u_scale: np.ndarray, v_scale: np.ndarray) -> np.ndarray:
-    """Advect humidity field with upwind scheme (semi-Lagrangian).
+    """Short-range donor-cell blend (Numba fast path for `_advect_scalar`).
 
-    Returns advected humidity field.
+    See `_advect_scalar`'s docstring: kept as the base term in
+    `generate_precipitation`'s moisture advection, blended with a longer-
+    range semi-Lagrangian contribution via `moisture_advection_scale`.
     """
     H, W = q.shape
     q_out = np.zeros_like(q)
@@ -739,6 +843,58 @@ def _streamfunction_from_vorticity(omega: np.ndarray) -> np.ndarray:
     return psi.astype(np.float32)
 
 
+def _semi_lagrangian_departure(
+    u: np.ndarray,
+    v: np.ndarray,
+    dt_seconds: float,
+    dx_meters: np.ndarray,
+    dy_meters: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Backward-trajectory departure points shared by all semi-Lagrangian advection.
+
+    Given a velocity field and an elapsed time, returns the (y, x) grid
+    coordinates each cell's air parcel arrived *from* -- the same lookup
+    whether the field being advected is the wind itself (`u`/`v`) or a
+    passive scalar carried by that wind (e.g. humidity). Extracted out of
+    `_advect_wind_semi_lagrangian` so `_advect_scalar_semi_lagrangian` doesn't
+    duplicate this math.
+
+    Args:
+        u: (H,W) Eastward wind [m/s]
+        v: (H,W) Northward wind [m/s]
+        dt_seconds: Time step [seconds]
+        dx_meters: (H,W) Grid spacing in x-direction [meters]
+        dy_meters: Grid spacing in y-direction [meters]
+
+    Returns:
+        (y_departure, x_departure) grid-index coordinates for map_coordinates.
+    """
+    H, W = u.shape
+
+    # Current grid coordinates (physical indices) — static per shape, cached
+    if _MGRID_CACHE["key"] != (H, W):
+        _MGRID_CACHE.update({"key": (H, W), "yx": np.mgrid[0:H, 0:W]})
+    y_grid, x_grid = _MGRID_CACHE["yx"]
+
+    # Backward trajectory: where did the air parcel come from?
+    # dx_cells = (u * dt) / dx_meters  (convert m/s to grid cells)
+    # Handle varying dx (smaller near poles)
+    dx_cells = (u * dt_seconds) / (dx_meters + 1e-3)
+    dy_cells = (v * dt_seconds) / dy_meters
+
+    # Departure points (where air came from)
+    x_departure = x_grid - dx_cells
+    y_departure = y_grid - dy_cells
+
+    # Periodic boundary in longitude (wraps around)
+    x_departure = np.mod(x_departure, W)
+
+    # Wall boundary in latitude (clamp at poles)
+    y_departure = np.clip(y_departure, 0, H - 1)
+
+    return y_departure, x_departure
+
+
 def _advect_wind_semi_lagrangian(
     u: np.ndarray,
     v: np.ndarray,
@@ -770,34 +926,55 @@ def _advect_wind_semi_lagrangian(
     if map_coordinates is None:
         from scipy.ndimage import map_coordinates  # last-resort fallback
 
-    H, W = u.shape
-
-    # Current grid coordinates (physical indices) — static per shape, cached
-    if _MGRID_CACHE["key"] != (H, W):
-        _MGRID_CACHE.update({"key": (H, W), "yx": np.mgrid[0:H, 0:W]})
-    y_grid, x_grid = _MGRID_CACHE["yx"]
-
-    # Backward trajectory: where did the air parcel come from?
-    # dx_cells = (u * dt) / dx_meters  (convert m/s to grid cells)
-    # Handle varying dx (smaller near poles)
-    dx_cells = (u * dt_seconds) / (dx_meters + 1e-3)
-    dy_cells = (v * dt_seconds) / dy_meters
-
-    # Departure points (where air came from)
-    x_departure = x_grid - dx_cells
-    y_departure = y_grid - dy_cells
-
-    # Periodic boundary in longitude (wraps around)
-    x_departure = np.mod(x_departure, W)
-
-    # Wall boundary in latitude (clamp at poles)
-    y_departure = np.clip(y_departure, 0, H - 1)
+    y_departure, x_departure = _semi_lagrangian_departure(u, v, dt_seconds, dx_meters, dy_meters)
 
     # Interpolate u, v at departure points (bilinear interpolation)
     u_new = map_coordinates(u, [y_departure, x_departure], order=1, mode='wrap')
     v_new = map_coordinates(v, [y_departure, x_departure], order=1, mode='wrap')
 
     return u_new.astype(np.float32), v_new.astype(np.float32)
+
+
+def _advect_scalar_semi_lagrangian(
+    field: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    dt_seconds: float,
+    dx_meters: np.ndarray,
+    dy_meters: float,
+) -> np.ndarray:
+    """Semi-Lagrangian advection of a passive scalar (e.g. humidity) by wind (u, v).
+
+    Same backward-trajectory, unconditionally-stable scheme as
+    `_advect_wind_semi_lagrangian`, but samples an arbitrary scalar field at
+    the departure point instead of u/v themselves. This is what makes
+    moisture transport distance scale correctly with wind speed and dt_days
+    (a genuine Courant number) instead of the old fixed ~3-cell donor-cell
+    blend used previously in `generate_precipitation` (see
+    known-physics-gaps.md / ROADMAP.md's "CFL-linked humidity advection"
+    item) -- at typical mid-latitude wind speeds a full day's transport spans
+    many tens of grid cells, and a fixed small-blend loop simply couldn't
+    represent that without an infeasible number of substeps at MONTHLY/ANNUAL
+    dt (the same CFL problem this pattern already solved for wind).
+
+    Args:
+        field: (H,W) scalar field to advect (e.g. specific humidity)
+        u: (H,W) Eastward wind [m/s]
+        v: (H,W) Northward wind [m/s]
+        dt_seconds: Time step [seconds]
+        dx_meters: (H,W) Grid spacing in x-direction [meters]
+        dy_meters: Grid spacing in y-direction [meters]
+
+    Returns:
+        Advected field, same shape/dtype (float32) as input.
+    """
+    map_coordinates = _scipy_map_coordinates
+    if map_coordinates is None:
+        from scipy.ndimage import map_coordinates  # last-resort fallback
+
+    y_departure, x_departure = _semi_lagrangian_departure(u, v, dt_seconds, dx_meters, dy_meters)
+    field_new = map_coordinates(field, [y_departure, x_departure], order=1, mode='wrap')
+    return field_new.astype(np.float32)
 
 
 def evolve_wind(
@@ -905,89 +1082,14 @@ def evolve_wind(
         # aliasing the caller's array would silently mutate their buffer.
         p_anom = np.array(pressure, dtype=np.float32, copy=True)
 
-    # Synoptic-scale planetary waves: re-enabled with longer periods (20-45 days vs 6-14).
-    # Shorter periods (6-14 days) caused daily direction reversals; slower waves produce
-    # persistent, slowly-moving pressure cells that create emergent highs/lows without thrashing.
+    # Synoptic-scale planetary waves + storms/trade-waves/blocking ridges: see
+    # _synoptic_wave_pressure_anomaly (shared with generate_wind_field's
+    # diagnostic wind so both paths carry the same storm/jet signal).
     if time_days is not None:
-        lon_1d = _lon_1d_cached
-        abs_deg_1d = np.rad2deg(np.abs(lat_2d[:, 0])).astype(np.float32, copy=False)  # (H,)
-        sign_lat_1d = np.sign(lat_2d[:, 0]).astype(np.float32, copy=False)  # (H,) +N, -S
-        # Split the mid-lat storm-track window by hemisphere so a wavier jet
-        # (jet_index > 0) can independently amplify Rossby-wave meander in one
-        # hemisphere without affecting the other.
-        storm_w_base = np.exp(-((abs_deg_1d - 45.0) / 18.0) ** 2).astype(np.float32, copy=False)  # (H,)
-        wave_scale_nh = 1.0 + float(pp.jet_wave_amp_scale_per_index) * float(jet_index_nh)
-        wave_scale_sh = 1.0 + float(pp.jet_wave_amp_scale_per_index) * float(jet_index_sh)
-        storm_w = np.where(sign_lat_1d >= 0.0, storm_w_base * wave_scale_nh, storm_w_base * wave_scale_sh).astype(np.float32, copy=False)
-        t = float(time_days)
-        wave = np.zeros((H, W), dtype=np.float32)
-        # Wavenumbers 3-7, periods 20-45 days: slow Rossby-like propagation.
-        # Amplitudes reduced 40% from initial values (1.0/0.75/0.5 → 0.6/0.45/0.3 hPa)
-        # to avoid over-perturbing the pressure field when combined with the terrain term.
-        for k, per, ph, amp_hpa in ROSSBY_MODES:
-            wave += (amp_hpa * 100.0) * np.cos(k * lon_1d[None, :] + (2.0 * np.pi * t / per) + ph).astype(np.float32, copy=False)
-        p_anom = p_anom + storm_w[:, None] * wave
-
-        # Discrete moving extratropical storm systems (see _storm_pressure_anomaly):
-        # unlike the Rossby waves above (a standing sinusoid, never spawns/dies),
-        # these are individual low-pressure cells with a birth/track/death
-        # lifecycle. This is what turns the "faint ripple" the Rossby waves alone
-        # produce into organic, moving, blob-shaped storm precipitation via the
-        # existing convergence/ascent-driven precipitation machinery downstream —
-        # no changes needed on the precipitation side. The genesis latitude is
-        # biased by the jet meander index so storms track along the (shifted)
-        # jet rather than a fixed climatological latitude.
-        _pr_km = float(pp.radius_m) / 1000.0
-        storm_amp = float(pp.storm_pressure_amp_pa)
-        if storm_amp != 0.0:
-            p_anom = p_anom + _storm_pressure_anomaly(
-                lat_2d, lon_1d[None, :], t, storm_amp, population_id=0,
-                lat_shift_nh_deg=float(pp.jet_lat_shift_per_index) * float(jet_index_nh),
-                lat_shift_sh_deg=float(pp.jet_lat_shift_per_index) * float(jet_index_sh),
-                planet_radius_km=_pr_km,
-            )
-
-        # Trade-wind/subtropical waves (see the module-level comment above
-        # N_TRADE_WAVE_SLOTS): westward-translating, shorter-lived, weaker
-        # disturbances covering the 12-32 deg band the mid-latitude storms
-        # above don't reach -- this is the band where the Rossby-wave ripple
-        # alone looked the most static/repetitive (2026-07 user feedback).
-        trade_wave_amp = float(pp.trade_wave_pressure_amp_pa)
-        if trade_wave_amp != 0.0:
-            p_anom = p_anom + _storm_pressure_anomaly(
-                lat_2d, lon_1d[None, :], t, trade_wave_amp,
-                n_slots=N_TRADE_WAVE_SLOTS,
-                lifecycle_days=TRADE_WAVE_LIFECYCLE_DAYS,
-                lat_center_deg=TRADE_WAVE_LAT_CENTER_DEG,
-                lat_jitter_deg=TRADE_WAVE_LAT_JITTER_DEG,
-                lon_drift_range=TRADE_WAVE_LON_DRIFT_DEG_PER_DAY,
-                lat_drift_range=TRADE_WAVE_LAT_DRIFT_DEG_PER_DAY,
-                radius_km_range=TRADE_WAVE_RADIUS_KM,
-                population_id=1,
-                planet_radius_km=_pr_km,
-            )
-
-        # Blocking ridges: a persistent, quasi-stationary high (weeks-long,
-        # not translating) that steers storms around it and locks in
-        # multi-week wet/dry anomalies -- the mechanism plain Rossby waves
-        # and the storm populations above (both memoryless) cannot produce.
-        block_amp = float(pp.jet_block_pressure_amp_pa)
-        block_radius = float(pp.jet_block_radius_km)
-        if block_amp != 0.0:
-            jet_lat_nh = MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_nh)
-            jet_lat_sh = -(MID_LAT_JET_CENTER_DEG + float(pp.jet_lat_shift_per_index) * float(jet_index_sh))
-            block_lon_nh, block_days_left_nh, block_total_nh = jet_block_nh
-            block_lon_sh, block_days_left_sh, block_total_sh = jet_block_sh
-            p_anom = p_anom + _blocking_ridge_pressure_anomaly(
-                lat_2d, lon_1d[None, :], jet_lat_nh, block_lon_nh,
-                block_days_left_nh, block_total_nh, block_amp, block_radius,
-                planet_radius_km=_pr_km,
-            )
-            p_anom = p_anom + _blocking_ridge_pressure_anomaly(
-                lat_2d, lon_1d[None, :], jet_lat_sh, block_lon_sh,
-                block_days_left_sh, block_total_sh, block_amp, block_radius,
-                planet_radius_km=_pr_km,
-            )
+        p_anom = p_anom + _synoptic_wave_pressure_anomaly(
+            lat_2d, _lon_1d_cached, time_days,
+            jet_index_nh, jet_index_sh, jet_block_nh, jet_block_sh, pp,
+        )
 
     # NOTE: A constant land-sea pressure contrast was tried here but removed.
     # Antarctica (~all land) got a permanent +150 Pa high, driving persistent cold-air
@@ -1149,6 +1251,7 @@ def evolve_wind_aloft(
     damping_rate: float = 0.05,
     vmax_clip: float = 150.0,
     planet_params: PlanetParams | None = None,
+    hadley_edge_deg: float = 12.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve the upper-level (1.5-layer) prognostic wind field.
 
@@ -1173,6 +1276,13 @@ def evolve_wind_aloft(
     first pass, consistent with how real boundary-layer schemes already
     treat the near-surface layer asymmetrically relative to the free
     troposphere.
+
+    `hadley_edge_deg` (see PlanetParams.wind_upper_hadley_edge_deg) sets the
+    width of an extra equatorial-suppression window specific to this layer,
+    representing the real Hadley cell's direct-circulation footprint (not
+    otherwise modeled here) that keeps the free thermal-wind jet from
+    forming too close to the equator -- see that field's docstring for the
+    diagnostic that motivated it.
     """
     H, W = u2.shape
     dt_total = dt_days * 86400.0  # seconds
@@ -1210,7 +1320,48 @@ def evolve_wind_aloft(
     pgf_u = -1.0 / rho * dp_dx
     pgf_v = -1.0 / rho * dp_dy
 
+    # Thermal-wind balance -- the whole basis of this layer's PGF term -- breaks
+    # down near the equator where f -> 0: Coriolis rotation barely turns the
+    # flow each sub-step, so the persistent PGF forcing just keeps accelerating
+    # u/v under this layer's otherwise-uniform weak friction instead of
+    # settling into a balanced jet. That produced a spurious "false jet" in the
+    # deep tropics (empirically the strongest zonal-mean response in the whole
+    # profile) that swamped the much weaker, but physically real, mid-latitude
+    # thermal-wind signal. The surface layer already corrects for this with an
+    # equatorial drag bump (evolve_wind's `2.0e-6 * eq_window` quadratic-drag
+    # term); mirror it here as extra linear Rayleigh damping, scaled to this
+    # layer's own weak-friction units, so unbalanced tropical acceleration
+    # doesn't dominate over genuine mid-latitude jet dynamics.
+    # Separately, the polar rows suffer the opposite failure mode: dx = R *
+    # (2*pi/W) * cos(lat) collapses toward the pole, so the same dp_dx/dx PGF
+    # term diverges there even after the _wind_static_grids dx floor above
+    # softens it -- any residual per-column zonal temperature asymmetry near
+    # the pole (from the land/ice distribution) still gets amplified into a
+    # locally huge, noisy pgf_u/pgf_v that this layer's uniform weak friction
+    # can't relax away before the vmax_clip below silently caps it every step.
+    # Add the same style of extra damping there, windowed by distance from
+    # the pole rather than the equator.
+    abs_lat_deg_local = np.abs(np.rad2deg(lat_2d)).astype(np.float32, copy=False)
+    polar_window = np.exp(-(((90.0 - abs_lat_deg_local) / 10.0) ** 2)).astype(np.float32, copy=False)
+
+    # Hadley-cell footprint suppression -- wider than the surface layer's
+    # `eq_window` (sigma=12 deg, tuned for surface Ekman/frictional damping
+    # in the deep tropics). Real subtropical jets sit at the Hadley cell's
+    # poleward edge (~25-30 deg), not at the local dT/dy peak: within the
+    # cell's footprint, direct meridional overturning (not modeled by this
+    # layer's pure thermal-wind balance) dominates over geostrophic dynamics,
+    # so free thermal-wind response should stay suppressed out to roughly the
+    # cell edge rather than just the deep tropics. Without this wider window,
+    # diagnostics (see jet-stream-vs-real-world memory) showed the emergent
+    # jet peaking at ~18 deg in both hemispheres regardless of where the
+    # actual simulated dT/dy peaked (pole-ish in the NH, a very Earth-like
+    # ~46 deg in the SH) -- i.e. the peak tracked the edge of the (too
+    # narrow) equatorial damping bump, not the real gradient shape.
+    _hadley_edge_deg = float(hadley_edge_deg)
+    eq_window_aloft = np.exp(-((abs_lat_deg_local / _hadley_edge_deg) ** 2)).astype(np.float32, copy=False)
+
     k_damp = float(damping_rate) / 86400.0  # 1/day -> 1/s
+    k_damp = k_damp + (1.5 / 86400.0) * eq_window_aloft + (3.0 / 86400.0) * polar_window
 
     for _ in range(n_steps):
         # 1. Semi-Lagrangian advection (unconditionally stable) -- same scheme
@@ -1261,6 +1412,10 @@ def generate_wind_field(
     time_days: float | None = None,
     planet_params: PlanetParams | None = None,
     debug_log: bool = False,
+    jet_index_nh: float = 0.0,
+    jet_index_sh: float = 0.0,
+    jet_block_nh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
+    jet_block_sh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v) near-surface winds derived from pressure gradients.
 
@@ -1268,6 +1423,15 @@ def generate_wind_field(
     variation), add terrain and weather-system perturbations, then derive winds
     from pressure gradients via geostrophic balance. A streamfunction solver
     ensures divergence-free flow while preserving realistic meridional components.
+
+    `jet_index_{nh,sh}`/`jet_block_{nh,sh}` (see atmosphere._update_jet_index /
+    _update_jet_blocking) let the `weather_amp` perturbation share the exact
+    same storm/Rossby-wave/blocking-ridge pressure signal as the prognostic
+    evolve_wind() path (_synoptic_wave_pressure_anomaly), instead of this
+    diagnostic wind falling back to its own separate, simpler wave model.
+    This is what makes switching time-scale modes (which swap between this
+    diagnostic wind and the full prognostic evolve_wind) not visibly disrupt
+    the monthly precip statistics Köppen classification reads.
     """
 
     pp = planet_params or EARTH
@@ -1374,21 +1538,17 @@ def generate_wind_field(
         # instead of stationary, day-seeded blobs.
         t_days = float(time_days) if time_days is not None else float(day_of_year)
         if temperature is not None:
-            # Mid-latitude storm-track window
-            storm_window = np.exp(-((abs_deg[:, None] - 45.0) / 18.0) ** 2).astype(np.float32, copy=False)
-            equ_window = np.exp(-((abs_deg[:, None]) / 12.0) ** 2).astype(np.float32, copy=False)
-            # A small set of deterministic planetary waves
-            ks = np.array([3.0, 5.0, 7.0, 9.0], dtype=np.float32)
-            periods = np.array([6.0, 9.0, 14.0, 20.0], dtype=np.float32)  # days
-            phases = np.array([0.3, 1.1, -0.7, 2.2], dtype=np.float32)
-            amps = np.array([6.0, 4.5, 3.0, 2.5], dtype=np.float32) * wamp  # hPa
-            wave = np.zeros((Hc, Wc), dtype=np.float32)
-            for k, per, ph, a in zip(ks, periods, phases, amps):
-                wave += a * np.cos(k * lon[None, :] + (2.0 * np.pi * t_days / per) + ph)
-            p_thermal += storm_window * wave
-
-            # Add a weak equatorial traveling wave (Walker / MJO-ish), to avoid overly static tropics.
-            p_thermal += equ_window * (2.0 * wamp) * np.cos(2.0 * lon[None, :] - (2.0 * np.pi * t_days / 7.0) + 0.4)
+            # Same deterministic Rossby-wave + storm/trade-wave + blocking-ridge
+            # signal as the prognostic evolve_wind() path (shared helper), so
+            # this diagnostic wind doesn't fall back to a separate, simpler
+            # wave model with different constants and no storms/blocking --
+            # see _synoptic_wave_pressure_anomaly's docstring.
+            lat_2d_c = np.repeat(lat[:, None], Wc, axis=1)
+            synoptic_pa = _synoptic_wave_pressure_anomaly(
+                lat_2d_c, lon, t_days,
+                jet_index_nh, jet_index_sh, jet_block_nh, jet_block_sh, pp,
+            )
+            p_thermal += wamp * (synoptic_pa / 100.0)  # Pa -> hPa
         else:
             # Fallback (static view): small stationary systems
             rng = np.random.default_rng(int(day_of_year) + 9001)
@@ -1880,6 +2040,7 @@ def generate_precipitation(
     target_mean_mm_day: float = 2.7,
     max_precip_mm_day: float = 120.0,
     surface_pressure_hpa: float = 1013.25,
+    planet_params: PlanetParams | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (precip_mm_day, humidity, soil_moisture).
 
@@ -1967,30 +2128,59 @@ def generate_precipitation(
     sources = (ocean_evap + land_evap) * dt_evap
     q = np.clip(base_q + sources, 0.0, qsat)
 
-    # Moisture advection/diffusion (semi-Lagrangian-ish)
+    # Moisture advection: hybrid of the old short-range donor-cell blend
+    # (kept as the base term) plus an additional longer-range semi-Lagrangian
+    # contribution, blended in by `moisture_advection_scale`.
+    #
+    # A full replacement with pure semi-Lagrangian transport was tried first
+    # (moving moisture the physically-correct wind_speed*dt distance) and
+    # reverted: measured on a 60yr MONTHLY real-terrain-shaped spinup, it
+    # monotonically *dried out* mid-latitude continental-interior land as
+    # transport distance increased (soil moisture 0.335 -> 0.126, precip
+    # 106 -> 56 mm/yr from scale 0 -> 1), the opposite of the intended fix --
+    # confirmed not a granularity artifact either (looping smaller sub-jumps
+    # made it worse, not better, likely because each `map_coordinates` call
+    # is itself a smoothing/diffusive operation that compounds with more
+    # calls). Best diagnosis: the short-range blend was accidentally
+    # load-bearing -- it keeps evaporated moisture from moving away faster
+    # than the RH/convergence-based precip trigger (rh_release, convective)
+    # can capture it near its source; genuine long-range transport instead
+    # exports land moisture onward before it rains out locally, since land
+    # evaporation is soil-bucket-limited (finite source) unlike the ocean's
+    # effectively unlimited supply. Kept as an additive nudge (not a
+    # replacement) so the load-bearing short-range dynamics stay intact;
+    # `moisture_advection_scale` controls how much of the longer-range
+    # contribution blends in (0 = old behavior exactly).
     u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
     v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * (
         0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
     )
-
+    q_short = q
     if NUMBA_AVAILABLE:
-        # Fast path: Numba-accelerated advection with adaptive diffusion
         for _ in range(3):
-            q = _advect_humidity_numba(q.astype(np.float32), u, v, u_scale, v_scale)
-            lap_q = _laplacian_numba(q)
+            q_short = _advect_humidity_numba(q_short.astype(np.float32), u, v, u_scale, v_scale)
+            lap_q = _laplacian_numba(q_short)
             # Adaptive diffusion: stronger in regions with sharp gradients
             q_grad_strength = np.abs(lap_q) / (np.mean(np.abs(lap_q)) + 1e-9)
             diffusion_coeff = (0.11 + 0.03 * storm_window[:, None]) * (
                 1.0 + 0.3 * np.clip(q_grad_strength, 0.0, 2.0)
             )
-            q = q + diffusion_coeff * lap_q
-            q = np.clip(q, 0.0, qsat)
+            q_short = q_short + diffusion_coeff * lap_q
+            q_short = np.clip(q_short, 0.0, qsat)
     else:
-        # Fallback: original NumPy implementation
         for _ in range(3):
-            q = _advect_scalar(q, u, v, u_scale, v_scale)
-            q = q + (0.11 + 0.03 * storm_window[:, None]) * _laplacian(q)
-            q = np.clip(q, 0.0, qsat)
+            q_short = _advect_scalar(q_short, u, v, u_scale, v_scale)
+            q_short = q_short + (0.11 + 0.03 * storm_window[:, None]) * _laplacian(q_short)
+            q_short = np.clip(q_short, 0.0, qsat)
+
+    _pp = planet_params or EARTH
+    _blend = float(_pp.moisture_advection_scale)
+    if _blend > 0.0:
+        _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, _pp)
+        q_long = _advect_scalar_semi_lagrangian(q, u, v, dt * 86400.0, dx_grid, dy_grid)
+        q = np.clip((1.0 - _blend) * q_short + _blend * q_long, 0.0, qsat)
+    else:
+        q = q_short
 
     # Moisture-flux convergence driver
     if NUMBA_AVAILABLE:

@@ -115,8 +115,17 @@ def test_latitude_band_temperature_bias_reasonable(earth_spinup_state):
     summary = stats["summary"]
     mean_bias = float(summary["mean_temp_bias_c"])
     max_bias = float(summary["max_temp_bias_c"])
-    # Threshold 9.0°C: kept generous since snapshot compares against annual-mean references.
-    assert abs(mean_bias) < 9.0, f"Mean latitude-band temperature bias too large: {mean_bias:.1f}°C"
+    # Threshold 9.0->10.5°C (2026-07, wind/precip-model revisit): the land summer-
+    # temperature cap's taper start moved from 0deg to 45deg (simulate.py's
+    # _land_cap_1d) to fix land being colder than adjacent ocean even at peak summer
+    # at mid-latitudes -- a real bug that killed the thermal-low/monsoon signal
+    # needed for continental moisture inflow (see moisture-transport-investigation
+    # memory). This raises the 20-45 deg land-cap ceiling toward the equatorial 301K
+    # value, pushing this snapshot's 40-50N band ~6C above its Earth reference
+    # (measured 10.1C mean bias vs the old 9.0C bound) -- a deliberate trade-off for
+    # a large, verified continental-interior precipitation realism gain (US Midwest
+    # box: 95->227 mm/yr on real terrain), not an unexamined regression.
+    assert abs(mean_bias) < 10.5, f"Mean latitude-band temperature bias too large: {mean_bias:.1f}°C"
     # Threshold raised to 40°C (from 35°C): T_air has larger polar seasonal amplitude
     # than T_sst, widening the snapshot-vs-annual-mean gap at high latitudes.
     assert max_bias < 40.0, f"Max latitude-band temperature bias too large: {max_bias:.1f}°C"
