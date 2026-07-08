@@ -122,7 +122,8 @@ _PRECIP_SUBSTEP_DAYS = 8.0
 
 
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
-                                        humidity, soil_moisture, cloud_fraction,
+                                        humidity, soil_moisture, soil_moisture_deep,
+                                        cloud_fraction,
                                         day_of_year, dt_days,
                                         surface_pressure_hpa=1013.25,
                                         planet_params=None):
@@ -131,22 +132,24 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
         return generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=humidity, soil_moisture=soil_moisture,
+            soil_moisture_deep=soil_moisture_deep,
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
         )
     n_sub = max(1, int(round(dt_days / _PRECIP_SUBSTEP_DAYS)))
     sub_dt = dt_days / n_sub
-    hum, soil = humidity, soil_moisture
+    hum, soil, soil_deep = humidity, soil_moisture, soil_moisture_deep
     P_accum = None
     for _ in range(n_sub):
-        P_i, hum, soil = generate_precipitation(
+        P_i, hum, soil, soil_deep = generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
-            humidity=hum, soil_moisture=soil, cloud_fraction=cloud_fraction,
+            humidity=hum, soil_moisture=soil, soil_moisture_deep=soil_deep,
+            cloud_fraction=cloud_fraction,
             day_of_year=day_of_year, dt_days=sub_dt,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
         )
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
-    return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil
+    return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil, soil_deep
 
 
 # Cache for coarsened elevation. Elevation is static terrain — the same array
@@ -378,6 +381,12 @@ class PlanetState(NamedTuple):
     # Feature 8: 1.5-layer atmosphere (real prognostic upper-level wind)
     wind_u_aloft: np.ndarray | None = None  # (H, W) upper-level eastward wind (m/s)
     wind_v_aloft: np.ndarray | None = None  # (H, W) upper-level northward wind (m/s)
+    # Planet identity this save belongs to (None = EARTH, for saves predating this field)
+    planet_params: PlanetParams | None = None
+    # 2-layer soil-moisture bucket (Feature: soil desiccation-bistability fix, Jul 2026):
+    # soil_moisture (above) is now the fast-draining surface layer; this is the
+    # slow-draining deep/root-zone reservoir. See atmosphere.generate_precipitation.
+    soil_moisture_deep: np.ndarray | None = None
 
 
 def simulate_step(
@@ -1122,6 +1131,7 @@ def simulate_step(
             round(float(pp.obliquity_deg), 4),
             round(float(pp.sidereal_day_hours), 4),
             round(float(pp.radius_m), 1),
+            round(float(pp.pgf_continentality_amp), 4),
         )
         cache = _RELAX_CACHE
         if cache["key"] == key and cache["u"] is not None and cache["v"] is not None:
@@ -1487,6 +1497,8 @@ def simulate_step(
                 _group_p_in["hum"] = state.humidity
             if state.soil_moisture is not None:
                 _group_p_in["soil"] = state.soil_moisture
+            if state.soil_moisture_deep is not None:
+                _group_p_in["soil_deep"] = state.soil_moisture_deep
             if cloud_full is not None:
                 _group_p_in["cloud"] = cloud_full
             _group_p_out = _coarsen_many(_group_p_in, _Hcp, _Wcp, _pbs)
@@ -1495,27 +1507,30 @@ def simulate_step(
             _v_p = _group_p_out["v"]
             _hum_p = _group_p_out.get("hum")
             _soil_p = _group_p_out.get("soil")
+            _soil_deep_p = _group_p_out.get("soil_deep")
             _cloud_p = _group_p_out.get("cloud")
-            P_p, hum_p_next, soil_p_next = _generate_precipitation_substepped(
+            P_p, hum_p_next, soil_p_next, soil_deep_p_next = _generate_precipitation_substepped(
                 _Hcp, _Wcp, _elev_p,
                 temperature=_T_p, wind_u=_u_p, wind_v=_v_p,
-                humidity=_hum_p, soil_moisture=_soil_p,
+                humidity=_hum_p, soil_moisture=_soil_p, soil_moisture_deep=_soil_deep_p,
                 cloud_fraction=_cloud_p,
                 day_of_year=int(new_day), dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
                 planet_params=pp,
             )
             _up = _upsample_bilinear_many(
-                {"P": P_p, "q": hum_p_next, "soil": soil_p_next}, H, W, _pbs
+                {"P": P_p, "q": hum_p_next, "soil": soil_p_next, "soil_deep": soil_deep_p_next}, H, W, _pbs
             )
             P_full: np.ndarray | None = _up["P"]
             humidity_next: np.ndarray | None = _up["q"]
             soil_next: np.ndarray | None = _up["soil"]
+            soil_deep_next: np.ndarray | None = _up["soil_deep"]
         else:
-            P_full, humidity_next, soil_next = _generate_precipitation_substepped(
+            P_full, humidity_next, soil_next, soil_deep_next = _generate_precipitation_substepped(
                 H, W, state.elevation,
                 temperature=T_full, wind_u=u_full, wind_v=v_full,
                 humidity=state.humidity, soil_moisture=state.soil_moisture,
+                soil_moisture_deep=state.soil_moisture_deep,
                 cloud_fraction=cloud_full,
                 day_of_year=int(new_day), dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
@@ -1525,6 +1540,7 @@ def simulate_step(
         P_full = None
         humidity_next = None
         soil_next = None
+        soil_deep_next = None
     # NOTE: latent cooling from precipitation is already applied inside
     # _evolve_temperature (via evaporation) and generate_precipitation.
     # Applying it again here was a double-count and has been removed.
@@ -1750,6 +1766,7 @@ def simulate_step(
         precipitation=P_full,
         humidity=humidity_next,
         soil_moisture=soil_next,
+        soil_moisture_deep=soil_deep_next,
         cloud_cover=cloud_full,
         snow_depth=snow_depth_new,
         ice_cover=ice_full,
@@ -1789,6 +1806,7 @@ def simulate_step(
         # Feature 8: 1.5-layer atmosphere upper-level wind
         wind_u_aloft=u2_full,
         wind_v_aloft=v2_full,
+        planet_params=pp,
     )
 
     # Return state and components (empty dict if not tracking)
@@ -1857,6 +1875,7 @@ def create_initial_state(
         humidity=None,
         co2_atmosphere=float(_pp_init.co2_initial_ppm),
         ch4_atmosphere=float(_pp_init.ch4_initial_ppb),
+        planet_params=_pp_init,
     )
     new_state, _ = simulate_step(state, days=0.0, **kwargs)
     return new_state

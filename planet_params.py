@@ -187,6 +187,29 @@ class PlanetParams:
     0 = no ice-albedo effect; 1 = full sea-ice albedo contrast applied.
     Default 0.30 weakens runaway glaciation while preserving the signal."""
 
+    pgf_continentality_amp: float = 0.0
+    """Continental-interior amplification of `evolve_wind`'s thermal pressure
+    term [dimensionless, >=0]. Real continental interiors develop stronger
+    seasonal thermal lows/highs than coastal land or islands because they're
+    far from the ocean's moderating heat capacity -- the same temperature
+    anomaly should produce a proportionally larger pressure response inland.
+    Locally scales the existing `-pgf_temp_scale * (T-273.15)/30` term by
+    `(1 + pgf_continentality_amp * continentality)`, where `continentality`
+    (masks.get_continentality) is a `[0,1]` distance-from-coast proxy, 0 at
+    coast/ocean. Deliberately still anomaly-following (scales with the
+    already-tuned T field, zero-inert when T is at its reference value) --
+    NOT a flat additive land-sea bonus, which was tried and reverted
+    (evolve_wind's own docstring/comments) because it gave Antarctica (all
+    land, always cold) a permanent artificial high and crashed the SH pole
+    via runaway katabatic/ice-albedo feedback. A cold interior still gets a
+    *high* here, just a more strongly and correctly signed one (the Siberian
+    High is real, not a bug), so it shouldn't reproduce that failure mode --
+    but it touches the same high-latitude pressure/ice-feedback machinery
+    that caused it, so re-verify ice-sensitivity tests after changing this.
+    Default 0.0 (exact no-op) until calibrated against
+    `scripts/check_real_terrain_koppen.py --wind-diagnostics`
+    (known-physics-gaps.md item 3b)."""
+
     # ------------------------------------------------------------------ #
     # Ocean circulation — AMOC / ACC bonus magnitudes
     # ------------------------------------------------------------------ #
@@ -244,6 +267,63 @@ class PlanetParams:
     convergence/arrival rather than static local RH, not just a transport-distance
     change) rather than removed, since the underlying mechanism may still be useful
     once that larger redesign happens."""
+
+    # ------------------------------------------------------------------ #
+    # 2-layer soil moisture bucket (Jul 2026 desiccation-bistability fix)
+    # ------------------------------------------------------------------ #
+    # The single-layer bucket's gain/drain balance is genuinely bistable under one
+    # global gain constant -- soil either saturates near 1.0 everywhere or collapses
+    # to its 0.05 floor, with no stable middle ground (measured directly while
+    # calibrating; see atmosphere.generate_precipitation's soil-update comment and
+    # known-physics-gaps.md). These fields add a slow deep/root-zone reservoir
+    # alongside the existing fast surface layer (`PlanetState.soil_moisture`) so each
+    # region's long-term precip/evap balance can settle at its own differentiated
+    # equilibrium instead of being pinned to one of two global attractors.
+    #
+    # NOTE on design: an earlier version gated the deep layer's input on surface
+    # moisture exceeding a field-capacity threshold (real-soil-physics-style
+    # percolation). Measured directly on real terrain that this doesn't work: the
+    # surface layer is *already* pinned at its 0.05 floor (the exact bug being
+    # fixed) and can never climb back above a field-capacity threshold on its own,
+    # so percolation never triggers and the deep layer just decays to zero with no
+    # input -- a chicken-and-egg trap. Replaced with a direct precipitation-fed gain
+    # for the deep layer (independent of the surface layer's own state), which
+    # sidesteps the trap entirely: the deep layer's equilibrium reflects each
+    # region's real long-run precip rate directly, decoupled from whichever branch
+    # the bistable surface layer happens to be on.
+    soil_deep_gain_rate: float = 0.0
+    """Fraction of precipitation that feeds the deep layer directly per day
+    [1/day], independent of the surface layer's own state (see NOTE above).
+    Default kept at 0.0 (exact no-op, matching moisture_advection_scale /
+    pgf_continentality_amp's convention): calibrated directly against real
+    terrain (2026-07) and found the deep layer amplifies whatever desert-vs-
+    continental-interior precip differentiation already exists in its input,
+    rather than creating it -- a controlled 20yr real-terrain comparison
+    (deep layer on vs off) showed no measurable net effect at conservative
+    gain rates, and pushing the gain rate up 20x made a desert box (Sahara)
+    *wetter* (up to ~354 mm/yr, above its own realism target) without
+    reliably helping continental interior. The real bottleneck is upstream --
+    desert vs. continental-interior precipitation isn't reliably
+    differentiated by the model in the first place (see known-physics-gaps.md)
+    -- fixing that is a precondition for this knob to be useful, not
+    something this knob can produce on its own. Left wired and tested as
+    infrastructure for whoever picks that up."""
+
+    soil_deep_drain_rate: float = 0.002
+    """Slow baseflow/groundwater drain rate for the deep layer [1/day]. Unlike
+    percolation, this *is* a sink (water leaves the system). ~500-day (1.4yr)
+    e-folding time by default -- deliberately much slower than the surface layer's
+    day-to-week response, so the deep reservoir carries real multi-year memory rather
+    than snapping to a new equilibrium within one spinup like the single-layer bucket
+    did."""
+
+    soil_deep_evap_weight: float = 0.5
+    """Efficiency of deep-layer moisture at supporting evaporation, relative to
+    surface moisture [0-1]. `land_evap`'s soil factor becomes
+    `0.35 + 0.65*max(soil_surface, soil_deep_evap_weight*soil_deep)` -- deep moisture
+    can "rescue" evaporation via root uptake when the surface is dry, at reduced
+    efficiency, without needing to dominate when the surface is already adequately
+    moist. 0.5 is a starting point pending calibration against real terrain."""
 
     # ------------------------------------------------------------------ #
     # Cloud radiative feedback (Feature 1)

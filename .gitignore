@@ -4,3 +4,4 @@
 /testing/results/**/*.json
 settings.json
 /saves/**
+*.pyc

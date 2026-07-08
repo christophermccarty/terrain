@@ -37,7 +37,7 @@ N_STEPS = 15  # long enough for transient mechanisms (storms, trade waves) to be
 
 _COMPARE_FIELDS = [
     "temperature", "air_temperature", "wind_u", "wind_v", "precipitation",
-    "humidity", "cloud_cover", "soil_moisture", "salinity", "ice_cover",
+    "humidity", "cloud_cover", "soil_moisture", "soil_moisture_deep", "salinity", "ice_cover",
     "co2_atmosphere", "ch4_atmosphere", "co2_ocean",
 ]
 
@@ -101,6 +101,14 @@ PLANET_PARAM_CASES = [
     ("cloud_greenhouse_factor", 0.0),
     ("wv_greenhouse_factor", 0.0),
     ("deep_ocean_exchange_rate", 5e-4),
+    ("soil_deep_gain_rate", 0.001),  # default 0.0 (inert) -- see planet_params.py docstring
+    ("soil_deep_drain_rate", 0.05),
+    # A fresh state's surface soil starts at 0.55 (well above the eventual 0.05
+    # floor), so soil_deep_evap_weight's max(soil, weight*soil_deep) only picks
+    # the deep-weighted branch if weight*soil_deep exceeds that fresh-start
+    # value -- needs a large perturbation (not e.g. 0.0) to actually exercise
+    # the code path in this short/fresh-start test.
+    ("soil_deep_evap_weight", 5.0),
 ]
 
 
@@ -118,6 +126,31 @@ def test_planet_param_is_wired(field, perturbed):
 # ---------------------------------------------------------------------------
 # create_initial_state must actually seed from PlanetParams (2026-07-03 fix)
 # ---------------------------------------------------------------------------
+
+def test_pgf_continentality_amp_wired_in_diagnostic_wind():
+    # pgf_continentality_amp only affects atmosphere.generate_wind_field (the
+    # diagnostic/climatological wind used whenever update_wind=False, i.e.
+    # MONTHLY/ANNUAL time-scale mode) -- NOT evolve_wind (DAILY/WEEKLY), so
+    # this needs its own test with update_wind=False rather than joining
+    # PLANET_PARAM_CASES above (which runs with the default update_wind=True
+    # and would exercise the wrong code path, silently passing for the wrong
+    # reason). Also a regression guard for the specific bug found while
+    # calibrating this parameter: simulate.py's `_diag_wind_cached` module-
+    # level cache key omitted new PlanetParams fields by default, so a second
+    # call with a different `pgf_continentality_amp` (but identical day/jet-
+    # index/other cache-key inputs) silently returned the *first* call's
+    # stale cached wind -- this test would have caught that as a false
+    # "unwired" failure.
+    changed_pp = dataclasses.replace(EARTH, pgf_continentality_amp=8.0)
+    baseline = _run(EARTH, update_wind=False)
+    changed = _run(changed_pp, update_wind=False)
+    assert _states_differ(baseline, changed), (
+        "PlanetParams.pgf_continentality_amp=0.0 vs 8.0 produced a byte-identical "
+        "state under update_wind=False (MONTHLY/ANNUAL mode) after "
+        f"{N_STEPS} steps -- parameter may be dead/unwired, or the "
+        "_diag_wind_cached cache key needs updating again"
+    )
+
 
 def test_co2_ch4_initial_values_applied():
     # create_initial_state also runs one simulate_step to populate derived
