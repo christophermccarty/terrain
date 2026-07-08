@@ -15,7 +15,7 @@ from functools import lru_cache
 import numpy as np
 from temperature import temperature_kelvin_for_lat
 from planet_params import PlanetParams, EARTH
-from masks import get_masks
+from masks import get_masks, get_continentality
 
 # Numba JIT compilation for performance
 try:
@@ -1003,6 +1003,7 @@ def evolve_wind(
     jet_block_sh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
     u_aloft: np.ndarray | None = None,
     v_aloft: np.ndarray | None = None,
+    debug_fields: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evolve wind field using simplified primitive momentum equations.
 
@@ -1029,6 +1030,15 @@ def evolve_wind(
     baroclinic mixing term relaxes the surface wind toward this field on a
     per-cell, direction-sensitive basis instead of the old magnitude-only
     `|dT/dy|` proxy.
+
+    `debug_fields`, if provided (an empty dict to populate), receives the
+    per-term pressure-anomaly decomposition (`p_anom_thermal`, `p_anom_terrain`,
+    `p_anom_ice`, `p_anom_synoptic` -- any not applicable this call are left
+    out) *before* they're summed into `p_anom`. Diagnostic-only; no effect on
+    the returned wind when omitted (default `None`). Used by
+    `scripts/check_real_terrain_koppen.py --wind-diagnostics` to measure the
+    real magnitude of each pressure-forcing term without duplicating this
+    function's formulas in a separate script.
     """
     H, W = u.shape
     dt_total = dt_days * 86400.0  # seconds
@@ -1057,10 +1067,16 @@ def evolve_wind(
         # P ~ P0 * exp(-z/H) * (T0/T)^g/R... simplified:
         # NOTE: Keep this in Pa (not hPa). Scale is intentionally "synoptic-ish":
         # order ~5-10 hPa swings across large temperature gradients.
-        p_anom = -float(pgf_temp_scale) * ((temperature - 273.15) / 30.0)  # Pa anomaly
+        p_thermal = -float(pgf_temp_scale) * ((temperature - 273.15) / 30.0)  # Pa anomaly
+        p_anom = p_thermal
+        if debug_fields is not None:
+            debug_fields["p_anom_thermal"] = p_thermal
         if elevation is not None:
              # Terrain effect: flow around obstacles, high pressure wedge
-             p_anom += float(pgf_terrain_scale) * elevation
+             p_terrain = float(pgf_terrain_scale) * elevation
+             p_anom = p_anom + p_terrain
+             if debug_fields is not None:
+                 debug_fields["p_anom_terrain"] = p_terrain
         if ice_cover is not None and float(ice_pressure_scale) != 0.0:
             # Sea ice → wind/pressure feedback. Physically: ice-covered surfaces
             # radiatively cool efficiently, reinforcing a shallow cold-air dome
@@ -1076,7 +1092,10 @@ def evolve_wind(
             # that failure mode. Dynamically coupled to the ice model (grows/
             # shrinks with `ice_cover`) rather than a static continent-scale
             # bonus, which should make it self-limiting rather than persistent.
-            p_anom = p_anom + float(ice_pressure_scale) * np.clip(ice_cover, 0.0, 1.0)
+            p_ice = float(ice_pressure_scale) * np.clip(ice_cover, 0.0, 1.0)
+            p_anom = p_anom + p_ice
+            if debug_fields is not None:
+                debug_fields["p_anom_ice"] = p_ice
     else:
         # Copy: the wave/storm/blocking terms below accumulate into p_anom, and
         # aliasing the caller's array would silently mutate their buffer.
@@ -1086,10 +1105,13 @@ def evolve_wind(
     # _synoptic_wave_pressure_anomaly (shared with generate_wind_field's
     # diagnostic wind so both paths carry the same storm/jet signal).
     if time_days is not None:
-        p_anom = p_anom + _synoptic_wave_pressure_anomaly(
+        p_synoptic = _synoptic_wave_pressure_anomaly(
             lat_2d, _lon_1d_cached, time_days,
             jet_index_nh, jet_index_sh, jet_block_nh, jet_block_sh, pp,
         )
+        p_anom = p_anom + p_synoptic
+        if debug_fields is not None:
+            debug_fields["p_anom_synoptic"] = p_synoptic
 
     # NOTE: A constant land-sea pressure contrast was tried here but removed.
     # Antarctica (~all land) got a permanent +150 Pa high, driving persistent cold-air
@@ -1416,6 +1438,7 @@ def generate_wind_field(
     jet_index_sh: float = 0.0,
     jet_block_nh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
     jet_block_sh: tuple[float, float, float] = (-1.0, 0.0, 0.0),
+    debug_fields: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, v) near-surface winds derived from pressure gradients.
 
@@ -1432,6 +1455,24 @@ def generate_wind_field(
     This is what makes switching time-scale modes (which swap between this
     diagnostic wind and the full prognostic evolve_wind) not visibly disrupt
     the monthly precip statistics Köppen classification reads.
+
+    IMPORTANT: this is the wind actually used for MONTHLY/ANNUAL time-scale
+    modes (`update_wind=False` in `simulate_step`), which is this project's
+    established calibration methodology -- not just a preview/fallback path.
+    When `temperature` is provided (the real simulated field, always true for
+    in-sim calls), `zonal_pressure` (default 0.85) blends 85% of the pressure
+    signal from the *zonal-mean* temperature at that latitude, diluting any
+    actual per-cell land/ocean contrast -- `pgf_continentality_amp`
+    (PlanetParams) locally reduces that blend fraction over continental
+    interior (`masks.get_continentality`), letting the real per-cell thermal
+    signal matter more precisely where the zonal-mean dilution was
+    suppressing the thermal-low/monsoon convergence signal
+    (known-physics-gaps.md item 3b).
+
+    `debug_fields`, if provided (an empty dict to populate), receives
+    `p_thermal`, `p_terrain`, and `zonal_blend_eff` (the continentality-
+    adjusted zonal blend fraction actually used). Diagnostic-only; no effect
+    on the returned wind when omitted (default `None`).
     """
 
     pp = planet_params or EARTH
@@ -1464,12 +1505,22 @@ def generate_wind_field(
         _g_row, _g_col = np.gradient(elev_c)
         gx = _g_col
         gy = -_g_row
+        # Full-resolution continentality (masks.get_continentality, id-cached
+        # per elevation array), coarsened the same way elev_c is above.
+        _cont_full = get_continentality(elevation.astype(np.float32, copy=False))
+        _cont_pad = np.pad(
+            _cont_full,
+            ((0, Hc * block_size - H), (0, Wc * block_size - W)),
+            mode="edge",
+        )
+        continentality_c = _cont_pad.reshape(Hc, block_size, Wc, block_size).mean(axis=(1, 3))
     else:
         elev_c = np.zeros((Hc, Wc), dtype=np.float32)
         land_mask = np.zeros((Hc, Wc), dtype=bool)
         sea_mask = np.ones((Hc, Wc), dtype=bool)
         gx = np.zeros((Hc, Wc), dtype=np.float32)
         gy = np.zeros((Hc, Wc), dtype=np.float32)
+        continentality_c = np.zeros((Hc, Wc), dtype=np.float32)
 
     # Temperature field:
     # - If provided, use it (it should come from the simulation state).
@@ -1517,19 +1568,28 @@ def generate_wind_field(
     
     # Convert temperature to surface pressure (ideal gas law approximation)
     # For sim-driven winds we keep it mostly zonal to avoid stationary continent-scale blobs.
+    # Locally reduced over continental interior (pgf_continentality_amp) so the real
+    # per-cell land/ocean thermal contrast isn't diluted away exactly where it should
+    # matter most -- see this function's docstring / known-physics-gaps.md item 3b.
     T_ref = 273.15
     zp = float(np.clip(zonal_pressure, 0.0, 1.0))
+    zonal_blend_eff = zp * (1.0 - np.clip(float(pp.pgf_continentality_amp) * continentality_c, 0.0, 1.0))
     if temperature is not None and zp > 0.0:
         T_zonal = np.mean(T, axis=1, keepdims=True)
-        T_used = zp * T_zonal + (1.0 - zp) * T
+        T_used = zonal_blend_eff * T_zonal + (1.0 - zonal_blend_eff) * T
     else:
         T_used = T
     # Warmer = lower pressure (thermal low), colder = higher pressure (thermal high)
     p_thermal = (pp.surface_pressure_pa / 100.0) * (T_ref / (T_used + 1e-6)) ** 2.2  # hPa
-    
+    if debug_fields is not None:
+        debug_fields["p_thermal"] = p_thermal
+        debug_fields["zonal_blend_eff"] = zonal_blend_eff
+
     # Add terrain pressure anomalies (mountains create blocking highs)
     tp = float(np.clip(terrain_pressure_amp, 0.0, 1.0))
     p_terrain = 25.0 * tp * terrain_influence * np.clip(elev_c, 0.0, 1.0)
+    if debug_fields is not None:
+        debug_fields["p_terrain"] = p_terrain
     
     # Optional: inject weak synoptic-scale perturbations.
     wamp = float(np.clip(weather_amp, 0.0, 1.0))
@@ -2031,6 +2091,7 @@ def generate_precipitation(
     wind_v: np.ndarray | None = None,
     humidity: np.ndarray | None = None,
     soil_moisture: np.ndarray | None = None,
+    soil_moisture_deep: np.ndarray | None = None,
     cloud_fraction: np.ndarray | None = None,
     day_of_year: int = 80,
     dt_days: float = 1.0,
@@ -2041,11 +2102,22 @@ def generate_precipitation(
     max_precip_mm_day: float = 120.0,
     surface_pressure_hpa: float = 1013.25,
     planet_params: PlanetParams | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (precip_mm_day, humidity, soil_moisture).
+    debug_fields: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (precip_mm_day, humidity, soil_moisture, soil_moisture_deep).
 
-    The model keeps a prognostic surface humidity field and a simple soil-moisture
-    bucket while blending three precipitation triggers: moisture convergence,
+    `debug_fields`, if provided (an empty dict to populate), receives the
+    `div`/`ascent`/`conv` wind-convergence driver arrays used internally.
+    Diagnostic-only; no effect on the returned precipitation when omitted
+    (default `None`). Used by `scripts/check_real_terrain_koppen.py
+    --wind-diagnostics` to measure the real convergence signal without
+    duplicating this function's formulas in a separate script.
+
+    The model keeps a prognostic surface humidity field and a 2-layer soil-moisture
+    bucket (fast surface layer `soil_moisture` + slow deep/root-zone reservoir
+    `soil_moisture_deep`, see PlanetParams' `soil_field_capacity`/
+    `soil_percolation_rate`/`soil_deep_drain_rate`/`soil_deep_evap_weight`) while
+    blending three precipitation triggers: moisture convergence,
     orographic lift, and convective instability. Everything runs at the native
     grid resolution so it can operate in both snapshot and time-stepping modes.
 
@@ -2055,6 +2127,8 @@ def generate_precipitation(
     trigger, closing the gap where clouds and precipitation were diagnosed from
     shared RH/ascent fields but never actually informed each other.
     """
+
+    pp = planet_params or EARTH
 
     H = int(height)
     W = int(width)
@@ -2098,6 +2172,36 @@ def generate_precipitation(
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
     qsat = np.clip(0.622 * es / surface_pressure_hpa, 0.0, 0.035).astype(np.float32, copy=False)
 
+    # Subsidence/dry-belt suppression, computed early (needs only u/v/lat, no q)
+    # so it can also gate land evapotranspiration below, not just precip_potential
+    # further down (which reuses this same array unchanged). Moved up because
+    # desert land_evap was riding up with temperature/qsat alone (hot desert air
+    # has high evaporative demand) with nothing holding it down: the soil-moisture
+    # bucket doesn't reliably differentiate desert from continental-interior land
+    # (both settle near the same low floor -- see known-physics-gaps.md item 3
+    # UPDATE 2), so absolute humidity q came out HIGHER over deserts than over
+    # continental interior despite precip_potential ranking them correctly.
+    # Final rainfall is dq = remove_frac * q, an absolute quantity, so the
+    # inflated desert q dominated over the correctly-ranked precip_potential
+    # (measured directly: Sahara q ~3.5x Canadian Prairies' despite Prairies'
+    # precip_potential being ~2.4x Sahara's -- see UPDATE 4).
+    #
+    # Meridional term sign: row index increases southward while v is northward,
+    # so physical divergence is ∂u/∂x − ∂v/∂i. With the previous (+) sign the
+    # ITCZ's meridional convergence registered as DIVERGENCE (and the horse
+    # latitudes' divergence as convergence), inverting the ascent/subsidence
+    # drivers wherever the meridional wind dominated.
+    div = _ddx_periodic(u) - np.gradient(v, axis=0)
+    _div_pos_early = np.clip(div, 0.0, None)
+    _subsidence_norm_early = np.clip(_div_pos_early / (np.mean(_div_pos_early) + 1e-6), 0.0, 2.5)
+    subsidence_suppression = np.clip(
+        1.0 - 0.34 * _subsidence_norm_early - 0.45 * drybelt_window[:, None],
+        0.08,
+        1.0,
+    ).astype(np.float32, copy=False)
+    if debug_fields is not None:
+        debug_fields["subsidence_suppression"] = subsidence_suppression
+
     if humidity is None:
         base_q = np.where(sea_mask, 0.013, 0.009).astype(np.float32, copy=False)
     else:
@@ -2107,6 +2211,11 @@ def generate_precipitation(
         soil = np.where(land_mask, 0.55, 0.0).astype(np.float32, copy=False)
     else:
         soil = soil_moisture.astype(np.float32)
+
+    if soil_moisture_deep is None:
+        soil_deep = np.where(land_mask, 0.3, 0.0).astype(np.float32, copy=False)
+    else:
+        soil_deep = soil_moisture_deep.astype(np.float32)
 
     dt = max(float(dt_days), 1.0)
     # At large dt (monthly/annual mode) evaporation would saturate the entire humidity
@@ -2118,15 +2227,31 @@ def generate_precipitation(
     # Evaporation and evapotranspiration sources
     wind_norm = np.clip(wind_speed / 15.0, 0.0, 1.5)
     ocean_evap = evap_coeff * sea_f * (0.45 + 0.55 * wind_norm) * np.clip(qsat - base_q, 0.0, None)
+    # Soil factor draws from whichever layer has more effective moisture: the fast
+    # surface layer directly, or the slow deep/root-zone reservoir at reduced
+    # efficiency (root uptake) via soil_deep_evap_weight. Lets deep moisture
+    # "rescue" evaporation when the surface is dry without needing to dominate when
+    # the surface is already adequately moist -- see PlanetParams.soil_deep_evap_weight.
+    soil_evap_factor = np.maximum(soil, float(pp.soil_deep_evap_weight) * soil_deep)
     land_evap = (
         evap_coeff
         * land_f
         * (0.20 + 0.65 * temp_norm)
-        * (0.35 + 0.65 * soil)
+        * (0.35 + 0.65 * soil_evap_factor)
         * np.clip(qsat - base_q, 0.0, None)
+        * subsidence_suppression
     )
     sources = (ocean_evap + land_evap) * dt_evap
     q = np.clip(base_q + sources, 0.0, qsat)
+    if debug_fields is not None:
+        debug_fields["temp_norm"] = temp_norm
+        debug_fields["qsat"] = qsat
+        debug_fields["base_q"] = base_q
+        debug_fields["soil"] = soil
+        debug_fields["soil_deep"] = soil_deep
+        debug_fields["soil_evap_factor"] = soil_evap_factor
+        debug_fields["land_evap"] = land_evap
+        debug_fields["ocean_evap"] = ocean_evap
 
     # Moisture advection: hybrid of the old short-range donor-cell blend
     # (kept as the base term) plus an additional longer-range semi-Lagrangian
@@ -2173,10 +2298,9 @@ def generate_precipitation(
             q_short = q_short + (0.11 + 0.03 * storm_window[:, None]) * _laplacian(q_short)
             q_short = np.clip(q_short, 0.0, qsat)
 
-    _pp = planet_params or EARTH
-    _blend = float(_pp.moisture_advection_scale)
+    _blend = float(pp.moisture_advection_scale)
     if _blend > 0.0:
-        _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, _pp)
+        _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
         q_long = _advect_scalar_semi_lagrangian(q, u, v, dt * 86400.0, dx_grid, dy_grid)
         q = np.clip((1.0 - _blend) * q_short + _blend * q_long, 0.0, qsat)
     else:
@@ -2198,37 +2322,19 @@ def generate_precipitation(
         conv = conv / (np.mean(conv) + 1e-6)
         conv = np.clip(conv + 0.15 * _laplacian(conv), 0.0, 3.0)
 
-    # Large-scale ascent proxy from wind convergence.
-    # Meridional term sign: row index increases southward while v is northward,
-    # so physical divergence is ∂u/∂x − ∂v/∂i. With the previous (+) sign the
-    # ITCZ's meridional convergence registered as DIVERGENCE (and the horse
-    # latitudes' divergence as convergence), inverting the ascent/subsidence
-    # drivers wherever the meridional wind dominated.
+    # Large-scale ascent proxy from wind convergence. `div` and
+    # `subsidence_suppression` (used to gate both this and land_evap above) were
+    # already computed early, right after wind/qsat, since neither needs q --
+    # see the sign-convention note there.
     _lap = _laplacian_numba if NUMBA_AVAILABLE else _laplacian
-    div = _ddx_periodic(u) - np.gradient(v, axis=0)
     ascent = np.clip(-div, 0.0, None)
     ascent = ascent / (np.mean(ascent) + 1e-6)
     ascent = np.clip(ascent + 0.15 * _lap(ascent.astype(np.float32)), 0.0, 3.0)
 
-    # Subsidence drying: suppresses precipitation in divergent (descending) regions.
-    # In the real atmosphere the Hadley cell's descending branch at ~25-35° drives
-    # subtropical high pressure → subsidence → compression warming → low RH → dry belt.
-    # Without this, divergent zones (horse latitudes) get as much rain as convergent zones.
-    div_pos = np.clip(div, 0.0, None)
-    subsidence_norm = div_pos / (np.mean(div_pos) + 1e-6)
-    subsidence_norm = np.clip(subsidence_norm, 0.0, 2.5)
-    # Reduce precipitation in strong-subsidence / dry-belt regions.
-    # Coefficients deepened and floor lowered (2026-07): real subtropical deserts
-    # (Sahara, Arabian Peninsula, Kalahari) were coming out 3-10x too wet — most
-    # drybelt cells sat around subsidence_suppression~0.5 (52% cut), nowhere near
-    # the floor, because the drybelt_window term alone (0.18 coeff) was too weak to
-    # reach the floor except at extreme subsidence_norm. Deepened so a typical
-    # drybelt-center cell reaches ~0.2 (80% cut) even at average local subsidence.
-    subsidence_suppression = np.clip(
-        1.0 - 0.34 * subsidence_norm - 0.45 * drybelt_window[:, None],
-        0.08,
-        1.0,
-    ).astype(np.float32, copy=False)
+    if debug_fields is not None:
+        debug_fields["div"] = div
+        debug_fields["ascent"] = ascent
+        debug_fields["conv"] = conv
 
     # Orographic uplift signal.
     # gy must be the physical NORTHWARD slope (row index increases southward),
@@ -2333,11 +2439,55 @@ def generate_precipitation(
     dq = np.clip(remove_frac * q, 0.0, q)
     column_mm_per_q = 2000.0  # ~20 mm PW for q=0.01
     P = dq * (column_mm_per_q / dt)
+    if debug_fields is not None:
+        debug_fields["q"] = q
+        debug_fields["precip_potential_prerescale"] = precip_potential
+        debug_fields["remove_frac_prerescale"] = remove_frac
+        debug_fields["rh_release"] = rh_release
+        debug_fields["conv_driver"] = conv_driver
+        debug_fields["ascent_driver"] = ascent_driver
+        debug_fields["stratiform"] = stratiform
+        debug_fields["convective"] = convective
+        debug_fields["orog"] = orog
+        debug_fields["rain_shadow_suppression"] = rain_shadow_suppression
     if target_mean_mm_day > 0.0:
         mean_p = float(np.mean(P))
+        # ATTEMPTED FIX, TESTED AND REVERTED (2026-07, aridity-drift-30yr
+        # investigation): raising this ceiling and rescaling `precip_potential`
+        # pre-clip (instead of the already-clipped `dq`) was tried here, on the
+        # reasoning that it would preserve relative proportions between cells
+        # instead of disproportionately inflating unsaturated (dry) regions --
+        # see global-rescale-saturation-2026-07's candidate fix #1. Measured
+        # directly on real terrain (1yr MONTHLY continuation of saves/earth.pkl):
+        # it made the desert-vs-continental ranking WORSE, not better (Sahara
+        # 246 vs Canadian Prairies 132 mm/yr, both worse than the ~3.0-ceiling
+        # baseline). Root cause: a higher ceiling raises remove_frac broadly,
+        # which raises the FRACTION of each region's own (already scant) q
+        # stripped out per substep -- continental-interior land, which has
+        # naturally higher precip_potential (correctly differentiated, see
+        # desert-evapotranspiration-fix-2026-07), gets proportionally MORE
+        # depletion pressure, and its evaporation supply (land_evap) isn't
+        # strong enough to keep pace, so q collapses toward zero there faster
+        # than in deserts -- and since final rain is dq=remove_frac*q, a
+        # collapsing q dominates over a favorable remove_frac. This mirrors the
+        # SAME failure mode found from the opposite direction in
+        # moisture-transport-investigation-2026-07 ("more/better moisture
+        # transport monotonically dries out continental interior instead of
+        # wetting it") -- strong convergent evidence that the model's
+        # substep-local moisture-budget (evaporate once, then remove a fraction,
+        # repeat) can't sustain a higher removal fraction without a
+        # correspondingly stronger replenishment mechanism (evaporation or
+        # advection) reaching continental interior specifically. Reverted to
+        # the original 3.0 ceiling / dq-rescale exactly. See
+        # known-physics-gaps.md item 3 for the write-up -- fixing the *raw*
+        # chronic under-production requires strengthening moisture supply to
+        # high-potential regions, not just raising how hard the model is
+        # allowed to wring out whatever moisture is already there.
         scale = float(np.clip(target_mean_mm_day / (mean_p + 1e-6), 0.2, 3.0))
         dq = np.clip(dq * scale, 0.0, q)
         P = dq * (column_mm_per_q / dt)
+        if debug_fields is not None:
+            debug_fields["global_rescale_factor"] = scale
     rain_export_factor = np.clip(
         0.94 - 0.14 * itcz_window[:, None] + 0.08 * storm_window[:, None],
         0.70,
@@ -2388,10 +2538,40 @@ def generate_precipitation(
     # test_midlat_precip_quantity) rather than leaving the ceiling-saturation
     # bug in place.
     soil += (P * land_f) * 0.00015 * dt - (land_evap * dt_evap) * 0.4
+
+    # 2-LAYER BUCKET (2026-07): the floor/ceiling above is a safety net, not a
+    # differentiator -- item FOLLOW-UP FIX above found the single-layer gain/drain
+    # balance is genuinely bistable (soil either saturates near 1.0 everywhere or
+    # collapses to the 0.05 floor, with no stable middle ground under one global
+    # gain constant), which was silently collapsing non-desert continental interior
+    # onto the same low branch used to fix desert over-wetting. A slow deep/
+    # root-zone reservoir breaks that: its large capacity and slow time constant
+    # can't snap between two states in one spinup, so each region's real long-term
+    # precip/evap balance can settle at its own differentiated equilibrium instead.
+    #
+    # The deep layer is fed *directly* by precipitation (like the surface layer,
+    # just at a much smaller rate), not via surface-moisture overflow/percolation --
+    # an earlier version gated it on the surface exceeding a field-capacity
+    # threshold, which measured out as a chicken-and-egg trap: the surface layer is
+    # *already* pinned at its 0.05 floor (the exact bug being fixed), so it can
+    # never climb back above a threshold on its own, and the deep layer just decays
+    # to zero with no input. Feeding it directly from P sidesteps that: its
+    # equilibrium reflects each region's real long-run precip rate, independent of
+    # whichever branch the bistable surface layer happens to be on.
+    soil_deep += (P * land_f) * float(pp.soil_deep_gain_rate) * dt
+
+    # Deep-layer drain: slow baseflow/groundwater loss -- a genuine sink (water
+    # leaves the system, unlike the surface layer's evaporation which stays in the
+    # atmosphere-humidity budget). Gives the reservoir real multi-year memory
+    # instead of another instant-equilibrium bucket.
+    soil_deep -= float(pp.soil_deep_drain_rate) * soil_deep * dt
+
     soil = np.where(land_mask, np.clip(soil, 0.05, 1.0), 0.0)
+    soil_deep = np.where(land_mask, np.clip(soil_deep, 0.0, 1.0), 0.0)
 
     return (
         P.astype(np.float32),
         humidity_next.astype(np.float32),
         soil.astype(np.float32),
+        soil_deep.astype(np.float32),
     )

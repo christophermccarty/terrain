@@ -79,13 +79,13 @@ def test_orographic_uplift_exceeds_rain_shadow_on_windward_side():
 
     # Windward: flowing south (toward higher ground, since elevation rises southward).
     v_windward = np.full((H, W), -8.0, dtype=np.float32)
-    P_windward, _, _ = atmo.generate_precipitation(
+    P_windward, _, _, _ = atmo.generate_precipitation(
         H, W, elev, wind_u=u_zero, wind_v=v_windward, day_of_year=80, dt_days=1.0,
     )
 
     # Leeward: flowing north (away from higher ground, descending).
     v_leeward = np.full((H, W), 8.0, dtype=np.float32)
-    P_leeward, _, _ = atmo.generate_precipitation(
+    P_leeward, _, _, _ = atmo.generate_precipitation(
         H, W, elev, wind_u=u_zero, wind_v=v_leeward, day_of_year=80, dt_days=1.0,
     )
 

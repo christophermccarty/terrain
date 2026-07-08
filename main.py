@@ -37,6 +37,8 @@ from masks import get_masks
 from terrain import precipitation_to_rgb, cloud_cover_to_rgb
 from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps, save_state, load_state, TimeScaleMode
 from diagnostics import ClimateDiagnostics
+from planet_params import PlanetParams, EARTH, MARS
+import dataclasses
 import graphs
 
 AUTOSAVE_PATH = Path("saves/autosave.pkl")
@@ -55,13 +57,15 @@ class SimulationThread(Thread):
     """Background thread that runs physics simulation independently of UI."""
 
     def __init__(self, initial_state, days_per_step=1.0, wind_block_size=8, diagnostics=None,
-                 time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY):
+                 time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY,
+                 planet_params: PlanetParams = EARTH):
         super().__init__(daemon=True)
         self.state = initial_state
         self.days_per_step = days_per_step
         self.wind_block_size = wind_block_size
         self.diagnostics = diagnostics
         self.time_scale_mode = time_scale_mode
+        self.planet_params = planet_params
         self.running = Event()
         self.paused = Event()
         self.paused.set()  # Start paused
@@ -104,6 +108,7 @@ class SimulationThread(Thread):
                         debug_log=False,
                         track_components=self.diagnostics is not None,
                         time_scale=mode,
+                        planet_params=self.planet_params,
                     )
 
                     # Record diagnostics each sub-step for correct time-averaging
@@ -152,6 +157,10 @@ class SimulationThread(Thread):
         """Update wind resolution."""
         self.wind_block_size = block_size
 
+    def update_planet_params(self, planet_params: PlanetParams):
+        """Swap the live planet parameters (single-attribute swap, GIL-safe)."""
+        self.planet_params = planet_params
+
 
 def main() -> None:
     """Tiny Tk UI to toggle globe/map and rotate with keys.
@@ -176,7 +185,30 @@ def main() -> None:
         # Larger => fewer wind cells => faster, but more approximate.
         "wind_block_size": 8,
         "show_jet_stream": True,
+        "planet_preset": "Earth",
+        "planet_solar_constant": EARTH.solar_constant,
+        "planet_obliquity_deg": EARTH.obliquity_deg,
+        "planet_eccentricity": EARTH.eccentricity,
+        "planet_aerosol_optical_depth": EARTH.aerosol_optical_depth,
+        "planet_co2_climate_feedback": EARTH.co2_climate_feedback,
+        "planet_ocean_transport_coeff": EARTH.ocean_transport_coeff,
+        "planet_ice_albedo_strength": EARTH.ice_albedo_strength,
+        "planet_thermal_diffusivity": EARTH.thermal_diffusivity,
+        "planet_polar_cooling_scale": EARTH.polar_cooling_scale,
     }
+    # Curated set of PlanetParams fields exposed as live-tunable sliders. Chosen
+    # because simulate_step reads each fresh every call and none feed the only
+    # param-dependent cache (atmosphere._wind_static_grids, keyed on radius_m/
+    # omega/rotation_direction) -- safe to change on a running simulation with
+    # no reset. Anything identity-changing (radius, rotation, CO2 seeding, ocean
+    # fraction, ...) is reachable only via the Earth/Mars preset switch, which
+    # does a full reset.
+    PLANET_LIVE_FIELDS = [
+        "solar_constant", "obliquity_deg", "eccentricity", "aerosol_optical_depth",
+        "co2_climate_feedback", "ocean_transport_coeff", "ice_albedo_strength",
+        "thermal_diffusivity", "polar_cooling_scale",
+    ]
+    PLANET_PRESETS = {"Earth": EARTH, "Mars": MARS}
 
     root = tk.Tk()
     root.title(f"Sphere {size}x{size} (262,144 cells)")
@@ -202,6 +234,17 @@ def main() -> None:
     # Terrain mode: "procedural" or "loaded"
     terrain_mode = "procedural"
     loaded_heightmap_path = None
+
+    # Live planet parameters (Planet tab). Restored from settings.json unless
+    # a loaded autosave carries its own planet_params (handled where the
+    # autosave is loaded, in start_simulation).
+    def _planet_params_from_settings() -> PlanetParams:
+        base = PLANET_PRESETS.get(settings.get("planet_preset", "Earth"), EARTH)
+        overrides = {f: float(settings.get(f"planet_{f}", getattr(base, f))) for f in PLANET_LIVE_FIELDS}
+        return dataclasses.replace(base, **overrides)
+
+    current_planet_params: PlanetParams = _planet_params_from_settings()
+    _syncing_planet_sliders = False  # guards against slider traces fighting a preset sync
     
     # --- Main layout scaffold ---
     # A persistent bottom status bar (packed first so it keeps its slice of
@@ -223,8 +266,10 @@ def main() -> None:
 
     terrain_tab = ttk.Frame(notebook, padding=6)
     sim_tab = ttk.Frame(notebook, padding=6)
+    planet_tab = ttk.Frame(notebook, padding=6)
     notebook.add(sim_tab, text="Simulation")
     notebook.add(terrain_tab, text="Terrain")
+    notebook.add(planet_tab, text="Planet")
     notebook.select(sim_tab)
 
     # Controls
@@ -876,6 +921,7 @@ def main() -> None:
             elev,
             day_of_year=80.0,
             wind_block_size=int(wind_block_size_var.get()),
+            planet_params=current_planet_params,
         )
         sim_running = False
         sim_paused = False
@@ -1166,6 +1212,86 @@ def main() -> None:
     latlon_label = ttk.Label(status_bar, textvariable=latlon_var, width=60, anchor="e")
     latlon_label.pack(side="right")
 
+    # --- Planet tab: Earth/Mars preset switcher + live-tunable headline knobs ---
+    # (field, display label, slider min, slider max, step)
+    PLANET_SLIDER_SPECS = [
+        ("solar_constant", "Solar Constant (W/m²)", 200.0, 2600.0, 1.0),
+        ("obliquity_deg", "Obliquity (°)", 0.0, 90.0, 0.1),
+        ("eccentricity", "Eccentricity", 0.0, 0.6, 0.001),
+        ("aerosol_optical_depth", "Aerosol/Volcanic AOD", 0.0, 0.5, 0.01),
+        ("co2_climate_feedback", "Climate Sensitivity", 0.2, 2.5, 0.01),
+        ("ocean_transport_coeff", "Ocean Heat Transport", 0.0, 1.0, 0.01),
+        ("ice_albedo_strength", "Ice-Albedo Strength", 0.0, 1.0, 0.01),
+        ("thermal_diffusivity", "Thermal Diffusivity", 0.0, 0.2, 0.001),
+        ("polar_cooling_scale", "Polar Cooling Scale", 0.0, 1.0, 0.01),
+    ]
+
+    planet_preset_var = tk.StringVar(value=settings.get("planet_preset", "Earth"))
+    planet_field_vars: dict[str, tk.DoubleVar] = {
+        field: tk.DoubleVar(value=getattr(current_planet_params, field))
+        for field, *_ in PLANET_SLIDER_SPECS
+    }
+
+    ttk.Label(planet_tab, text="Preset:").pack(anchor="w")
+    planet_preset_combo = ttk.Combobox(
+        planet_tab, textvariable=planet_preset_var,
+        values=["Earth", "Mars", "Custom"], state="readonly", width=10,
+    )
+    planet_preset_combo.pack(fill="x", pady=(0, 8))
+
+    def _sync_planet_ui_from_params(pp: PlanetParams) -> None:
+        """Push pp's values into the sliders/preset combo without re-triggering a reset."""
+        nonlocal _syncing_planet_sliders
+        _syncing_planet_sliders = True
+        try:
+            for field, *_ in PLANET_SLIDER_SPECS:
+                planet_field_vars[field].set(getattr(pp, field))
+            preset_name = next((name for name, preset in PLANET_PRESETS.items() if preset == pp), "Custom")
+            planet_preset_var.set(preset_name)
+        finally:
+            _syncing_planet_sliders = False
+
+    def _on_planet_slider_change(*_args) -> None:
+        nonlocal current_planet_params
+        if _syncing_planet_sliders:
+            return
+        overrides = {field: planet_field_vars[field].get() for field, *_ in PLANET_SLIDER_SPECS}
+        current_planet_params = dataclasses.replace(current_planet_params, **overrides)
+        if sim_thread is not None and sim_thread.is_alive():
+            sim_thread.update_planet_params(current_planet_params)
+        if planet_preset_var.get() != "Custom":
+            planet_preset_var.set("Custom")
+
+    def _on_preset_selected() -> None:
+        """Fires only on an explicit user pick from the dropdown (not on .set())."""
+        nonlocal current_planet_params
+        name = planet_preset_var.get()
+        pp = PLANET_PRESETS.get(name)
+        if pp is None:  # user picked "Custom" directly -- nothing to apply
+            return
+        current_planet_params = pp
+        _sync_planet_ui_from_params(pp)
+        reset_simulation()
+
+    def _add_planet_slider(parent, field, label, from_, to_, resolution) -> None:
+        frm = ttk.Frame(parent)
+        frm.pack(fill="x", pady=2)
+        ttk.Label(frm, text=label, anchor="w").pack(fill="x")
+        tk.Scale(
+            frm, from_=from_, to=to_, resolution=resolution, orient="horizontal",
+            variable=planet_field_vars[field], showvalue=True, length=180,
+        ).pack(fill="x")
+
+    for _field, _label, _from, _to, _res in PLANET_SLIDER_SPECS:
+        _add_planet_slider(planet_tab, _field, _label, _from, _to, _res)
+
+    # Attach live-apply traces only after every var/widget exists, so the
+    # initial slider construction above doesn't spuriously flip the preset to
+    # "Custom" or push an update into a (not yet running) sim thread.
+    for _field, *_ in PLANET_SLIDER_SPECS:
+        planet_field_vars[_field].trace_add("write", _on_planet_slider_change)
+    planet_preset_combo.bind("<<ComboboxSelected>>", lambda e: _on_preset_selected())
+
     # Profile initial generation once at startup
     profiler = cProfile.Profile()
     profiler.enable()
@@ -1382,7 +1508,7 @@ def main() -> None:
                         elif use_sim_data and sim_state is not None and sim_state.precipitation is not None:
                             P = sim_state.precipitation.astype(np.float32)
                         else:
-                            P, _, _ = generate_precipitation(*tex.shape, tex, day_of_year=int(day))
+                            P, _, _, _ = generate_precipitation(*tex.shape, tex, day_of_year=int(day))
                         p_overlay, p_alpha = precipitation_to_rgb(P)
                         comb = (1.0 - p_alpha[..., None]) * comb + p_alpha[..., None] * p_overlay
                         if (show_jet_stream_var.get() and use_sim_data and sim_state is not None
@@ -1484,7 +1610,7 @@ def main() -> None:
                     v = sim_state.wind_v if (use_sim_data and sim_state is not None) else None
                     pkey = (tex.shape, int(day), id(T), id(u), id(v))
                     if _PRECIP_VIEW_CACHE["key"] != pkey:
-                        P, _, _ = generate_precipitation(
+                        P, _, _, _ = generate_precipitation(
                             h,
                             w,
                             tex,
@@ -1608,7 +1734,7 @@ def main() -> None:
             latlon_var.set("")
 
     def start_simulation():
-        nonlocal sim_state, sim_thread, sim_running, sim_paused, _sim_ever_started
+        nonlocal sim_state, sim_thread, sim_running, sim_paused, _sim_ever_started, current_planet_params
         if not _sim_ever_started:
             # On first Start: load the active file's autosave if enabled and available
             if _auto_save_enabled and _current_state_path.exists():
@@ -1617,6 +1743,10 @@ def main() -> None:
                     total_years = sim_state.total_days / 365.2422
                     sim_status_var.set(f"Loaded Y{total_years:.1f}")
                     LOG.info(f"Autosave loaded: day {sim_state.total_days:.0f} ({total_years:.2f} years)")
+                    # Restore the planet this save belongs to (old saves lack the
+                    # field entirely and fall back to Earth).
+                    current_planet_params = sim_state.planet_params or EARTH
+                    _sync_planet_ui_from_params(current_planet_params)
                 except Exception as e:
                     LOG.warning(f"Failed to load autosave ({e}); starting fresh.")
         _sim_ever_started = True
@@ -1629,6 +1759,7 @@ def main() -> None:
                 wind_block_size=int(wind_block_size_var.get()),
                 diagnostics=diagnostics,
                 time_scale_mode=time_scale_options.get(time_scale_var.get(), TimeScaleMode.DAILY),
+                planet_params=current_planet_params,
             )
             sim_thread.start()
 
@@ -2006,7 +2137,9 @@ def main() -> None:
             "show_jet_stream": bool(show_jet_stream_var.get()),
             "auto_save_state": bool(_auto_save_enabled),
             "last_state_path": str(_current_state_path),
+            "planet_preset": planet_preset_var.get(),
         }
+        s.update({f"planet_{field}": planet_field_vars[field].get() for field, *_ in PLANET_SLIDER_SPECS})
         save_settings(s)
         graphs_controller.close()
         root.destroy()

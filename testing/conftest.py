@@ -101,8 +101,17 @@ def earth_long_spinup_state(mixed_elev):
     from simulate import create_initial_state, simulate_step, TimeScaleMode
     state = create_initial_state(mixed_elev, day_of_year=80.0)
     for _ in range(60 * 12):   # 60 years, monthly steps
+        # update_wind=False matches main.py's SimulationThread.run() dispatch for
+        # MONTHLY/ANNUAL mode (routes through generate_wind_field's diagnostic wind
+        # instead of the prognostic evolve_wind). Omitting this defaults to True,
+        # which silently ran full DAILY-fidelity wind under a MONTHLY-sized time
+        # step -- found while investigating the soil-moisture desiccation
+        # bistability (2026-07): this fixture's "not floored" guard was passing
+        # for the wrong reason, since it never actually exercised the code path
+        # real MONTHLY-mode users hit. See wind-model-generate-wind-field-fix-2026-07
+        # memory for the matching fix in scripts/check_real_terrain_koppen.py.
         state, _ = simulate_step(
             state, days=30.44, block_size=4, wind_block_size=4,
-            time_scale=TimeScaleMode.MONTHLY,
+            time_scale=TimeScaleMode.MONTHLY, update_wind=False,
         )
     return state

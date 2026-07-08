@@ -68,8 +68,17 @@ def load_settings() -> dict:
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+            # Merge ALL keys present in the file over the defaults, not just
+            # the ones _DEFAULT_SETTINGS happens to know about. The previous
+            # version only copied keys already listed in _DEFAULT_SETTINGS,
+            # silently dropping everything else main.py persists on close
+            # (wind_block_size, show_jet_stream, auto_save_state,
+            # last_state_path, the Planet-tab planet_* keys, ...) -- meaning
+            # those settings were written correctly but never actually read
+            # back on the next launch. Found while investigating an unrelated
+            # file-diff during the wind-model-fix session (2026-07).
             out = dict(_DEFAULT_SETTINGS)
-            out.update({k: data.get(k, v) for k, v in _DEFAULT_SETTINGS.items()})
+            out.update(data)
             return out
     except Exception:
         return dict(_DEFAULT_SETTINGS)
@@ -350,7 +359,7 @@ def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0
     elif view == "Precipitation":
         pkey = (tex.shape, int(day_of_year), "precip")
         if _PRECIP_CACHE["key"] != pkey:
-            P, _, _ = generate_precipitation(tex_h, tex_w, tex, day_of_year=int(day_of_year))
+            P, _, _, _ = generate_precipitation(tex_h, tex_w, tex, day_of_year=int(day_of_year))
             _PRECIP_CACHE.update({"key": pkey, "P": P})
         else:
             P = _PRECIP_CACHE["P"]

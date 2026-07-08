@@ -33,7 +33,7 @@ from scripts.generate_golden_state import GOLDEN_STATE_CONFIG, FIXTURE_PATH
 _ARRAY_OR_SCALAR_FIELDS = [
     "day_of_year", "total_days",
     "temperature", "air_temperature", "wind_u", "wind_v", "precipitation",
-    "humidity", "soil_moisture", "cloud_cover", "cloud_water", "snow_depth",
+    "humidity", "soil_moisture", "soil_moisture_deep", "cloud_cover", "cloud_water", "snow_depth",
     "ice_cover", "co2_atmosphere", "co2_ocean", "vegetation_biomass",
     "salinity", "ch4_atmosphere", "permafrost_carbon", "T_deep_ocean",
     "ice_thickness", "biome_type", "koppen_type",
