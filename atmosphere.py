@@ -2455,7 +2455,21 @@ def generate_precipitation(
     if _blend > 0.0:
         _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
         q_long = _advect_scalar_flux_eulerian(q, u, v, dt * 86400.0, dx_grid, dy_grid)
-        q = np.clip((1.0 - _blend) * q_short + _blend * q_long, 0.0, qsat)
+        # Gate the long-range contribution by the same subsidence_suppression
+        # that already gates land_evap, so imported moisture is damped in
+        # descending/dry-belt (desert) cells rather than reaching the
+        # convective term's RH>=0.8 trigger ungated. Without this, real-
+        # terrain sweeps show the fixed transport wets deserts (Kalahari
+        # 167->350, Atacama 57->137 mm/yr at scale 0->1) proportionally more
+        # than it helps continental interior -- see
+        # moisture-advection-scale-real-terrain-sweep-2026-07 project memory.
+        # Only a partial fix (re-measured after adding this gate: Kalahari
+        # still 167->306, Atacama 57->122 at scale 0->1 -- reduced overshoot
+        # but not eliminated); subsidence_suppression is already in
+        # [0.08, 1.0] (1.0 = no suppression), so this only ever damps the
+        # blend, never amplifies it.
+        _effective_blend = _blend * subsidence_suppression
+        q = np.clip((1.0 - _effective_blend) * q_short + _effective_blend * q_long, 0.0, qsat)
     else:
         q = q_short
 

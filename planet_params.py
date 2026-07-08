@@ -256,30 +256,33 @@ class PlanetParams:
     """Blend weight [0-1] for an additional longer-range moisture transport term
     in `atmosphere.generate_precipitation` (`_advect_scalar_flux_eulerian`),
     layered on top of (not replacing) the existing short-range donor-cell blend
-    -- 0.0 = original behavior exactly. Default kept at 0.0: measured directly
-    (2026-07 moisture-transport investigation, see known-physics-gaps.md) that
-    ANY positive blend monotonically *dries out* mid-latitude continental-
-    interior land instead of the intended fix, across three different transport
-    implementations (full-distance single jump, smaller sequential jumps, and
-    this additive blend) -- the model's precip trigger depends on *local* RH,
-    which rewards moisture staying near where it evaporated over moisture
-    arriving via long-range transport. Left as a knob for future work (a
-    genuine fix likely needs the precip-trigger formula itself reweighted
-    toward convergence/arrival rather than static local RH, not just a
-    transport-distance change) rather than removed, since the underlying
-    mechanism may still be useful once that larger redesign happens.
+    -- 0.0 = original behavior exactly.
 
-    The transport term itself was rebuilt 2026-07 (moisture-advection-jump-
-    dilution-2026-07 memory): the original single-jump semi-Lagrangian sampler
-    was found to dilute even the ocean source at real substep dt, and was
-    replaced with a CFL-safe Eulerian upwind advection scheme
-    (`_advect_scalar_flux_eulerian`, many small substeps instead of one huge
-    jump). Verified directly against real terrain (saves/earth.pkl, same
-    transect the diagnosing session used): ocean-cell RH held at
-    92%/93.6%/94.2% across scale 0/0.3/0.7 with the new scheme, vs. the old
-    scheme's 92%/78.6%/59.3% collapse. That fixes the transport mechanism's
-    own correctness but does not by itself resolve the RH-trigger drying issue
-    described above -- still untested/uncalibrated, default stays 0.0."""
+    History: the original transport implementation (single-jump semi-
+    Lagrangian, pre-2026-07) monotonically *dried out* mid-latitude
+    continental-interior land at any positive blend, across three variants
+    (moisture-transport-investigation-2026-07 memory) -- traced to that jump
+    diluting even the *ocean source* cells at real MONTHLY-mode substep dt
+    (coastal RH 100%->66% at scale 0.7; moisture-advection-jump-dilution-
+    2026-07 memory), not a property of transport itself. Replaced with a
+    CFL-safe Eulerian upwind scheme (`_advect_scalar_flux_eulerian`, many
+    small substeps instead of one ~5000km jump) that holds ocean RH steady
+    (moisture-flux-eulerian-fix-2026-07 memory).
+
+    With that fix, a re-swept real-terrain check (moisture-advection-scale-
+    real-terrain-sweep-2026-07 memory) shows the opposite failure mode: it now
+    *wets* both continental interior (Canadian Prairies/Central Europe improve
+    correctly relative to Sahara) and Southern Hemisphere deserts (Kalahari
+    167->350, Atacama 57->136 mm/yr at scale 0->1 -- overshoot, undesirable).
+    Gating the long-range contribution's blend weight by the same
+    `subsidence_suppression` that already gates `land_evap` (added same
+    session) reduces but does not eliminate this overshoot (Kalahari
+    167->306, Atacama 57->122 at scale 0->1 with the gate). US Midwest barely
+    responds either way -- its bottleneck is a genuinely weak/divergent
+    wind-derived `ascent` signal at that latitude band, not moisture transport
+    or evaporation (same memory's wind-diagnostics check). Default stays 0.0:
+    not yet clean enough to enable, but the remaining gap is now narrow and
+    well-characterized rather than a fundamental mechanism failure."""
 
     # ------------------------------------------------------------------ #
     # 2-layer soil moisture bucket (Jul 2026 desiccation-bistability fix)
