@@ -977,6 +977,144 @@ def _advect_scalar_semi_lagrangian(
     return field_new.astype(np.float32)
 
 
+@jit(nopython=True, parallel=True, cache=True)
+def _advect_scalar_cfl_step_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray,
+                                  u_cfl: np.ndarray, v_cfl: np.ndarray) -> np.ndarray:
+    """One CFL-safe upwind advection step of `dq/dt = -u*dq/dx - v*dq/dy`.
+
+    Same donor-cell structure as `_advect_humidity_numba` (upwind donor
+    selected by each cell's own wind sign, sequential x-then-y blend), but
+    `u_cfl`/`v_cfl` are real Courant numbers (`|wind|*dt_sub/spacing`, clipped
+    to a stable range by the caller) instead of that function's fixed
+    empirical blend fractions -- this is what lets the *total* displacement
+    over many calls scale correctly with `wind_speed * dt_seconds`.
+
+    Deliberately the *advection* (material-derivative) equation, not a flux-
+    divergence/conservation-law form: specific humidity here is a mixing
+    ratio (moisture per unit air mass) with no companion air-density
+    continuity equation in this model, so a `-div(q*V)` formulation would add
+    an unphysical `q*div(V)` reaction term that compounds exponentially over
+    a multi-day integration under perfectly ordinary wind divergence (found
+    directly while building this: a smooth, realistic ~9e-5/s divergence
+    blew a bounded field up over a 5-day integration). Advection form has no
+    such term -- it can only reshuffle/smooth the field, never blow it up.
+    """
+    H, W = q.shape
+    q_out = np.empty_like(q)
+
+    for i in prange(H):
+        for j in range(W):
+            j_east = (j + 1) % W
+            j_west = (j - 1 + W) % W
+
+            if u[i, j] >= 0:
+                q_x = q[i, j_west]
+            else:
+                q_x = q[i, j_east]
+            q_adv_x = q[i, j] + u_cfl[i, j] * (q_x - q[i, j])
+
+            if i == 0 or i == H - 1:
+                q_out[i, j] = q_adv_x
+            else:
+                if v[i, j] >= 0:
+                    q_y = q[i + 1, j]  # Southward: donor is the south neighbor
+                else:
+                    q_y = q[i - 1, j]  # Northward: donor is the north neighbor
+                q_out[i, j] = q_adv_x + v_cfl[i, j] * (q_y - q_adv_x)
+
+    return q_out
+
+
+def _advect_scalar_cfl_step(q: np.ndarray, u: np.ndarray, v: np.ndarray,
+                           u_cfl: np.ndarray, v_cfl: np.ndarray) -> np.ndarray:
+    """NumPy fallback for `_advect_scalar_cfl_step_numba` -- see its docstring."""
+    east = np.roll(q, -1, axis=1)
+    west = np.roll(q, 1, axis=1)
+    row_south = np.concatenate([q[1:, :], q[-1:, :]], axis=0)
+    row_north = np.concatenate([q[:1, :], q[:-1, :]], axis=0)
+
+    adv_x = q + u_cfl * (np.where(u >= 0, west, east) - q)
+    adv_xy = adv_x + v_cfl * (np.where(v >= 0, row_south, row_north) - adv_x)
+    adv_xy[0, :] = adv_x[0, :]
+    adv_xy[-1, :] = adv_x[-1, :]
+    return adv_xy.astype(np.float32)
+
+
+def _advect_scalar_flux_eulerian(
+    field: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    dt_seconds: float,
+    dx_meters: np.ndarray,
+    dy_meters: float,
+    max_courant: float = 0.5,
+) -> np.ndarray:
+    """CFL-safe Eulerian upwind advection of a passive scalar (e.g. specific
+    humidity) by wind (u, v), integrated over the full `dt_seconds` in many
+    small substeps instead of `_advect_scalar_semi_lagrangian`'s single
+    backward-trajectory jump.
+
+    Fixes the mechanism that function used to implement: a single point
+    sample covering the *entire* `dt_seconds` at once, which at real
+    MONTHLY-mode substep dt (~7.6 days) and typical mid-latitude wind speed is
+    a ~5000km jump -- nearly a quarter of the latitude circle. Measured
+    directly (2026-07 moisture-advection-jump-dilution investigation, see
+    project memory) to dilute even the *ocean* source cells (coastal RH
+    100%->66% at `moisture_advection_scale` 0->0.7), not just fail to reach
+    the continental interior, because a single huge jump samples an
+    effectively uncorrelated point in the domain -- closer to diffusive
+    homogenization toward the domain mean than believable local transport.
+
+    This instead takes `n_sub` sequential upwind steps (see
+    `_advect_scalar_cfl_step_numba`), each respecting `max_courant`, so no
+    individual step moves moisture more than a bounded fraction of one grid
+    cell -- the total displacement across all substeps still equals
+    `wind_speed * dt_seconds` (a real Courant distance), it just accumulates
+    via many small, well-behaved steps rather than one huge one.
+
+    Cost scales with `max(|u|/dx, |v|/dy) * dt_seconds / max_courant` substeps
+    -- at real MONTHLY-mode substep dt and this grid's resolution, that's on
+    the order of several hundred to ~1500 substeps (each a cheap O(H*W) pass).
+    Only paid when the caller actually enables the term this feeds
+    (`PlanetParams.moisture_advection_scale`, default 0.0/never called in
+    default runs).
+
+    Args:
+        field: (H,W) scalar field to advect (e.g. specific humidity)
+        u: (H,W) Eastward wind [m/s]
+        v: (H,W) Northward wind [m/s]
+        dt_seconds: Time step [seconds]
+        dx_meters: (H,W) Grid spacing in x-direction [meters]
+        dy_meters: Grid spacing in y-direction [meters]
+        max_courant: Per-substep, per-direction CFL bound (fraction of one
+            grid cell moved per substep, each direction independently). 0.5
+            keeps the upwind scheme comfortably stable and monotone (no new
+            extrema) -- matches `_advect_humidity_numba`'s sequential x-then-y
+            blend structure, where each direction's own convex-combination
+            step just needs its own factor in [0, 1].
+
+    Returns:
+        Advected field, same shape/dtype (float32) as input.
+    """
+    dx_f = dx_meters.astype(np.float32, copy=False)
+    courant_u = np.abs(u) / dx_f
+    courant_v = np.abs(v) / float(dy_meters)
+    max_c = float(max(courant_u.max(), courant_v.max()))
+    if max_c <= 0.0:
+        return field.astype(np.float32, copy=True)
+
+    n_sub = max(1, int(np.ceil(max_c * float(dt_seconds) / max_courant)))
+    dt_sub = float(dt_seconds) / n_sub
+    u_cfl = np.clip(courant_u * dt_sub, 0.0, max_courant).astype(np.float32)
+    v_cfl = np.clip(courant_v * dt_sub, 0.0, max_courant).astype(np.float32)
+
+    q = field.astype(np.float32, copy=True)
+    step = _advect_scalar_cfl_step_numba if NUMBA_AVAILABLE else _advect_scalar_cfl_step
+    for _ in range(n_sub):
+        q = step(q, u, v, u_cfl, v_cfl)
+    return q.astype(np.float32, copy=False)
+
+
 def evolve_wind(
     u: np.ndarray,
     v: np.ndarray,
@@ -2254,28 +2392,43 @@ def generate_precipitation(
         debug_fields["ocean_evap"] = ocean_evap
 
     # Moisture advection: hybrid of the old short-range donor-cell blend
-    # (kept as the base term) plus an additional longer-range semi-Lagrangian
+    # (kept as the base term) plus an additional longer-range transport
     # contribution, blended in by `moisture_advection_scale`.
     #
-    # A full replacement with pure semi-Lagrangian transport was tried first
-    # (moving moisture the physically-correct wind_speed*dt distance) and
-    # reverted: measured on a 60yr MONTHLY real-terrain-shaped spinup, it
-    # monotonically *dried out* mid-latitude continental-interior land as
-    # transport distance increased (soil moisture 0.335 -> 0.126, precip
-    # 106 -> 56 mm/yr from scale 0 -> 1), the opposite of the intended fix --
-    # confirmed not a granularity artifact either (looping smaller sub-jumps
-    # made it worse, not better, likely because each `map_coordinates` call
-    # is itself a smoothing/diffusive operation that compounds with more
-    # calls). Best diagnosis: the short-range blend was accidentally
-    # load-bearing -- it keeps evaporated moisture from moving away faster
-    # than the RH/convergence-based precip trigger (rh_release, convective)
-    # can capture it near its source; genuine long-range transport instead
-    # exports land moisture onward before it rains out locally, since land
-    # evaporation is soil-bucket-limited (finite source) unlike the ocean's
-    # effectively unlimited supply. Kept as an additive nudge (not a
-    # replacement) so the load-bearing short-range dynamics stay intact;
-    # `moisture_advection_scale` controls how much of the longer-range
-    # contribution blends in (0 = old behavior exactly).
+    # A full replacement with pure transport (moving moisture the physically-
+    # correct wind_speed*dt distance) was tried first and reverted: measured
+    # on a 60yr MONTHLY real-terrain-shaped spinup, it monotonically *dried
+    # out* mid-latitude continental-interior land as transport distance
+    # increased (soil moisture 0.335 -> 0.126, precip 106 -> 56 mm/yr from
+    # scale 0 -> 1), the opposite of the intended fix. Best diagnosis: the
+    # short-range blend was accidentally load-bearing -- it keeps evaporated
+    # moisture from moving away faster than the RH/convergence-based precip
+    # trigger (rh_release, convective) can capture it near its source; genuine
+    # long-range transport instead exports land moisture onward before it
+    # rains out locally, since land evaporation is soil-bucket-limited (finite
+    # source) unlike the ocean's effectively unlimited supply. Kept as an
+    # additive nudge (not a replacement) so the load-bearing short-range
+    # dynamics stay intact; `moisture_advection_scale` controls how much of
+    # the longer-range contribution blends in (0 = old behavior exactly).
+    #
+    # The long-range term itself was originally a single semi-Lagrangian
+    # backward-trajectory sample covering the whole substep's distance at
+    # once (`_advect_scalar_semi_lagrangian`) -- found (2026-07 moisture-
+    # advection-jump-dilution investigation, see project memory) to dilute
+    # even the *ocean* source cells at real MONTHLY-mode substep dt (~7.6
+    # days: a ~5000km single jump, coastal RH 100%->66% at scale 0->0.7)
+    # before land ever enters the picture, because one huge jump samples an
+    # effectively uncorrelated point rather than believable local transport.
+    # Replaced with `_advect_scalar_flux_eulerian`: a CFL-safe Eulerian upwind
+    # advection scheme that integrates many small substeps instead of one huge
+    # jump (see its docstring). Verified directly against real terrain
+    # (saves/earth.pkl, same transect the diagnosing session used): ocean-cell
+    # RH held at 92%/93.6%/94.2% across scale 0/0.3/0.7, vs. the old scheme's
+    # 92%/78.6%/59.3% collapse. This fixes the transport mechanism's own
+    # correctness; it does not by itself resolve whether transport helps the
+    # continental-interior/desert gap above -- that remains a separate, open
+    # question (the RH-trigger-favors-local-moisture mechanism described in
+    # the paragraph above still applies).
     u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
     v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * (
         0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
@@ -2301,7 +2454,7 @@ def generate_precipitation(
     _blend = float(pp.moisture_advection_scale)
     if _blend > 0.0:
         _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
-        q_long = _advect_scalar_semi_lagrangian(q, u, v, dt * 86400.0, dx_grid, dy_grid)
+        q_long = _advect_scalar_flux_eulerian(q, u, v, dt * 86400.0, dx_grid, dy_grid)
         q = np.clip((1.0 - _blend) * q_short + _blend * q_long, 0.0, qsat)
     else:
         q = q_short
