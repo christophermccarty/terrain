@@ -253,20 +253,33 @@ class PlanetParams:
     Gated by has_liquid_water_ocean."""
 
     moisture_advection_scale: float = 0.0
-    """Blend weight [0-1] for an additional longer-range semi-Lagrangian moisture
-    transport term in `atmosphere.generate_precipitation`, layered on top of (not
-    replacing) the existing short-range donor-cell blend -- 0.0 = original behavior
-    exactly. Default kept at 0.0: measured directly (2026-07 moisture-transport
-    investigation, see known-physics-gaps.md) that ANY positive blend monotonically
-    *dries out* mid-latitude continental-interior land instead of the intended fix,
-    across three different transport implementations (full-distance single jump,
-    smaller sequential jumps, and this additive blend) -- the model's precip trigger
-    depends on *local* RH, which rewards moisture staying near where it evaporated
-    over moisture arriving via long-range transport. Left as a knob for future work
-    (a genuine fix likely needs the precip-trigger formula itself reweighted toward
-    convergence/arrival rather than static local RH, not just a transport-distance
-    change) rather than removed, since the underlying mechanism may still be useful
-    once that larger redesign happens."""
+    """Blend weight [0-1] for an additional longer-range moisture transport term
+    in `atmosphere.generate_precipitation` (`_advect_scalar_flux_eulerian`),
+    layered on top of (not replacing) the existing short-range donor-cell blend
+    -- 0.0 = original behavior exactly. Default kept at 0.0: measured directly
+    (2026-07 moisture-transport investigation, see known-physics-gaps.md) that
+    ANY positive blend monotonically *dries out* mid-latitude continental-
+    interior land instead of the intended fix, across three different transport
+    implementations (full-distance single jump, smaller sequential jumps, and
+    this additive blend) -- the model's precip trigger depends on *local* RH,
+    which rewards moisture staying near where it evaporated over moisture
+    arriving via long-range transport. Left as a knob for future work (a
+    genuine fix likely needs the precip-trigger formula itself reweighted
+    toward convergence/arrival rather than static local RH, not just a
+    transport-distance change) rather than removed, since the underlying
+    mechanism may still be useful once that larger redesign happens.
+
+    The transport term itself was rebuilt 2026-07 (moisture-advection-jump-
+    dilution-2026-07 memory): the original single-jump semi-Lagrangian sampler
+    was found to dilute even the ocean source at real substep dt, and was
+    replaced with a CFL-safe Eulerian upwind advection scheme
+    (`_advect_scalar_flux_eulerian`, many small substeps instead of one huge
+    jump). Verified directly against real terrain (saves/earth.pkl, same
+    transect the diagnosing session used): ocean-cell RH held at
+    92%/93.6%/94.2% across scale 0/0.3/0.7 with the new scheme, vs. the old
+    scheme's 92%/78.6%/59.3% collapse. That fixes the transport mechanism's
+    own correctness but does not by itself resolve the RH-trigger drying issue
+    described above -- still untested/uncalibrated, default stays 0.0."""
 
     # ------------------------------------------------------------------ #
     # 2-layer soil moisture bucket (Jul 2026 desiccation-bistability fix)
