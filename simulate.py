@@ -37,7 +37,7 @@ from atmosphere import (
     _update_jet_index, _update_jet_blocking,
 )
 from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
-from ocean import calculate_ocean_heat_transport, update_sea_ice, compute_ekman_transport
+from ocean import calculate_ocean_heat_transport, update_sea_ice, compute_ekman_transport, compute_gyre_currents
 from carbon_cycle import (
     carbon_cycle_step, co2_temperature_response, CO2_PREINDUSTRIAL,
     co2_radiative_forcing, vegetation_albedo,
@@ -2498,6 +2498,29 @@ def _evolve_temperature(
             ekman_adj = np.clip(-(shift_x * dT_dx + shift_y * dT_dy), -1.5, 1.5)
             _ocean_mask, _ = get_masks(elev_c)
             T_ocean_adj = T_ocean_adj + ekman_adj * _ocean_mask.astype(np.float32)
+
+        # 2D barotropic gyre currents (Jul 2026): purely additive alongside the
+        # zonal-mean transport and Ekman deflection above, never replacing
+        # them -- gated independently of ekman_strength so it can be enabled
+        # (or not) on its own. See ocean.compute_gyre_currents and
+        # PlanetParams.ocean_gyre_strength docstrings for the full mechanism
+        # and risk notes; highest-risk/most-structural item of the Jul 2026
+        # backlog session, hence the conservative 0.0 default.
+        if _pp.has_liquid_water_ocean and _pp.ocean_gyre_strength > 0.0:
+            u_gy, v_gy = compute_gyre_currents(u, v, elev_c)
+            gyre_scale = float(_pp.ocean_gyre_strength)
+            dy_m_gy = (np.pi / Hc) * float(_pp.radius_m)
+            dx_m_gy = (2.0 * np.pi / Wc) * float(_pp.radius_m) * cos_lat[:, None]
+            dt_gy = float(days)
+            shift_x_gy = np.clip(gyre_scale * u_gy * dt_gy * 86400.0 / dx_m_gy, -0.5, 0.5)
+            shift_y_gy = np.clip(gyre_scale * v_gy * dt_gy * 86400.0 / dy_m_gy, -0.5, 0.5)
+            T_gy = T_sst
+            dT_dx_gy = 0.5 * (np.roll(T_gy, -1, axis=1) - np.roll(T_gy, 1, axis=1))
+            dT_dy_gy = np.zeros_like(T_gy)
+            dT_dy_gy[1:-1, :] = 0.5 * (T_gy[:-2, :] - T_gy[2:, :])
+            gyre_adj = np.clip(-(shift_x_gy * dT_dx_gy + shift_y_gy * dT_dy_gy), -1.5, 1.5)
+            _ocean_mask_gy, _ = get_masks(elev_c)
+            T_ocean_adj = T_ocean_adj + gyre_adj * _ocean_mask_gy.astype(np.float32)
 
         _oc["adj"] = T_ocean_adj
         _oc["key"] = _oc_key
