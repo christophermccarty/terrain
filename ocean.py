@@ -357,6 +357,70 @@ def compute_ekman_transport(
     return u_ekman.astype(np.float32), v_ekman.astype(np.float32)
 
 
+def compute_gyre_currents(
+    wind_u: np.ndarray,
+    wind_v: np.ndarray,
+    elevation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute a 2D barotropic gyre circulation from wind-stress curl (Jul 2026).
+
+    Unlike `compute_ekman_transport` (a local, per-cell deflection of the wind
+    itself), this solves for a real streamfunction from the *curl* of wind
+    stress over the whole ocean basin, giving currents genuine east-west
+    (gyre) structure -- western boundary currents, subpolar gyres -- that the
+    existing 1D zonal-mean transport (`calculate_ocean_heat_transport`) and
+    Ekman deflection can't produce on their own. Reuses
+    `atmosphere._streamfunction_from_vorticity`, the same generic `∇²ψ=ω`
+    spectral Poisson solver already used to divergence-clean the diagnosed
+    wind field in `generate_wind_field` -- no new solver needed, just a new
+    vorticity source (wind-stress curl instead of wind vorticity) and the
+    standard barotropic relation `u=-∂ψ/∂y, v=∂ψ/∂x` instead of atmosphere.py's
+    own sign/scale convention, which this function matches exactly for
+    consistency (see its usage in `atmosphere.generate_wind_field`).
+
+    Args:
+        wind_u: (H,W) Eastward wind speed [m/s]
+        wind_v: (H,W) Northward wind speed [m/s]
+        elevation: (H,W) Elevation map (to determine ocean mask)
+
+    Returns:
+        (u_gyre, v_gyre): barotropic gyre current velocities [m/s], ocean-only
+
+    Physics:
+    - Wind stress ∝ wind_speed² (quadratic drag), matching Wanninkhof-style
+      wind-stress conventions used elsewhere in this codebase
+      (carbon_cycle.ocean_co2_flux).
+    - Vorticity ω = ∂τ_y/∂x - ∂τ_x/∂y (curl of wind stress).
+    - Streamfunction ψ solves ∇²ψ = ω on the periodic-in-x, DFT-in-y coarse
+      grid (an approximation that tolerates no true meridional boundary
+      condition, same caveat as its atmosphere.py usage).
+    - No natural physical amplitude from this idealized solve -- clipped to
+      ±0.5 m/s the same way `compute_ekman_transport`'s informal bound works,
+      rather than a derived value.
+    """
+    is_ocean, _ = get_masks(elevation)
+    ocean_f = is_ocean.astype(np.float32)
+
+    from atmosphere import _streamfunction_from_vorticity, _ddx_periodic
+
+    wind_speed = np.sqrt(wind_u**2 + wind_v**2)
+    tau_x = (wind_u * wind_speed * ocean_f).astype(np.float32)
+    tau_y = (wind_v * wind_speed * ocean_f).astype(np.float32)
+
+    dtau_y_dx = _ddx_periodic(tau_y)
+    dtau_x_dy = np.gradient(tau_x, axis=0)
+    omega = (dtau_y_dx - dtau_x_dy).astype(np.float32)
+
+    psi = _streamfunction_from_vorticity(omega)
+    H, W = wind_u.shape
+    u_gyre = -np.gradient(psi, axis=0) * (H / np.pi)
+    v_gyre = -_ddx_periodic(psi) * (W / (2.0 * np.pi))
+
+    u_gyre = (np.clip(u_gyre, -0.5, 0.5) * ocean_f).astype(np.float32)
+    v_gyre = (np.clip(v_gyre, -0.5, 0.5) * ocean_f).astype(np.float32)
+    return u_gyre, v_gyre
+
+
 def get_major_ocean_currents(
     Hc: int,
     Wc: int,

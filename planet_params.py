@@ -252,6 +252,23 @@ class PlanetParams:
     At 0.3, coastal upwelling introduces realistic SST gradients at continental margins.
     Gated by has_liquid_water_ocean."""
 
+    ocean_gyre_strength: float = 0.0
+    """Scaling factor for the 2D barotropic gyre current contribution to ocean
+    heat transport (`ocean.compute_gyre_currents`) [0-1, >=0 in principle].
+    0 = disabled (exact no-op: skips the whole block, matching `ekman_strength`'s
+    own guard pattern). Purely additive alongside (never replacing) the existing
+    1D zonal-mean transport (`calculate_ocean_heat_transport`) and Ekman
+    deflection (`ekman_strength`) -- gives ocean currents real east-west (gyre)
+    structure that those two mechanisms can't produce on their own. No prior-
+    session calibration history -- this is the highest-risk, most-structural
+    item in the Jul 2026 backlog session (see six-item-backlog-session-2026-07
+    memory): ocean SST feeds every downstream climate metric, so re-verify
+    conservation/climate-drift/ECS guard-rail tests carefully before ever
+    raising this default, and check the resulting SST pattern for plausible
+    western-boundary-current structure rather than noise (the underlying
+    streamfunction solve is periodic-in-x/DFT-in-y, tolerating no true
+    meridional boundary condition -- same caveat as its atmosphere.py usage)."""
+
     moisture_advection_scale: float = 0.0
     """Blend weight [0-1] for an additional longer-range moisture transport term
     in `atmosphere.generate_precipitation` (`_advect_scalar_flux_eulerian`),
