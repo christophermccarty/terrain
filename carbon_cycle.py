@@ -210,17 +210,14 @@ def ocean_co2_flux(
     Gas exchange rate proportional to wind speed and (C_eq - C_actual).
     Piston velocity: k = 0.31 * u² (Wanninkhof 1992)
 
-    KNOWN SIMPLIFICATION: Wanninkhof's k∝u² is calibrated for time-averaged
-    (monthly-ish) wind speed, but the caller (carbon_cycle_step) passes the
-    instantaneous per-step wind_speed. Because of the quadratic term, added
-    high-frequency wind variance raises mean(k) via Jensen's inequality even
-    at unchanged mean wind -- e.g. the atmosphere.py jet-stream/storm-track
-    variability speeds up convergence toward this model's ocean-atmosphere
-    CO2 quasi-equilibrium (see testing/test_conservation.py's
-    test_co2_budget_near_steady_state, which had to widen its tolerance
-    because of this). A more correct fix would time-average wind_speed
-    (e.g. a 30-day rolling mean carried in PlanetState) before it reaches
-    this function; not yet implemented.
+    Wanninkhof's k∝u² is calibrated for time-averaged (monthly-ish) wind speed.
+    Fed the instantaneous per-step wind_speed, the quadratic term would raise
+    mean(k) via Jensen's inequality whenever wind has day-to-day variance (e.g.
+    atmosphere.py's jet-stream/storm-track variability). FIXED (Jul 2026):
+    carbon_cycle_step now passes `state.wind_speed_avg`, a rolling EMA over
+    `PlanetParams.co2_wind_averaging_days` (default 30d) maintained in
+    simulate.py, instead of the instantaneous value. This function itself is
+    agnostic to which wind_speed it's given.
     """
     # Gas transfer velocity (piston velocity) [m/day]
     # k ∝ u² (quadratic wind speed dependence)
@@ -754,8 +751,18 @@ def carbon_cycle_step(
         biomass = np.where(biome == 2, CARBON_GRASSLAND_MAX * 0.5, biomass)  # 50% for grassland
         biomass = biomass.astype(np.float32)
 
-    # Ocean CO2 exchange
-    wind_speed = np.sqrt(state.wind_u**2 + state.wind_v**2) if state.wind_u is not None else np.ones_like(temperature) * 5.0
+    # Ocean CO2 exchange. Use the rolling wind-speed average (state.wind_speed_avg)
+    # rather than the instantaneous value: Wanninkhof's k∝u² is calibrated for
+    # time-averaged wind, and feeding it per-step wind inflates mean(k) via
+    # Jensen's inequality whenever wind has day-to-day variance (see
+    # ocean_co2_flux's docstring). Falls back to instantaneous wind if no
+    # average has been computed yet (e.g. carbon cycle called standalone).
+    if state.wind_speed_avg is not None:
+        wind_speed = state.wind_speed_avg
+    elif state.wind_u is not None:
+        wind_speed = np.sqrt(state.wind_u**2 + state.wind_v**2)
+    else:
+        wind_speed = np.ones_like(temperature) * 5.0
     co2_ocean_eq = ocean_co2_solubility(temperature, co2_atm)
     co2_ocean_new, d_co2_ocean = ocean_co2_flux(co2_ocean, co2_ocean_eq, wind_speed, sea_mask, dt_days)
 

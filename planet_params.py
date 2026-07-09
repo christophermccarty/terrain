@@ -391,6 +391,13 @@ class PlanetParams:
     deep_ocean_depth_m: float = 3700.0
     """Mean abyssal ocean depth [m].  Used only for diagnostic OHC calculations."""
 
+    co2_wind_averaging_days: float = 30.0
+    """EMA window [days] for the wind speed fed into ocean_co2_flux's piston
+    velocity (Jul 2026 fix). Wanninkhof's k∝u² is calibrated for time-averaged
+    wind; feeding it the instantaneous per-step value inflates mean(k) via
+    Jensen's inequality whenever wind has day-to-day variance. See
+    carbon_cycle.ocean_co2_flux docstring for the full explanation."""
+
     # ------------------------------------------------------------------ #
     # Eddy meridional heat flux (Feature 7)
     # ------------------------------------------------------------------ #
