@@ -70,26 +70,25 @@ def test_temperature_stays_bounded(flat_ocean_state):
 # ---------------------------------------------------------------------------
 
 def test_co2_budget_near_steady_state(flat_ocean_state):
-    """Starting at preindustrial CO2 (280 ppm), CO2 should stay within ±40 ppm
+    """Starting at preindustrial CO2 (280 ppm), CO2 should stay within ±25 ppm
     over 50 years with no anthropogenic emissions.
 
-    Bound widened 30->40 (jet-stream feature, 2026-07): this exposed a
-    pre-existing simplification in carbon_cycle.py's ocean_co2_flux, which
-    computes its piston velocity as k ∝ instantaneous daily wind_speed²
-    (Wanninkhof 1992) rather than the time-averaged wind speed that
-    parameterization is calibrated for. The jet meander/blocking mechanism
-    adds real synoptic-scale wind variance (by design -- see
-    atmosphere._update_jet_index / _blocking_ridge_pressure_anomaly), and by
-    Jensen's inequality added variance raises mean(wind_speed²) even at
-    unchanged mean wind, which speeds up convergence toward the model's
-    ocean-atmosphere carbon quasi-equilibrium (280 -> ~313 ppm over 50 years,
-    verified still rising slowly rather than plateauing -- not a runaway, but
-    not fully converged in 50 years either). This isn't a jet-stream logic
-    bug: the pre-existing equilibrium gap and the instantaneous-vs-averaged
-    wind simplification were already there, just too slow to surface within
-    this test's window before. A proper fix would time-average wind speed
-    before ocean_co2_flux; tracked as a known gap rather than fixed here
-    (out of scope for the jet-stream feature).
+    Bound was widened 30->40 (jet-stream feature, 2026-07) after the jet
+    meander/blocking mechanism's added synoptic-scale wind variance exposed a
+    pre-existing simplification in carbon_cycle.py's ocean_co2_flux: piston
+    velocity k ∝ instantaneous daily wind_speed² (Wanninkhof 1992) rather than
+    the time-averaged wind speed that parameterization is calibrated for. By
+    Jensen's inequality, added variance raised mean(wind_speed²) even at
+    unchanged mean wind, speeding convergence toward the model's ocean-
+    atmosphere quasi-equilibrium (280 -> ~313 ppm over 50 years).
+
+    FIXED (2026-07): carbon_cycle_step now feeds ocean_co2_flux a rolling EMA
+    of wind speed (state.wind_speed_avg, PlanetParams.co2_wind_averaging_days
+    default 30d, maintained in simulate.py) instead of the instantaneous
+    value. Re-measured drift with the fix: 280 -> ~296 ppm over 50 years
+    (+16.1 ppm), down from the pre-fix +33 ppm -- tightened the bound back
+    below the original pre-jet-stream 30 to 25 for headroom above the
+    measured 16.1 without being brittle.
     """
     from simulate import simulate_step
 
@@ -99,7 +98,7 @@ def test_co2_budget_near_steady_state(flat_ocean_state):
                                  enable_carbon_cycle=True, track_components=False)
 
     final_co2 = state.co2_atmosphere
-    assert abs(final_co2 - 280.0) < 40.0, (
+    assert abs(final_co2 - 280.0) < 25.0, (
         f"CO2 drifted to {final_co2:.1f} ppm from 280 ppm preindustrial start "
         f"(drift = {final_co2 - 280.0:+.1f} ppm)"
     )

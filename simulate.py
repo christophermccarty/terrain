@@ -387,6 +387,10 @@ class PlanetState(NamedTuple):
     # soil_moisture (above) is now the fast-draining surface layer; this is the
     # slow-draining deep/root-zone reservoir. See atmosphere.generate_precipitation.
     soil_moisture_deep: np.ndarray | None = None
+    # Rolling wind-speed average for ocean_co2_flux's piston velocity (Jul 2026 fix):
+    # Wanninkhof's k∝u² is calibrated for time-averaged wind, not the instantaneous
+    # per-step value. See carbon_cycle.ocean_co2_flux docstring.
+    wind_speed_avg: np.ndarray | None = None
 
 
 def simulate_step(
@@ -1686,6 +1690,18 @@ def simulate_step(
             cached_biome = _cs["biome"]
             _carbon_dt = 0.0  # unused unless _do_carbon_slow
 
+        # Rolling wind-speed EMA feeding ocean_co2_flux's piston velocity (Jul 2026
+        # fix): Wanninkhof's k∝u² is calibrated for time-averaged wind, not the
+        # instantaneous per-step value used previously (see
+        # carbon_cycle.ocean_co2_flux docstring).
+        _wind_speed_now = np.sqrt(u_full**2 + v_full**2).astype(np.float32, copy=False)
+        if state.wind_speed_avg is None:
+            wind_speed_avg_new = _wind_speed_now.copy()
+        else:
+            _alpha = np.clip(days / max(pp.co2_wind_averaging_days, 1e-6), 0.0, 1.0)
+            wind_speed_avg_new = ((1.0 - _alpha) * state.wind_speed_avg
+                                   + _alpha * _wind_speed_now).astype(np.float32, copy=False)
+
         # Create temporary state for carbon cycle computation
         temp_state_for_carbon = PlanetState(
             day_of_year=new_day,
@@ -1698,6 +1714,7 @@ def simulate_step(
             co2_atmosphere=state.co2_atmosphere,
             co2_ocean=state.co2_ocean,
             vegetation_biomass=state.vegetation_biomass,
+            wind_speed_avg=wind_speed_avg_new,
         )
 
         # Evolve the per-step half of the carbon cycle: ocean CO2 exchange +
@@ -1754,6 +1771,7 @@ def simulate_step(
         biomass_new = state.vegetation_biomass
         ch4_atm_new = state.ch4_atmosphere
         pfc_new = state.permafrost_carbon
+        wind_speed_avg_new = state.wind_speed_avg
 
     new_state = PlanetState(
         day_of_year=new_day,
@@ -1773,6 +1791,7 @@ def simulate_step(
         co2_atmosphere=co2_atm_new,
         co2_ocean=co2_ocean_new,
         vegetation_biomass=biomass_new,
+        wind_speed_avg=wind_speed_avg_new,
         # Phase 1: Climate averaging and stable biomes
         climate_temp_avg=temp_avg,
         climate_precip_avg=precip_avg,
