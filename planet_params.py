@@ -280,9 +280,26 @@ class PlanetParams:
     167->306, Atacama 57->122 at scale 0->1 with the gate). US Midwest barely
     responds either way -- its bottleneck is a genuinely weak/divergent
     wind-derived `ascent` signal at that latitude band, not moisture transport
-    or evaporation (same memory's wind-diagnostics check). Default stays 0.0:
-    not yet clean enough to enable, but the remaining gap is now narrow and
-    well-characterized rather than a fundamental mechanism failure."""
+    or evaporation (same memory's wind-diagnostics check).
+
+    Second gate (Jul 2026 follow-up): additionally damping the effective
+    blend by `(1.0 - 0.5*drybelt_window)` -- deserts sit at drybelt_window's
+    peak, continental-interior boxes near zero -- cut desert overshoot
+    substantially further without eroding continental gains. Re-measured on
+    the same real-terrain boxes at scale=0.7 (instantaneous, 2nd half of a
+    1yr MONTHLY continuation): Sahara 155->157, Kalahari 117->163, Atacama
+    74->109 (all three now stay under the 200 mm/yr desert target at every
+    scale up to 1.0), vs. Canadian Prairies 138->243 and Central Europe
+    99->236 -- both continental boxes now clearly exceed all three deserts,
+    a clean ranking flip that wasn't achieved before. US Midwest still lags
+    (73->127, still under Sahara) -- unchanged, confirms this is genuinely
+    the separate wind-model gap, not a moisture-gate tuning issue. Default
+    stays 0.0: this result is promising enough to be a real candidate for
+    enabling by default, but flipping it is a deliberate separate decision
+    (would need golden-state/climate-drift/ECS bound re-baselining across
+    the whole test suite, and a longer multi-year check that continental
+    interior's 10yr EMA -- which barely moves within 1yr -- actually reaches
+    the 350-450 mm/yr target over time), not bundled into this fix."""
 
     humidity_advection_cfl: bool = False
     """Use a real Courant-number-based velocity scale for the short-range

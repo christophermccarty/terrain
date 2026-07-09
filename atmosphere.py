@@ -2478,7 +2478,15 @@ def generate_precipitation(
         # but not eliminated); subsidence_suppression is already in
         # [0.08, 1.0] (1.0 = no suppression), so this only ever damps the
         # blend, never amplifies it.
-        _effective_blend = _blend * subsidence_suppression
+        #
+        # Second gate (moisture-advection-scale-real-terrain-sweep-2026-07
+        # follow-up): subsidence_suppression alone doesn't distinguish "this
+        # cell is in the drybelt" from "this cell is merely descending" --
+        # additionally damp by drybelt_window directly (deserts sit at its
+        # peak; continental-interior boxes used in the sweep are near-zero
+        # here), since the desert overshoot is disproportionately larger than
+        # continental gains, not just proportionally present everywhere.
+        _effective_blend = _blend * subsidence_suppression * (1.0 - 0.5 * drybelt_window[:, None])
         q = np.clip((1.0 - _effective_blend) * q_short + _effective_blend * q_long, 0.0, qsat)
     else:
         q = q_short
