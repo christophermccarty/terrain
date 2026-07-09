@@ -284,6 +284,16 @@ class PlanetParams:
     not yet clean enough to enable, but the remaining gap is now narrow and
     well-characterized rather than a fundamental mechanism failure."""
 
+    humidity_advection_cfl: bool = False
+    """Use a real Courant-number-based velocity scale for the short-range
+    donor-cell humidity advection in `atmosphere.generate_precipitation`,
+    instead of the fixed `|u|/20`, `|v|/12` divisors (tuned constants,
+    independent of dt or grid spacing). When True, the scale becomes
+    `|u|*dt_seconds/dx` / `|v|*dt_seconds/dy` (clipped to [0,1]), matching the
+    real Courant number the long-range `_advect_scalar_flux_eulerian` term
+    already computes and substeps against. Default False reproduces the
+    original constants exactly (bit-identical output)."""
+
     # ------------------------------------------------------------------ #
     # 2-layer soil moisture bucket (Jul 2026 desiccation-bistability fix)
     # ------------------------------------------------------------------ #
