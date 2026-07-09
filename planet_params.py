@@ -377,6 +377,27 @@ class PlanetParams:
     times cloud fraction.  0.12 gives tropical cloud LW CRE ≈ +6–10 W/m².
     Set 0.0 to disable cloud greenhouse effect."""
 
+    cloud_water_feedback: float = 0.0
+    """Blend weight [0-1] for prognostic cloud water (`PlanetState.cloud_water`)
+    feeding back into `cloud_fraction`, layered on top of the existing
+    RH-diagnosed value -- 0.0 = pure diagnostic, bit-identical to before.
+    `cloud_water` accrues a real condensation/rain-out/evaporation/baseline-
+    settling mass budget every step regardless of this weight (so enabling
+    it later doesn't cold-start from zero memory), but only feeds back into
+    `cloud_fraction` (and therefore albedo/greenhouse) when > 0.
+
+    Calibrated (Jul 2026) against real terrain (saves/earth.pkl): makes
+    cloud cover measurably smoother day-to-day as intended -- std of
+    day-to-day cloud_cover change drops ~23% from w=0 to w=1 (0.00098 ->
+    0.00075), with mean cloud cover drifting down only modestly (0.171 ->
+    0.157). An earlier, uncalibrated version of this mechanism (missing a
+    baseline droplet-settling sink) instead inflated mean cloud cover
+    (0.17->0.56 at w=0.5) via saturation -- see
+    simulate._evolve_temperature's calibration note. Default stays 0.0
+    (opt-in): this is a first-pass calibration with only a short real-
+    terrain check behind it, not the multi-decade climate-drift/ECS
+    re-validation a default flip would warrant."""
+
     # ------------------------------------------------------------------ #
     # Water vapor greenhouse (Feature 2)
     # ------------------------------------------------------------------ #
