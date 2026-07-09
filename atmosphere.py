@@ -2429,10 +2429,21 @@ def generate_precipitation(
     # continental-interior/desert gap above -- that remains a separate, open
     # question (the RH-trigger-favors-local-moisture mechanism described in
     # the paragraph above still applies).
-    u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
-    v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * (
-        0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
-    )
+    _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
+    if pp.humidity_advection_cfl:
+        # Real Courant number (matches the long-range term's own CFL check
+        # below) instead of the fixed |u|/20, |v|/12 divisors.
+        courant_u = np.abs(u) * dt * 86400.0 / dx_grid
+        courant_v = np.abs(v) * dt * 86400.0 / dy_grid
+        u_scale = np.clip(courant_u, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
+        v_scale = np.clip(courant_v, 0.0, 1.0) * (
+            0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
+        )
+    else:
+        u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
+        v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * (
+            0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
+        )
     q_short = q
     if NUMBA_AVAILABLE:
         for _ in range(3):
@@ -2453,7 +2464,6 @@ def generate_precipitation(
 
     _blend = float(pp.moisture_advection_scale)
     if _blend > 0.0:
-        _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
         q_long = _advect_scalar_flux_eulerian(q, u, v, dt * 86400.0, dx_grid, dy_grid)
         # Gate the long-range contribution by the same subsidence_suppression
         # that already gates land_evap, so imported moisture is damped in
