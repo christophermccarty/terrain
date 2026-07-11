@@ -9,5 +9,15 @@
   "wind_block_size": 8,
   "show_jet_stream": true,
   "auto_save_state": false,
-  "last_state_path": "D:\\dev\\planetsim\\saves\\earth.pkl"
+  "last_state_path": "D:\\dev\\planetsim\\saves\\earth.pkl",
+  "planet_preset": "Earth",
+  "planet_solar_constant": 1361.0,
+  "planet_obliquity_deg": 23.4,
+  "planet_eccentricity": 0.017,
+  "planet_aerosol_optical_depth": 0.0,
+  "planet_co2_climate_feedback": 0.8,
+  "planet_ocean_transport_coeff": 0.3,
+  "planet_ice_albedo_strength": 0.3,
+  "planet_thermal_diffusivity": 0.04,
+  "planet_polar_cooling_scale": 0.3
 }

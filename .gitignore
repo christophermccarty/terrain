@@ -5,3 +5,4 @@
 settings.json
 /saves/**
 *.pyc
+*.pkl

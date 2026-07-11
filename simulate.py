@@ -118,6 +118,11 @@ def _coarsen_many(fields: dict[str, np.ndarray], Hc: int, Wc: int, bs: int) -> d
 # rain out multiple times per outer call, closing the gap without touching
 # per-call physics or DAILY/WEEKLY-mode behavior (n_sub=1 there, so this is a
 # no-op below the threshold).
+#
+# PlanetParams.precip_substep_days (default 0.0/off) can override this
+# threshold on an opt-in basis -- see that field's docstring. 0.0 keeps this
+# module constant as the effective threshold for every existing caller,
+# exactly as before.
 _PRECIP_SUBSTEP_DAYS = 8.0
 
 
@@ -128,7 +133,9 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
                                         surface_pressure_hpa=1013.25,
                                         planet_params=None):
     dt_days = float(dt_days)
-    if dt_days <= _PRECIP_SUBSTEP_DAYS:
+    _pp_substep = float(planet_params.precip_substep_days) if planet_params is not None else 0.0
+    substep_days = _pp_substep if _pp_substep > 0.0 else _PRECIP_SUBSTEP_DAYS
+    if dt_days <= substep_days:
         return generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=humidity, soil_moisture=soil_moisture,
@@ -136,7 +143,7 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
         )
-    n_sub = max(1, int(round(dt_days / _PRECIP_SUBSTEP_DAYS)))
+    n_sub = max(1, int(round(dt_days / substep_days)))
     sub_dt = dt_days / n_sub
     hum, soil, soil_deep = humidity, soil_moisture, soil_moisture_deep
     P_accum = None
@@ -150,6 +157,141 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
         )
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
     return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil, soil_deep
+
+
+def _evolve_wind_substepped(
+    u, v, u2, v2, *,
+    temperature, elevation, ice_cover,
+    dt_days_total: float, substep_days: float, time_days_end: float,
+    damping, pgf_temp_scale, pgf_terrain_scale, drag_base, drag_elev_scale,
+    vmax_clip, baroclinic_jet_amp, baroclinic_mix, cell_relax_days,
+    planet_params, jet_index_nh, jet_index_sh, jet_block_nh, jet_block_sh,
+    upper_pgf_amp, upper_damping, upper_hadley_edge_deg,
+):
+    """Advance surface+aloft wind by `dt_days_total`, in equal inner chunks of
+    ~`substep_days` (PlanetParams.wind_prognostic_substep_days).
+
+    Mirrors `_generate_precipitation_substepped`'s outer-loop-splitting idiom
+    above, applied to wind instead of precip: re-runs `evolve_wind`/
+    `evolve_wind_aloft`'s own already-tuned per-call physics `n_sub` times
+    rather than asking one call to integrate a multi-day step it wasn't
+    tuned for (both functions' internal sub-step count is fixed regardless
+    of `dt_days`, so a single big-`dt_days` call means each of *their*
+    internal sub-steps is proportionally larger than the ~1-day steps this
+    physics was calibrated at).
+
+    `substep_days <= 0` (the default, `wind_prognostic_substep_days=0.0`) or
+    `>= dt_days_total` collapses to `n_sub=1` -- a single call at
+    `dt_days=dt_days_total`, bit-identical to the un-substepped call sites
+    this replaces. This is what keeps DAILY/WEEKLY (which already call this
+    once per 1-day step) and the MONTHLY/ANNUAL default (gate off) exactly
+    unchanged.
+    """
+    dt_days_total = float(dt_days_total)
+    if substep_days <= 0.0 or substep_days >= dt_days_total:
+        n_sub = 1
+    else:
+        n_sub = max(1, int(round(dt_days_total / substep_days)))
+    sub_dt = dt_days_total / n_sub
+    t = float(time_days_end) - dt_days_total
+    for _ in range(n_sub):
+        t += sub_dt
+        u2, v2 = evolve_wind_aloft(
+            u2, v2,
+            temperature=temperature,
+            dt_days=sub_dt,
+            pgf_temp_scale=pgf_temp_scale,
+            upper_pgf_amp=upper_pgf_amp,
+            damping_rate=upper_damping,
+            vmax_clip=vmax_clip,
+            planet_params=planet_params,
+            hadley_edge_deg=upper_hadley_edge_deg,
+        )
+        u, v = evolve_wind(
+            u, v,
+            temperature=temperature,
+            pressure=None,
+            elevation=elevation,
+            dt_days=sub_dt,
+            damping=damping,
+            pgf_temp_scale=pgf_temp_scale,
+            pgf_terrain_scale=pgf_terrain_scale,
+            drag_base=drag_base,
+            drag_elev_scale=drag_elev_scale,
+            vmax_clip=vmax_clip,
+            baroclinic_jet_amp=baroclinic_jet_amp,
+            baroclinic_mix=baroclinic_mix,
+            cell_relax_days=cell_relax_days,
+            time_days=t,
+            planet_params=planet_params,
+            ice_cover=ice_cover,
+            jet_index_nh=jet_index_nh,
+            jet_index_sh=jet_index_sh,
+            jet_block_nh=jet_block_nh,
+            jet_block_sh=jet_block_sh,
+            u_aloft=u2,
+            v_aloft=v2,
+        )
+    return u, v, u2, v2
+
+
+def _evolve_temperature_substepped(
+    T_prev, T_base, elevation, Hc, Wc, block_size, H, W,
+    day_of_year, days: float, *,
+    substep_days: float = 0.0,
+    total_days: float | None = None,
+    T_air_prev=None,
+    prev_cloud_cover=None,
+    T_deep_ocean=None,
+    prev_cloud_water=None,
+    **kwargs,
+):
+    """Advance temperature by `days`, in equal inner chunks of ~`substep_days`
+    (PlanetParams.temperature_substep_days).
+
+    Mirrors `_evolve_wind_substepped`/`_generate_precipitation_substepped`'s
+    outer-loop-splitting idiom, applied to `_evolve_temperature`: re-runs its
+    own already-tuned per-call physics `n_sub` times, advancing `day_of_year`
+    and `total_days` by each inner `sub_dt` and threading the prognostic
+    state (`T_sst`/`T_air`/cloud/deep-ocean/cloud-water) forward between
+    calls, instead of asking one call to integrate a multi-day seasonal span
+    from a single `day_of_year` snapshot.
+
+    `substep_days <= 0` (the default, `temperature_substep_days=0.0`) or
+    `>= days` collapses to `n_sub=1` -- a single call at `days=days`,
+    bit-identical to the un-substepped call this replaces.
+    """
+    days = float(days)
+    if substep_days <= 0.0 or substep_days >= days:
+        return _evolve_temperature(
+            T_prev, T_base, elevation, Hc, Wc, block_size, H, W,
+            day_of_year=day_of_year, days=days,
+            T_air_prev=T_air_prev, total_days=total_days,
+            prev_cloud_cover=prev_cloud_cover, T_deep_ocean=T_deep_ocean,
+            prev_cloud_water=prev_cloud_water,
+            **kwargs,
+        )
+    n_sub = max(1, int(round(days / substep_days)))
+    sub_dt = days / n_sub
+    T_sst, T_air = T_prev, T_air_prev
+    cloud_cover, T_deep, cloud_water = prev_cloud_cover, T_deep_ocean, prev_cloud_water
+    day = float(day_of_year) - days
+    t = (float(total_days) - days) if total_days is not None else None
+    cloud_c = snow_c = components = None
+    for _ in range(n_sub):
+        day += sub_dt
+        if t is not None:
+            t += sub_dt
+        T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water = _evolve_temperature(
+            T_sst, T_base, elevation, Hc, Wc, block_size, H, W,
+            day_of_year=day, days=sub_dt,
+            T_air_prev=T_air, total_days=t,
+            prev_cloud_cover=cloud_cover, T_deep_ocean=T_deep,
+            prev_cloud_water=cloud_water,
+            **kwargs,
+        )
+        cloud_cover = cloud_c
+    return T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water
 
 
 # Cache for coarsened elevation. Elevation is static terrain — the same array
@@ -1175,6 +1317,20 @@ def simulate_step(
     # exists yet (first step).
     _do_evolve_wind = bool(update_wind) or state.wind_u is None or state.wind_v is None
 
+    # Opt-in (PlanetParams.wind_prognostic_substep_days, default 0.0/off): when
+    # the caller requested the diagnostic MONTHLY/ANNUAL wind (update_wind=
+    # False), run the real prognostic evolve_wind/evolve_wind_aloft path
+    # instead, internally sub-stepped in ~wind_prognostic_substep_days chunks
+    # via _evolve_wind_substepped -- trading MONTHLY/ANNUAL's speed for
+    # DAILY-consistent wind (see PlanetParams.wind_prognostic_substep_days
+    # docstring for why/cost). Default 0.0 makes this an exact no-op: DAILY/
+    # WEEKLY (update_wind=True) are untouched either way, and MONTHLY/ANNUAL
+    # keep today's diagnostic path and speed unless a user opts in.
+    _wind_substep_days = float(pp.wind_prognostic_substep_days)
+    _prognostic_gate_active = (not _do_evolve_wind) and _wind_substep_days > 0.0
+    if _prognostic_gate_active:
+        _do_evolve_wind = True
+
     if not _do_evolve_wind:
         # Diagnostic/climatological wind on the wind grid, upsampled to full res.
         if wind_bs > 1:
@@ -1221,25 +1377,17 @@ def simulate_step(
         # 1.5-layer atmosphere: evolve the upper-level wind first, at the same
         # wind-grid resolution, so evolve_wind's baroclinic mixing term below
         # can relax the surface toward this step's freshly-updated aloft wind.
-        u2_coarse_evol, v2_coarse_evol = evolve_wind_aloft(
-            u2_coarse_evol, v2_coarse_evol,
+        # Internally sub-stepped in ~wind_prognostic_substep_days chunks when
+        # that gate is active (n_sub=1, i.e. one call at dt_days=days,
+        # otherwise -- see _evolve_wind_substepped).
+        u_coarse_evol, v_coarse_evol, u2_coarse_evol, v2_coarse_evol = _evolve_wind_substepped(
+            u_coarse_evol, v_coarse_evol, u2_coarse_evol, v2_coarse_evol,
             temperature=T_for_wind,
-            dt_days=days,
-            pgf_temp_scale=float(wind_pgf_temp_scale),
-            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
-            damping_rate=float(pp.wind_upper_damping),
-            vmax_clip=float(wind_vmax_clip),
-            planet_params=pp,
-            hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
-        )
-
-        # Evolve at wind-grid resolution.
-        u_coarse_evol, v_coarse_evol = evolve_wind(
-            u_coarse_evol, v_coarse_evol,
-            temperature=T_for_wind,
-            pressure=None,
             elevation=elev_c_w,
-            dt_days=days,
+            ice_cover=ice_c_w,
+            dt_days_total=days,
+            substep_days=_wind_substep_days if _prognostic_gate_active else 0.0,
+            time_days_end=float(new_total_days),
             damping=float(wind_damping),
             pgf_temp_scale=float(wind_pgf_temp_scale),
             pgf_terrain_scale=float(wind_pgf_terrain_scale),
@@ -1249,15 +1397,14 @@ def simulate_step(
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
             cell_relax_days=float(wind_cell_relax_days),
-            time_days=float(new_total_days),
             planet_params=pp,
-            ice_cover=ice_c_w,
             jet_index_nh=jet_index_nh_new,
             jet_index_sh=jet_index_sh_new,
             jet_block_nh=_jet_block_nh,
             jet_block_sh=_jet_block_sh,
-            u_aloft=u2_coarse_evol,
-            v_aloft=v2_coarse_evol,
+            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
+            upper_damping=float(pp.wind_upper_damping),
+            upper_hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
         )
 
         # Keep winds energized + seasonally varying by weakly relaxing toward a diagnostic wind
@@ -1296,24 +1443,16 @@ def simulate_step(
         # 1.5-layer atmosphere: evolve the upper-level wind first (same
         # full-resolution grid), so evolve_wind's baroclinic mixing term below
         # can relax the surface toward this step's freshly-updated aloft wind.
-        u2_full, v2_full = evolve_wind_aloft(
-            u2_full, v2_full,
+        # Internally sub-stepped in ~wind_prognostic_substep_days chunks when
+        # that gate is active (see _evolve_wind_substepped).
+        u_full, v_full, u2_full, v2_full = _evolve_wind_substepped(
+            u_full, v_full, u2_full, v2_full,
             temperature=T_wind_full,
-            dt_days=days,
-            pgf_temp_scale=float(wind_pgf_temp_scale),
-            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
-            damping_rate=float(pp.wind_upper_damping),
-            vmax_clip=float(wind_vmax_clip),
-            planet_params=pp,
-            hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
-        )
-
-        u_full, v_full = evolve_wind(
-            u_full, v_full,
-            temperature=T_wind_full,
-            pressure=None,
             elevation=elev_wind_full,
-            dt_days=days,
+            ice_cover=state.ice_cover,
+            dt_days_total=days,
+            substep_days=_wind_substep_days if _prognostic_gate_active else 0.0,
+            time_days_end=float(new_total_days),
             damping=float(wind_damping),
             pgf_temp_scale=float(wind_pgf_temp_scale),
             pgf_terrain_scale=float(wind_pgf_terrain_scale),
@@ -1323,15 +1462,14 @@ def simulate_step(
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
             cell_relax_days=float(wind_cell_relax_days),
-            time_days=float(new_total_days),
             planet_params=pp,
-            ice_cover=state.ice_cover,
             jet_index_nh=jet_index_nh_new,
             jet_index_sh=jet_index_sh_new,
             jet_block_nh=_jet_block_nh,
             jet_block_sh=_jet_block_sh,
-            u_aloft=u2_full,
-            v_aloft=v2_full,
+            upper_pgf_amp=float(pp.wind_upper_pgf_amp),
+            upper_damping=float(pp.wind_upper_damping),
+            upper_hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
         )
         if wind_relax > 0.0:
             T_for_wind = T_wind_full
@@ -1417,9 +1555,10 @@ def simulate_step(
     # ice_thick_prev_coarse already computed above
 
     # Always track components for diagnostics (minimal overhead)
-    T_sst_coarse, T_air_coarse_new, cloud_c, snow_c, temp_components, T_deep_coarse_new, cloud_water_coarse_new = _evolve_temperature(
+    T_sst_coarse, T_air_coarse_new, cloud_c, snow_c, temp_components, T_deep_coarse_new, cloud_water_coarse_new = _evolve_temperature_substepped(
         T_prev_coarse, T_base, state.elevation, Hc, Wc, block_size, H, W,
         day_of_year=int(new_day), days=days,
+        substep_days=float(pp.temperature_substep_days),
         T_air_prev=T_air_coarse,
         wind_u=u_coarse, wind_v=v_coarse,
         T_base_land=T_base_land,
