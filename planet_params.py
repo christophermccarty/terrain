@@ -612,6 +612,142 @@ class PlanetParams:
     (wind_drag_base/wind_drag_elev_scale), since the upper troposphere is
     nearly frictionless compared to the boundary layer."""
 
+    wind_prognostic_substep_days: float = 0.0
+    """Opt-in: run the real prognostic `evolve_wind`/`evolve_wind_aloft`
+    integration (in inner chunks of this many days) instead of the cached
+    diagnostic `generate_wind_field` snapshot during MONTHLY/ANNUAL
+    (`update_wind=False`) substeps. `0.0` (default) is an exact no-op —
+    MONTHLY/ANNUAL behave identically to today, at today's speed.
+    DAILY/WEEKLY (`update_wind=True`) already run the real prognostic wind
+    every step and are unaffected by this field either way.
+
+    Why this exists: MONTHLY/ANNUAL's diagnostic wind is a memoryless
+    per-call snapshot solve, structurally different from DAILY/WEEKLY's
+    momentum-carrying prognostic integration -- small systematic
+    differences between the two compound over the multi-year EMA that
+    feeds Köppen biome classification, so switching speeds (or running the
+    same span at different speeds) can diverge into different long-run
+    biome outcomes even after the two paths were unified to share the same
+    storm/Rossby/blocking forcing (see speed-switch-biome-consistency
+    session notes). This field trades MONTHLY/ANNUAL's speed for
+    DAILY-consistent wind by re-running the *same*, untouched,
+    already-tuned `evolve_wind` code path internally, in `dt_days`-sized
+    chunks, instead of asking a single diagnostic snapshot to stand in for
+    a whole month/year.
+
+    This was a deliberate re-opening of a previously-resolved design
+    question (PLAN.md Open Question 1: "cached relaxation target ...
+    chosen for speed") and has a real, non-trivial performance cost:
+    `evolve_wind`'s internal physics is tuned around ~1-day steps, so
+    preserving that fidelity at finer substep sizes costs roughly the same
+    compute MONTHLY/ANNUAL were designed to avoid -- benchmark before
+    relying on it in any latency-sensitive context (optimizer sweeps,
+    long spinups). Recommended starting point if enabling: 1.0-3.0 (see
+    `scripts/check_real_terrain_koppen.py` sweep results for the
+    fidelity/speed tradeoff curve)."""
+
+    precip_substep_days: float = 0.0
+    """Opt-in: override `simulate.py`'s `_PRECIP_SUBSTEP_DAYS` (8.0) chunk
+    size used by `_generate_precipitation_substepped` to split a large
+    outer `dt_days` into repeated `atmosphere.generate_precipitation` calls.
+    `0.0` (default) is an exact no-op -- every existing caller keeps using
+    the hardcoded 8.0-day threshold, bit-identical to today's output. When
+    `> 0`, it replaces that threshold/chunk-size outright (e.g. `1.0` makes
+    every call at or below ~1-day granularity).
+
+    Why this exists: `generate_precipitation` has two independent, hardcoded
+    per-call caps -- evaporation replenishment capped at a 1.5-day
+    equivalent (`dt_evap = min(dt, 1.5)`) and the rain-out fraction capped
+    at a 2.0-day equivalent (`remove_frac`'s `min(dt, 2.0)`) -- that throttle
+    the *absolute* moisture cycled through a single call regardless of how
+    many days it spans, then divide that capped total by the *full*
+    (uncapped) `dt` to report a mm/day rate. A single 6-7 day MONTHLY/ANNUAL
+    call therefore produces roughly the same absolute rain as a ~1.5-2 day
+    call would, silently deflating the reported rate. The existing 8.0-day
+    substep threshold doesn't fix this in practice: real GUI MONTHLY/ANNUAL
+    dispatch (`main.py`'s `[(6.0, False)]*5` / `[(7.0, False)]*52`) never
+    exceeds it (6.0, 7.0 <= 8.0), so `_generate_precipitation_substepped`
+    never actually splits in real usage -- every real MONTHLY/ANNUAL
+    precipitation call hits both caps directly. This mirrors
+    `wind_prognostic_substep_days`'s "reuse-already-tuned-physics-via-finer-
+    substep" shape, applied to precipitation's rain-out mechanic instead of
+    wind. See `atmosphere.generate_precipitation`'s `dt_evap`/`remove_frac`
+    comments (atmosphere.py) for the caps themselves.
+
+    `generate_precipitation`'s own `dt = max(dt_days, 1.0)` floors the
+    per-call timestep at 1 day -- setting this below `1.0` buys no extra
+    fidelity, only extra call overhead. `1.0` is the natural target (true
+    per-day cadence, matches how many inner calls a 6/7-day outer step would
+    need to reconstruct a real daily sequence). Has a real, non-trivial
+    performance cost: profiled at roughly a 1.65-1.7x total per-step
+    slowdown at MONTHLY speed (precipitation's own per-call cost is ~12% of
+    total step cost at the default 1-call-per-outer-step, and scales
+    ~linearly with the number of inner calls) -- benchmark before relying on
+    it in any latency-sensitive context (optimizer sweeps, long spinups)."""
+
+    temperature_substep_days: float = 0.0
+    """Opt-in: split a large outer `dt_days` into repeated
+    `simulate._evolve_temperature` calls of ~this many days each, instead of
+    one call spanning the whole outer step. `0.0` (default) is an exact
+    no-op -- every existing caller keeps calling `_evolve_temperature` once
+    per outer step, bit-identical to today's output. Mirrors
+    `wind_prognostic_substep_days`/`precip_substep_days`'s contract exactly,
+    applied to `_evolve_temperature` via the new `_evolve_temperature_substepped`
+    wrapper (`simulate.py`) instead of wind/precip.
+
+    Why this exists: `_evolve_temperature` samples the insolation/seasonal
+    cycle (`day_of_year`) and every relaxation term (`k_relax*days`,
+    `k_airsea*days`, evaporative cooling, deep-ocean exchange, ...) exactly
+    once per call, at the single `day_of_year` passed in, scaled by the
+    *entire* `days` span in one shot. A single 6-7 day MONTHLY/ANNUAL call
+    therefore applies one day's insolation as if it were constant for the
+    whole week -- the same "one snapshot stands in for a multi-day span"
+    shape as `wind_prognostic_substep_days` (wind solver) and
+    `precip_substep_days` (rain-out caps), just applied to the radiative/
+    relaxation physics instead. This was diagnosed (not fixed) by the
+    precip-gate session: even after both the wind and precip gates closed
+    most of MONTHLY-vs-DAILY's arid/humid Köppen divergence, polar land
+    fraction stayed diverged (~42-44% vs DAILY's stable ~29%), traced to
+    MONTHLY's winter land temperature running ~9-10°C warmer than DAILY's
+    at every timescale tested -- consistent with a dampened/aliased
+    seasonal cycle from this same snapshot-per-chunk pattern, just on
+    temperature instead of wind or precip.
+
+    `_evolve_temperature_substepped` threads `T_sst`/`T_air`/
+    `prev_cloud_cover`/`T_deep_ocean`/`prev_cloud_water` forward between
+    inner calls and advances `day_of_year`/`total_days` by each inner
+    `sub_dt`, so the insolation calc and ocean-transport cache both see a
+    real daily cadence instead of one stretched sample.
+
+    **Tried at `1.0` and measured worse, not better -- do not enable as a
+    fix without first addressing the root cause below.** A 1yr real-terrain
+    trace (synthetic 32x64 elevation, `scripts/`-style headless run) showed
+    MONTHLY's midlat-NH winter minimum overshooting *past* DAILY's own
+    (265K vs DAILY's 279.5K), while the summer maximum tracked DAILY
+    closely (293.8K vs 293.9K) -- i.e. this makes the season-vs-DAILY gap
+    *bigger* in the cooling direction, opposite of the goal. Root cause:
+    `T_base_land` (the land seasonal-baseline target `_evolve_temperature`'s
+    land-blend term relaxes toward, `simulate.py` ~line 866-872) is computed
+    exactly *once* per outer `simulate_step` call, at `day_of_year=int(new_day)`
+    -- the day at the *end* of the whole outer window -- and passed into
+    every inner substep call unchanged. The land-blend fraction itself
+    (`land_blend = 0.2`, flat, not scaled by `days`) already relies on being
+    called at DAILY's own ~1-day cadence to produce DAILY's realistic
+    seasonal tracking; substepping `_evolve_temperature` alone reproduces
+    that per-day pull-strength but keeps pulling all `n_sub` inner days
+    toward the *same*, stale, end-of-window `T_base_land` value instead of
+    each day's own baseline -- during a fast seasonal transition (e.g.
+    heading into winter) that stale target is colder than warranted for the
+    early days in the window, and the now-correctly-frequent pull drags the
+    whole window toward it, overshooting. A real fix needs `T_base_land`'s
+    upstream computation (the `temperature_kelvin_for_lat` + land-cap +
+    transport block, `simulate.py` ~lines 860-976) made substep-aware too --
+    a substantially bigger, riskier change than this gate alone, not
+    attempted. Left in place as inert, tested (default-off no-op verified),
+    zero-regression infrastructure only, same as `wind_prognostic_substep_days`
+    was after its own session concluded it wasn't sufficient alone -- not
+    recommended for use until that follow-up fix exists."""
+
     # ------------------------------------------------------------------ #
     # Derived convenience properties
     # ------------------------------------------------------------------ #
