@@ -143,7 +143,10 @@ KOPPEN_TO_LEGACY_BIOME = {
 def update_climate_averages(
     state,  # PlanetState
     dt_days: float,
-    window_days: float = 3650.0,  # 10 years × 365 days
+    window_days: float | None = None,
+    *,
+    orbital_period_days: float = 365.2422,
+    window_years: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Update exponential moving average for climate variables.
 
@@ -165,7 +168,9 @@ def update_climate_averages(
             - precip_avg: (H,W) 10-year average precipitation [mm/day]
             - updated_sample_count: Total days in average
     """
-    alpha = dt_days / window_days  # Smoothing factor
+    if window_days is None:
+        window_days = window_years * orbital_period_days
+    alpha = min(float(dt_days) / float(window_days), 1.0)
 
     # Handle initialization: if temperature/precip not yet initialized, return None
     if state.temperature is None or state.precipitation is None:
@@ -190,6 +195,8 @@ def update_monthly_statistics(
     state,  # PlanetState
     dt_days: float,
     window_years: float = 1.0,  # 1-year rolling average per month
+    *,
+    orbital_period_days: float = 365.2422,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Update per-month rolling averages for Köppen classification.
 
@@ -215,9 +222,13 @@ def update_monthly_statistics(
 
     H, W = state.temperature.shape
 
-    # Determine current month (0-11) from day_of_year
+    # Twelve equal orbital-phase bins, not Earth calendar months.
     day_of_year = state.day_of_year if state.day_of_year is not None else 80.0
-    month = int(day_of_year / 30.44) % 12
+    orbital_month_days = float(orbital_period_days) / 12.0
+    month = min(
+        int((float(day_of_year) % float(orbital_period_days)) / orbital_month_days),
+        11,
+    )
 
     # Initialize if needed
     if state.monthly_temp is None or state.monthly_precip is None:
@@ -233,10 +244,9 @@ def update_monthly_statistics(
         monthly_precip = state.monthly_precip.copy()
         monthly_sample_count = state.monthly_sample_count.copy()
 
-    # EMA smoothing factor (~30 samples per year = 1 per day in each month)
-    # With window_years=1, we average over ~30 samples per month
-    alpha = dt_days / (window_years * 30.44)
-    alpha = min(alpha, 0.1)  # Cap for stability
+    # EMA window is expressed in this planet's orbital months.
+    alpha = dt_days / (window_years * orbital_month_days)
+    alpha = min(alpha, 1.0)
 
     # Update current month's statistics
     monthly_temp[month] = (1.0 - alpha) * monthly_temp[month] + alpha * state.temperature.astype(np.float32)
@@ -298,6 +308,7 @@ def classify_koppen(
     land_mask: np.ndarray,         # (H, W) boolean or float
     elevation: np.ndarray | None = None,  # (H, W) normalized elevation [0-1]
     elevation_baseline: np.ndarray | None = None,  # (H, W) coarse elevation the input temps already reflect
+    orbital_period_days: float = 365.2422,
 ) -> np.ndarray:
     """Classify Köppen climate type for each grid cell.
 
@@ -334,7 +345,7 @@ def classify_koppen(
 
     # Convert to useful derived quantities
     T_celsius = monthly_temp - 273.15  # (12, H, W)
-    P_monthly_mm = monthly_precip * 30.44  # mm/day -> mm/month
+    P_monthly_mm = monthly_precip * (float(orbital_period_days) / 12.0)
 
     # ==========================================================================
     # Terrain-based temperature adjustments
@@ -628,6 +639,7 @@ def compute_stable_biomes(
     prev_biome: np.ndarray | None = None,
     hysteresis_temp: float = 2.0,       # ±2K temperature buffer
     hysteresis_precip: float = 100.0,   # ±100 mm/yr precipitation buffer
+    orbital_period_days: float = 365.2422,
 ) -> np.ndarray:
     """Classify biomes with hysteresis to prevent boundary oscillations.
 
@@ -672,7 +684,7 @@ def compute_stable_biomes(
 
     # Convert to classification-friendly units
     T_celsius = temp_avg - 273.15  # Kelvin → Celsius
-    P_annual = precip_avg * 365.0  # mm/day → mm/year
+    P_annual = precip_avg * float(orbital_period_days)  # mm/day → mm/orbit
 
     # Initialize biome array
     biome = np.zeros((H, W), dtype=np.int32)

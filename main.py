@@ -13,7 +13,7 @@ import pstats
 import logging
 import time
 from pathlib import Path
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from queue import Queue, Empty
 
 from terrain import (
@@ -35,7 +35,16 @@ from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from ocean import generate_ocean_currents
 from masks import get_masks
 from terrain import precipitation_to_rgb, cloud_cover_to_rgb
-from simulate import PlanetState, create_initial_state, simulate_step, simulate_multiple_steps, save_state, load_state, TimeScaleMode
+from simulate import (
+    PlanetState,
+    create_initial_state,
+    simulate_step,
+    simulate_multiple_steps,
+    save_state,
+    load_state,
+    TimeScaleMode,
+    clear_simulation_caches,
+)
 from diagnostics import ClimateDiagnostics
 from planet_params import PlanetParams, EARTH, MARS
 import dataclasses
@@ -51,6 +60,15 @@ _OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None, "computed_at": 0.0}
 # time. Throttle regeneration to wall-clock cadence instead of sim-day cadence.
 _OCEAN_CURRENT_REFRESH_SEC = 2.0
 _PRECIP_VIEW_CACHE = {"key": None, "P": None}
+
+
+def _cache_saved_elevation(state: PlanetState, source_path: Path) -> None:
+    """Make a loaded state's terrain the active elevation source."""
+    set_elevation_cache(
+        state.elevation,
+        key=("loaded", f"saved-state:{source_path.as_posix()}"),
+    )
+    invalidate_view_caches()
 
 
 class SimulationThread(Thread):
@@ -69,6 +87,10 @@ class SimulationThread(Thread):
         self.running = Event()
         self.paused = Event()
         self.paused.set()  # Start paused
+        # The worker is the sole writer of state.  UI actions that need an
+        # authoritative snapshot (save, benchmark, close) pause first, then
+        # acquire this lock to wait for any in-flight physics cycle to finish.
+        self.state_lock = Lock()
         self.state_queue = Queue(maxsize=1)  # Only keep latest state
         self.component_queue = Queue(maxsize=1)  # Track temperature components
 
@@ -81,53 +103,58 @@ class SimulationThread(Thread):
                 continue
 
             try:
-                # Select sub-stepping strategy based on time scale mode.
-                # Each entry is (step_days, update_wind):
-                #   DAILY   — 1 × 1-day full physics (most accurate)
-                #   WEEKLY  — 7 × 1-day full physics (7 simulated days per frame)
-                #   MONTHLY — 5 × 6-day steps, no wind (≈30 days; ~5× faster than 30 daily)
-                #   ANNUAL  — 52 × 7-day steps, no wind (≈364 days; stable large-step physics)
-                mode = self.time_scale_mode
-                if mode == TimeScaleMode.WEEKLY:
-                    substeps = [(1.0, True)] * 7
-                elif mode == TimeScaleMode.MONTHLY:
-                    substeps = [(6.0, False)] * 5
-                elif mode == TimeScaleMode.ANNUAL:
-                    substeps = [(7.0, False)] * 52
-                else:  # DAILY (default)
-                    substeps = [(1.0, True)]
+                # Re-check paused after acquiring the lock: a UI pause request
+                # may have arrived between the loop check and lock acquisition.
+                with self.state_lock:
+                    if self.paused.is_set():
+                        continue
+                    # Select sub-stepping strategy based on time scale mode.
+                    # Each entry is (step_days, update_wind):
+                    #   DAILY   — 1 × 1-day full physics (most accurate)
+                    #   WEEKLY  — 7 × 1-day full physics (7 simulated days per frame)
+                    #   MONTHLY — 5 × 6-day steps, no wind (≈30 days; ~5× faster than 30 daily)
+                    #   ANNUAL  — 52 × 7-day steps, no wind (≈364 days; stable large-step physics)
+                    mode = self.time_scale_mode
+                    if mode == TimeScaleMode.WEEKLY:
+                        substeps = [(1.0, True)] * 7
+                    elif mode == TimeScaleMode.MONTHLY:
+                        substeps = [(6.0, False)] * 5
+                    elif mode == TimeScaleMode.ANNUAL:
+                        substeps = [(7.0, False)] * 52
+                    else:  # DAILY (default)
+                        substeps = [(1.0, True)]
 
-                new_state = self.state
-                temp_components: dict = {}
-                for step_days, do_wind in substeps:
-                    new_state, temp_components = simulate_step(
-                        new_state,
-                        days=step_days,
-                        wind_block_size=self.wind_block_size,
-                        update_wind=do_wind,
-                        debug_log=False,
-                        track_components=self.diagnostics is not None,
-                        time_scale=mode,
-                        planet_params=self.planet_params,
-                    )
-
-                    # Record diagnostics each sub-step for correct time-averaging
-                    if self.diagnostics is not None:
-                        self.diagnostics.record_step(
+                    new_state = self.state
+                    temp_components: dict = {}
+                    for step_days, do_wind in substeps:
+                        new_state, temp_components = simulate_step(
                             new_state,
-                            new_state.day_of_year,
-                            days_elapsed=step_days,
-                            component_contributions=temp_components
+                            days=step_days,
+                            wind_block_size=self.wind_block_size,
+                            update_wind=do_wind,
+                            debug_log=False,
+                            track_components=self.diagnostics is not None,
+                            time_scale=mode,
+                            planet_params=self.planet_params,
                         )
 
-                self.state = new_state
+                        # Record diagnostics each sub-step for correct time-averaging
+                        if self.diagnostics is not None:
+                            self.diagnostics.record_step(
+                                new_state,
+                                new_state.day_of_year,
+                                days_elapsed=step_days,
+                                component_contributions=temp_components
+                            )
 
-                # Push final state to UI (non-blocking, drop if UI busy)
-                try:
-                    self.state_queue.put_nowait(new_state)
-                    self.component_queue.put_nowait(temp_components)
-                except Exception:
-                    pass  # Drop frame if queue full
+                    self.state = new_state
+
+                    # Push final state to UI (non-blocking, drop if UI busy)
+                    try:
+                        self.state_queue.put_nowait(new_state)
+                        self.component_queue.put_nowait(temp_components)
+                    except Exception:
+                        pass  # Drop frame if queue full
 
             except Exception as e:
                 LOG.error(f"Simulation thread error: {e}")
@@ -136,6 +163,29 @@ class SimulationThread(Thread):
     def pause(self):
         """Pause simulation."""
         self.paused.set()
+
+    def pause_and_get_state(self):
+        """Pause and return the latest state after any active cycle completes."""
+        self.paused.set()
+        with self.state_lock:
+            state = self.state
+        # The caller now owns this latest snapshot directly.  Discard queued
+        # frames so the UI cannot subsequently replace it with an older state.
+        for queue in (self.state_queue, self.component_queue):
+            try:
+                while True:
+                    queue.get_nowait()
+            except Empty:
+                pass
+        return state
+
+    def snapshot_state(self):
+        """Return a synchronized state snapshot without changing pause state."""
+        was_paused = self.paused.is_set()
+        state = self.pause_and_get_state()
+        if not was_paused and self.running.is_set():
+            self.resume()
+        return state
 
     def resume(self):
         """Resume simulation."""
@@ -573,7 +623,7 @@ def main() -> None:
         ocean_mask, _ = get_masks(tex)
 
         # Fetch ocean current u, v (reuse shared cache)
-        use_sim_data = sim_state is not None and sim_running
+        use_sim_data = sim_state is not None
         day = int(sim_state.day_of_year) if sim_state is not None else 80
         tdays = float(sim_state.total_days) if sim_state is not None else float(day)
         wu = sim_state.wind_u if use_sim_data else None
@@ -713,10 +763,8 @@ def main() -> None:
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export data:\n{str(e)}")
     
-    def run_benchmark():
-        # Without the nonlocal, `sim_running = False` bound a LOCAL variable and
-        # the simulation thread kept stepping while the benchmark ran on the
-        # same state (race + double-stepping).
+    def _run_benchmark_synchronized():
+        """Run the benchmark after the caller has synchronized the worker."""
         nonlocal sim_running
         if sim_state is None:
             messagebox.showinfo("Info", "Please start or initialize simulation first.")
@@ -822,6 +870,35 @@ def main() -> None:
         
         sim_status_var.set("Stopped")
 
+    def run_benchmark():
+        """Benchmark a stable snapshot, then restore the prior run/pause state."""
+        nonlocal sim_state, sim_running, sim_paused
+        if sim_state is None:
+            messagebox.showinfo("Info", "Please start or initialize simulation first.")
+            return
+
+        was_running = sim_running
+        was_paused = sim_paused
+        worker_was_paused = True
+        if sim_thread is not None and sim_thread.is_alive():
+            worker_was_paused = sim_thread.paused.is_set()
+            sim_state = sim_thread.pause_and_get_state()
+
+        try:
+            _run_benchmark_synchronized()
+        finally:
+            sim_running = was_running
+            sim_paused = was_paused
+            if sim_thread is not None and sim_thread.is_alive():
+                if worker_was_paused:
+                    sim_thread.pause()
+                else:
+                    sim_thread.resume()
+            if was_running:
+                sim_status_var.set("Paused" if was_paused else "Running")
+            else:
+                sim_status_var.set("Stopped")
+
     # Export Data / Benchmark are exposed via the Simulation menu (see menu
     # setup near the end of main()) rather than as always-visible buttons.
 
@@ -843,13 +920,20 @@ def main() -> None:
         if sim_state is None:
             messagebox.showinfo("Save State", "No simulation state to save. Start the simulation first.")
             return
+        resume_after_save = False
         try:
+            if sim_thread is not None and sim_thread.is_alive():
+                resume_after_save = not sim_thread.paused.is_set()
+                sim_state = sim_thread.pause_and_get_state()
             save_state(sim_state, _current_state_path)
             _refresh_save_info()
             total_years = sim_state.total_days / 365.2422
             messagebox.showinfo("Save State", f"State saved to {_current_state_path.name}.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
+        finally:
+            if resume_after_save and sim_thread is not None and sim_thread.is_alive():
+                sim_thread.resume()
 
     def _do_save_state_as() -> None:
         """Prompt for a new file path and save the current state there."""
@@ -871,9 +955,20 @@ def main() -> None:
         _current_state_path = Path(path_str)
         _do_save_state()
 
+    def _restore_loaded_state_context(loaded_state: PlanetState, source_path: Path) -> None:
+        """Restore non-state GUI context carried by a saved simulation."""
+        nonlocal current_planet_params, terrain_mode, loaded_heightmap_path
+        current_planet_params = loaded_state.planet_params or EARTH
+        _sync_planet_ui_from_params(current_planet_params)
+        _cache_saved_elevation(loaded_state, source_path)
+        terrain_mode = "loaded"
+        loaded_heightmap_path = None
+        for entry in (seed_entry, octaves_entry, freq_entry, lac_entry, gain_entry):
+            entry.config(state="disabled")
+
     def _do_load_state() -> None:
         """Prompt for a state file to open and load it."""
-        nonlocal sim_state, sim_running, sim_paused, sim_thread, _current_state_path
+        nonlocal sim_state, sim_running, sim_paused, sim_thread, _current_state_path, _sim_ever_started
         saves_dir = Path("saves")
         saves_dir.mkdir(parents=True, exist_ok=True)
         path_str = filedialog.askopenfilename(
@@ -887,12 +982,16 @@ def main() -> None:
         # Stop and discard the thread so Start recreates it from the loaded state
         if sim_thread and sim_thread.is_alive():
             sim_thread.stop()
+            sim_thread.join(timeout=2.0)
             sim_thread = None
         sim_running = False
         sim_paused = False
         try:
             sim_state = load_state(chosen_path)
             _current_state_path = chosen_path
+            _sim_ever_started = True
+            _restore_loaded_state_context(sim_state, chosen_path)
+            clear_simulation_caches()
             total_years = sim_state.total_days / 365.2422
             sim_status_var.set("Stopped")
             year = int(sim_state.total_days // 365.2422) + 1
@@ -1112,6 +1211,7 @@ def main() -> None:
         
         # Clear loaded terrain
         clear_elevation_cache()
+        clear_simulation_caches()
         invalidate_view_caches()
         terrain_mode = "procedural"
         loaded_heightmap_path = None
@@ -1142,6 +1242,7 @@ def main() -> None:
         # Only clear cache if using procedural terrain
         if terrain_mode == "procedural":
             clear_elevation_cache()
+            clear_simulation_caches()
         _PRECIP_VIEW_CACHE.update({"key": None, "P": None})
         invalidate_view_caches()
         p = {
@@ -1152,7 +1253,7 @@ def main() -> None:
             "gain": float(gain_var.get()),
         }
         if mode_var.get() == "globe":
-            day = int(sim_state.day_of_year) if (sim_state is not None and sim_running) else 80
+            day = int(sim_state.day_of_year) if sim_state is not None else 80
             view_name = view_var.get()
             if view_name == "Wind Arrows" or view_name == "Wind Particles":
                 view_name = "Wind"
@@ -1169,7 +1270,7 @@ def main() -> None:
                 return
             if view_var.get() == "Wind Arrows":
                 # Use simulated wind if available, otherwise generate synthetic wind
-                if sim_state is not None and sim_running and sim_state.wind_u is not None:
+                if sim_state is not None and sim_state.wind_u is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
                 else:
                     wkey = (tex.shape, int(wind_arrows_var.get()), float(wind_scale_var.get()), "bilinear")
@@ -1440,8 +1541,8 @@ def main() -> None:
 
     def render():
         nonlocal tk_img, terrain_mode, particle_anim_running, oc_anim_running, display_scale_x, display_scale_y, _last_render_arr
-        # Use simulation data if available and running
-        use_sim_data = sim_state is not None and sim_running
+        # A loaded/stopped snapshot is still authoritative display data.
+        use_sim_data = sim_state is not None
         
         if mode_var.get() == "globe":
             day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
@@ -1727,7 +1828,7 @@ def main() -> None:
         tk_img = ImageTk.PhotoImage(new_img)
         canvas.itemconfig(img_id, image=tk_img)
         # Update status with simulation day (only if not paused)
-        if use_sim_data and not sim_paused:
+        if sim_running and not sim_paused:
             sim_status_var.set(f"Day: {sim_state.day_of_year:.0f}")
         # Clear lat/lon when switching out of map
         if mode_var.get() != "map":
@@ -1743,10 +1844,7 @@ def main() -> None:
                     total_years = sim_state.total_days / 365.2422
                     sim_status_var.set(f"Loaded Y{total_years:.1f}")
                     LOG.info(f"Autosave loaded: day {sim_state.total_days:.0f} ({total_years:.2f} years)")
-                    # Restore the planet this save belongs to (old saves lack the
-                    # field entirely and fall back to Earth).
-                    current_planet_params = sim_state.planet_params or EARTH
-                    _sync_planet_ui_from_params(current_planet_params)
+                    _restore_loaded_state_context(sim_state, _current_state_path)
                 except Exception as e:
                     LOG.warning(f"Failed to load autosave ({e}); starting fresh.")
         _sim_ever_started = True
@@ -1806,7 +1904,7 @@ def main() -> None:
             sim_thread.stop()
             sim_thread = None
         # Reset to a freshly initialized (stopped) state from current elevation.
-        use_sim_data = sim_state is not None and sim_running
+        use_sim_data = sim_state is not None
         if use_sim_data and sim_state is not None and sim_state.elevation is not None:
             tex = sim_state.elevation
         else:
@@ -1850,7 +1948,7 @@ def main() -> None:
         if mode_var.get() != "map":
             _tooltip_win.withdraw()
             return
-        use_sim_data = sim_state is not None and sim_running
+        use_sim_data = sim_state is not None
         if use_sim_data and sim_state.elevation is not None:
             tex = sim_state.elevation
         else:
@@ -2111,9 +2209,12 @@ def main() -> None:
     mode_var.trace_add("write", _on_view_change)
     view_var.trace_add("write", _on_view_change)
     def on_close():
-        nonlocal sim_thread
-        # Stop simulation thread if running
+        nonlocal sim_state, sim_thread
+        # Synchronize before stopping so autosave owns the worker's latest
+        # completed state rather than the UI queue's potentially stale copy.
         if sim_thread:
+            if sim_thread.is_alive():
+                sim_state = sim_thread.pause_and_get_state()
             sim_thread.stop()
             sim_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
         # Persist current UI parameters to settings.json

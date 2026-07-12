@@ -54,6 +54,13 @@ class PlanetParams:
     """Day of year when planet is closest to star (perihelion).
     Earth: ~Jan 3, i.e. day 3.  Irrelevant for circular orbits."""
 
+    vernal_equinox_day: float = 80.0
+    """Orbital day of northern vernal equinox.
+
+    This is the zero phase for seasonal declination.  It is intentionally
+    planet-relative rather than an Earth day-number convention.
+    """
+
     # ------------------------------------------------------------------ #
     # Rotation
     # ------------------------------------------------------------------ #
@@ -453,6 +460,9 @@ class PlanetParams:
     """Heat exchange rate between mixed layer and deep ocean [1/day].
     τ = 1/rate ≈ 10957 days ≈ 30 yr.  Slows surface warming to realistic TCR."""
 
+    deep_ocean_heat_capacity_ratio: float = 50.0 / 3700.0
+    """Mixed-layer / abyssal heat-capacity ratio (≈ 50 m / 3700 m)."""
+
     deep_ocean_depth_m: float = 3700.0
     """Mean abyssal ocean depth [m].  Used only for diagnostic OHC calculations."""
 
@@ -647,13 +657,11 @@ class PlanetParams:
     fidelity/speed tradeoff curve)."""
 
     precip_substep_days: float = 0.0
-    """Opt-in: override `simulate.py`'s `_PRECIP_SUBSTEP_DAYS` (8.0) chunk
+    """Override `simulate.py`'s `_PRECIP_SUBSTEP_DAYS` (1.0) chunk
     size used by `_generate_precipitation_substepped` to split a large
     outer `dt_days` into repeated `atmosphere.generate_precipitation` calls.
-    `0.0` (default) is an exact no-op -- every existing caller keeps using
-    the hardcoded 8.0-day threshold, bit-identical to today's output. When
-    `> 0`, it replaces that threshold/chunk-size outright (e.g. `1.0` makes
-    every call at or below ~1-day granularity).
+    `0.0` uses the calibrated module default; a positive value replaces it.
+    Set `8.0` to reproduce the former one-call cadence for 6/7-day chunks.
 
     Why this exists: `generate_precipitation` has two independent, hardcoded
     per-call caps -- evaporation replenishment capped at a 1.5-day
@@ -668,7 +676,9 @@ class PlanetParams:
     dispatch (`main.py`'s `[(6.0, False)]*5` / `[(7.0, False)]*52`) never
     exceeds it (6.0, 7.0 <= 8.0), so `_generate_precipitation_substepped`
     never actually splits in real usage -- every real MONTHLY/ANNUAL
-    precipitation call hits both caps directly. This mirrors
+    precipitation call hit both caps directly before the default changed.
+    A 32x64, 0.5-orbit convergence run reduced MONTHLY mean-precipitation
+    error versus DAILY from 1.554 to 0.148 mm/day at 1-day cadence. This mirrors
     `wind_prognostic_substep_days`'s "reuse-already-tuned-physics-via-finer-
     substep" shape, applied to precipitation's rain-out mechanic instead of
     wind. See `atmosphere.generate_precipitation`'s `dt_evap`/`remove_frac`
@@ -689,64 +699,13 @@ class PlanetParams:
     """Opt-in: split a large outer `dt_days` into repeated
     `simulate._evolve_temperature` calls of ~this many days each, instead of
     one call spanning the whole outer step. `0.0` (default) is an exact
-    no-op -- every existing caller keeps calling `_evolve_temperature` once
-    per outer step, bit-identical to today's output. Mirrors
-    `wind_prognostic_substep_days`/`precip_substep_days`'s contract exactly,
-    applied to `_evolve_temperature` via the new `_evolve_temperature_substepped`
-    wrapper (`simulate.py`) instead of wind/precip.
+    no-op. Inner calls advance all prognostic temperature fields and rebuild
+    land/ocean seasonal targets for each fractional date, avoiding the former
+    stale-`T_base_land` overshoot.
 
-    Why this exists: `_evolve_temperature` samples the insolation/seasonal
-    cycle (`day_of_year`) and every relaxation term (`k_relax*days`,
-    `k_airsea*days`, evaporative cooling, deep-ocean exchange, ...) exactly
-    once per call, at the single `day_of_year` passed in, scaled by the
-    *entire* `days` span in one shot. A single 6-7 day MONTHLY/ANNUAL call
-    therefore applies one day's insolation as if it were constant for the
-    whole week -- the same "one snapshot stands in for a multi-day span"
-    shape as `wind_prognostic_substep_days` (wind solver) and
-    `precip_substep_days` (rain-out caps), just applied to the radiative/
-    relaxation physics instead. This was diagnosed (not fixed) by the
-    precip-gate session: even after both the wind and precip gates closed
-    most of MONTHLY-vs-DAILY's arid/humid Köppen divergence, polar land
-    fraction stayed diverged (~42-44% vs DAILY's stable ~29%), traced to
-    MONTHLY's winter land temperature running ~9-10°C warmer than DAILY's
-    at every timescale tested -- consistent with a dampened/aliased
-    seasonal cycle from this same snapshot-per-chunk pattern, just on
-    temperature instead of wind or precip.
-
-    `_evolve_temperature_substepped` threads `T_sst`/`T_air`/
-    `prev_cloud_cover`/`T_deep_ocean`/`prev_cloud_water` forward between
-    inner calls and advances `day_of_year`/`total_days` by each inner
-    `sub_dt`, so the insolation calc and ocean-transport cache both see a
-    real daily cadence instead of one stretched sample.
-
-    **Tried at `1.0` and measured worse, not better -- do not enable as a
-    fix without first addressing the root cause below.** A 1yr real-terrain
-    trace (synthetic 32x64 elevation, `scripts/`-style headless run) showed
-    MONTHLY's midlat-NH winter minimum overshooting *past* DAILY's own
-    (265K vs DAILY's 279.5K), while the summer maximum tracked DAILY
-    closely (293.8K vs 293.9K) -- i.e. this makes the season-vs-DAILY gap
-    *bigger* in the cooling direction, opposite of the goal. Root cause:
-    `T_base_land` (the land seasonal-baseline target `_evolve_temperature`'s
-    land-blend term relaxes toward, `simulate.py` ~line 866-872) is computed
-    exactly *once* per outer `simulate_step` call, at `day_of_year=int(new_day)`
-    -- the day at the *end* of the whole outer window -- and passed into
-    every inner substep call unchanged. The land-blend fraction itself
-    (`land_blend = 0.2`, flat, not scaled by `days`) already relies on being
-    called at DAILY's own ~1-day cadence to produce DAILY's realistic
-    seasonal tracking; substepping `_evolve_temperature` alone reproduces
-    that per-day pull-strength but keeps pulling all `n_sub` inner days
-    toward the *same*, stale, end-of-window `T_base_land` value instead of
-    each day's own baseline -- during a fast seasonal transition (e.g.
-    heading into winter) that stale target is colder than warranted for the
-    early days in the window, and the now-correctly-frequent pull drags the
-    whole window toward it, overshooting. A real fix needs `T_base_land`'s
-    upstream computation (the `temperature_kelvin_for_lat` + land-cap +
-    transport block, `simulate.py` ~lines 860-976) made substep-aware too --
-    a substantially bigger, riskier change than this gate alone, not
-    attempted. Left in place as inert, tested (default-off no-op verified),
-    zero-regression infrastructure only, same as `wind_prognostic_substep_days`
-    was after its own session concluded it wasn't sufficient alone -- not
-    recommended for use until that follow-up fix exists."""
+    The default remains off pending longer calibrated DAILY-vs-coarse
+    convergence runs. Precipitation cadence is independently configurable
+    with `precip_substep_days` and is likewise not enabled by default."""
 
     # ------------------------------------------------------------------ #
     # Derived convenience properties
@@ -776,17 +735,52 @@ class PlanetParams:
         """
         return -25.0 * self.aerosol_optical_depth
 
+    @property
+    def reference_air_density(self) -> float:
+        """Reference surface-air density [kg/m³] at 288.15 K."""
+        return self.surface_pressure_pa / (self.gas_constant_dry * 288.15)
+
+    def equinox_phase(self, day_of_year: float) -> float:
+        """Wrapped orbital phase since northern vernal equinox [0, 2π)."""
+        return (
+            2.0 * math.pi
+            * (
+                (float(day_of_year) - self.vernal_equinox_day)
+                % self.orbital_period_days
+            )
+            / self.orbital_period_days
+        )
+
+    def solar_declination(self, day_of_year: float) -> float:
+        """Solar declination [radians] for a fractional orbital day."""
+        return math.asin(
+            math.sin(self.obliquity_rad) * math.sin(self.equinox_phase(day_of_year))
+        )
+
     def solar_distance_factor(self, day_of_year: float) -> float:
         """Ratio of actual to mean Sun–planet distance at the given day.
 
         Returns ``r/a`` where ``a`` is the semi-major axis.
         TOA insolation scales as ``1 / factor²``.
-        Uses the first-order Kepler expansion (accurate to ~1 % for e < 0.2).
+        Solves Kepler's equation with bounded Newton iterations, then returns
+        the exact elliptic-orbit radius ``r/a = 1 - e cos(E)``.
         """
-        M = 2.0 * math.pi * (day_of_year - self.perihelion_day) / self.orbital_period_days
-        nu = M + 2.0 * self.eccentricity * math.sin(M)
         e = self.eccentricity
-        return (1.0 - e * e) / (1.0 + e * math.cos(nu))
+        if not 0.0 <= e < 1.0:
+            raise ValueError("eccentricity must satisfy 0 <= e < 1")
+        M = 2.0 * math.pi * (
+            float(day_of_year) - self.perihelion_day
+        ) / self.orbital_period_days
+        M = (M + math.pi) % (2.0 * math.pi) - math.pi
+        E = M if e < 0.8 else math.copysign(math.pi, M if M != 0.0 else 1.0)
+        for _ in range(12):
+            residual = E - e * math.sin(E) - M
+            derivative = 1.0 - e * math.cos(E)
+            step = max(-1.0, min(1.0, residual / derivative))
+            E -= step
+            if abs(step) < 1e-13:
+                break
+        return 1.0 - e * math.cos(E)
 
     def effective_solar_constant(self, day_of_year: float) -> float:
         """Solar constant corrected for orbital distance [W/m²]."""
@@ -813,9 +807,7 @@ class PlanetParams:
         """
         lat = np.asarray(lat_rad, dtype=np.float64)
         S0 = self.effective_solar_constant(day_of_year)
-        obliq = self.obliquity_rad
-        gamma = 2.0 * math.pi * (float(day_of_year) - 80.0) / self.orbital_period_days
-        delta = math.asin(math.sin(obliq) * math.sin(gamma))  # solar declination
+        delta = self.solar_declination(day_of_year)
 
         lat_safe = np.clip(lat, -math.pi / 2 + 1e-9, math.pi / 2 - 1e-9)
         cosH0 = -np.tan(lat_safe) * math.tan(delta)
@@ -870,6 +862,7 @@ MARS = PlanetParams(
     orbital_period_days=686.97,
     eccentricity=0.0934,
     perihelion_day=477.0,
+    vernal_equinox_day=0.0,
     sidereal_day_hours=24.623,
     radius_m=3.3895e6,
     surface_gravity=3.71,

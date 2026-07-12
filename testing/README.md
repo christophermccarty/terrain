@@ -7,9 +7,11 @@ root/`testing/`), not a collection of standalone scripts. As of 2026-07, it hold
 ### Run Commands
 
 ```powershell
-python -m pytest testing/                 # full suite (includes @slow tests; can take ~10+ min)
-python -m pytest testing/ -m "not slow"    # fast subset — use this for routine iteration
-python -m pytest testing/test_foo.py -q    # a single file
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pytest testing/                 # full suite (includes @slow tests; can take ~10+ min)
+.\.venv\Scripts\python.exe -m pytest testing/ -m "not slow"    # fast subset — use this for routine iteration
+.\.venv\Scripts\python.exe -m pytest testing/test_foo.py -q    # a single file
 ```
 
 Long-running benchmark/integration tests are marked `@pytest.mark.slow` (see `pytest.ini`) and

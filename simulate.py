@@ -36,7 +36,12 @@ from atmosphere import (
     evolve_wind, evolve_wind_aloft, _upsample_bilinear_many,
     _update_jet_index, _update_jet_blocking,
 )
-from temperature import temperature_kelvin_for_lat, elevation_to_alt_km
+from temperature import (
+    temperature_kelvin_for_lat,
+    elevation_to_alt_km,
+    STEFAN_BOLTZMANN,
+    equilibrium_temperature_k,
+)
 from ocean import calculate_ocean_heat_transport, update_sea_ice, compute_ekman_transport, compute_gyre_currents
 from carbon_cycle import (
     carbon_cycle_step, co2_temperature_response, CO2_PREINDUSTRIAL,
@@ -114,16 +119,14 @@ def _coarsen_many(fields: dict[str, np.ndarray], Hc: int, Wc: int, bs: int) -> d
 # moisture to its floor within a few decades of MONTHLY-mode spinup (observed:
 # Canadian-Prairies-latitude precip collapsing to ~12 mm/yr vs Earth's
 # 350-450 mm/yr), even though the underlying replenish/drain calibration is
-# sound at dt=1. Sub-stepping in ~1-week chunks lets humidity evaporate and
-# rain out multiple times per outer call, closing the gap without touching
-# per-call physics or DAILY/WEEKLY-mode behavior (n_sub=1 there, so this is a
-# no-op below the threshold).
+# sound at dt=1. Sub-stepping at one-day cadence lets humidity evaporate and
+# rain out repeatedly, closing the gap without changing per-call physics.
 #
-# PlanetParams.precip_substep_days (default 0.0/off) can override this
-# threshold on an opt-in basis -- see that field's docstring. 0.0 keeps this
-# module constant as the effective threshold for every existing caller,
-# exactly as before.
-_PRECIP_SUBSTEP_DAYS = 8.0
+# One-day cadence is now the calibrated default.  A 32x64, 0.5-orbit
+# DAILY-vs-MONTHLY convergence check reduced mean-precipitation error from
+# 1.554 to 0.148 mm/day. PlanetParams.precip_substep_days can still override
+# this threshold (for example 8.0 reproduces the former coarse cadence).
+_PRECIP_SUBSTEP_DAYS = 1.0
 
 
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
@@ -147,12 +150,17 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
     sub_dt = dt_days / n_sub
     hum, soil, soil_deep = humidity, soil_moisture, soil_moisture_deep
     P_accum = None
+    period_days = float(
+        planet_params.orbital_period_days if planet_params is not None else 365.2422
+    )
+    sub_day = float(day_of_year) - dt_days
     for _ in range(n_sub):
+        sub_day = (sub_day + sub_dt) % period_days
         P_i, hum, soil, soil_deep = generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             humidity=hum, soil_moisture=soil, soil_moisture_deep=soil_deep,
             cloud_fraction=cloud_fraction,
-            day_of_year=day_of_year, dt_days=sub_dt,
+            day_of_year=sub_day, dt_days=sub_dt,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
         )
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
@@ -244,6 +252,7 @@ def _evolve_temperature_substepped(
     prev_cloud_cover=None,
     T_deep_ocean=None,
     prev_cloud_water=None,
+    temperature_bases_for_day=None,
     **kwargs,
 ):
     """Advance temperature by `days`, in equal inner chunks of ~`substep_days`
@@ -282,13 +291,20 @@ def _evolve_temperature_substepped(
         day += sub_dt
         if t is not None:
             t += sub_dt
+        T_base_i, T_base_land_i = (
+            temperature_bases_for_day(day)
+            if temperature_bases_for_day is not None
+            else (T_base, kwargs.get("T_base_land"))
+        )
+        kwargs_i = dict(kwargs)
+        kwargs_i["T_base_land"] = T_base_land_i
         T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water = _evolve_temperature(
-            T_sst, T_base, elevation, Hc, Wc, block_size, H, W,
+            T_sst, T_base_i, elevation, Hc, Wc, block_size, H, W,
             day_of_year=day, days=sub_dt,
             T_air_prev=T_air, total_days=t,
             prev_cloud_cover=cloud_cover, T_deep_ocean=T_deep,
             prev_cloud_water=cloud_water,
-            **kwargs,
+            **kwargs_i,
         )
         cloud_cover = cloud_c
     return T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water
@@ -717,12 +733,14 @@ def simulate_step(
 
     # Update climate averages (exponential moving average)
     temp_avg, precip_avg, sample_days = update_climate_averages(
-        state, days, window_days=10.0 * 365.2422  # 10-year averaging window
+        state, days, orbital_period_days=pp.orbital_period_days,
+        window_years=10.0,
     )
 
     # Update monthly statistics for Köppen classification
     monthly_temp, monthly_precip, monthly_sample_count = update_monthly_statistics(
-        state, days, window_years=1.0  # 1-year rolling average per month
+        state, days, window_years=1.0,
+        orbital_period_days=pp.orbital_period_days,
     )
 
     # Initialize biome/Köppen variables
@@ -754,6 +772,7 @@ def simulate_step(
                 monthly_temp, monthly_precip, land_mask_for_biomes,
                 elevation=state.elevation,
                 elevation_baseline=elev_baseline_for_biomes,
+                orbital_period_days=pp.orbital_period_days,
             )
             # Convert Köppen to legacy biome for backward compatibility
             biome_new = koppen_to_legacy_biome(koppen_new)
@@ -865,7 +884,7 @@ def simulate_step(
     # Calculate temperature for current day (land response)
     T_lat_land = temperature_kelvin_for_lat(
         lat,
-        day_of_year=int(new_day),
+        day_of_year=new_day,
         polar_cooling_scale=polar_cooling_scale,
         planet_params=pp,
     )
@@ -957,8 +976,7 @@ def simulate_step(
         _, _land_mask_early = get_masks(_elev_c_early)
     else:
         _land_mask_early = np.zeros((Hc, Wc), dtype=bool)
-    _gamma_season = 2.0 * np.pi * (float(new_day) - 80.0) / float(pp.orbital_period_days)
-    _delta_season = float(np.arcsin(np.clip(np.sin(pp.obliquity_rad) * np.sin(_gamma_season), -1.0, 1.0)))
+    _delta_season = pp.solar_declination(new_day)
     _summer_signal_1d = np.sign(lat) * (_delta_season / max(pp.obliquity_rad, 1e-6))
     _summer_factor_1d = np.clip(_summer_signal_1d, 0.0, 1.0).astype(np.float32)  # 0 in winter, 1 at local summer peak
     _EVAP_COOL_THRESHOLD_K = 290.0
@@ -980,7 +998,7 @@ def simulate_step(
     lagged_day = (new_day - lag_days) % float(pp.orbital_period_days)
     T_lat_ocean_lagged = temperature_kelvin_for_lat(
         lat,
-        day_of_year=int(lagged_day),
+        day_of_year=lagged_day,
         polar_cooling_scale=polar_cooling_scale,
         planet_params=pp,
     )
@@ -1000,7 +1018,7 @@ def simulate_step(
 
     T_lat_annual_mean = temperature_kelvin_for_lat(
         lat,
-        day_of_year=(80.0 / 365.2422) * float(pp.orbital_period_days),  # Earth-relative spring equinox proxy
+        day_of_year=pp.vernal_equinox_day,
         polar_cooling_scale=polar_cooling_scale,
         planet_params=pp,
     )
@@ -1098,6 +1116,62 @@ def simulate_step(
 
     T_base_ocean = np.repeat(T_lat_ocean[:, None], Wc, axis=1).astype(np.float32, copy=False) + co2_temp_offset
 
+    def _temperature_bases_for_day(day: float) -> tuple[np.ndarray, np.ndarray]:
+        """Rebuild seasonal targets at an inner integration date.
+
+        The static transport calibration is shared with the outer calculation;
+        only radiative/seasonal terms are resampled.  This prevents temperature
+        substeps from repeatedly relaxing toward a stale end-of-chunk land
+        target.
+        """
+        T_land_lat = temperature_kelvin_for_lat(
+            lat,
+            day_of_year=day,
+            polar_cooling_scale=polar_cooling_scale,
+            planet_params=pp,
+        )
+        land_base = (
+            np.repeat(T_land_lat[:, None], Wc, axis=1).astype(np.float32, copy=False)
+            + co2_temp_offset
+            + (_atm_land_transport_1d + _midlat_storm_bonus_1d)[:, None]
+        )
+        summer_signal = np.sign(lat) * (
+            pp.solar_declination(day) / max(pp.obliquity_rad, 1e-6)
+        )
+        summer_factor = np.clip(summer_signal, 0.0, 1.0).astype(np.float32)
+        evap_excess = np.maximum(land_base - _EVAP_COOL_THRESHOLD_K, 0.0)
+        evap_cooling = (
+            summer_factor[:, None]
+            * _EVAP_COOL_COEFF_MAX
+            * np.clip(_soil_2d, 0.0, 1.0)
+            * evap_excess
+            * _land_mask_early.astype(np.float32)
+        )
+        land_base = np.minimum(
+            land_base - evap_cooling,
+            _land_cap_1d[:, None],
+        ).astype(np.float32, copy=False)
+
+        ocean_day = (
+            float(day) - lag_days
+        ) % float(pp.orbital_period_days)
+        ocean_lagged = temperature_kelvin_for_lat(
+            lat,
+            day_of_year=ocean_day,
+            polar_cooling_scale=polar_cooling_scale,
+            planet_params=pp,
+        )
+        ocean_lat = (
+            T_lat_annual_mean
+            + transport_warming
+            + ocean_seasonal_frac * (ocean_lagged - T_lat_annual_mean)
+        )
+        ocean_base = (
+            np.repeat(ocean_lat[:, None], Wc, axis=1).astype(np.float32, copy=False)
+            + co2_temp_offset
+        )
+        return ocean_base, land_base
+
     def _compute_T_base_ocean_full() -> np.ndarray:
         """Full-resolution fallback base temperature.
 
@@ -1110,13 +1184,13 @@ def simulate_step(
         lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
         T_lat_ocean_full_lagged = temperature_kelvin_for_lat(
             lat_full,
-            day_of_year=int(lagged_day),
+            day_of_year=lagged_day,
             polar_cooling_scale=polar_cooling_scale,
             planet_params=pp,
         )
         T_lat_annual_mean_full = temperature_kelvin_for_lat(
             lat_full,
-            day_of_year=(80.0 / 365.2422) * float(pp.orbital_period_days),
+            day_of_year=pp.vernal_equinox_day,
             polar_cooling_scale=polar_cooling_scale,
             planet_params=pp,
         )
@@ -1285,7 +1359,7 @@ def simulate_step(
         u_diag, v_diag = generate_wind_field(
             h,
             w,
-            day_of_year=int(new_day),
+            day_of_year=new_day,
             block_size=1,
             temperature=temp_field,
             elevation=elev_field,
@@ -1368,7 +1442,7 @@ def simulate_step(
             lat_w = (0.5 - (np.arange(Hcw, dtype=np.float32) + 0.5) / Hcw) * np.pi
             T_lat_ocean_w = temperature_kelvin_for_lat(
                 lat_w,
-                day_of_year=int(lagged_day),
+                day_of_year=lagged_day,
                 polar_cooling_scale=polar_cooling_scale,
                 planet_params=pp,
             )
@@ -1557,7 +1631,7 @@ def simulate_step(
     # Always track components for diagnostics (minimal overhead)
     T_sst_coarse, T_air_coarse_new, cloud_c, snow_c, temp_components, T_deep_coarse_new, cloud_water_coarse_new = _evolve_temperature_substepped(
         T_prev_coarse, T_base, state.elevation, Hc, Wc, block_size, H, W,
-        day_of_year=int(new_day), days=days,
+        day_of_year=new_day, days=days,
         substep_days=float(pp.temperature_substep_days),
         T_air_prev=T_air_coarse,
         wind_u=u_coarse, wind_v=v_coarse,
@@ -1590,6 +1664,7 @@ def simulate_step(
         T_deep_ocean=T_deep_coarse,            # Feature 5: deep ocean layer
         ice_thickness=ice_thick_prev_coarse,   # Feature 6: thickness-dependent albedo
         prev_cloud_water=cloud_water_coarse,   # Feature: prognostic cloud water
+        temperature_bases_for_day=_temperature_bases_for_day,
     )
     T_coarse = T_sst_coarse  # alias: T_coarse continues to mean T_sst going forward
     
@@ -1665,7 +1740,7 @@ def simulate_step(
                 temperature=_T_p, wind_u=_u_p, wind_v=_v_p,
                 humidity=_hum_p, soil_moisture=_soil_p, soil_moisture_deep=_soil_deep_p,
                 cloud_fraction=_cloud_p,
-                day_of_year=int(new_day), dt_days=float(days),
+                day_of_year=new_day, dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
                 planet_params=pp,
             )
@@ -1683,7 +1758,7 @@ def simulate_step(
                 humidity=state.humidity, soil_moisture=state.soil_moisture,
                 soil_moisture_deep=state.soil_moisture_deep,
                 cloud_fraction=cloud_full,
-                day_of_year=int(new_day), dt_days=float(days),
+                day_of_year=new_day, dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
                 planet_params=pp,
             )
@@ -2057,7 +2132,7 @@ def _evolve_temperature(
     block_size: int,
     H: int,
     W: int,
-    day_of_year: int,
+    day_of_year: float,
     days: float,
     *,
     T_air_prev: np.ndarray | None = None,
@@ -2187,14 +2262,6 @@ def _evolve_temperature(
                 T_lap = n + s + e + w - 4.0 * c
                 T_air = T_air + thermal_diffusion * 1.2 * np.clip(T_lap, -30.0, 30.0) * _days_diff_sub
 
-    # T_air relaxes toward surface temperature (T_sst).
-    # Over ocean: ~4-day time constant (efficient sensible heat flux at ocean surface).
-    # Over land: ~2-day time constant (land surface heats/cools overlying air quickly).
-    # Fraction capped at 0.5 so relaxation is stable for any dt (no overshoot).
-    k_air_surface = np.where(sea_mask, 0.25, 0.50).astype(np.float32, copy=False)
-    _air_frac = np.minimum(k_air_surface * float(days), 0.5).astype(np.float32, copy=False)
-    T_air = (T_air + _air_frac * (T_sst - T_air)).astype(np.float32, copy=False)
-        
     # --- Radiative Balance (Physics Item 1, 2, 10, 12) ---
     # Incoming Solar (S_in) - Albedo (A)
     # A depends on: Land/Ocean, Snow/Ice, Cloud
@@ -2233,13 +2300,16 @@ def _evolve_temperature(
         base_q = np.where(sea_mask, 0.012, 0.008).astype(np.float32, copy=False)
         q = base_q * (0.5 + 0.7 * temp_norm)
     rh = np.clip(q / qsat, 0.0, 1.5)
-    div = 0.5 * (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1)) + np.gradient(v, axis=0)
+    # Row indices increase southward while v is northward-positive, so the
+    # physical meridional derivative is -d(v)/d(row).
+    div = 0.5 * (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1)) - np.gradient(v, axis=0)
     ascent = np.clip(-div, 0.0, None)
     subsidence = np.clip(div, 0.0, None)
     ascent = ascent / (np.mean(ascent) + 1e-6)
     subsidence = subsidence / (np.mean(subsidence) + 1e-6)
     gx = 0.5 * (np.roll(elev_c, -1, axis=1) - np.roll(elev_c, 1, axis=1))
-    gy = np.gradient(elev_c, axis=0)
+    # Physical northward terrain slope; row index increases toward the south.
+    gy = -np.gradient(elev_c, axis=0)
     orog = np.clip(gx * u + gy * v, 0.0, None)
     orog = orog / (np.mean(orog) + 1e-6)
     rh_core = np.clip((rh - 0.65) * 2.0, 0.0, 1.0)
@@ -2353,9 +2423,7 @@ def _evolve_temperature(
     
     # Insolation Q (Daily mean) - use proper astronomical calculation
     _pp = planet_params if planet_params is not None else EARTH
-    obliq = _pp.obliquity_rad
-    gamma = 2.0 * np.pi * (day_of_year - 80.0) / _pp.orbital_period_days
-    decl = np.arcsin(np.sin(obliq) * np.sin(gamma))
+    decl = _pp.solar_declination(day_of_year)
     S0 = _pp.effective_solar_constant(day_of_year)
 
     # Clamp to avoid domain errors in polar regions
@@ -2392,14 +2460,14 @@ def _evolve_temperature(
         wv_reduction = _pp.wv_greenhouse_factor * np.clip(rh - 0.5, 0.0, 1.0).astype(np.float32, copy=False)
         epsilon = np.clip(epsilon - wv_reduction, 0.30, 0.95).astype(np.float32, copy=False)
 
-    sigma = 5.67e-8
+    sigma = STEFAN_BOLTZMANN
     # Longwave emission is from the surface (T_sst drives outgoing radiation)
     L_out = epsilon * sigma * (T_sst ** 4)
 
     R_net = S_absorbed - L_out  # W/m²
 
     # Radiative equilibrium temperature for the surface
-    T_eq_rad = (S_absorbed / (epsilon * sigma + 1e-9)) ** 0.25
+    T_eq_rad = equilibrium_temperature_k(S_absorbed, epsilon, sigma=sigma)
     T_eq_rad = np.clip(T_eq_rad, 150.0, 350.0)
     
     # CRITICAL FIX: Blend radiation equilibrium with base temperature
@@ -2511,33 +2579,27 @@ def _evolve_temperature(
         land_blend = np.where(land_mask, 0.2, 0.0)
         T_sst = ((1.0 - land_blend) * T_sst + land_blend * T_base_land).astype(np.float32, copy=False)
 
-    # --- Air-sea sensible heat exchange (secondary coupling of T_sst to T_air) ---
-    # k_airsea = 0.001/day (~1000-day τ at 50m MLD).
-    #
-    # Why so weak? With k_airsea=0.004 and T_air=-20°C at 55°N in winter, the
-    # steady-state T_sst is:
-    #   T_sst_ss = (k_relax*T_eq + k_airsea*T_air) / (k_relax + k_airsea)
-    #            = (0.024*271 + 0.004*253) / 0.028 = 269.1K < ice_freeze_temp
-    # The atmosphere-ocean coupling OVERRIDES the T_eq floor, pushing T_sst below
-    # freezing at 55°N and triggering ice-albedo runaway.
-    # With k_airsea=0.001:
-    #   T_sst_ss = (0.024*271 + 0.001*253) / 0.025 = 270.3K > freeze_temp ✓
-    # The ocean's primary thermal driver is its radiative balance (T_eq), not
-    # atmospheric temperature. Sensible heat flux is handled mainly by evaporation.
-    k_airsea = _pp.k_airsea
-    T_sst = (T_sst + np.where(sea_mask, k_airsea * (T_air - T_sst) * float(days), 0.0)).astype(np.float32, copy=False)
+    # --- Equal-and-opposite air–surface sensible heat exchange ---
+    H_air = 1.0
+    H_surf = np.where(sea_mask, np.clip(mld / 50.0, 0.3, 4.0), 0.35).astype(np.float32, copy=False)
+    k_couple = np.where(sea_mask, float(_pp.k_airsea) * 4.0, 0.25).astype(np.float32, copy=False)
+    dT_exchange = k_couple * (T_sst - T_air) * float(days)
+    dT_exchange = np.clip(dT_exchange, -5.0, 5.0).astype(np.float32, copy=False)
+    T_air = (T_air + dT_exchange / H_air).astype(np.float32, copy=False)
+    T_sst = (T_sst - dT_exchange / H_surf).astype(np.float32, copy=False)
 
-    # --- Feature 5: Deep ocean heat uptake ---
-    # The abyssal ocean (~3700m) stores 15–30× more heat than the mixed layer.
-    # Exchange rate k_deep ≈ 1/(30yr) delays surface warming to realistic TCR.
+    # --- Feature 5: Deep ocean heat uptake (heat-capacity weighted) ---
+    # Mixed layer and abyss exchange equal heat fluxes; abyssal ΔT is scaled by
+    # the mixed/deep heat-capacity ratio so total ocean heat content is conserved.
     T_deep_out: np.ndarray | None = T_deep_ocean
     if T_deep_ocean is not None and _pp.has_liquid_water_ocean:
         k_deep = float(_pp.deep_ocean_exchange_rate)  # ~9.1e-5 /day
-        dT_to_deep = k_deep * (T_sst - T_deep_ocean) * float(days)
-        dT_to_deep = np.clip(dT_to_deep, -0.5, 0.5).astype(np.float32, copy=False)
+        cap_ratio = float(_pp.deep_ocean_heat_capacity_ratio)
+        dT_mixed = k_deep * (T_sst - T_deep_ocean) * float(days)
+        dT_mixed = np.clip(dT_mixed, -0.5, 0.5).astype(np.float32, copy=False)
         ocean_f = sea_mask.astype(np.float32)
-        T_sst = (T_sst - dT_to_deep * ocean_f).astype(np.float32, copy=False)
-        T_deep_out = (T_deep_ocean + dT_to_deep * ocean_f).astype(np.float32, copy=False)
+        T_sst = (T_sst - dT_mixed * ocean_f).astype(np.float32, copy=False)
+        T_deep_out = (T_deep_ocean + dT_mixed * cap_ratio * ocean_f).astype(np.float32, copy=False)
 
     # --- Feature 7: Meridional eddy heat flux ---
     # Baroclinic eddies and storm tracks transport heat poleward proportional
@@ -2707,12 +2769,36 @@ def _evolve_temperature(
 
 
 # ============================================================================
+# Simulation cache management
+# ============================================================================
+
+def clear_simulation_caches() -> None:
+    """Reset module-level simulation caches (call on load/preset/new sim)."""
+    from masks import clear_all_caches
+    from temperature import clear_temperature_cache
+
+    _RELAX_CACHE.clear()
+    _RELAX_CACHE.update({"key": None, "u": None, "v": None})
+    _ELEV_COARSEN_CACHE.clear()
+    _ELEV_COARSEN_CACHE_FP.clear()
+    _OCEAN_ADJ_CACHE.clear()
+    _OCEAN_ADJ_CACHE.update({"adj": None, "last_update_day": -9999.0})
+    _CARBON_SLOW_CACHE.clear()
+    _CARBON_SLOW_CACHE.update({"key": None, "last_update_day": -9999.0, "biome": None})
+    clear_all_caches()
+    clear_temperature_cache()
+
+
+# ============================================================================
 # State Serialization Functions
 # Enable saving and loading simulation states for experiments
 # ============================================================================
 
+STATE_SCHEMA_VERSION = 1
+
+
 def save_state(state: PlanetState, filepath: str | Path) -> None:
-    """Save PlanetState to disk using pickle.
+    """Save PlanetState to disk using a versioned pickle envelope.
 
     Args:
         state: PlanetState to save
@@ -2724,8 +2810,13 @@ def save_state(state: PlanetState, filepath: str | Path) -> None:
     filepath = Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
+    envelope = {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "planet_params": state.planet_params,
+        "state": state,
+    }
     with open(filepath, 'wb') as f:
-        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(envelope, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     file_size_mb = filepath.stat().st_size / 1e6
     print(f"State saved to {filepath} ({file_size_mb:.1f} MB)")
@@ -2733,6 +2824,8 @@ def save_state(state: PlanetState, filepath: str | Path) -> None:
 
 def load_state(filepath: str | Path) -> PlanetState:
     """Load PlanetState from disk.
+
+    Accepts both the versioned envelope (schema v1+) and legacy raw pickles.
 
     Args:
         filepath: Path to saved state file
@@ -2749,7 +2842,20 @@ def load_state(filepath: str | Path) -> PlanetState:
         raise FileNotFoundError(f"State file not found: {filepath}")
 
     with open(filepath, 'rb') as f:
-        state = pickle.load(f)
+        obj = pickle.load(f)
+
+    if isinstance(obj, dict) and "schema_version" in obj:
+        version = int(obj["schema_version"])
+        if version > STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported save schema v{version} "
+                f"(this build supports up to v{STATE_SCHEMA_VERSION})"
+            )
+        state = obj["state"]
+        if state.planet_params is None and obj.get("planet_params") is not None:
+            state = state._replace(planet_params=obj["planet_params"])
+    else:
+        state = obj
 
     print(f"State loaded from {filepath} (day {state.total_days:.1f})")
     return state

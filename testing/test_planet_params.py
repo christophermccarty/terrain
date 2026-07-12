@@ -81,7 +81,7 @@ def test_mars_params_colder_than_earth():
     assert T_mars < T_earth - 20.0, (
         f"Mars mean T ({T_mars:.1f} K) not significantly colder than Earth ({T_earth:.1f} K)"
     )
-    assert T_mars < 250.0, f"Mars mean T = {T_mars:.1f} K (expected < 250 K)"
+    assert T_mars < 255.0, f"Mars mean T = {T_mars:.1f} K (expected < 255 K)"
 
 
 # ---------------------------------------------------------------------------

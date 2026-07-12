@@ -203,7 +203,10 @@ def random_search(
         for f in planet_params.__dataclass_fields__.values()  # type: ignore[attr-defined]
     } if planet_params is not EARTH else {}
 
-    ref_kwargs: dict = {}  # EARTH_REFERENCE = default; no need to serialise
+    ref_kwargs: dict = (
+        {name: getattr(reference, name) for name in reference.__dataclass_fields__}
+        if reference is not EARTH_REFERENCE else {}
+    )
 
     worker_args = [
         (i, cfg, pp_kwargs, run_kwargs, ref_kwargs)
@@ -275,8 +278,14 @@ def grid_search(
     value_lists = [param_grid[n] for n in names]
     configs = [dict(zip(names, combo)) for combo in itertools.product(*value_lists)]
 
-    pp_kwargs: dict = {}
-    ref_kwargs: dict = {}
+    pp_kwargs = {
+        f.name: getattr(planet_params, f.name)
+        for f in planet_params.__dataclass_fields__.values()  # type: ignore[attr-defined]
+    } if planet_params is not EARTH else {}
+    ref_kwargs = (
+        {name: getattr(reference, name) for name in reference.__dataclass_fields__}
+        if reference is not EARTH_REFERENCE else {}
+    )
 
     worker_args = [
         (i, cfg, pp_kwargs, run_kwargs, ref_kwargs)

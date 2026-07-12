@@ -88,7 +88,7 @@ def _wind_static_grids(H: int, W: int, pp: PlanetParams):
 # ---------------------------------------------------------------------------
 
 RHO_AIR: float = 1.225
-"""Air density at sea level [kg/m³].  Used in PGF and geostrophic wind."""
+"""Legacy Earth sea-level density [kg/m³]; retained for external imports."""
 
 # 3-cell circulation centres and widths [degrees latitude]
 HADLEY_CELL_CENTER_DEG: float = 14.0   # Trade-wind peak latitude
@@ -1196,7 +1196,7 @@ def evolve_wind(
     # Gradients dx, dy
     # (dx,dy already computed above)
     
-    rho = RHO_AIR
+    rho = pp.reference_air_density
 
     u_curr, v_curr = u.copy(), v.copy()
     
@@ -1454,7 +1454,7 @@ def evolve_wind_aloft(
     # timescale; 4 sub-steps (half the surface's 8) keeps this affordable.
     n_steps = 4
     dt_sub = dt_total / n_steps
-    rho = RHO_AIR
+    rho = pp.reference_air_density
 
     u_curr, v_curr = u2.copy(), v2.copy()
 
@@ -1559,7 +1559,7 @@ def generate_wind_field(
     height: int,
     width: int,
     *,
-    day_of_year: int = 80,
+    day_of_year: float = 80.0,
     block_size: int = 3,
     upsample: str = "repeat",
     temperature: np.ndarray | None = None,
@@ -1789,7 +1789,7 @@ def generate_wind_field(
     dp_dx = _ddx_periodic(p_pa) / (dx + 1e-3)
     
     # Geostrophic wind (m/s)
-    rho = RHO_AIR
+    rho = pp.reference_air_density
     u_geo = -(1.0 / (rho * f_coriolis[:, None])) * dp_dy
     v_geo = (1.0 / (rho * f_coriolis[:, None])) * dp_dx
     
@@ -2231,7 +2231,7 @@ def generate_precipitation(
     soil_moisture: np.ndarray | None = None,
     soil_moisture_deep: np.ndarray | None = None,
     cloud_fraction: np.ndarray | None = None,
-    day_of_year: int = 80,
+    day_of_year: float = 80.0,
     dt_days: float = 1.0,
     evap_coeff: float = 1.0,
     uplift_coeff: float = 1.0,
@@ -2669,10 +2669,12 @@ def generate_precipitation(
         # high-potential regions, not just raising how hard the model is
         # allowed to wring out whatever moisture is already there.
         scale = float(np.clip(target_mean_mm_day / (mean_p + 1e-6), 0.2, 3.0))
+        dq_before = dq.copy()
         dq = np.clip(dq * scale, 0.0, q)
         P = dq * (column_mm_per_q / dt)
         if debug_fields is not None:
             debug_fields["global_rescale_factor"] = scale
+            debug_fields["precip_rescale_dq_added"] = np.maximum(dq - dq_before, 0.0)
     rain_export_factor = np.clip(
         0.94 - 0.14 * itcz_window[:, None] + 0.08 * storm_window[:, None],
         0.70,

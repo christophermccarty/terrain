@@ -1223,3 +1223,65 @@ def compute_radiation_balance(components: dict) -> dict:
     if "L_out" in components:
         result["l_out_mean_w_m2"] = area_weighted_global_mean(components["L_out"])
     return result
+
+
+def compute_budget_diagnostics(
+    state,
+    *,
+    components: dict | None = None,
+    prev_state=None,
+) -> dict:
+    """Aggregate conservation-relevant budget diagnostics for a PlanetState."""
+    from masks import get_masks
+
+    diag: dict[str, float] = {}
+    elev = getattr(state, "elevation", None)
+    if elev is None:
+        return diag
+
+    sea_mask, land_mask = get_masks(elev)
+    ocean_frac = float(np.mean(sea_mask))
+
+    if state.temperature is not None:
+        diag["global_mean_surface_t_k"] = area_weighted_global_mean(state.temperature)
+    if state.air_temperature is not None:
+        diag["global_mean_air_t_k"] = area_weighted_global_mean(state.air_temperature)
+    if state.T_deep_ocean is not None:
+        deep = state.T_deep_ocean[sea_mask]
+        if deep.size:
+            diag["mean_deep_ocean_t_k"] = float(np.mean(deep))
+
+    if state.precipitation is not None:
+        diag["global_mean_precip_mm_day"] = area_weighted_global_mean(state.precipitation)
+    if state.humidity is not None:
+        diag["global_mean_humidity_kg_kg"] = area_weighted_global_mean(state.humidity)
+
+    if state.salinity is not None:
+        ocean_sal = state.salinity[sea_mask]
+        if ocean_sal.size:
+            diag["mean_ocean_salinity_psu"] = float(np.mean(ocean_sal))
+
+    if getattr(state, "co2_atmosphere", None) is not None:
+        diag["co2_atmosphere_ppm"] = float(state.co2_atmosphere)
+    if getattr(state, "ch4_atmosphere", None) is not None:
+        diag["ch4_atmosphere_ppb"] = float(state.ch4_atmosphere)
+
+    if components is not None:
+        diag.update(compute_radiation_balance(components))
+        for key in (
+            "evaporation_mm_day",
+            "precipitation_mm_day",
+            "sensible_heat_flux",
+            "deep_ocean_heat_flux",
+            "ocean_transport_heat",
+        ):
+            if key in components:
+                diag[f"mean_{key}"] = area_weighted_global_mean(components[key])
+
+    if prev_state is not None and state.salinity is not None and prev_state.salinity is not None:
+        ds = state.salinity - prev_state.salinity
+        diag["salinity_change_mean_psu"] = area_weighted_global_mean(ds)
+
+    diag["ocean_fraction"] = ocean_frac
+    diag["land_fraction"] = 1.0 - ocean_frac
+    return diag

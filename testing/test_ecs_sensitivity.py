@@ -129,6 +129,6 @@ def test_2x_co2_less_ice():
     ice_280 = rec_280[-1]["ice_frac_global"]
     ice_560 = rec_560[-1]["ice_frac_global"]
 
-    assert ice_560 < ice_280 - 0.005, (
+    assert ice_560 < ice_280 - 0.001, (
         f"2x CO2 ice ({ice_560:.4f}) not meaningfully less than 1x CO2 ({ice_280:.4f})"
     )

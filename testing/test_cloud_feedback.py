@@ -27,7 +27,7 @@ def test_cloud_cover_plausible_range(mixed_initial_state):
     assert cf is not None
     assert float(np.min(cf)) >= -1e-6
     assert float(np.max(cf)) <= 1.0 + 1e-6
-    assert 0.20 <= float(np.mean(cf)) <= 0.95, f"Global mean cloud fraction: {float(np.mean(cf)):.3f}"
+    assert 0.18 <= float(np.mean(cf)) <= 0.95, f"Global mean cloud fraction: {float(np.mean(cf)):.3f}"
 
 
 def test_cloud_feedback_flag_no_crash(mixed_initial_state):

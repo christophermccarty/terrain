@@ -16,6 +16,30 @@ from planet_params import PlanetParams, EARTH
 # Combined with mild evaporative cooling and improved color gradient
 EPSILON_ATM = 0.68
 
+# CODATA 2018 Stefan–Boltzmann constant — shared by temperature.py and simulate.py
+STEFAN_BOLTZMANN = 5.670374419e-8  # W m^-2 K^-4
+GRAY_ATMOSPHERE_EPSILON_FACTOR = 0.5
+
+
+def gray_atmosphere_denominator(
+    epsilon_lat: np.ndarray,
+    *,
+    factor: float = GRAY_ATMOSPHERE_EPSILON_FACTOR,
+) -> np.ndarray:
+    """One-layer gray-atmosphere OLR denominator: (1 - factor * ε(φ))."""
+    return np.maximum(1.0 - factor * epsilon_lat, 1e-6)
+
+
+def equilibrium_temperature_k(
+    F_net: np.ndarray,
+    epsilon_lat: np.ndarray,
+    *,
+    sigma: float = STEFAN_BOLTZMANN,
+) -> np.ndarray:
+    """Gray-atmosphere equilibrium temperature from net absorbed flux."""
+    gh_denom = gray_atmosphere_denominator(epsilon_lat)
+    return np.power(np.clip(F_net, 1e-9, None) / (sigma * gh_denom), 0.25)
+
 # Cache for base temperature calculations (optimization 2.6)
 _TEMP_BASE_CACHE = {}
 
@@ -24,6 +48,11 @@ _TEMP_LUT = None
 _TEMP_LUT_TMIN = 193.15
 _TEMP_LUT_TMAX = 313.15
 _TEMP_LUT_SIZE = 256
+
+
+def clear_temperature_cache() -> None:
+    """Reset the base-temperature calculation cache."""
+    _TEMP_BASE_CACHE.clear()
 
 
 def elevation_to_alt_km(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: float = 0.05) -> np.ndarray:
@@ -55,7 +84,7 @@ def elevation_to_alt_km(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: f
 
 def _daily_mean_insolation_Q(
     lat_rad: np.ndarray,
-    day_of_year: int,
+    day_of_year: float,
     *,
     planet_params: PlanetParams | None = None,
 ) -> np.ndarray:
@@ -167,7 +196,7 @@ def temperature_to_rgb(T_kelvin: np.ndarray) -> np.ndarray:
     return rgb_flat.reshape(original_shape + (3,)).astype(np.float32)
 
 
-def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, epsilon_atm: float = EPSILON_ATM, block_size: int = 3, elevation: np.ndarray | None = None) -> np.ndarray:
+def generate_temperature_overlay(height: int, width: int, day_of_year: float = 1.0, epsilon_atm: float = EPSILON_ATM, block_size: int = 3, elevation: np.ndarray | None = None) -> np.ndarray:
     """Return an (H,W,3) float32 RGB overlay in [0,1] for given map size.
 
     NOW USES SIMULATION PHYSICS for consistency:
@@ -238,7 +267,7 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: int = 1, 
 
 def _albedo_for_latitude(
     lat_rad: np.ndarray,
-    day_of_year: int = 1,
+    day_of_year: float = 1.0,
     *,
     planet_params: PlanetParams | None = None,
 ) -> np.ndarray:
@@ -266,9 +295,7 @@ def _albedo_for_latitude(
     # Fix: use 0.80 as the base polar albedo (continental ice sheet value); sea ice
     # at lower latitudes is handled by the prognostic ice_cover field in simulate.py.
     transition_start = 65.0
-    obliq = pp.obliquity_rad
-    gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / pp.orbital_period_days
-    delta = np.arcsin(np.sin(obliq) * np.sin(gamma))
+    delta = pp.solar_declination(day_of_year)
     season_factor = np.clip(1.0 - 0.5 * (np.abs(delta) / np.deg2rad(15.0)), 0.5, 1.0)
     # Range: 0.725 (polar summer melt) to 0.75 (polar winter) — compromise between
     # sea ice (0.65) and full dry-snow continental ice sheet (0.82).  The previous
@@ -286,7 +313,7 @@ def _albedo_for_latitude(
 
 def temperature_kelvin_for_lat(
     lat_rad: np.ndarray | float,
-    day_of_year: int = 1,
+    day_of_year: float = 1.0,
     epsilon_atm: float = EPSILON_ATM,
     *,
     polar_cooling_scale: float = 0.8,
@@ -319,11 +346,14 @@ def temperature_kelvin_for_lat(
         # e.g. Mars day 400 onto day 35 — two different seasons — silently
         # returning the wrong cached seasonal profile for any planet with a
         # non-Earth year length.
-        day_int = int(day_of_year) % max(1, int(round(float(pp.orbital_period_days))))
+        day_phase = round(float(day_of_year) % float(pp.orbital_period_days), 6)
         pp_key = (
             round(float(pp.solar_constant), 4),
             round(float(pp.obliquity_deg), 4),
             round(float(pp.orbital_period_days), 4),
+            round(float(pp.vernal_equinox_day), 4),
+            round(float(pp.eccentricity), 6),
+            round(float(pp.perihelion_day), 4),
             round(float(pp.epsilon_equator), 4),
             round(float(pp.epsilon_pole), 4),
             round(float(pp.aerosol_optical_depth), 4),
@@ -331,7 +361,7 @@ def temperature_kelvin_for_lat(
         # Create cache key from latitude array shape and hash of values
         if np.isscalar(lat_rad):
             cache_key = (
-                day_int,
+                day_phase,
                 'scalar',
                 round(float(lat_rad), 4),
                 float(epsilon_atm),
@@ -350,7 +380,7 @@ def temperature_kelvin_for_lat(
                 )
             else:
                 lat_hash = (0.0, 0.0, 0.0, 0)
-            cache_key = (day_int, lat_hash, float(epsilon_atm), float(polar_cooling_scale), pp_key)
+            cache_key = (day_phase, lat_hash, float(epsilon_atm), float(polar_cooling_scale), pp_key)
         
         if cache_key in _TEMP_BASE_CACHE:
             cached_result = _TEMP_BASE_CACHE[cache_key]
@@ -359,7 +389,7 @@ def temperature_kelvin_for_lat(
                 return float(cached_result)
             return cached_result.copy()
     A = _albedo_for_latitude(lat, day_of_year, planet_params=pp)
-    sigma = 5.670374419e-8
+    sigma = STEFAN_BOLTZMANN
     Q = _daily_mean_insolation_Q(lat, day_of_year, planet_params=pp)
     F_abs = (1.0 - A) * np.maximum(Q, 0.0)
 
@@ -377,9 +407,7 @@ def temperature_kelvin_for_lat(
     # ==============================================================================
 
     # Determine if we're in melting season (spring/summer) for each hemisphere
-    obliq = pp.obliquity_rad
-    gamma = 2.0 * np.pi * (float(day_of_year) - 80.0) / pp.orbital_period_days
-    solar_declination = np.arcsin(np.sin(obliq) * np.sin(gamma))
+    solar_declination = pp.solar_declination(day_of_year)
     
     nh_melt_season = solar_declination > np.deg2rad(-10.0)
     sh_melt_season = solar_declination < np.deg2rad(10.0)
@@ -439,8 +467,7 @@ def temperature_kelvin_for_lat(
     
     # Estimate surface temperature for convection calculation (rough approximation)
     # Use a simplified greenhouse calculation just for this check
-    gh_denom_simple = np.maximum(1.0 - 0.5 * epsilon_lat, 1e-6)
-    T_estimate = np.power(np.clip(F_abs, 1e-9, None) / (sigma * gh_denom_simple), 0.25)
+    T_estimate = equilibrium_temperature_k(F_abs, epsilon_lat, sigma=sigma)
     
     # Convective flux scales with temperature excess above freezing (273K)
     # Only active when surface is warm enough to drive convection (>260K = -13°C)
@@ -465,8 +492,7 @@ def temperature_kelvin_for_lat(
     F_net = np.maximum(F_net, 1.0)  # Floor at 1 W/m² to prevent numerical issues
     
     # Calculate temperature from net available flux
-    gh_denom = np.maximum(1.0 - 0.5 * epsilon_lat, 1e-6)
-    T = np.power(F_net / (sigma * gh_denom), 0.25)
+    T = equilibrium_temperature_k(F_net, epsilon_lat, sigma=sigma)
     
     # Minimum temperature floor during polar night (accounts for heat transport/thermal inertia)
     # Earth's coldest recorded ANNUAL MEAN: Vostok ~216K (-57°C).

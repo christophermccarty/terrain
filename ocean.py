@@ -154,7 +154,9 @@ def calculate_ocean_heat_transport(
     # so we must weight by cos(lat) to avoid over-representing polar rows.
     cos_lat_1d = np.cos(np.deg2rad(lat_rows))                   # (Hc,)
     lat_weight = cos_lat_1d[:, np.newaxis]                       # (Hc, 1) broadcast
-    total_area = float(np.sum(lat_weight))
+    # lat_weight broadcasts across W columns in the numerator, so the
+    # denominator must include the same longitude multiplicity.
+    total_area = float(np.sum(lat_weight)) * float(T.shape[1])
     global_mean = float(np.sum(T * lat_weight) / max(total_area, 1.0))
     with np.errstate(invalid='ignore', divide='ignore'):
         T_ocean_zonal = ocean_sum / np.maximum(ocean_count, 1.0)
@@ -269,6 +271,7 @@ def calculate_ocean_heat_transport(
     # Now we accept T_equilibrium from simulate.py (the per-cell radiative
     # equilibrium).  Rate 0.03 K/day → ~30-day ocean skin-layer timescale.
     # If T_equilibrium is not provided the exchange remains zero (safe default).
+    heat_exchange = np.zeros_like(T_adjustment, dtype=np.float32)
     if T_equilibrium is not None:
         if prev_T is not None and exchange_inertia > 0.0:
             a = float(np.clip(exchange_inertia, 0.0, 1.0))
@@ -289,6 +292,15 @@ def calculate_ocean_heat_transport(
         heat_exchange = np.clip(heat_exchange, -2.0, 2.0)   # ≤ 2 K/step
         heat_exchange = heat_exchange * is_ocean.astype(np.float32)
         T_adjustment = T_adjustment + heat_exchange
+    
+    # Parameterized redistribution (currents + WBC) must not inject net ocean
+    # heat; remove its cos(lat)-weighted mean while preserving radiative restoring.
+    redistribution = T_adjustment - heat_exchange
+    cos_lat_rows = np.cos(np.deg2rad(lat_rows)).astype(np.float32, copy=False)
+    ocean_w = is_ocean.astype(np.float32) * cos_lat_rows[:, np.newaxis]
+    total_ocean_w = float(np.sum(ocean_w)) + 1e-12
+    redist_mean = float(np.sum(redistribution * ocean_w) / total_ocean_w)
+    T_adjustment = (redistribution - redist_mean * is_ocean.astype(np.float32) + heat_exchange).astype(np.float32, copy=False)
     
     # Final clamp on total ocean adjustment
     T_adjustment = np.clip(T_adjustment, -10.0, 10.0)  # Max ±10K total per day
@@ -680,7 +692,10 @@ def evolve_salinity(
     # Brine rejection: freezing (ice_delta > 0) → salt expelled to ocean
     # Melting (ice_delta < 0) → freshwater → salinity decreases
     # Scale: 0.5 PSU per unit of ice_delta per day (crude but plausible)
-    brine_tendency = np.clip(ice_delta, -0.5, 0.5) * 0.5 * float(dt_days)
+    # ice_delta is already the total interval change produced by
+    # update_sea_ice(dt_days); multiplying by dt_days again would make this
+    # response scale quadratically with the outer timestep.
+    brine_tendency = np.clip(ice_delta, -0.5, 0.5) * 0.5
 
     # Restoring toward reference with τ = 2yr = 730 days
     tau_restore = 730.0

@@ -25,6 +25,8 @@ _MASK_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 # Lightweight content fingerprint to guard against Python id() reuse after GC.
 # Stores (first_elem, last_elem) of the elevation array at cache-write time.
 _MASK_CACHE_FP: dict[int, tuple[float, float]] = {}
+_CONTINENTALITY_CACHE: dict[int, np.ndarray] = {}
+_CONTINENTALITY_CACHE_FP: dict[int, tuple[float, float, float]] = {}
 
 
 def get_masks(
@@ -90,6 +92,14 @@ def get_masks(
     return result
 
 
+def clear_all_caches() -> None:
+    """Reset module-level mask and continentality caches (tests / load / preset)."""
+    _MASK_CACHE.clear()
+    _MASK_CACHE_FP.clear()
+    _CONTINENTALITY_CACHE.clear()
+    _CONTINENTALITY_CACHE_FP.clear()
+
+
 def invalidate(elevation: np.ndarray) -> None:
     """Remove *elevation* from the mask and continentality caches (call after terrain mutation)."""
     key = id(elevation)
@@ -97,12 +107,6 @@ def invalidate(elevation: np.ndarray) -> None:
     _MASK_CACHE_FP.pop(key, None)
     _CONTINENTALITY_CACHE.pop(key, None)
     _CONTINENTALITY_CACHE_FP.pop(key, None)
-
-
-# Module-level cache for get_continentality, same id+fingerprint convention as
-# the mask cache above.
-_CONTINENTALITY_CACHE: dict[int, np.ndarray] = {}
-_CONTINENTALITY_CACHE_FP: dict[int, tuple[float, float, float]] = {}
 
 
 def get_continentality(

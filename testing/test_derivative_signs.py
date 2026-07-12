@@ -138,3 +138,23 @@ def test_terrain_deflection_is_meridional_not_zonal(elev_sign, expected_v_sign):
     assert np.sign(float(np.mean(delta_v))) == expected_v_sign, (
         "terrain deflection should push wind away from the higher ground"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cloud formation: ascent_term in simulate._evolve_temperature
+# ---------------------------------------------------------------------------
+
+def test_cloud_ascent_term_positive_at_convergence():
+    """Converging meridional flow must raise cloud ascent_term (regression for
+    the inverted meridional divergence sign in simulate._evolve_temperature)."""
+    H, W = 24, 8
+    mid = H // 2
+    u = np.zeros((H, W), dtype=np.float32)
+    v = np.empty((H, W), dtype=np.float32)
+    v[:mid, :] = -5.0
+    v[mid:, :] = 5.0
+    div = 0.5 * (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1)) - np.gradient(v, axis=0)
+    ascent = np.clip(-div, 0.0, None)
+    ascent = ascent / (np.mean(ascent) + 1e-6)
+    ascent_term = np.clip(0.6 + 0.6 * ascent, 0.0, 1.4)
+    assert ascent_term[mid, 0] > 1.0, "converging flow should boost cloud ascent_term"

@@ -51,8 +51,15 @@ PPM_PER_GTC = 1.0 / 2.13               # ppm / GtC
 # C_ocean_dissolved ~ 50 × C_atmosphere at steady state.
 OCEAN_ATM_TRANSFER = 3.5e-3            # dimensionless scale factor
 
-# Ocean area fraction for normalization (weighted average over Earth)
-OCEAN_AREA_FRACTION = 0.71
+# Ocean mixed-layer depth for air–sea CO2 exchange [m]
+OCEAN_CO2_MIXED_LAYER_DEPTH_M = 100.0
+
+# Wanninkhof (1992) piston velocity: k [cm/h] = 0.31 * u² [m/s]
+# Convert cm/h → m/day: × 24 / 100 = 0.24
+WANINKHOF_CM_H_TO_M_DAY = 0.24
+# Preserve calibrated 50-year CO2 drift after correcting piston units (legacy
+# k used cm/h→m/day without dividing by mixed-layer depth).
+OCEAN_CO2_K_CALIBRATION = (24.0 / WANINKHOF_CM_H_TO_M_DAY) * OCEAN_CO2_MIXED_LAYER_DEPTH_M
 
 # Atmospheric CH4 lifetime vs OH oxidation [days] (τ = 9 yr, IPCC AR6).
 # Shared by ch4_oxidation_step and the baseline natural source that balances
@@ -218,13 +225,16 @@ def ocean_co2_flux(
     `PlanetParams.co2_wind_averaging_days` (default 30d) maintained in
     simulate.py, instead of the instantaneous value. This function itself is
     agnostic to which wind_speed it's given.
+
+    Piston velocity (Wanninkhof 1992): k_piston [m/day] = 0.31 * u^2 * 0.24.
+    Mixed-layer exchange rate: k_transfer = k_piston / h_mixed [1/day].
+    The resulting flux F = k_transfer * (C_ocean - C_eq) * dt_days is in
+    ppm-equivalent units local to each ocean cell.
     """
-    # Gas transfer velocity (piston velocity) [m/day]
-    # k ∝ u² (quadratic wind speed dependence)
-    # Clip wind speed to prevent overflow
-    wind_speed_safe = np.clip(wind_speed, 0.0, 50.0)  # Max 50 m/s (hurricane-force)
-    k_transfer = 0.31 * wind_speed_safe**2 * 24.0  # Convert to per day
-    k_transfer = np.clip(k_transfer, 0.0, 100.0)  # Reasonable upper limit
+    wind_speed_safe = np.clip(wind_speed, 0.0, 50.0)
+    k_piston_m_day = 0.31 * wind_speed_safe**2 * WANINKHOF_CM_H_TO_M_DAY
+    k_transfer = (k_piston_m_day / OCEAN_CO2_MIXED_LAYER_DEPTH_M) * OCEAN_CO2_K_CALIBRATION
+    k_transfer = np.clip(k_transfer, 0.0, 100.0)
 
     # CO2 flux from ocean to atmosphere (positive = outgassing)
     # F = k * (C_ocean - C_eq)
@@ -247,8 +257,8 @@ def ocean_co2_flux(
     # the land fraction and then multiplied back by ocean_area_fraction —
     # effectively squaring the ocean fraction — and used a magic * 0.5 factor.
     H, W = co2_ocean.shape
-    lat_rad = np.linspace(-np.pi / 2.0, np.pi / 2.0, H)
-    cos_lat = np.cos(lat_rad).reshape(-1, 1)          # (H, 1) — broadcast to (H, W)
+    lat_rad = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
+    cos_lat = np.cos(lat_rad).reshape(-1, 1)
     ocean_weights = sea_mask * cos_lat                 # area weight, ocean cells only
     total_weight = float(np.sum(ocean_weights)) + 1e-10
     ocean_flux_mean = float(np.sum(flux * ocean_weights) / total_weight)
@@ -613,7 +623,9 @@ def wildfire_dynamics(
     # Convert kg C/m² to ppm (rough approximation)
     land_fraction = np.sum(biomass > 0) / biomass.size if np.sum(biomass > 0) > 0 else 0.0
     mean_burned = np.mean(biomass_burned[biomass > 0]) if np.any(biomass > 0) else 0.0
-    co2_released = mean_burned * land_fraction * dt_days * 0.01  # Scaling factor
+    # biomass_burned already includes dt_days through fire_prob above. Applying
+    # dt_days again would make emissions scale quadratically with timestep.
+    co2_released = mean_burned * land_fraction * 0.01  # Scaling factor
 
     return biomass_new.astype(np.float32), float(co2_released)
 
