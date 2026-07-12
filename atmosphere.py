@@ -2241,6 +2241,7 @@ def generate_precipitation(
     surface_pressure_hpa: float = 1013.25,
     planet_params: PlanetParams | None = None,
     debug_fields: dict | None = None,
+    _static_cache: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return (precip_mm_day, humidity, soil_moisture, soil_moisture_deep).
 
@@ -2264,6 +2265,18 @@ def generate_precipitation(
     sheets (frontal/persistent cover) produce rain even without a deep-convective
     trigger, closing the gap where clouds and precipitation were diagnosed from
     shared RH/ascent fields but never actually informed each other.
+
+    `_static_cache` (internal, opt-in): when the caller drives several
+    consecutive substeps with the *same* `elevation`/`temperature`/`wind`/
+    `surface_pressure`/`dt` and only lets `humidity`/`soil` evolve (see
+    `simulate._generate_precipitation_substepped`), pass a fresh empty dict so
+    the loop-invariant fields — land/sea masks, `qsat`, wind divergence and its
+    subsidence-suppression, the advection Courant scalings, the ascent proxy,
+    and the percentile-normalised orographic uplift / rain-shadow blocks — are
+    computed on the first substep and reused thereafter. Every cached quantity
+    is a pure function of those invariant inputs, so the result is identical to
+    recomputing it; the arrays are stored read-only. Leave it `None` (the
+    default, and every other call site) to recompute everything as before.
     """
 
     pp = planet_params or EARTH
@@ -2277,9 +2290,19 @@ def generate_precipitation(
     storm_window = np.exp(-((abs_lat_deg - STORM_TRACK_CENTER_DEG) / 15.0) ** 2).astype(np.float32, copy=False)
     drybelt_window = np.exp(-((abs_lat_deg - DRYBELT_CENTER_DEG) / 8.0) ** 2).astype(np.float32, copy=False)
 
-    land_mask, sea_mask = _derive_land_sea_masks(elev)
-    land_f = land_mask.astype(np.float32)
-    sea_f = sea_mask.astype(np.float32)
+    _sc = _static_cache
+    if _sc is not None and "land_mask" in _sc:
+        land_mask, sea_mask = _sc["land_mask"], _sc["sea_mask"]
+        land_f, sea_f = _sc["land_f"], _sc["sea_f"]
+    else:
+        land_mask, sea_mask = _derive_land_sea_masks(elev)
+        land_f = land_mask.astype(np.float32)
+        sea_f = sea_mask.astype(np.float32)
+        if _sc is not None:
+            for _k, _v in (("land_mask", land_mask), ("sea_mask", sea_mask),
+                           ("land_f", land_f), ("sea_f", sea_f)):
+                _v.flags.writeable = False
+                _sc[_k] = _v
 
     if temperature is None:
         lat = np.deg2rad(lat_deg).astype(np.float32, copy=False)
@@ -2306,9 +2329,15 @@ def generate_precipitation(
     wind_speed = np.sqrt(u * u + v * v) + 1e-6
     temp_norm = np.clip((temperature - 255.0) / 45.0, 0.0, 1.0)
 
-    Tc = np.clip(temperature - 273.15, -60.0, 60.0)
-    es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
-    qsat = np.clip(0.622 * es / surface_pressure_hpa, 0.0, 0.035).astype(np.float32, copy=False)
+    if _sc is not None and "qsat" in _sc:
+        qsat = _sc["qsat"]
+    else:
+        Tc = np.clip(temperature - 273.15, -60.0, 60.0)
+        es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
+        qsat = np.clip(0.622 * es / surface_pressure_hpa, 0.0, 0.035).astype(np.float32, copy=False)
+        if _sc is not None:
+            qsat.flags.writeable = False
+            _sc["qsat"] = qsat
 
     # Subsidence/dry-belt suppression, computed early (needs only u/v/lat, no q)
     # so it can also gate land evapotranspiration below, not just precip_potential
@@ -2329,14 +2358,23 @@ def generate_precipitation(
     # ITCZ's meridional convergence registered as DIVERGENCE (and the horse
     # latitudes' divergence as convergence), inverting the ascent/subsidence
     # drivers wherever the meridional wind dominated.
-    div = _ddx_periodic(u) - np.gradient(v, axis=0)
-    _div_pos_early = np.clip(div, 0.0, None)
-    _subsidence_norm_early = np.clip(_div_pos_early / (np.mean(_div_pos_early) + 1e-6), 0.0, 2.5)
-    subsidence_suppression = np.clip(
-        1.0 - 0.34 * _subsidence_norm_early - 0.45 * drybelt_window[:, None],
-        0.08,
-        1.0,
-    ).astype(np.float32, copy=False)
+    if _sc is not None and "div" in _sc:
+        div = _sc["div"]
+        subsidence_suppression = _sc["subsidence_suppression"]
+    else:
+        div = _ddx_periodic(u) - np.gradient(v, axis=0)
+        _div_pos_early = np.clip(div, 0.0, None)
+        _subsidence_norm_early = np.clip(_div_pos_early / (np.mean(_div_pos_early) + 1e-6), 0.0, 2.5)
+        subsidence_suppression = np.clip(
+            1.0 - 0.34 * _subsidence_norm_early - 0.45 * drybelt_window[:, None],
+            0.08,
+            1.0,
+        ).astype(np.float32, copy=False)
+        if _sc is not None:
+            div.flags.writeable = False
+            subsidence_suppression.flags.writeable = False
+            _sc["div"] = div
+            _sc["subsidence_suppression"] = subsidence_suppression
     if debug_fields is not None:
         debug_fields["subsidence_suppression"] = subsidence_suppression
 
@@ -2430,23 +2468,37 @@ def generate_precipitation(
     # question (the RH-trigger-favors-local-moisture mechanism described in
     # the paragraph above still applies).
     _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
-    if pp.humidity_advection_cfl:
-        # Real Courant number (matches the long-range term's own CFL check
-        # below) instead of the fixed |u|/20, |v|/12 divisors.
-        courant_u = np.abs(u) * dt * 86400.0 / dx_grid
-        courant_v = np.abs(v) * dt * 86400.0 / dy_grid
-        u_scale = np.clip(courant_u, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
-        v_scale = np.clip(courant_v, 0.0, 1.0) * (
-            0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
-        )
+    if _sc is not None and "u_scale" in _sc:
+        u_scale, v_scale = _sc["u_scale"], _sc["v_scale"]
     else:
-        u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
-        v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * (
-            0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
-        )
+        if pp.humidity_advection_cfl:
+            # Real Courant number (matches the long-range term's own CFL check
+            # below) instead of the fixed |u|/20, |v|/12 divisors.
+            courant_u = np.abs(u) * dt * 86400.0 / dx_grid
+            courant_v = np.abs(v) * dt * 86400.0 / dy_grid
+            u_scale = np.clip(courant_u, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
+            v_scale = np.clip(courant_v, 0.0, 1.0) * (
+                0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
+            )
+        else:
+            u_scale = np.clip(np.abs(u) / 20.0, 0.0, 1.0) * (0.32 + 0.16 * storm_window[:, None])
+            v_scale = np.clip(np.abs(v) / 12.0, 0.0, 1.0) * (
+                0.34 + 0.06 * drybelt_window[:, None] + 0.16 * storm_window[:, None]
+            )
+        if _sc is not None:
+            u_scale = u_scale.astype(np.float32, copy=False)
+            v_scale = v_scale.astype(np.float32, copy=False)
+            u_scale.flags.writeable = False
+            v_scale.flags.writeable = False
+            _sc["u_scale"] = u_scale
+            _sc["v_scale"] = v_scale
     q_short = q
     if NUMBA_AVAILABLE:
         for _ in range(3):
+            # _advect_humidity_numba always allocates a fresh output (np.zeros_like
+            # internally), so q_short is a unique array from here on -- safe to mutate
+            # in place below instead of allocating a new array for the add and another
+            # for the clip.
             q_short = _advect_humidity_numba(q_short.astype(np.float32), u, v, u_scale, v_scale)
             lap_q = _laplacian_numba(q_short)
             # Adaptive diffusion: stronger in regions with sharp gradients
@@ -2454,13 +2506,16 @@ def generate_precipitation(
             diffusion_coeff = (0.11 + 0.03 * storm_window[:, None]) * (
                 1.0 + 0.3 * np.clip(q_grad_strength, 0.0, 2.0)
             )
-            q_short = q_short + diffusion_coeff * lap_q
-            q_short = np.clip(q_short, 0.0, qsat)
+            np.add(q_short, diffusion_coeff * lap_q, out=q_short)
+            np.clip(q_short, 0.0, qsat, out=q_short)
     else:
         for _ in range(3):
+            # _advect_scalar always returns a fresh array -- same in-place reasoning
+            # as the Numba branch above.
             q_short = _advect_scalar(q_short, u, v, u_scale, v_scale)
-            q_short = q_short + (0.11 + 0.03 * storm_window[:, None]) * _laplacian(q_short)
-            q_short = np.clip(q_short, 0.0, qsat)
+            lap_q = _laplacian(q_short)
+            np.add(q_short, (0.11 + 0.03 * storm_window[:, None]) * lap_q, out=q_short)
+            np.clip(q_short, 0.0, qsat, out=q_short)
 
     _blend = float(pp.moisture_advection_scale)
     if _blend > 0.0:
@@ -2512,9 +2567,16 @@ def generate_precipitation(
     # already computed early, right after wind/qsat, since neither needs q --
     # see the sign-convention note there.
     _lap = _laplacian_numba if NUMBA_AVAILABLE else _laplacian
-    ascent = np.clip(-div, 0.0, None)
-    ascent = ascent / (np.mean(ascent) + 1e-6)
-    ascent = np.clip(ascent + 0.15 * _lap(ascent.astype(np.float32)), 0.0, 3.0)
+    if _sc is not None and "ascent" in _sc:
+        ascent = _sc["ascent"]
+    else:
+        ascent = np.clip(-div, 0.0, None)
+        ascent = ascent / (np.mean(ascent) + 1e-6)
+        ascent = np.clip(ascent + 0.15 * _lap(ascent.astype(np.float32)), 0.0, 3.0)
+        if _sc is not None:
+            ascent = ascent.astype(np.float32, copy=False)
+            ascent.flags.writeable = False
+            _sc["ascent"] = ascent
 
     if debug_fields is not None:
         debug_fields["div"] = div
@@ -2526,26 +2588,36 @@ def generate_precipitation(
     # so gy = -∂elev/∂i; otherwise northward wind blowing up a north-facing
     # slope registered as downslope (and vice versa), inverting the meridional
     # half of both the uplift and rain-shadow terms.
-    gx = _ddx_periodic(elev)
-    gy = -np.gradient(elev, axis=0)
-    slope = np.hypot(gx, gy)
-    orog = np.clip(gx * u + gy * v, 0.0, None) + 0.25 * slope
-    orog = land_f * orog
-    orog = orog / (np.percentile(orog, 90.0) + 1e-6)
-    orog = np.clip(orog + 0.15 * _lap(orog.astype(np.float32)), 0.0, 2.0)
+    if _sc is not None and "orog" in _sc:
+        orog = _sc["orog"]
+        rain_shadow_suppression = _sc["rain_shadow_suppression"]
+    else:
+        gx = _ddx_periodic(elev)
+        gy = -np.gradient(elev, axis=0)
+        slope = np.hypot(gx, gy)
+        orog = np.clip(gx * u + gy * v, 0.0, None) + 0.25 * slope
+        orog = land_f * orog
+        orog = orog / (np.percentile(orog, 90.0) + 1e-6)
+        orog = np.clip(orog + 0.15 * _lap(orog.astype(np.float32)), 0.0, 2.0)
 
-    # Rain-shadow drying: the mirror image of orographic uplift. Descending air on
-    # the lee side of a range compresses and warms, lowering RH — this is why the
-    # Atacama (lee of the Andes), Patagonia, the Great Basin, and the Gobi (lee of
-    # the Himalaya/Tibetan Plateau) are deserts in reality. Previously `orog` only
-    # ever added rain (windward term clipped to >=0) with no leeward counterpart, so
-    # these regions had no mechanism to dry out relative to the surrounding potential
-    # field (observed: Atacama sample came out ~780 mm/yr vs Earth's near-zero).
-    downslope = np.clip(-(gx * u + gy * v), 0.0, None)
-    downslope = land_f * downslope
-    downslope = downslope / (np.percentile(downslope, 90.0) + 1e-6)
-    downslope = np.clip(downslope, 0.0, 2.0)
-    rain_shadow_suppression = np.clip(1.0 - 0.40 * downslope, 0.35, 1.0).astype(np.float32, copy=False)
+        # Rain-shadow drying: the mirror image of orographic uplift. Descending air
+        # on the lee side of a range compresses and warms, lowering RH — this is why
+        # the Atacama (lee of the Andes), Patagonia, the Great Basin, and the Gobi
+        # (lee of the Himalaya/Tibetan Plateau) are deserts in reality. Previously
+        # `orog` only ever added rain (windward term clipped to >=0) with no leeward
+        # counterpart, so these regions had no mechanism to dry out relative to the
+        # surrounding potential field (observed: Atacama ~780 mm/yr vs Earth's ~0).
+        downslope = np.clip(-(gx * u + gy * v), 0.0, None)
+        downslope = land_f * downslope
+        downslope = downslope / (np.percentile(downslope, 90.0) + 1e-6)
+        downslope = np.clip(downslope, 0.0, 2.0)
+        rain_shadow_suppression = np.clip(1.0 - 0.40 * downslope, 0.35, 1.0).astype(np.float32, copy=False)
+        if _sc is not None:
+            orog = orog.astype(np.float32, copy=False)
+            orog.flags.writeable = False
+            rain_shadow_suppression.flags.writeable = False
+            _sc["orog"] = orog
+            _sc["rain_shadow_suppression"] = rain_shadow_suppression
 
     # Phase 2: Enhanced convective precipitation with CAPE-like triggering
     # This significantly improves tropical rainfall (ITCZ) realism
@@ -2559,7 +2631,15 @@ def generate_precipitation(
     )
     # Normalize convective contribution to blend with other terms
     conv_norm = np.clip(conv, 0.0, 1.5) / 1.5
-    ascent_norm = np.clip(ascent, 0.0, 1.5) / 1.5
+    if _sc is not None and "ascent_norm" in _sc:
+        ascent_norm = _sc["ascent_norm"]
+    else:
+        # Depends only on the already-cached `ascent`, not on q -- substep-invariant.
+        ascent_norm = np.clip(ascent, 0.0, 1.5) / 1.5
+        if _sc is not None:
+            ascent_norm = ascent_norm.astype(np.float32, copy=False)
+            ascent_norm.flags.writeable = False
+            _sc["ascent_norm"] = ascent_norm
     convective = np.clip(P_convective / 10.0, 0.0, 2.0)  # Scale to [0, 2] for blending
     convective = np.clip(convective + 0.10 * conv, 0.0, 2.0)
     convective = convective * (0.05 + 0.40 * itcz_window[:, None]) * (
@@ -2579,7 +2659,15 @@ def generate_precipitation(
     # boosts double-counted it (tropical band hit 9.6 mm/day vs the 8.0 gate).
     rh_release = rh * (0.10 + 0.22 * itcz_window[:, None] + 0.06 * storm_window[:, None])
     conv_driver = conv * (0.12 + 0.22 * itcz_window[:, None] + 0.08 * storm_window[:, None])
-    ascent_driver = ascent * (0.20 + 0.20 * itcz_window[:, None] + 0.08 * storm_window[:, None])
+    if _sc is not None and "ascent_driver" in _sc:
+        ascent_driver = _sc["ascent_driver"]
+    else:
+        # Depends only on the already-cached `ascent` and the static lat windows.
+        ascent_driver = ascent * (0.20 + 0.20 * itcz_window[:, None] + 0.08 * storm_window[:, None])
+        if _sc is not None:
+            ascent_driver = ascent_driver.astype(np.float32, copy=False)
+            ascent_driver.flags.writeable = False
+            _sc["ascent_driver"] = ascent_driver
     # Stratiform term: existing cloud cover (frontal/persistent sheets) rains even
     # without a fresh convective trigger. target_mean_mm_day rescaling below keeps
     # the global mean calibrated, so this mainly reshapes *where* rain falls to track
@@ -2588,10 +2676,18 @@ def generate_precipitation(
     # test_subtropical_precip_quantity's 2.8 cap (bisected precisely — 0.09 still
     # fails at 2.81, 0.08 is the first passing value; 0.06 leaves headroom rather
     # than sitting right at that boundary again).
-    if cloud_fraction is not None:
-        stratiform = np.clip(cloud_fraction.astype(np.float32), 0.0, 1.0)
+    if _sc is not None and "stratiform" in _sc:
+        stratiform = _sc["stratiform"]
     else:
-        stratiform = np.zeros((H, W), dtype=np.float32)
+        # Depends only on cloud_fraction, which the substep loop passes through
+        # unchanged (only humidity/soil evolve between substeps) -- invariant.
+        if cloud_fraction is not None:
+            stratiform = np.clip(cloud_fraction.astype(np.float32), 0.0, 1.0)
+        else:
+            stratiform = np.zeros((H, W), dtype=np.float32)
+        if _sc is not None:
+            stratiform.flags.writeable = False
+            _sc["stratiform"] = stratiform
     precip_potential = uplift_coeff * (
         0.18 * rh_release +
         0.24 * conv_driver +
@@ -2604,14 +2700,21 @@ def generate_precipitation(
     precip_potential = precip_potential * lat_shape
 
     if NUMBA_AVAILABLE:
-        # Fast path: Numba-accelerated smoothing
+        # Fast path: Numba-accelerated smoothing. precip_potential was assigned via
+        # `* lat_shape` just above (a fresh array), and `.astype()` below copies before
+        # the Numba call reads it, so it's always safe to mutate in place: each
+        # iteration fully computes lap_p from the old values before writing.
         for _ in range(3):
             lap_p = _laplacian_numba(precip_potential.astype(np.float32))
-            precip_potential = np.clip(precip_potential + 0.18 * lap_p, 0.0, 3.0)
+            np.add(precip_potential, 0.18 * lap_p, out=precip_potential)
+            np.clip(precip_potential, 0.0, 3.0, out=precip_potential)
     else:
-        # Fallback: original NumPy implementation
+        # Fallback: original NumPy implementation. Same in-place reasoning as above --
+        # _laplacian reads and fully materializes its output before we mutate.
         for _ in range(3):
-            precip_potential = np.clip(precip_potential + 0.18 * _laplacian(precip_potential), 0.0, 3.0)
+            lap_p = _laplacian(precip_potential)
+            np.add(precip_potential, 0.18 * lap_p, out=precip_potential)
+            np.clip(precip_potential, 0.0, 3.0, out=precip_potential)
     post_shape = np.clip(0.92 + 0.20 * itcz_window[:, None] - 0.10 * storm_window[:, None], 0.82, 1.12)
     precip_potential = np.clip(precip_potential * post_shape, 0.0, 3.0)
 

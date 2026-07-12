@@ -71,39 +71,73 @@ except ImportError:
 _RELAX_CACHE = {"key": None, "u": None, "v": None}
 
 
+def _pad_edge_inplace(buf: np.ndarray, H: int, W: int) -> None:
+    """Edge-replicate `buf`'s [..., H:, :]/[..., :, W:] margins from its [..., :H, :W] data.
+
+    `buf`'s last two axes are (Hp, Wp) with Hp >= H, Wp >= W; the leading axes (if any)
+    are left untouched. Row-fill must run before column-fill so the corner block picks
+    up the already-row-replicated values -- this reproduces `np.pad(..., mode="edge")`
+    exactly (same corner = original[..., H-1, W-1]) without allocating the intermediate
+    unpadded array `np.pad` requires.
+    """
+    Hp, Wp = buf.shape[-2], buf.shape[-1]
+    if Hp > H:
+        buf[..., H:, :W] = buf[..., H - 1:H, :W]
+    if Wp > W:
+        buf[..., :, W:] = buf[..., :, W - 1:W]
+
+
 def _coarsen(arr: np.ndarray, Hc: int, Wc: int, bs: int) -> np.ndarray:
     """Downsample (H,W) → (Hc,Wc) by block-averaging.
 
     Avoids np.pad when the grid divides evenly (the common case for standard
-    block sizes), which eliminates a full-array copy per field per step.
+    block sizes), which eliminates a full-array copy per field per step. When it
+    doesn't divide evenly (e.g. the real 512x1024 Earth grid at block_size=3),
+    writes directly into a single (Hc*bs, Wc*bs) buffer instead of padding a
+    separate already-materialized array, saving one full-size allocation+copy.
     """
     a: np.ndarray = arr if arr.dtype == np.float32 else arr.astype(np.float32)
     H, W = a.shape
-    ph, pw = Hc * bs - H, Wc * bs - W
-    if ph > 0 or pw > 0:
-        a = np.pad(a, ((0, ph), (0, pw)), mode="edge")
-    return a.reshape(Hc, bs, Wc, bs).mean(axis=(1, 3)).astype(np.float32, copy=False)
+    Hp, Wp = Hc * bs, Wc * bs
+    if Hp == H and Wp == W:
+        buf = a
+    else:
+        buf = np.empty((Hp, Wp), dtype=np.float32)
+        buf[:H, :W] = a
+        _pad_edge_inplace(buf, H, W)
+    return buf.reshape(Hc, bs, Wc, bs).mean(axis=(1, 3)).astype(np.float32, copy=False)
 
 
 def _coarsen_many(fields: dict[str, np.ndarray], Hc: int, Wc: int, bs: int) -> dict[str, np.ndarray]:
     """Batched `_coarsen`: downsample multiple same-shape (H,W) fields in one pass.
 
-    Stacks inputs into one (K,H,W) array and does a single pad+reshape+mean instead
-    of K separate `_coarsen` calls — mirrors `_upsample_bilinear_many`'s batching
-    approach for the opposite (upsample) direction. Every field must share the same
-    (H, W) shape; callers with mixed shapes should group fields accordingly first.
+    Stacks inputs into one (K,H,W) array and does a single reshape+mean instead of K
+    separate `_coarsen` calls — mirrors `_upsample_bilinear_many`'s batching approach
+    for the opposite (upsample) direction. Every field must share the same (H, W)
+    shape; callers with mixed shapes should group fields accordingly first.
+
+    When the grid doesn't divide evenly (the common case: real terrain at the
+    default block_size=3), fields are written directly into a single (K, Hc*bs,
+    Wc*bs) buffer instead of stacking into an unpadded (K,H,W) array and then
+    `np.pad`-ing a second, larger array from it — one allocation instead of two.
     """
     if not fields:
         return {}
     keys = list(fields.keys())
-    stack = np.stack(
-        [f if f.dtype == np.float32 else f.astype(np.float32) for f in fields.values()],
-        axis=0,
-    )
-    K, H, W = stack.shape
-    ph, pw = Hc * bs - H, Wc * bs - W
-    if ph > 0 or pw > 0:
-        stack = np.pad(stack, ((0, 0), (0, ph), (0, pw)), mode="edge")
+    values = list(fields.values())
+    K = len(values)
+    H, W = values[0].shape
+    Hp, Wp = Hc * bs, Wc * bs
+    if Hp == H and Wp == W:
+        stack = np.stack(
+            [f if f.dtype == np.float32 else f.astype(np.float32) for f in values],
+            axis=0,
+        )
+    else:
+        stack = np.empty((K, Hp, Wp), dtype=np.float32)
+        for i, f in enumerate(values):
+            stack[i, :H, :W] = f if f.dtype == np.float32 else f.astype(np.float32)
+        _pad_edge_inplace(stack, H, W)
     out = stack.reshape(K, Hc, bs, Wc, bs).mean(axis=(2, 4)).astype(np.float32, copy=False)
     return {k: out[i] for i, k in enumerate(keys)}
 
@@ -154,6 +188,12 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
         planet_params.orbital_period_days if planet_params is not None else 365.2422
     )
     sub_day = float(day_of_year) - dt_days
+    # Every substep sees identical elevation/temperature/wind/pressure/dt and only
+    # evolves humidity+soil, so generate_precipitation's wind/terrain-derived fields
+    # (masks, qsat, divergence, ascent, orographic uplift, ...) are the same each
+    # pass. Compute them once and reuse via this cache (see its docstring); the
+    # result is identical to recomputing them every substep.
+    _static_cache: dict = {}
     for _ in range(n_sub):
         sub_day = (sub_day + sub_dt) % period_days
         P_i, hum, soil, soil_deep = generate_precipitation(
@@ -162,6 +202,7 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             cloud_fraction=cloud_fraction,
             day_of_year=sub_day, dt_days=sub_dt,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
+            _static_cache=_static_cache,
         )
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
     return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil, soil_deep

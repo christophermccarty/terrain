@@ -16,6 +16,8 @@ Updated to support Köppen classification for more realistic climate zones.
 import numpy as np
 from typing import NamedTuple
 
+from masks import _elev_fingerprint
+
 
 # =============================================================================
 # Köppen Climate Classification Constants
@@ -256,19 +258,50 @@ def update_monthly_statistics(
     return monthly_temp, monthly_precip, monthly_sample_count
 
 
+# id(land_mask) -> (max_dist, fingerprint) -> continentality result, guarding against
+# Python id() reuse after GC the same way masks.py's own caches do.
+_CONTINENTALITY_KOPPEN_CACHE: dict[int, tuple[float, tuple[float, float, float], np.ndarray]] = {}
+
+
 def _compute_continentality(land_mask: np.ndarray, max_dist: int = 50) -> np.ndarray:
     """Compute continentality index based on distance from ocean.
 
     Returns a (H, W) array where 0 = coastal, 1 = deep interior.
     Uses a simple distance transform approximation.
+
+    `land_mask` here is `classify_koppen`'s caller-supplied land mask, which in
+    practice always traces back to `masks.get_masks(state.elevation)` -- itself
+    cached and returning the *same array object* across steps while elevation is
+    unchanged (see masks.py). This function is only invoked from `classify_koppen`,
+    which itself already only runs once per ~30 sim-days, but `scipy.ndimage.
+    distance_transform_edt` is the single most expensive step inside it, so it's
+    still worth caching by identity rather than re-running the transform every
+    reclassification. Same id()+content-fingerprint guard as `masks.py`.
     """
+    key = id(land_mask)
+    cached = _CONTINENTALITY_KOPPEN_CACHE.get(key)
+    if cached is not None:
+        cached_max_dist, cached_fp, cached_result = cached
+        land_r = np.asarray(land_mask, dtype=np.float32).ravel()
+        fp = _elev_fingerprint(land_r)
+        if cached_max_dist == float(max_dist) and cached_result.shape == land_mask.shape and cached_fp == fp:
+            return cached_result
+
     from scipy.ndimage import distance_transform_edt
     land = land_mask > 0.5
     # Distance from ocean (in grid cells)
     dist = distance_transform_edt(land)
     # Normalize: 0 at coast, 1 at max_dist cells inland
-    continentality = np.clip(dist / max_dist, 0.0, 1.0)
-    return continentality.astype(np.float32)
+    continentality = np.clip(dist / max_dist, 0.0, 1.0).astype(np.float32)
+
+    land_r = np.asarray(land_mask, dtype=np.float32).ravel()
+    fp = _elev_fingerprint(land_r)
+    continentality.flags.writeable = False
+    _CONTINENTALITY_KOPPEN_CACHE[key] = (float(max_dist), fp, continentality)
+    return continentality
+
+
+_NOISE_CACHE: dict[tuple[int, int, float], np.ndarray] = {}
 
 
 def _deterministic_noise(H: int, W: int, scale: float = 8.0) -> np.ndarray:
@@ -276,7 +309,17 @@ def _deterministic_noise(H: int, W: int, scale: float = 8.0) -> np.ndarray:
 
     Uses a simple hash-based approach to create reproducible spatial noise
     that breaks up the perfectly horizontal climate boundaries.
+
+    The result is a pure function of ``(H, W, scale)`` (no randomness or
+    time dependence), so it is memoized: ``classify_koppen`` runs once every
+    ~30 sim-days and calls this twice, recomputing the same two full-grid
+    trig fields each time otherwise. The cache holds a couple of read-only
+    (H, W) float32 arrays per distinct (H, W, scale) — negligible memory.
     """
+    cache_key = (int(H), int(W), float(scale))
+    cached = _NOISE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     # Create coordinate grids
     y_idx = np.arange(H)[:, None]
     x_idx = np.arange(W)[None, :]
@@ -299,7 +342,10 @@ def _deterministic_noise(H: int, W: int, scale: float = 8.0) -> np.ndarray:
     freq6 = 2.0 * np.pi / (H / 12.0)
     noise += 0.2 * np.cos(x_idx * freq5 + y_idx * freq6 * 0.7)
 
-    return (noise * scale).astype(np.float32, copy=False)
+    result = (noise * scale).astype(np.float32, copy=False)
+    result.flags.writeable = False  # cached & shared — guard against accidental mutation
+    _NOISE_CACHE[cache_key] = result
+    return result
 
 
 def classify_koppen(
@@ -428,36 +474,37 @@ def classify_koppen(
     # Summer months: Apr-Sep (months 3-8) for NH, Oct-Mar (months 9-11, 0-2) for SH
     # Winter months: Oct-Mar for NH, Apr-Sep for SH
     summer_mask_nh = np.array([False, False, False, True, True, True, True, True, True, False, False, False])
-    summer_mask_sh = ~summer_mask_nh
 
-    # Calculate summer and winter precipitation
+    # Per-(month, pixel) "is this month locally summer" mask: NH pixels use
+    # summer_mask_nh directly, SH pixels use its complement -- encoded in one XOR
+    # broadcast instead of a Python loop over 12 months each doing up to 6 full-grid
+    # np.where calls (~72 total) to pick NH-vs-SH and summer-vs-winter branches.
+    season_is_summer = summer_mask_nh[:, None, None] ^ is_southern[None, :, :]  # (12, H, 1) bool
+
+    P_summer_masked = np.where(season_is_summer, P_monthly_mm, np.float32(0.0)).astype(np.float32, copy=False)
+    P_winter_masked = np.where(season_is_summer, np.float32(0.0), P_monthly_mm).astype(np.float32, copy=False)
+
+    # Sum via explicit sequential accumulation (month order 0..11) to stay bit-identical
+    # to the original per-month loop: adding an exact 0.0 for non-qualifying months is
+    # IEEE754-exact (x + 0.0 == x, no rounding), reproducing the same rounding as the
+    # original "only add on qualifying months" loop -- unlike a vectorized .sum(axis=0),
+    # whose internal reduction order (and therefore rounding) isn't guaranteed to match.
     P_summer = np.zeros((H, W), dtype=np.float32)
     P_winter = np.zeros((H, W), dtype=np.float32)
-    P_summer_driest = np.full((H, W), np.inf, dtype=np.float32)
-    P_winter_driest = np.full((H, W), np.inf, dtype=np.float32)
-    P_summer_wettest = np.zeros((H, W), dtype=np.float32)
-    P_winter_wettest = np.zeros((H, W), dtype=np.float32)
-
     for m in range(12):
-        P_m = P_monthly_mm[m]
-        # Northern hemisphere
-        if summer_mask_nh[m]:
-            P_summer = np.where(~is_southern, P_summer + P_m, P_summer)
-            P_summer_driest = np.where(~is_southern, np.minimum(P_summer_driest, P_m), P_summer_driest)
-            P_summer_wettest = np.where(~is_southern, np.maximum(P_summer_wettest, P_m), P_summer_wettest)
-        else:
-            P_winter = np.where(~is_southern, P_winter + P_m, P_winter)
-            P_winter_driest = np.where(~is_southern, np.minimum(P_winter_driest, P_m), P_winter_driest)
-            P_winter_wettest = np.where(~is_southern, np.maximum(P_winter_wettest, P_m), P_winter_wettest)
-        # Southern hemisphere (reversed seasons)
-        if summer_mask_sh[m]:
-            P_summer = np.where(is_southern, P_summer + P_m, P_summer)
-            P_summer_driest = np.where(is_southern, np.minimum(P_summer_driest, P_m), P_summer_driest)
-            P_summer_wettest = np.where(is_southern, np.maximum(P_summer_wettest, P_m), P_summer_wettest)
-        else:
-            P_winter = np.where(is_southern, P_winter + P_m, P_winter)
-            P_winter_driest = np.where(is_southern, np.minimum(P_winter_driest, P_m), P_winter_driest)
-            P_winter_wettest = np.where(is_southern, np.maximum(P_winter_wettest, P_m), P_winter_wettest)
+        P_summer = P_summer + P_summer_masked[m]
+        P_winter = P_winter + P_winter_masked[m]
+
+    # Min/max reductions are associative and order-independent (no rounding to
+    # preserve), so these are safe to fully vectorize via axis=0 reductions.
+    P_summer_driest = np.where(season_is_summer, P_monthly_mm, np.inf).min(axis=0).astype(np.float32, copy=False)
+    P_winter_driest = np.where(season_is_summer, np.inf, P_monthly_mm).min(axis=0).astype(np.float32, copy=False)
+    P_summer_wettest = np.maximum(
+        np.where(season_is_summer, P_monthly_mm, -np.inf).max(axis=0), 0.0
+    ).astype(np.float32, copy=False)
+    P_winter_wettest = np.maximum(
+        np.where(season_is_summer, -np.inf, P_monthly_mm).max(axis=0), 0.0
+    ).astype(np.float32, copy=False)
 
     # Land mask as boolean
     land = land_mask > 0.5
