@@ -860,6 +860,66 @@ def _moisture_convergence_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray) -> 
     return conv
 
 
+def flux_divergence_spherical(
+    q: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    lat_rad: np.ndarray,
+    *,
+    radius_m: float = 6.371e6,
+    cos_floor: float = 1e-3,
+) -> np.ndarray:
+    """Signed spherical divergence of the moisture flux ``q * V`` [kg/kg per second].
+
+    Implements the true spherical form
+
+        div(F) = 1/(a cos(phi)) * [ dFx/dlambda + d(Fy cos(phi))/dphi ]
+
+    which `_moisture_convergence_numba` omits entirely: that kernel takes raw
+    index differences, so the zonal term is under-weighted by 1/cos(phi)
+    (negligible in the tropics, x2 at 60 deg, x3.9 at 75 deg) and the meridional
+    term is missing the cos(phi) flux weighting that accounts for converging
+    meridians. It also skips both pole rows; this function includes them via
+    one-sided differences.
+
+    Sign conventions, matching the rest of this module: `u` is eastward-positive,
+    `v` is northward-positive, and the row index increases SOUTHWARD, so
+    dphi/di = -pi/H.
+
+    Returns *signed* divergence (positive = diverging). Callers wanting the
+    convergence driver should take ``clip(-result, 0, None)``, mirroring
+    `_moisture_convergence_numba`'s built-in clip.
+
+    Verified against closed-form cases in
+    `testing/test_spherical_metric.py` (solid-body rotation, a zonally-varying
+    zonal flow whose divergence scales as 1/cos(phi), and a uniform meridional
+    flow whose divergence is -V*tan(phi)/a).
+    """
+    H, W = q.shape
+    cos_phi = np.maximum(np.cos(np.asarray(lat_rad, dtype=np.float64)), cos_floor)
+    if cos_phi.ndim == 1:
+        cos_phi = cos_phi[:, None]
+
+    Fx = np.asarray(q, dtype=np.float64) * np.asarray(u, dtype=np.float64)
+    Fy = np.asarray(q, dtype=np.float64) * np.asarray(v, dtype=np.float64)
+
+    # Zonal term: periodic central difference in longitude.
+    dlam = 2.0 * np.pi / W
+    dFx_dlam = (np.roll(Fx, -1, axis=1) - np.roll(Fx, 1, axis=1)) / (2.0 * dlam)
+
+    # Meridional term: d(Fy cos phi)/dphi. Central in the interior, one-sided at
+    # the poles so rows 0 and H-1 are real values rather than identically zero.
+    G = Fy * cos_phi
+    dG_di = np.empty_like(G)
+    dG_di[1:-1] = 0.5 * (G[2:] - G[:-2])
+    dG_di[0] = G[1] - G[0]
+    dG_di[-1] = G[-1] - G[-2]
+    dphi_di = -np.pi / H
+    dG_dphi = dG_di / dphi_di
+
+    return (dFx_dlam + dG_dphi) / (float(radius_m) * cos_phi)
+
+
 def _streamfunction_from_vorticity(omega: np.ndarray) -> np.ndarray:
     H, W = omega.shape
     ky = 2.0 * np.pi * np.fft.fftfreq(H)
@@ -1348,7 +1408,31 @@ def evolve_wind(
         u_target = (U_TARGET_TRADE * w_trade + u_mid + U_TARGET_POLAR * w_polar).astype(np.float32, copy=False)
         # v_target: Hadley (equatorward), Ferrel (poleward), Polar (equatorward), by hemisphere.
         # Strengthen Ferrel return flow while reducing polar leakage into the 30-60° band.
-        v_mid = V_TARGET_MIDLAT * (speed_nh * w_mid_nh + speed_sh * w_mid_sh)
+        # The meridional (Ferrel) lobe uses its OWN centre, decoupled from the
+        # westerly jet's, exactly as in generate_wind_field -- see
+        # PlanetParams.ferrel_v_centre_deg. Both paths must use the same centre or
+        # DAILY/WEEKLY (this prognostic solver) and MONTHLY/ANNUAL (the diagnostic
+        # one) would place the subtropical dry belt at different latitudes, which
+        # is the speed-inconsistency bug class that speed-switch-biome-consistency
+        # worked to close. The meander shift (jet_lat_shift_per_index) is applied
+        # to both centres identically so the cells still migrate together.
+        _v_centre = float(getattr(pp, "ferrel_v_centre_deg", MID_LAT_JET_CENTER_DEG))
+        if _v_centre == MID_LAT_JET_CENTER_DEG:
+            w_mid_v_nh, w_mid_v_sh = w_mid_nh, w_mid_sh
+        else:
+            _vc_nh = _v_centre + float(pp.jet_lat_shift_per_index) * float(jet_index_nh)
+            _vc_sh = _v_centre + float(pp.jet_lat_shift_per_index) * float(jet_index_sh)
+            w_mid_v_nh = np.where(
+                sign_lat >= 0.0,
+                np.exp(-((abs_deg_1d - _vc_nh) / MID_LAT_JET_WIDTH_DEG) ** 2),
+                0.0,
+            ).astype(np.float32, copy=False)
+            w_mid_v_sh = np.where(
+                sign_lat < 0.0,
+                np.exp(-((abs_deg_1d - _vc_sh) / MID_LAT_JET_WIDTH_DEG) ** 2),
+                0.0,
+            ).astype(np.float32, copy=False)
+        v_mid = V_TARGET_MIDLAT * (speed_nh * w_mid_v_nh + speed_sh * w_mid_v_sh)
         v_target = (V_TARGET_TRADE * w_trade + v_mid + V_TARGET_POLAR * w_polar).astype(np.float32, copy=False) * sign_lat
         # Remove the equator sign ambiguity (sign(0)=0) so the equator stays calm.
         v_target = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target).astype(np.float32, copy=False)
@@ -1911,7 +1995,24 @@ def generate_wind_field(
     w_mid = np.exp(-((abs_deg - 48.0) / 13.0) ** 2).astype(np.float32, copy=False)
     w_polar = np.exp(-((abs_deg - 74.0) / 10.0) ** 2).astype(np.float32, copy=False)
     u_surface = (-3.5 * w_trade + 8.5 * w_mid - 1.5 * w_polar).astype(np.float32, copy=False)
-    v_surface = (-3.5 * w_trade + 5.0 * w_mid - 1.2 * w_polar).astype(np.float32, copy=False) * sign_lat
+    # The meridional cell structure gets its OWN mid-latitude centre, decoupled
+    # from u_surface's. Both used `w_mid` (48 deg) until 2026-07-25, which meant
+    # the latitude where the zonal-mean flow switches from diverging to
+    # converging could not be moved without also moving the surface jet.
+    #
+    # Why this matters: that crossing latitude is what decides whether a mid-
+    # latitude continent sits in the subtropical dry belt. Measured on real
+    # terrain, the model's zonal-mean divergence crosses zero at ~48N vs Earth's
+    # ~40N, which puts the whole 38-45N band -- every continent at that latitude,
+    # the US Midwest box among them -- on the diverging side. Its divergence is
+    # 85% zonal-mean, so no local perturbation can overcome it (which is why the
+    # two attempts in us-midwest-wind-convergence-investigation-2026-07 failed).
+    # The analytic crossing responds ~1:1 to this centre: 48->46.4N, 44->42.6N,
+    # 42->40.7N, 40->38.8N. See PLAN_PHYSICS_FIXES.md.
+    _v_centre = float(getattr(pp, "ferrel_v_centre_deg", 48.0))
+    w_mid_v = (w_mid if _v_centre == 48.0
+               else np.exp(-((abs_deg - _v_centre) / 13.0) ** 2).astype(np.float32, copy=False))
+    v_surface = (-3.5 * w_trade + 5.0 * w_mid_v - 1.2 * w_polar).astype(np.float32, copy=False) * sign_lat
     v_surface = np.where(abs_deg < 2.0, 0.0, v_surface).astype(np.float32, copy=False)
     uc_zm = np.mean(uc, axis=1, keepdims=True)
     vc_zm = np.mean(vc, axis=1, keepdims=True)
@@ -2578,7 +2679,18 @@ def generate_precipitation(
         q = q_short
 
     # Moisture-flux convergence driver
-    if NUMBA_AVAILABLE:
+    if bool(getattr(pp, "spherical_metric_precip", False)):
+        # Metric-correct path (opt-in, see PlanetParams.spherical_metric_precip).
+        # Same clip/normalise/smooth pipeline as the two legacy branches below --
+        # only the divergence operator differs, so an A/B isolates the metric.
+        _div_q = flux_divergence_spherical(
+            q, u, v, np.radians(lat_deg.astype(np.float64)), radius_m=float(pp.radius_m)
+        )
+        conv = np.clip(-_div_q, 0.0, None).astype(np.float32, copy=False)
+        conv = conv / (np.mean(conv) + 1e-6)
+        _lap_c = _laplacian_numba if NUMBA_AVAILABLE else _laplacian
+        conv = np.clip(conv + 0.15 * _lap_c(conv), 0.0, 3.0)
+    elif NUMBA_AVAILABLE:
         # Fast path: Numba-accelerated convergence
         conv = _moisture_convergence_numba(q.astype(np.float32), u, v)
         conv = conv / (np.mean(conv) + 1e-6)

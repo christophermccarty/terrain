@@ -2303,6 +2303,22 @@ def _evolve_temperature(
                 T_lap = n + s + e + w - 4.0 * c
                 T_air = T_air + thermal_diffusion * 1.2 * np.clip(T_lap, -30.0, 30.0) * _days_diff_sub
 
+    # T_air relaxes toward surface temperature (T_sst).
+    # Over ocean: ~4-day time constant (efficient sensible heat flux at ocean surface).
+    # Over land: ~2-day time constant (land surface heats/cools overlying air quickly).
+    # Fraction capped at 0.5 so relaxation is stable for any dt (no overshoot).
+    #
+    # RESTORED 2026-07-25 after this block's removal in aa4b127 was measured to be
+    # a regression: without it the air column decouples from the surface and NH
+    # polar air runs ~25 degC too warm on the standard 64x128 spinup fixture
+    # (measured +25.4 degC vs +0.5 degC with this block restored). The
+    # equal-and-opposite exchange added below does NOT subsume this -- that term
+    # conserves heat between the two layers, but nothing else ties the air column
+    # to the surface it sits on. See overnight/FINDINGS.md (2026-07-25).
+    k_air_surface = np.where(sea_mask, 0.25, 0.50).astype(np.float32, copy=False)
+    _air_frac = np.minimum(k_air_surface * float(days), 0.5).astype(np.float32, copy=False)
+    T_air = (T_air + _air_frac * (T_sst - T_air)).astype(np.float32, copy=False)
+
     # --- Radiative Balance (Physics Item 1, 2, 10, 12) ---
     # Incoming Solar (S_in) - Albedo (A)
     # A depends on: Land/Ocean, Snow/Ice, Cloud
@@ -2620,10 +2636,26 @@ def _evolve_temperature(
         land_blend = np.where(land_mask, 0.2, 0.0)
         T_sst = ((1.0 - land_blend) * T_sst + land_blend * T_base_land).astype(np.float32, copy=False)
 
-    # --- Equal-and-opposite air–surface sensible heat exchange ---
+    # --- Equal-and-opposite air–surface sensible heat exchange (OCEAN ONLY) ---
+    # The land branch of `k_couple` was 0.25 until 2026-07-25. Combined with
+    # H_surf=0.35 that relaxed the *land surface* toward the air at ~0.71/day --
+    # a coupling direction that did not exist before aa4b127 (the pre-aa4b127
+    # term was `np.where(sea_mask, ..., 0.0)`, i.e. ocean-only by construction).
+    # Measured effect of the land branch on the standard 64x128 spinup fixture:
+    #   land 0.25 -> global mean 292.6 K, equator-pole gradient 18.3 K, ice 0.022
+    #   land 0.0  -> global mean 289.4 K, equator-pole gradient 32.3 K, ice 0.189
+    # i.e. it alone caused a +3.2 K global warm bias, halved the meridional
+    # gradient, and removed ~90% of NH sea ice, breaking 9 physics tests that
+    # were invisible to `pytest -m "not slow"`. Over land the surface has almost
+    # no heat capacity and is driven by radiation plus the seasonal-baseline
+    # blend above; the air follows it via the relaxation term earlier in this
+    # function, not the reverse. Ocean keeps the equal-and-opposite form, which
+    # is physically right for a mixed layer with real heat capacity (the ocean
+    # multiplier is measurement-neutral: 1.0 and 4.0 give identical results).
+    # See overnight/FINDINGS.md (2026-07-25) for the full bisect.
     H_air = 1.0
     H_surf = np.where(sea_mask, np.clip(mld / 50.0, 0.3, 4.0), 0.35).astype(np.float32, copy=False)
-    k_couple = np.where(sea_mask, float(_pp.k_airsea) * 4.0, 0.25).astype(np.float32, copy=False)
+    k_couple = np.where(sea_mask, float(_pp.k_airsea) * 4.0, 0.0).astype(np.float32, copy=False)
     dT_exchange = k_couple * (T_sst - T_air) * float(days)
     dT_exchange = np.clip(dT_exchange, -5.0, 5.0).astype(np.float32, copy=False)
     T_air = (T_air + dT_exchange / H_air).astype(np.float32, copy=False)

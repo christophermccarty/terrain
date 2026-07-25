@@ -7,4 +7,6 @@
 settings.json
 /saves/**
 *.pyc
-*.pkl
+*.pkl
+/overnight/
+/_planetsim_wt_blend/

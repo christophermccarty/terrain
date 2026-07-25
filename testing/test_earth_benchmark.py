@@ -17,7 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-pytestmark = pytest.mark.slow
+# NOT slow-marked (2026-07-25). This file carried a blanket
+# `pytestmark = pytest.mark.slow` until a 4K global warm bias, a halved
+# equator-pole gradient, and a ~90% loss of NH sea ice reached HEAD and sat there
+# for two weeks -- because `pytest -m "not slow"`, the project's standard
+# verification command, deselected every test here. The whole file (all 18 tests,
+# including the shared 2-year spinup fixture) runs in ~13s, which does not
+# justify hiding it from the default suite. If a genuinely expensive test is
+# added here later, mark that individual test, not the module.
 
 
 def _lat_rows(H: int) -> np.ndarray:
@@ -125,10 +132,29 @@ def test_latitude_band_temperature_bias_reasonable(earth_spinup_state):
     # (measured 10.1C mean bias vs the old 9.0C bound) -- a deliberate trade-off for
     # a large, verified continental-interior precipitation realism gain (US Midwest
     # box: 95->227 mm/yr on real terrain), not an unexamined regression.
-    assert abs(mean_bias) < 10.5, f"Mean latitude-band temperature bias too large: {mean_bias:.1f}°C"
-    # Threshold raised to 40°C (from 35°C): T_air has larger polar seasonal amplitude
-    # than T_sst, widening the snapshot-vs-annual-mean gap at high latitudes.
-    assert max_bias < 40.0, f"Max latitude-band temperature bias too large: {max_bias:.1f}°C"
+    # Threshold 10.5->11.5°C (2026-07-25): raised only after attributing every
+    # 0.1°C of the increase to a specific, deliberate correction in aa4b127 --
+    # not as a blanket accommodation. Measured on this fixture:
+    #   8f1703c (pre-aa4b127):            mean 10.10, max 39.70
+    #   HEAD with old ocean.py restored:  mean 10.30, max 39.70
+    #   HEAD (current):                   mean 10.80, max 40.20
+    # The +0.50°C step is ocean.py's two heat-transport corrections: (a) the
+    # `total_area` normalization was missing the longitude multiplicity (a factor
+    # of W), and (b) the parameterized current/WBC redistribution was injecting
+    # net ocean heat until its cos(lat)-weighted mean was removed. Both are
+    # genuine bug fixes that legitimately shift this snapshot metric. The
+    # remaining +0.20°C is carbon_cycle.py's Wanninkhof piston-velocity unit
+    # correction. See overnight/FINDINGS.md (2026-07-25).
+    #
+    # NOTE: this test and test_polar_balance.py were invisible to
+    # `pytest -m "not slow"` for two weeks (module-level slow marker), which is
+    # how a 4K global warm bias reached HEAD unnoticed. If this bound needs
+    # raising again, find the cause first -- that is what this comment is for.
+    assert abs(mean_bias) < 11.5, f"Mean latitude-band temperature bias too large: {mean_bias:.1f}°C"
+    # Threshold raised to 41°C (from 40°C, was 35°C): T_air has larger polar
+    # seasonal amplitude than T_sst, widening the snapshot-vs-annual-mean gap at
+    # high latitudes; the last +0.5°C is ocean.py's net-heat-injection fix above.
+    assert max_bias < 41.0, f"Max latitude-band temperature bias too large: {max_bias:.1f}°C"
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +344,28 @@ def test_midlat_precip_quantity(earth_spinup_state):
     to ~4.0-4.07 mm/day. Accepted as a worthwhile trade-off (2026-07 decision)
     rather than leaving the ceiling-saturation bug in place; 4.2 mm/day is still
     within plausible range for the Southern Ocean storm track.
+
+    Upper bound 4.2->4.6 (2026-07-25), the fourth widening of this ceiling and
+    the one to be most sceptical of -- so here is the evidence, and the caveat.
+
+    Cause: `ferrel_v_centre_deg` 48->44 moves the prescribed Ferrel cell (and so
+    the storm track) equatorward into this band. On THIS fixture SH 40-60 goes
+    2.44 -> 4.35 mm/day (+78%). But on the real-terrain save the same band goes
+    552 -> 654 mm/yr (1.51 -> 1.79 mm/day, +18%) against an Earth reference of
+    ~800-1200 mm/yr -- i.e. real terrain is too DRY here and the change moves it
+    toward Earth, while the fixture is already wet and overshoots.
+
+    The two disagree because this fixture is a poor absolute proxy for the
+    Southern Ocean: its value for this band is ~2.4x the real-terrain value
+    (1588 vs 654 mm/yr), it is a 2-year cold start on synthetic 64x128 terrain
+    with no Antarctic landmass, and its NH mid-lat moves the *opposite* way from
+    real terrain's (2.71 -> 2.31 here vs 808 -> 854 mm/yr on real terrain).
+
+    CAVEAT worth acting on: an absolute mm/day bound on a fixture that is 2.4x
+    off the real-terrain value is a weak guard. Its actual purpose -- catch a
+    mid-latitude precipitation runaway -- would be served far better by either
+    running against `saves/earth.pkl` or asserting on a normalised quantity
+    (e.g. mid-lat / global ratio). Prefer doing that over a fifth widening.
     """
     P = earth_spinup_state.precipitation
     if P is None:
@@ -326,8 +374,8 @@ def test_midlat_precip_quantity(earth_spinup_state):
     P_ml_n = float(np.mean(P[_row_slice(H, 60, 40), :]))
     P_ml_s = float(np.mean(P[_row_slice(H, -40, -60), :]))
     for label, val in [("NH mid-lat", P_ml_n), ("SH mid-lat", P_ml_s)]:
-        assert 0.5 < val < 4.2, (
-            f"{label} mean precip {val:.2f} mm/day outside [0.5, 4.2] mm/day"
+        assert 0.5 < val < 4.6, (
+            f"{label} mean precip {val:.2f} mm/day outside [0.5, 4.6] mm/day"
         )
 
 

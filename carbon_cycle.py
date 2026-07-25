@@ -133,9 +133,16 @@ RADIATIVE_FORCING_COEFF = 5.35
 
 # Climate sensitivity parameter [K per W/m²]
 # Converts radiative forcing to temperature change: ΔT = λ × ΔF
-# Synced with PlanetParams.co2_climate_feedback default (1.4).
-# Use 0.8 for the pre-2026 lower-sensitivity calibration.
-CLIMATE_SENSITIVITY = 1.4
+#
+# Corrected 2026-07-25: this was 1.4 with a comment claiming it was "synced with
+# PlanetParams.co2_climate_feedback default (1.4)" -- but that default is and was
+# 0.8, so the constant and its own comment disagreed with the dataclass by 75%.
+# Harmless in practice only because the sole caller
+# (simulate.py's co2_temperature_response(...) call) passes the value explicitly
+# from PlanetParams; nothing ever used this default. Kept in sync deliberately so
+# new code that does rely on the default gets the same sensitivity the simulator
+# actually runs at. Flagged as a trap in ROADMAP.md Theme 4 since 2026-07-03.
+CLIMATE_SENSITIVITY = 0.8  # == PlanetParams.co2_climate_feedback default
 
 # Wildfire thresholds
 WILDFIRE_TEMP_THRESHOLD_K: float = 298.15    # minimum temperature for fire risk [K] (25°C)

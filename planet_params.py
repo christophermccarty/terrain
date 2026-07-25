@@ -276,6 +276,64 @@ class PlanetParams:
     streamfunction solve is periodic-in-x/DFT-in-y, tolerating no true
     meridional boundary condition -- same caveat as its atmosphere.py usage)."""
 
+    ferrel_v_centre_deg: float = 44.0
+    """Latitude centre [deg] of the mid-latitude lobe of the prescribed
+    *meridional* 3-cell surface profile -- `v_surface` in `generate_wind_field`
+    (MONTHLY/ANNUAL) and `v_target` in `evolve_wind` (DAILY/WEEKLY). Both paths
+    read this so every time-scale places the dry belt at the same latitude.
+
+    **Changed 48.0 -> 44.0 on 2026-07-25** after root-causing the long-standing
+    US Midwest dryness. Measured effects at 44 on 30yr real terrain: Sahara
+    361->299, Kalahari 355->273, Atacama 161->154, Canadian Prairies 452->480,
+    US Midwest 300->400, Central Europe 451->494 -- all six boxes toward their
+    Earth values at once, and US Midwest clears the driest desert box for the
+    first time. The zonal-mean divergence peak moves 38-45N -> 30-38N (Earth
+    ~25-30N).
+
+    Why 44 and not 40, which scores better on those six boxes (total error 621 vs
+    962): 44 is the only tested value that ALSO improves the independent
+    ERA5/CRU zonal-band fit (61.8% -> 60.2% mean relative error), whereas 42 and
+    40 degrade it (64.7%, 67.9%) by over-wetting the 40-50N band, which is
+    already too wet in the zonal mean even though its *land* is too dry. The
+    six-box metric alone is not trustworthy for tuning -- it is dominated by US
+    Midwest still being ~330mm short, so it rewards more shift indefinitely.
+    Revisit once the 40-50N land/ocean partition is addressed.
+
+    Decoupled from `u_surface`'s mid-latitude centre (fixed at 48 deg, which sets
+    the surface westerly/jet latitude) on 2026-07-25. Before that both used the
+    same constant, so the latitude at which the zonal-mean flow switches from
+    diverging to converging could not be adjusted without also moving the jet.
+
+    That crossing latitude decides whether a mid-latitude continent sits inside
+    the subtropical dry belt. Measured: the model crosses at ~48 deg N vs Earth's
+    ~40 deg N, placing the entire 38-45N band on the diverging side -- the root
+    cause of the long-standing US Midwest dryness (its divergence is 85%
+    zonal-mean, so local fixes cannot work). The analytic crossing moves ~1:1
+    with this value: 48->46.4, 44->42.6, 42->40.7, 40->38.8.
+
+    Default 48.0 reproduces the previous behaviour exactly. See
+    PLAN_PHYSICS_FIXES.md and overnight/FINDINGS.md."""
+
+    spherical_metric_precip: bool = False
+    """Use the true spherical metric in the moisture-flux convergence driver.
+
+    `False` (default) keeps `_moisture_convergence_numba`, which takes raw index
+    differences: the zonal term is under-weighted by 1/cos(phi) (x2 at 60 deg,
+    x3.9 at 75 deg), the meridional term lacks the cos(phi) flux weighting for
+    converging meridians, and both pole rows are left identically zero.
+    `True` routes the driver through `atmosphere.flux_divergence_spherical`,
+    which implements
+        div(F) = 1/(a cos phi) [ dFx/dlambda + d(Fy cos phi)/dphi ]
+    and includes the pole rows. Verified against closed-form solutions in
+    `testing/test_spherical_metric.py`.
+
+    Opt-in because `u_scale`/`v_scale` and the `target_mean_mm_day` rescale were
+    all calibrated against the metric-free kernel, so enabling this shifts the
+    precipitation distribution poleward and will need recalibration -- that shift
+    is the intended effect, not a regression. Low urgency at Earth obliquity
+    (ROADMAP Theme 1); structural for high-obliquity or polar-precipitation
+    worlds. See PLAN_PHYSICS_FIXES.md."""
+
     moisture_advection_scale: float = 0.0
     """Blend weight [0-1] for an additional longer-range moisture transport term
     in `atmosphere.generate_precipitation` (`_advect_scalar_flux_eulerian`),
@@ -458,10 +516,31 @@ class PlanetParams:
     # ------------------------------------------------------------------ #
     deep_ocean_exchange_rate: float = 9.13e-5
     """Heat exchange rate between mixed layer and deep ocean [1/day].
-    τ = 1/rate ≈ 10957 days ≈ 30 yr.  Slows surface warming to realistic TCR."""
+
+    τ = 1/rate ≈ 10957 days ≈ 30 yr is the *mixed layer's* damping timescale.
+    It is NOT how fast the deep layer approaches equilibrium -- see
+    `deep_ocean_heat_capacity_ratio` below, which makes that ~74x slower."""
 
     deep_ocean_heat_capacity_ratio: float = 50.0 / 3700.0
-    """Mixed-layer / abyssal heat-capacity ratio (≈ 50 m / 3700 m)."""
+    """Mixed-layer / abyssal heat-capacity ratio (≈ 50 m / 3700 m).
+
+    Scales the abyssal ΔT for a given heat flux (correct: the same flux into a
+    ~74x larger reservoir produces 1/74 the temperature change), so the deep
+    ocean's own equilibration timescale is
+        τ_eff = 1 / (deep_ocean_exchange_rate * this) ≈ **2219 years**.
+    Measured 2026-07-25 on a 500-year real-terrain run: 3.41 K of a 16.8 K
+    surface-deep gap closed in 498 years, implying τ ≈ 2195 yr -- a 1% match.
+
+    Two consequences worth knowing before using deep-ocean temperature as a
+    validation target (see overnight/FINDINGS.md):
+      * Deep-ocean T cannot reach observational values in any practical run; it
+        is a structurally transient metric, not an equilibrium one.
+      * The equilibrium it is *heading toward* is ~25 degC, not Earth's 1-4 degC,
+        because the deep layer exchanges heat only vertically with the cell above
+        it -- there is no overturning or lateral abyssal transport, so each cell
+        relaxes toward its own local surface temperature. Raising the exchange
+        rate makes the deep ocean reach that wrong target sooner, not become more
+        realistic; a physical abyss needs overturning, not a rate tweak."""
 
     deep_ocean_depth_m: float = 3700.0
     """Mean abyssal ocean depth [m].  Used only for diagnostic OHC calculations."""
