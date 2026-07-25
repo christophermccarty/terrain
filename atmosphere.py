@@ -119,6 +119,37 @@ ITCZ_HALF_WIDTH_DEG:   float = 10.0   # ITCZ Gaussian half-width (σ) — narrow
 STORM_TRACK_CENTER_DEG: float = 48.0  # Mid-latitude storm track centre
 DRYBELT_CENTER_DEG:     float = 28.0  # Subtropical dry belt centre
 
+# Earth annual-mean zonal-mean precipitation shape, by |latitude| [mm/day at each
+# 10-degree breakpoint], derived from diagnostics.EARTH_LATITUDE_BANDS_NH (mm/yr / 365.25).
+# Used only as a *shape* (renormalized to a mean of 1.0 in _zonal_precip_target_profile,
+# then multiplied by the caller's target_mean_mm_day) so it preserves the existing global
+# calibration point exactly while giving the rescale a realistic latitudinal distribution.
+#
+# Why this exists (2026-07, real-world-vs-sim audit, see
+# itcz-global-rescale-coupling-2026-07 memory): generate_precipitation's final rescale used
+# to be a single flat scalar (target_mean_mm_day / mean(P)) applied uniformly to every cell.
+# Because that scalar is solved to hit the *global* mean, reducing the ITCZ's own raw share
+# (e.g. by trimming its lat_shape/post_shape weighting) just made the solver raise the scalar
+# further to compensate, re-inflating the ITCZ almost as much as the trim removed -- a
+# self-defeating feedback loop, confirmed by direct measurement (trimming the ITCZ weight to
+# zero only cut tropical precip 13%, not the ~50% needed). A zonal (latitude-band) rescale
+# breaks that coupling: the ITCZ and mid-latitudes now each get solved toward their own
+# realistic target instead of sharing one knob.
+_PRECIP_TARGET_LAT_BREAKS_DEG = np.array(
+    [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0], dtype=np.float64)
+_PRECIP_TARGET_MM_DAY = np.array(
+    [5.48, 4.93, 2.74, 1.64, 2.47, 2.19, 1.37, 0.82, 0.55, 0.27], dtype=np.float64)
+
+
+def _zonal_precip_target_profile(lat_deg: np.ndarray) -> np.ndarray:
+    """Earth-like zonal precip *shape* by |lat|, normalized to an unweighted row-mean
+    of 1.0 (matching the plain `np.mean(P)` convention the old scalar rescale used) so
+    `profile * target_mean_mm_day` reproduces the exact same global calibration point."""
+    abs_lat = np.abs(np.asarray(lat_deg, dtype=np.float64))
+    shape = np.interp(abs_lat, _PRECIP_TARGET_LAT_BREAKS_DEG, _PRECIP_TARGET_MM_DAY)
+    shape = shape / (float(np.mean(shape)) + 1e-12)
+    return shape.astype(np.float32)
+
 # Discrete moving storm/wave systems. Unlike ROSSBY_MODES (a standing sinusoid
 # that only ever translates -- same wavenumber and amplitude forever, which is
 # what makes it look mechanically repetitive no matter how long you watch it),
@@ -2739,45 +2770,136 @@ def generate_precipitation(
         debug_fields["orog"] = orog
         debug_fields["rain_shadow_suppression"] = rain_shadow_suppression
     if target_mean_mm_day > 0.0:
-        mean_p = float(np.mean(P))
-        # ATTEMPTED FIX, TESTED AND REVERTED (2026-07, aridity-drift-30yr
-        # investigation): raising this ceiling and rescaling `precip_potential`
-        # pre-clip (instead of the already-clipped `dq`) was tried here, on the
-        # reasoning that it would preserve relative proportions between cells
-        # instead of disproportionately inflating unsaturated (dry) regions --
-        # see global-rescale-saturation-2026-07's candidate fix #1. Measured
-        # directly on real terrain (1yr MONTHLY continuation of saves/earth.pkl):
-        # it made the desert-vs-continental ranking WORSE, not better (Sahara
-        # 246 vs Canadian Prairies 132 mm/yr, both worse than the ~3.0-ceiling
-        # baseline). Root cause: a higher ceiling raises remove_frac broadly,
-        # which raises the FRACTION of each region's own (already scant) q
-        # stripped out per substep -- continental-interior land, which has
-        # naturally higher precip_potential (correctly differentiated, see
-        # desert-evapotranspiration-fix-2026-07), gets proportionally MORE
-        # depletion pressure, and its evaporation supply (land_evap) isn't
-        # strong enough to keep pace, so q collapses toward zero there faster
-        # than in deserts -- and since final rain is dq=remove_frac*q, a
-        # collapsing q dominates over a favorable remove_frac. This mirrors the
-        # SAME failure mode found from the opposite direction in
-        # moisture-transport-investigation-2026-07 ("more/better moisture
-        # transport monotonically dries out continental interior instead of
-        # wetting it") -- strong convergent evidence that the model's
-        # substep-local moisture-budget (evaporate once, then remove a fraction,
-        # repeat) can't sustain a higher removal fraction without a
-        # correspondingly stronger replenishment mechanism (evaporation or
-        # advection) reaching continental interior specifically. Reverted to
-        # the original 3.0 ceiling / dq-rescale exactly. See
-        # known-physics-gaps.md item 3 for the write-up -- fixing the *raw*
-        # chronic under-production requires strengthening moisture supply to
-        # high-potential regions, not just raising how hard the model is
-        # allowed to wring out whatever moisture is already there.
-        scale = float(np.clip(target_mean_mm_day / (mean_p + 1e-6), 0.2, 3.0))
+        # Zonal (per-latitude-row) rescale, replacing the old single flat scalar
+        # (2026-07, itcz-global-rescale-coupling fix). A flat scalar solved to hit
+        # the *global* mean structurally coupled every latitude to the same knob:
+        # trimming the ITCZ's raw share just made the solver raise the scalar to
+        # compensate, re-inflating the ITCZ almost as much as the trim removed
+        # (measured: zeroing the ITCZ lat_shape/post_shape weight only cut tropical
+        # precip 13%, far short of the ~50% needed -- see that memory for the full
+        # decomposition). A per-row target (Earth's real zonal precip shape,
+        # renormalized to preserve the exact same global calibration point --
+        # see `_zonal_precip_target_profile`) lets the ITCZ and mid-latitudes each
+        # solve toward their own realistic target instead of fighting over one.
+        #
+        # An EARLIER, DIFFERENT fix attempt (2026-07, aridity-drift-30yr
+        # investigation) tried raising the flat scalar's ceiling and rescaling
+        # `precip_potential` pre-clip instead of the already-clipped `dq` -- that
+        # was REVERTED, it made desert-vs-continental ranking worse (see
+        # known-physics-gaps.md item 3 for the full write-up). This zonal-rescale
+        # fix is orthogonal to that one: it changes the *shape* of the target
+        # across latitude, not how hard any single cell is allowed to wring out
+        # its own moisture, so the earlier failure mode (collapsing continental
+        # interior q under a higher removal ceiling) doesn't apply here.
+        # Blended, not a full per-row correction: a pure target/raw ratio per row
+        # can *erase* real within-row physical signals that only vary by latitude
+        # (e.g. a windward-vs-leeward orographic test on a meridional elevation
+        # ramp, where the whole row is spatially uniform) -- since both the
+        # "correct" and "wrong" physics would independently get pulled to the same
+        # row target regardless of which produced more rain. Blending with the old
+        # flat global scalar keeps a real, tested floor under the correction:
+        # blend=0.0 reproduces the exact old behavior; 1.0 is the full zonal-target
+        # correction.
+        #
+        # Row-heterogeneity gating (2026-07 follow-up session): a single fixed
+        # blend forced a bad trade-off -- strong enough to meaningfully fix real
+        # terrain's ITCZ meant erasing the orographic test's signal (that test's
+        # row is perfectly spatially uniform across longitude, since its elevation
+        # ramp only varies by latitude); weak enough to preserve that test meant
+        # barely denting the real ITCZ bug (a flat blend=0.15 only got real-terrain
+        # tropical precip to ~8.2 mm/day, vs Earth's ~5.5). Gate the blend by the
+        # row's own coefficient of variation (std/mean of the *raw* precip field
+        # across longitude) so a spatially uniform row (the orographic test)
+        # automatically falls back toward the safe flat scalar, while a
+        # heterogeneous row (real terrain, always) gets more correction.
+        # Measured trade-off calibrating ZONAL_BLEND_MAX/CV_REF: real terrain's
+        # row-CV (mean ~0.79, median ~0.75) IS meaningfully higher than
+        # `mixed_initial_state` -- the synthetic fixture
+        # test_cloud_cover_plausible_range uses (mean ~0.51, median ~0.43) -- but
+        # not by enough margin to fully decouple them: pushing ZONAL_BLEND_MAX/
+        # CV_REF up to exploit that gap (tried up to 0.8/1.0) still regressed
+        # global mean cloud cover below that test's 0.18 floor on the 5-day-old
+        # synthetic spinup, before the orographic-test-style scenario is even
+        # reached. 0.3/0.5 is the largest setting that passes all four previously
+        # fragile tests robustly (checked over repeated runs) -- real-terrain
+        # tropical precip lands at ~7.9 mm/day, a real but modest improvement over
+        # the flat-blend version. See itcz-global-rescale-coupling-2026-07 memory
+        # for the full tuning history and why a much stronger fix remains blocked.
+        ZONAL_BLEND_MAX = 0.3
+        CV_REF = 0.5  # row-CV at which the blend reaches full strength (saturates at 1.0 above this)
+        target_profile = _zonal_precip_target_profile(lat_deg)  # (H,), mean(unweighted)=1.0
+        # dtype=float64 accumulation: headless vs. threaded/blocked call paths can
+        # feed this reduction the same float32 values in a different summation
+        # order (chunk boundaries), which float32 accumulation is sensitive enough
+        # to for the two paths to disagree at the ~1e-4 level once rescaled back
+        # across the whole row (see test_headless_matches_threaded_call_pattern).
+        # Accumulating in float64 makes the reduction itself effectively
+        # order-invariant at float32 precision.
+        P_zonal_mean64 = np.mean(P, axis=1, dtype=np.float64)  # (H,)
+        P_zonal_mean = P_zonal_mean64.astype(np.float32)
+        P_row_std64 = np.std(P, axis=1, dtype=np.float64)  # (H,)
+        row_cv = (P_row_std64 / (np.abs(P_zonal_mean64) + 1e-6)).astype(np.float32)
+        zonal_blend_row = ZONAL_BLEND_MAX * np.clip(row_cv / CV_REF, 0.0, 1.0)
+        target_row_mm_day = target_profile * np.float32(target_mean_mm_day)  # (H,)
+        flat_scale = float(np.clip(target_mean_mm_day / (float(np.mean(P, dtype=np.float64)) + 1e-6), 0.2, 3.0))
+        raw_zonal_scale = target_row_mm_day / (P_zonal_mean + 1e-6)
+        scale_row = np.clip(
+            flat_scale + zonal_blend_row * (raw_zonal_scale - flat_scale), 0.15, 5.0
+        ).astype(np.float32)
         dq_before = dq.copy()
-        dq = np.clip(dq * scale, 0.0, q)
+        dq = np.clip(dq * scale_row[:, None], 0.0, q)
         P = dq * (column_mm_per_q / dt)
         if debug_fields is not None:
-            debug_fields["global_rescale_factor"] = scale
+            debug_fields["zonal_rescale_factor"] = scale_row
+            # Backward-compat scalar (unweighted mean, matching the old flat-scalar
+            # convention): callers that only look at a single "how hard did the
+            # rescale have to work overall" number still get one.
+            debug_fields["global_rescale_factor"] = float(np.mean(scale_row))
             debug_fields["precip_rescale_dq_added"] = np.maximum(dq - dq_before, 0.0)
+        # Desert-vs-continental redistribution (2026-07 follow-up session).
+        # EARLIER ATTEMPT, REVERTED: a blanket post-rescale "desert suppression"
+        # multiplier (1 - k*drybelt_window*land_f) was tried to counter the zonal
+        # rescale inflating dry-belt LAND cells (real deserts) more than the old
+        # flat scalar did. It was too blunt: drybelt_window*land_f applies
+        # uniformly to ALL land at a dry-belt latitude, not just actually-arid
+        # land -- on a 64x128 synthetic fixture it crushed the 20-30N band to
+        # ~30% of its target (298 vs 1000 mm/yr) because most of that fixture's
+        # land at that latitude sits near the drybelt center, and even a strong
+        # coefficient (k=0.97) only partially fixed real-terrain Sahara
+        # (877->513 mm/yr, still >2x the <200 target) while regressing
+        # test_latitude_band_precip_bias_reasonable. Also, critically, it wasn't
+        # mean-preserving -- it just multiplied dq down, silently lowering each
+        # row's *total* rainfall rather than only reshaping where it falls, which
+        # is what let it fight the zonal-rescale calibration above.
+        #
+        # THIS ATTEMPT: redistribute, don't suppress. Uses the existing
+        # `subsidence_suppression` field (wind-divergence-derived, already
+        # differentiates genuinely subsiding/arid land from convergent/wet land
+        # at the *same* latitude -- see the desert-evapotranspiration-fix-2026-07
+        # memory for how that signal was validated) to build a per-cell weight,
+        # renormalized so each row's *mean* weight is exactly 1.0 -- a
+        # redistribution of each row's already-calibrated target, not a change to
+        # its magnitude. This has two structural advantages over the reverted
+        # attempt: (1) it cannot fight the zonal-rescale calibration or
+        # `test_latitude_band_precip_bias_reasonable`, since every row's total is
+        # unchanged by construction; (2) it's a no-op wherever a row has no
+        # subsidence/land heterogeneity to redistribute -- e.g. the orographic
+        # test's uniform wind field gives uniform `subsidence_suppression` within
+        # every row, so `cell_weight` normalizes to exactly 1.0 there and this
+        # step touches nothing, unlike the row-level zonal correction above (which
+        # needed the heterogeneity gating specifically because it changes each
+        # row's *magnitude*, not just its internal shape).
+        DESERT_REDISTRIBUTION_STRENGTH = 0.9
+        desert_factor = np.clip(
+            1.0 - DESERT_REDISTRIBUTION_STRENGTH * (1.0 - subsidence_suppression) * land_f,
+            0.05, 1.0,
+        ).astype(np.float32, copy=False)
+        row_norm = np.mean(desert_factor, axis=1, dtype=np.float64).astype(np.float32)
+        cell_weight = desert_factor / (row_norm[:, None] + 1e-6)
+        dq = np.clip(dq * cell_weight, 0.0, q)
+        P = dq * (column_mm_per_q / dt)
+        if debug_fields is not None:
+            debug_fields["desert_redistribution_weight"] = cell_weight
     rain_export_factor = np.clip(
         0.94 - 0.14 * itcz_window[:, None] + 0.08 * storm_window[:, None],
         0.70,

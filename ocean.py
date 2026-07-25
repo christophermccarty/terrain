@@ -678,8 +678,18 @@ def evolve_salinity(
     sal = salinity.copy()
 
     # Evaporation: raises salinity where T > 270 K (open water, not frozen)
+    # Coefficient recalibrated 2026-07 (was 0.002): the old value produced a
+    # mean ocean evap_rate ~11x the mean precip_dilution term below (measured on
+    # saves/earth.pkl real terrain: 0.0347 vs 0.0031 PSU/day), so E-P never
+    # balanced even approximately -- salinity climbed toward the module's own
+    # 45 PSU hard clip (measured 42.85 PSU after 42.7 simulated years) instead of
+    # stabilizing near Earth's ~35 PSU. 0.00018 sets the ocean-mean evap_rate
+    # roughly equal to the ocean-mean precip_dilution on that same real-terrain
+    # state, so E and P balance on average (as they must in a closed system with
+    # no net freshwater source) while preserving the existing warm/dry vs.
+    # cold/wet directional response test_salinity_ep_balance checks.
     T_above_freeze = np.clip(T_sst - 270.0, 0.0, None).astype(np.float32, copy=False)
-    evap_rate = 0.002 * T_above_freeze  # PSU/day per degree above freeze
+    evap_rate = 0.00018 * T_above_freeze  # PSU/day per degree above freeze
 
     # Precipitation: dilutes salinity (P in mm/day → scale 0.001 to PSU/day units)
     if precipitation is not None:

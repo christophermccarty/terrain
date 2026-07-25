@@ -1,6 +1,8 @@
 /temp
 /.venv
 /__pycache__
+/testing/__pycache__/
+/testing/results/
 /testing/results/**/*.json
 settings.json
 /saves/**
