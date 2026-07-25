@@ -5,8 +5,19 @@
 /testing/results/
 /testing/results/**/*.json
 settings.json
+
+# Simulation save states -- NEVER commit these.
+# They are machine-local derived artifacts (a single earth.pkl is ~100 MB and
+# grows as PlanetState gains fields), and every commit that touches one adds
+# another ~100 MB to repo history permanently. saves/earth.pkl was force-added
+# past these rules once before and reached 102 MiB, which exceeds GitHub's hard
+# 100 MiB per-file limit and made the repo unpushable (2026-07-25).
+# If you need to share a save, put it somewhere other than git.
+# Do NOT `git add -f` anything under saves/.
+/saves/
 /saves/**
+*.pkl
+
 *.pyc
-*.pkl
 /overnight/
 /_planetsim_wt_blend/
