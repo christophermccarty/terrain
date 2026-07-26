@@ -106,7 +106,7 @@
 
 ---
 
-> Created 2026-07-25, after the `aa4b127` coupling regression was fixed.
+> Created 2026-07-25, after the `d8631cb` coupling regression was fixed.
 > Both are physics changes that were deliberately kept out of the regression-repair
 > commit so each can be evaluated on its own. Evidence for both was gathered
 > post-fix; see `overnight/FINDINGS.md`.

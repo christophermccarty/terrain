@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 
 # NOT slow-marked (2026-07-25) -- see the matching note in test_earth_benchmark.py.
 # These polar/cryosphere gates are exactly the checks that should run on every
-# commit: they are the ones that caught aa4b127's air-surface coupling regression,
+# commit: they are the ones that caught d8631cb's air-surface coupling regression,
 # and they only ran at all because a full-suite sweep happened to include them.
 # Shares the same session-scoped fixture as test_earth_benchmark.py (~13s for both
 # files combined).

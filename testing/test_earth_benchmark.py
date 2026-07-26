@@ -133,9 +133,9 @@ def test_latitude_band_temperature_bias_reasonable(earth_spinup_state):
     # a large, verified continental-interior precipitation realism gain (US Midwest
     # box: 95->227 mm/yr on real terrain), not an unexamined regression.
     # Threshold 10.5->11.5°C (2026-07-25): raised only after attributing every
-    # 0.1°C of the increase to a specific, deliberate correction in aa4b127 --
+    # 0.1°C of the increase to a specific, deliberate correction in d8631cb --
     # not as a blanket accommodation. Measured on this fixture:
-    #   8f1703c (pre-aa4b127):            mean 10.10, max 39.70
+    #   b76078a (pre-d8631cb):            mean 10.10, max 39.70
     #   HEAD with old ocean.py restored:  mean 10.30, max 39.70
     #   HEAD (current):                   mean 10.80, max 40.20
     # The +0.50°C step is ocean.py's two heat-transport corrections: (a) the

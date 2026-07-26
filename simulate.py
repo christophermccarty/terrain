@@ -2308,7 +2308,7 @@ def _evolve_temperature(
     # Over land: ~2-day time constant (land surface heats/cools overlying air quickly).
     # Fraction capped at 0.5 so relaxation is stable for any dt (no overshoot).
     #
-    # RESTORED 2026-07-25 after this block's removal in aa4b127 was measured to be
+    # RESTORED 2026-07-25 after this block's removal in d8631cb was measured to be
     # a regression: without it the air column decouples from the surface and NH
     # polar air runs ~25 degC too warm on the standard 64x128 spinup fixture
     # (measured +25.4 degC vs +0.5 degC with this block restored). The
@@ -2639,7 +2639,7 @@ def _evolve_temperature(
     # --- Equal-and-opposite air–surface sensible heat exchange (OCEAN ONLY) ---
     # The land branch of `k_couple` was 0.25 until 2026-07-25. Combined with
     # H_surf=0.35 that relaxed the *land surface* toward the air at ~0.71/day --
-    # a coupling direction that did not exist before aa4b127 (the pre-aa4b127
+    # a coupling direction that did not exist before d8631cb (the pre-d8631cb
     # term was `np.where(sea_mask, ..., 0.0)`, i.e. ocean-only by construction).
     # Measured effect of the land branch on the standard 64x128 spinup fixture:
     #   land 0.25 -> global mean 292.6 K, equator-pole gradient 18.3 K, ice 0.022
