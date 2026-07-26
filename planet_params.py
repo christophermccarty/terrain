@@ -297,7 +297,8 @@ class PlanetParams:
     already too wet in the zonal mean even though its *land* is too dry. The
     six-box metric alone is not trustworthy for tuning -- it is dominated by US
     Midwest still being ~330mm short, so it rewards more shift indefinitely.
-    Revisit once the 40-50N land/ocean partition is addressed.
+    **Resolved 2026-07-26**: see `ferrel_v_land_shift_deg` below, which decouples
+    land from ocean instead of moving this shared centre further.
 
     Decoupled from `u_surface`'s mid-latitude centre (fixed at 48 deg, which sets
     the surface westerly/jet latitude) on 2026-07-25. Before that both used the
@@ -311,8 +312,93 @@ class PlanetParams:
     zonal-mean, so local fixes cannot work). The analytic crossing moves ~1:1
     with this value: 48->46.4, 44->42.6, 42->40.7, 40->38.8.
 
-    Default 48.0 reproduces the previous behaviour exactly. See
-    PLAN_PHYSICS_FIXES.md and overnight/FINDINGS.md."""
+    Default is 44.0 as of 2026-07-25 (see above); passing 48.0 reproduces the
+    original pre-fix behaviour exactly. See PLAN_PHYSICS_FIXES.md and
+    overnight/FINDINGS.md.
+
+    **2026-07-26**: `evolve_wind`'s v-relaxation *strength* weight (`a_v_row`)
+    now also uses this centre (via `w_mid_v`), closing the "known residual"
+    left open when this field first shipped -- previously that strength weight
+    stayed jet-centred (48 deg) even after the *target* it relaxes toward moved
+    to this field's centre, so the two peaked at different latitudes in
+    DAILY/WEEKLY mode. Bit-identical whenever this value equals 48.0."""
+
+    ferrel_v_land_shift_deg: float = -4.0
+    """Additional equatorward offset [deg] applied to `ferrel_v_centre_deg`
+    *only over land cells*, blended by land fraction so ocean cells keep the
+    unshifted centre. `0.0` is an exact no-op: land and ocean use the same
+    centre, identical to the shared-centre behaviour above.
+
+    **Added 2026-07-26 to address the "40-50N land/ocean partition" ceiling**
+    flagged in `ferrel_v_centre_deg`'s own docstring: that field is a single
+    *zonal-mean* correction applied identically at every longitude in a row
+    (`vc = vc + (v_surface[:, None] - vc_zm) * v_nudge`, an add-the-same-delta-
+    everywhere nudge), so pushing its centre from 44 toward 40 to fix
+    under-wet continental interiors (US Midwest, Canadian Prairies, Central
+    Europe) necessarily pushes the mostly-ocean 40-50N zonal mean the same
+    amount -- which is *already* a good fit to ERA5/CRU, so it gets over-wet.
+    There was no way to fix the land without also moving the (already-correct)
+    ocean, because the correction could not tell land and ocean apart.
+
+    This field lets it: `w_mid_v`'s centre becomes
+    `ferrel_v_centre_deg + ferrel_v_land_shift_deg * land_fraction` instead of
+    a single scalar, using the same land mask (`masks.get_masks`) the rest of
+    the model already derives from `elevation`. A negative value moves the
+    land-only crossing further equatorward (toward Earth's ~40N) while the
+    ocean-heavy zonal mean stays anchored near the reanalysis-validated 44.
+    This is also physically motivated, not just a numerical trick: real
+    continental summer thermal lows (the Asian and North American monsoon
+    troughs being the strongest examples) pull the moisture-convergence
+    latitude further poleward over land than the oceanic Ferrel cell sits at
+    over the open ocean at the same latitude -- exactly the asymmetry a
+    single shared centre cannot represent.
+
+    Applied identically in `generate_wind_field` (MONTHLY/ANNUAL) and
+    `evolve_wind` (DAILY/WEEKLY) so every time-scale still agrees on where the
+    dry belt sits, the same invariant `ferrel_v_centre_deg` itself maintains.
+
+    **Calibrated to -4.0 on 2026-07-26** via a 10yr real-terrain sweep on
+    `saves/earth.pkl` (ferrel_v_centre_deg pinned at 44). All six boxes
+    improve or hold vs. the shift=0 baseline, while the ERA5/CRU zonal-band
+    fit costs under 1pp (vs. 6-7pp for the old uniform 44->40 shift this
+    field replaces):
+
+    | shift | Sahara | Kalahari | Atacama | Can.Prairies | US Midwest | Cent.Europe | zonal fit err |
+    |---|---|---|---|---|---|---|---|
+    | 0 | 303 | 279 | 154 | 478 | 414 | 496 | 56.7% |
+    | **-4** | **211** | **166** | 142 | 451 | **602** | 504 | 57.3% |
+    | -8 | 161 | 119 | 136 | 445 | 782 | 499 | 57.5% |
+    | -12 | 159 | 137 | 143 | 388 | 913 | 466 | 57.0% |
+    | -16 | 267 (^) | 283 (^) | 166 | 344 | 918 | 418 | 55.6%* |
+    | Earth | <200 | <200 | <50 | 400-500 | 800-1000 | ~650 | -- |
+
+    -4 was chosen over the box/zonal-fit-preferred -8 (and -12, which lands US
+    Midwest almost exactly in its target range) after a *separate* 60yr
+    MONTHLY spinup on the synthetic `mixed_elev` test fixture
+    (`testing/test_climate_drift.py::test_nh_midlat_soil_moisture_not_floored`,
+    a regression guard for the soil-moisture desiccation-spiral bug) surfaced
+    a real risk the six real-terrain boxes never sampled: 45-65N land soil
+    moisture (none of the six boxes reach north of 55N) declined monotonically
+    and substantially with shift magnitude -- 0.302 (shift=0) -> 0.157 (-4,
+    barely above the test's 0.15 line) -> 0.110 (-8, below it, approaching the
+    hard 0.05 floor that triggers the spiral). Real terrain couldn't confirm
+    or rule out the same tendency: `saves/earth.pkl`'s own 45-65N band is
+    *already* pinned at the 0.05 floor at every tested shift including 0.0,
+    for a separate, pre-existing reason unrelated to this field, which
+    saturates the signal. Given the uncertainty, -4 was chosen as the largest
+    shift with real margin above that guard's threshold on the one fixture
+    that could show the effect at all -- user-confirmed choice (shown this
+    exact table plus the soil-moisture numbers) over -8 and over leaving this
+    gated at 0.0. -16 is worse than the table looks even ignoring the soil
+    -moisture finding: its zonal-band fit *improves*, but Sahara and Kalahari
+    both reverse direction there (the land-centre Gaussian window has drifted
+    far enough to start overlapping the trade-wind window), so that number
+    isn't trustworthy -- a reminder that no single metric here is sufficient,
+    the same lesson `ferrel_v_centre_deg`'s own docstring already draws.
+    Atacama remains far off target regardless of this field -- a separate,
+    known gap (coastal fog/cold-current desert mechanism, not modelled).
+    See PLAN_PHYSICS_FIXES.md for the fuller sweep log, including the -8
+    numbers this field was calibrated away from and why."""
 
     spherical_metric_precip: bool = False
     """Use the true spherical metric in the moisture-flux convergence driver.

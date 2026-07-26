@@ -1,6 +1,149 @@
 # Plans: A9 spherical metric, and the US Midwest divergence bug
 
 ---
+## EXECUTION LOG (2026-07-26) — the 40-50N land/ocean partition ceiling
+
+Direct follow-up to the "Still open" note at the bottom of the 2026-07-25 Plan 1 section
+below: `ferrel_v_centre_deg` couldn't be pushed from 44 toward 40 (which scores better on
+the six named boxes) because 42/40 degrade the independent ERA5/CRU zonal-band fit by
+over-wetting the mostly-ocean 40-50N band, which is already a good fit. Flagged there as
+"a genuinely open research question, not a concrete fix."
+
+**Root cause, confirmed by reading the code, not assumed:** both `generate_wind_field`'s
+`v_surface` nudge and `evolve_wind`'s `v_target` relaxation add the *same* per-latitude
+correction to every longitude in a row (`vc = vc + (v_surface[:, None] - vc_zm) * v_nudge`).
+There was no way for a centre-latitude shift to move only the land divergence without
+moving the ocean's by the identical amount — the correction literally cannot distinguish
+land from ocean at the same latitude.
+
+**Fix:** new `PlanetParams.ferrel_v_land_shift_deg` (default was `0.0` during development,
+shipped at `-8.0`). Blends `w_mid_v`'s centre between `ferrel_v_centre_deg` (ocean) and
+`ferrel_v_centre_deg + ferrel_v_land_shift_deg` (land) by land fraction (`masks.get_masks`),
+in both `generate_wind_field` and `evolve_wind` so DAILY/WEEKLY and MONTHLY/ANNUAL still
+agree on where the dry belt sits. `0.0` is an exact no-op (verified via a
+`getattr`-fallback-missing-field proxy test, not just an explicit-0.0 comparison — a
+plain full-pipeline row-uniformity check turned out NOT to be a valid no-op test, since
+terrain blocking/channeling and, in `evolve_wind`, advection/friction couple through
+elevation and make even a genuinely latitude-only correction look longitude-varying in
+the final output; see `testing/test_ferrel_land_shift.py`'s module docstring).
+
+**10yr real-terrain sweep** (`saves/earth.pkl`, `ferrel_v_centre_deg` pinned at 44,
+instantaneous 2nd-half-of-run precip; zonal-band fit = mean relative error across the 6
+`ERA5_CRU_REFERENCE` bands in `testing/test_reanalysis_validation.py`, land+ocean):
+
+| shift | Sahara | Kalahari | Atacama | Can.Prairies | US Midwest | Cent.Europe | zonal fit err |
+|---|---|---|---|---|---|---|---|
+| 0 (baseline) | 303 | 279 | 154 | 478 | 414 | 496 | 56.7% |
+| -4 | 211 | 166 | 142 | 451 | 602 | 504 | 57.3% |
+| **-8** | **161** | **119** | 136 | 445 | **782** | 499 | 57.5% |
+| -12 | 159 | 137 | 143 | 388 | 913 | 466 | 57.0% |
+| -16 | 267 ↑ | 283 ↑ | 166 | 344 | 918 | 418 | 55.6%* |
+| Earth target | <200 | <200 | <50 | 400-500 | 800-1000 | ~650 | — |
+
+Unlike the old uniform `ferrel_v_centre_deg` 44→40 shift (which cost +6-7pp on the zonal
+fit for a similar US Midwest gain — see the "Why 44 and not 40" note in the 2026-07-25
+section below), the land-only version costs under 1pp at -8 or -12, because the
+ocean-heavy 40-50N zonal mean barely moves. This confirms the land/ocean split is the
+actual resolution to the ceiling, not just a different tuning of the same lever.
+
+**-16 is a trap, not a win**: its zonal-fit number is the best of the sweep (55.6%), but
+Sahara and Kalahari both *reverse* direction there (worse than baseline) — the land-centre
+Gaussian window has drifted far enough to start overlapping the trade-wind window at 14°.
+Confirms this project's own repeated lesson (see `ferrel_v_centre_deg`'s "44 not 40"
+reasoning) that neither the box metric nor the zonal-fit metric is trustworthy alone.
+
+**First decision: shipped at -8.0** (later revised to -4.0, see below), chosen over -12.0
+(which lands US Midwest almost exactly in its 800-1000 target range, at the cost of
+Canadian Prairies dropping just under its lower bound and Central Europe drifting further
+from target) and over leaving the field gated at 0.0. User was shown this exact table and
+chose -8 (2026-07-26) — same "show the trade-off, let the user decide" process the
+44-vs-40 `ferrel_v_centre_deg` decision went through.
+
+Atacama stays far off target (136-166 vs <50) regardless of this field at any tested value
+— a separate, known, unaddressed gap (the model has no coastal-fog/cold-current desert
+mechanism).
+
+New tests: `testing/test_ferrel_land_shift.py`, 4 tests (2 no-op via the getattr-fallback
+proxy, 2 confirming land/ocean divergence at nonzero shift), all passing. Golden-state
+fixture regenerated (`testing/fixtures/golden_state_reference.pkl`) since `EARTH`'s default
+changed.
+
+**Three fast-suite tests broke on the first post-regen run**, all traced by direct
+reproduction (not assumed) to the same real, deliberate, bounded mechanism — none were a
+numerical blow-up (`max|u|`/`max|v|` stayed in normal range in every repro):
+
+- `test_itcz_precip_near_equator`: the 64x128 synthetic `mixed_elev` fixture's zonal-mean
+  precip peak jumped from the equator to 46.4S. Direct repro at shift=0.0 (i.e. the
+  pre-existing, unmodified code) showed this fixture's SH mid-lat band was **already**
+  within 5% of the ITCZ's magnitude (7.27 vs 7.60 mm/day) before this field existed at
+  all — a pre-existing near-tie this small, arbitrary land pattern happened to sit at,
+  not something this change created. The real, intended effect (intensifying continental
+  mid-lat convergence) tipped the raw argmax; the ITCZ's own strength barely moved
+  (7.60 -> 7.37, ~3%). Rewrote the test to fall back to comparing the equatorial band's
+  own peak against the global peak (85% threshold) instead of failing outright whenever
+  the argmax sits elsewhere — still catches a genuine ITCZ collapse, tolerates a
+  comparably-strong competing band. (First attempt at this fix compared a band *mean*
+  against a single-row peak, which fails unconditionally since a mean is always lower
+  than a peak regardless of any real effect — caught by rerunning, fixed to compare peak
+  vs peak.)
+- `test_latitude_band_precip_bias_reasonable`: max_bias 1285 -> 1525 mm/yr on the same
+  fixture, breaching the 1400 threshold. Same mechanism, proportionate move within an
+  already-loose bound. Widened to 1600.
+- `test_retrograde_trade_wind_magnitude`: retrograde/prograde ratio 0.313 -> 0.273,
+  breaching 0.3. This test is unrelated to Earth land geography (rotation-direction
+  generalization, uses `PlanetParams(rotation_direction=...)` directly, which now inherits
+  the new default) and was **already at a ~4% margin above its own threshold** before this
+  session touched anything — confirmed by direct repro at shift=0.0. Widened 0.3 -> 0.25.
+
+All three fixes documented in-place with the measured before/after numbers and the repro
+methodology, not just the new bound — following this project's own stated preference
+(see the `ferrel_v_centre_deg` docstring's "fourth widening -- be sceptical" note) for
+treating repeated synthetic-fixture threshold widenings with suspicion; the repro step
+here is what distinguishes "real regression" from "pre-existing fragile margin exposed by
+a validated change," and all three came back as the latter.
+
+Full fast suite after fixes: **292 passed, 0 failed, 11 xfailed, 2 xpassed** (1011s).
+
+**A fourth failure in the slow suite was NOT the same class of finding, and changed the
+final decision.** `test_climate_drift.py::test_nh_midlat_soil_moisture_not_floored` (a
+regression guard for the soil-moisture desiccation-spiral bug: floored soil moisture
+throttles land evaporation, starving humidity/precip in a self-reinforcing loop) failed
+on the 60yr MONTHLY `earth_long_spinup_state` fixture. Direct repro showed this one is
+NOT a pre-existing marginal test tipped by a real effect — the baseline was comfortable
+(0.302, 2x the 0.15 threshold) and declined *monotonically and substantially* with shift
+magnitude: 0.302 (shift=0) -> 0.157 (-4, barely above 0.15) -> 0.110 (-8, below it,
+approaching the hard 0.05 floor). None of the six real-terrain boxes sample north of 55N,
+so this risk was invisible to the sweep the -8 decision was based on. Cross-checked
+against real terrain (`saves/earth.pkl`, 10yr): inconclusive — that state's 45-65N band is
+**already pinned at the 0.05 floor at every tested shift including 0.0**, a separate,
+pre-existing issue unrelated to this field that saturates the signal and hides whatever
+this mechanism would otherwise show there.
+
+**Revised decision: shipped at -4.0**, shown this new table plus the soil-moisture numbers
+directly. -4 is the largest shift with real margin above the desiccation-spiral guard on
+the one fixture that can show the effect at all; -8 and -12's box/zonal-fit advantages
+weren't worth the unresolved risk that the six-box sweep couldn't see. `planet_params.py`,
+golden-state fixture, and the `ferrel_v_land_shift_deg` docstring's calibration table all
+updated to -4.0 accordingly (the -8 numbers stay in the docstring as the value this field
+was calibrated away from, and why).
+
+Full suite at -4.0, both regenerating the golden state and re-running everything: fast
+suite **292 passed, 0 failed** (998s); slow suite **56 passed, 0 failed** (813s, includes
+the soil-moisture guard that motivated this revision).
+
+**Residual, not addressed this session**: `simulate.py`'s `_diag_wind_cached` (`_RELAX_CACHE`)
+cache key includes `pgf_continentality_amp` but neither `ferrel_v_centre_deg` nor
+`ferrel_v_land_shift_deg` — the same missing-cache-key bug class
+`us-midwest-wind-convergence-investigation-2026-07` already found and fixed once for a
+different field. Checked whether it invalidated this session's own sweep measurements
+(sequential full runs, each starting fresh at a day count the previous run's cache entry
+had long since passed) — it does not, cache misses happen naturally between runs. But it
+remains a real latent bug for any future scenario that interleaves different
+`PlanetParams` at the same `(day, jet_index, ...)` combination within one process (e.g. a
+test session running many fresh-state fixtures back to back). Worth a scoped fix later;
+out of scope here.
+
+---
 ## EXECUTION LOG (2026-07-25)
 
 ### Plan 2 (A9) — Phases 1–4 complete; **gate shipped OFF by default**
@@ -34,10 +177,39 @@
   rescale factor **3.67 → 4.06**.
 
 - **Decision: default stays False.** The operator is correct physics and is now implemented and
-  analytically tested — that is the deliverable. Enabling it requires exactly the recalibration
-  this plan anticipated (`u_scale`/`v_scale`, `target_mean_mm_day`), which is its own piece of
-  work and should not be bundled here. **Follow-up**: recalibrate with the metric on, then
-  re-evaluate the default.
+  analytically tested — that is the deliverable.
+
+- **Follow-up (2026-07-26) — the anticipated recalibration turned out not to be available.**
+  Re-measured fresh on the current state (post-Ferrel-fix `saves/earth.pkl`, 10yr, matched
+  conditions) to rule out the old A9 numbers being stale: `global_rescale_factor` 3.75→4.10,
+  tropical precip 9.53→8.23 mm/day, high-lat (|lat|≥40) precipitation share 24.0%→25.9%. Same
+  shape and magnitude as the original measurement — the Ferrel change doesn't interact with this.
+
+  **`u_scale`/`v_scale` recalibration, as this plan originally speculated, is not the lever.**
+  `conv` is renormalized to `mean=1` in *both* branches
+  (`conv = conv / (np.mean(conv) + 1e-6)`) before it ever reaches `conv_driver`, which makes the
+  whole computation scale-invariant: no flat gain applied anywhere upstream can survive that
+  division. The cost is a **shape effect, not an amplitude effect** — correct 1/cos(phi)
+  weighting necessarily moves convergence mass from the tropics (where `itcz_window` multiplies
+  `conv_driver` up to 0.34) to high latitudes (where it doesn't), so the same fixed total produces
+  less precipitation once it passes through tropics-favoring weights. That is intrinsic to doing
+  the physics correctly; there is no scalar that removes it without also removing the redistribution.
+
+  **It also compounds an existing, independent, already-deferred problem.** Instrumented
+  `scale_row` (the actual applied per-row rescale multiplier) directly: the flat-scale ceiling
+  (3.0) is already pinned for **263/512 rows (51%) at baseline**, before this gate is even
+  touched — the chronic under-production issue `overnight/FINDINGS.md`'s A1 section and the
+  `global-rescale-saturation-2026-07` memory already identified as needing a redesigned
+  per-cell/aridity-aware target mechanism, not driver-term tuning. Enabling the spherical metric
+  pushes that same saturation to **411/512 rows (80%)**.
+
+  **Revised conclusion: there is no scoped Plan-2 recalibration available.** The only real lever
+  is the rescale-saturation mechanism itself, which is a bigger, independent, already-flagged
+  structural problem — fixing it is a prerequisite for this gate to have headroom, not a
+  follow-up task within this plan. Default stays False for that reason, not merely "not yet
+  recalibrated". Revisit together with the rescale-saturation fix if that work is ever taken up;
+  do not attempt a standalone `u_scale`/`v_scale` or `target_mean_mm_day` tweak for this gate in
+  isolation, it was checked and doesn't apply.
 
 ### Plan 1 (US Midwest) — Phases 1–2 complete, crux resolved
 - **Phase 1 done — partial confirmation.** The analytic `v_surface` divergence reproduces the
@@ -96,13 +268,27 @@
   tropical precipitation 9.57 → 9.50 mm/day, gradient_nh 34.0 → 33.9 K, NH sea ice 0.090 at
   every setting. Only cost: rescale factor 3.67 → 3.82 (+4%).
 
-- **Not flipped.** The default remains 48.0. Changing it materially alters the precipitation
-  field, so it needs golden-state regeneration and an explicit decision — not something to do
-  unilaterally at the end of a session. Everything needed to make that call is above.
-- **Scope note**: the split currently applies only to `generate_wind_field` (the diagnostic wind
-  used in MONTHLY/ANNUAL). `evolve_wind`'s own 3-cell relaxation has a separate `w_mid` left
-  untouched, so DAILY/WEEKLY are unaffected. If the sweep favours a change, that path needs the
-  same treatment for consistency.
+- **Flipped, after one more check the sections above don't mention.** Before committing to a
+  value, the six-box metric above was cross-checked against the independent ERA5/CRU zonal-band
+  fit in `test_reanalysis_validation.py`-style scoring. That check changed the answer: 40 and 42
+  *degrade* the reanalysis fit (64.7%, 67.9% mean relative error, up from baseline) by
+  over-wetting 40–50°N, which is already too wet in the zonal mean even though its *land* is too
+  dry. **44 is the only tested value that improves both metrics at once** (six-box total error
+  742→~700-ish territory *and* reanalysis fit 61.8%→60.2%). Recommended value revised from 40 to
+  **44** on that basis, and shipped: `PlanetParams.ferrel_v_centre_deg` default is now `44.0`
+  (commit `5e2b43f`, 2026-07-25). Golden-state fixture regenerated; `test_earth_benchmark.py` and
+  `test_cloud_feedback.py` thresholds widened accordingly (see their docstrings for the specific
+  before/after numbers and the caveat about the benchmark fixture being a poor absolute proxy for
+  the Southern Ocean band).
+- **Scope note resolved.** `evolve_wind`'s own 3-cell relaxation (~line 1419) now reads the same
+  `ferrel_v_centre_deg`, decoupled from its own jet centre the same way `generate_wind_field` is,
+  so DAILY/WEEKLY and MONTHLY/ANNUAL place the dry belt at the same latitude. Both call sites
+  fall back to `MID_LAT_JET_CENTER_DEG` (48) when the attribute is absent, so old pickled
+  `PlanetParams` remain a no-op.
+- **Resolved 2026-07-26**: the 40–50°N land/ocean partition flagged here as the reason 44
+  can't yet be pushed toward 40 without hurting the reanalysis fit. See the "40-50N
+  land/ocean partition ceiling" section at the top of this file — `ferrel_v_land_shift_deg`
+  decouples land from ocean instead of moving `ferrel_v_centre_deg` itself further.
 
 ---
 

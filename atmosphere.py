@@ -1432,10 +1432,49 @@ def evolve_wind(
                 np.exp(-((abs_deg_1d - _vc_sh) / MID_LAT_JET_WIDTH_DEG) ** 2),
                 0.0,
             ).astype(np.float32, copy=False)
+        # Combined window for the v-relaxation *strength* below (a_v_row), so the
+        # strength weighting peaks at the same latitude as v_target itself rather
+        # than at the jet's centre -- see the a_v_row comment for the mismatch
+        # this closes. Bit-identical to w_mid when ferrel_v_centre_deg == 48.
+        w_mid_v = w_mid_v_nh + w_mid_v_sh
         v_mid = V_TARGET_MIDLAT * (speed_nh * w_mid_v_nh + speed_sh * w_mid_v_sh)
         v_target = (V_TARGET_TRADE * w_trade + v_mid + V_TARGET_POLAR * w_polar).astype(np.float32, copy=False) * sign_lat
         # Remove the equator sign ambiguity (sign(0)=0) so the equator stays calm.
         v_target = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target).astype(np.float32, copy=False)
+        # PlanetParams.ferrel_v_land_shift_deg: blend v_target toward a further
+        # -shifted, land-only centre, mirroring generate_wind_field's identical
+        # mechanism (see that function and the field's own docstring for why:
+        # this zonal-mean nudge applies the same delta at every longitude in a
+        # row, so a shared centre can't fix under-wet continental interiors
+        # without also over-wetting the already-good ocean at the same
+        # latitude). 0.0 (default) skips this entirely -- exact no-op,
+        # bit-identical to the shared-centre v_target above. The a_v_row
+        # relaxation *strength* below deliberately still uses the shared-centre
+        # w_mid_v, not a land-blended version -- the same reviewability
+        # trade-off already accepted for the jet-vs-centre strength mismatch
+        # this file's a_v_row comment documents.
+        _v_land_shift = float(getattr(pp, "ferrel_v_land_shift_deg", 0.0))
+        if _v_land_shift == 0.0:
+            v_target_2d = v_target[:, None]
+        else:
+            _, land_mask_full = get_masks(elevation)
+            land_f_full = land_mask_full.astype(np.float32)
+            _vc_land_nh = _v_centre + _v_land_shift + float(pp.jet_lat_shift_per_index) * float(jet_index_nh)
+            _vc_land_sh = _v_centre + _v_land_shift + float(pp.jet_lat_shift_per_index) * float(jet_index_sh)
+            w_mid_v_land_nh = np.where(
+                sign_lat >= 0.0,
+                np.exp(-((abs_deg_1d - _vc_land_nh) / MID_LAT_JET_WIDTH_DEG) ** 2),
+                0.0,
+            ).astype(np.float32, copy=False)
+            w_mid_v_land_sh = np.where(
+                sign_lat < 0.0,
+                np.exp(-((abs_deg_1d - _vc_land_sh) / MID_LAT_JET_WIDTH_DEG) ** 2),
+                0.0,
+            ).astype(np.float32, copy=False)
+            v_mid_land = V_TARGET_MIDLAT * (speed_nh * w_mid_v_land_nh + speed_sh * w_mid_v_land_sh)
+            v_target_land = (V_TARGET_TRADE * w_trade + v_mid_land + V_TARGET_POLAR * w_polar).astype(np.float32, copy=False) * sign_lat
+            v_target_land = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target_land).astype(np.float32, copy=False)
+            v_target_2d = v_target[:, None] * (1.0 - land_f_full) + v_target_land[:, None] * land_f_full
         k_cell = 1.0 / (tau_cell * 86400.0)
     
     for _ in range(n_steps):
@@ -1502,8 +1541,13 @@ def evolve_wind(
             # Polar (25×): strong constraint prevents unrestricted poleward/equatorward
             # surges that caused extreme SH cooling when v-relaxation was too loose (8×).
             # With tau_cell=3d, a≈0.042: trade → 12.5%, mid-lat → 29%, polar → 65% per sub-step.
-            a_v_row = np.clip(a * (1.0 + 5.0 * w_trade[:, None] + 12.0 * w_mid[:, None] + 3.0 * w_polar[:, None]), 0.0, 0.75).astype(np.float32, copy=False)
-            v_curr = v_curr + (v_target[:, None] - v_zm) * a_v_row
+            # Uses w_mid_v (the v-target's own, decoupled centre), not w_mid (the jet's) --
+            # closes the strength/direction mismatch left open when ferrel_v_centre_deg was
+            # decoupled from the jet centre (see PlanetParams.ferrel_v_centre_deg / the
+            # "known residual" note in midwest-ferrel-and-spherical-metric-2026-07-25 memory).
+            # Bit-identical to the old behaviour whenever ferrel_v_centre_deg == 48.
+            a_v_row = np.clip(a * (1.0 + 5.0 * w_trade[:, None] + 12.0 * w_mid_v[:, None] + 3.0 * w_polar[:, None]), 0.0, 0.75).astype(np.float32, copy=False)
+            v_curr = v_curr + (v_target_2d - v_zm) * a_v_row
         
         # Soft clamp to prevent explosion
         total_v = np.hypot(u_curr, v_curr)
@@ -2012,14 +2056,30 @@ def generate_wind_field(
     _v_centre = float(getattr(pp, "ferrel_v_centre_deg", 48.0))
     w_mid_v = (w_mid if _v_centre == 48.0
                else np.exp(-((abs_deg - _v_centre) / 13.0) ** 2).astype(np.float32, copy=False))
-    v_surface = (-3.5 * w_trade + 5.0 * w_mid_v - 1.2 * w_polar).astype(np.float32, copy=False) * sign_lat
-    v_surface = np.where(abs_deg < 2.0, 0.0, v_surface).astype(np.float32, copy=False)
+    # PlanetParams.ferrel_v_land_shift_deg: land cells get their own, further
+    # -shifted centre; ocean cells keep `_v_centre` unshifted. Blended by
+    # `land_f` (computed above from the same elevation-derived mask the rest
+    # of this function uses), not a hard mask, so the transition across a
+    # coastline is smooth rather than a step discontinuity in the v-target.
+    # 0.0 (default) skips this branch entirely -- exact no-op, bit-identical
+    # to the single-centre behaviour above.
+    _v_land_shift = float(getattr(pp, "ferrel_v_land_shift_deg", 0.0))
+    if _v_land_shift == 0.0:
+        v_surface = (-3.5 * w_trade + 5.0 * w_mid_v - 1.2 * w_polar).astype(np.float32, copy=False) * sign_lat
+        v_surface = np.where(abs_deg < 2.0, 0.0, v_surface).astype(np.float32, copy=False)
+        v_surface_2d = v_surface[:, None]
+    else:
+        _v_centre_land = _v_centre + _v_land_shift
+        w_mid_v_land = np.exp(-((abs_deg - _v_centre_land) / 13.0) ** 2).astype(np.float32, copy=False)
+        w_mid_v_2d = w_mid_v[:, None] * (1.0 - land_f) + w_mid_v_land[:, None] * land_f
+        v_surface_2d = (-3.5 * w_trade[:, None] + 5.0 * w_mid_v_2d - 1.2 * w_polar[:, None]).astype(np.float32, copy=False) * sign_lat[:, None]
+        v_surface_2d = np.where(abs_deg[:, None] < 2.0, 0.0, v_surface_2d).astype(np.float32, copy=False)
     uc_zm = np.mean(uc, axis=1, keepdims=True)
     vc_zm = np.mean(vc, axis=1, keepdims=True)
     u_nudge = (0.18 + 0.18 * w_mid[:, None] + 0.06 * w_trade[:, None]).astype(np.float32, copy=False)
     v_nudge = (0.16 + 0.12 * w_trade[:, None] + 0.18 * w_mid[:, None]).astype(np.float32, copy=False)
     uc = uc + (u_surface[:, None] - uc_zm) * u_nudge
-    vc = vc + (v_surface[:, None] - vc_zm) * v_nudge
+    vc = vc + (v_surface_2d - vc_zm) * v_nudge
     
     # Apply terrain effects: blocking, channeling, deflection
     if terrain_influence > 0:
