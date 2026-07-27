@@ -150,6 +150,108 @@ def _zonal_precip_target_profile(lat_deg: np.ndarray) -> np.ndarray:
     shape = shape / (float(np.mean(shape)) + 1e-12)
     return shape.astype(np.float32)
 
+
+def _moisture_budget_precip_rescale(
+    dq: np.ndarray,
+    q: np.ndarray,
+    target_row_mm_day: np.ndarray,
+    *,
+    dt_days: float,
+    column_mm_per_q: float,
+    allocation_affinity: np.ndarray | None = None,
+    max_total_removal_fraction: float = 0.85,
+    max_added_removal_fraction: float = 0.15,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Move row precipitation toward targets without multiplying every cell.
+
+    Excess precipitation is scaled down conservatively. Deficits are filled
+    preferentially where condensation is already active, subject to both the
+    remaining atmospheric moisture and a per-step rainout cap. The target is
+    therefore aspirational: dry/moisture-limited rows may remain below it
+    instead of receiving an arbitrarily large multiplier.
+    """
+    dq64 = np.asarray(dq, dtype=np.float64)
+    q64 = np.maximum(np.asarray(q, dtype=np.float64), 0.0)
+    targets = np.asarray(target_row_mm_day, dtype=np.float64)
+    if dq64.shape != q64.shape:
+        raise ValueError("dq and q must have identical shapes")
+    if targets.shape != (dq64.shape[0],):
+        raise ValueError("target_row_mm_day must have one value per latitude row")
+    if allocation_affinity is None:
+        allocation = np.ones_like(dq64)
+    else:
+        allocation = np.clip(np.asarray(allocation_affinity, dtype=np.float64), 0.0, None)
+        if allocation.shape != dq64.shape:
+            raise ValueError("allocation_affinity must match dq shape")
+    if dt_days <= 0.0 or column_mm_per_q <= 0.0:
+        raise ValueError("dt_days and column_mm_per_q must be positive")
+
+    H, W = dq64.shape
+    result = np.clip(dq64, 0.0, max_total_removal_fraction * q64)
+    raw_row_mean = np.mean(result, axis=1)
+    target_row_dq = targets * float(dt_days) / float(column_mm_per_q)
+    capacity_limited = np.zeros(H, dtype=bool)
+    unmet_row_mm_day = np.zeros(H, dtype=np.float64)
+
+    for row in range(H):
+        target_total = max(float(target_row_dq[row]), 0.0) * W
+        current_total = float(np.sum(result[row]))
+        if current_total > target_total and current_total > 0.0:
+            result[row] *= target_total / current_total
+            continue
+        remaining = target_total - current_total
+        if remaining <= 1e-15:
+            continue
+
+        total_cap = max_total_removal_fraction * q64[row]
+        per_step_cap = result[row] + max_added_removal_fraction * q64[row]
+        capacity = np.maximum(np.minimum(total_cap, per_step_cap) - result[row], 0.0)
+        available = float(np.sum(capacity))
+        if available <= 1e-15:
+            capacity_limited[row] = True
+            unmet_row_mm_day[row] = remaining * column_mm_per_q / (dt_days * W)
+            continue
+
+        requested = min(remaining, available)
+        # Super-linear affinity concentrates correction in existing rain/cloud
+        # systems. The small row-relative floor keeps perfectly uniform or
+        # initially dry analytic fixtures well-defined without flattening real
+        # longitudinal contrasts.
+        affinity_floor = max(float(np.mean(result[row])) * 0.05, 1e-12)
+        affinity = (result[row] + affinity_floor) ** 2 * allocation[row]
+        amount_left = requested
+        active_capacity = capacity.copy()
+        for _ in range(6):
+            weights = affinity * active_capacity
+            weight_sum = float(np.sum(weights))
+            if amount_left <= 1e-15 or weight_sum <= 1e-30:
+                break
+            proposed = amount_left * weights / weight_sum
+            accepted = np.minimum(proposed, active_capacity)
+            result[row] += accepted
+            active_capacity -= accepted
+            amount_left -= float(np.sum(accepted))
+
+        unmet = remaining - (requested - amount_left)
+        if unmet > 1e-12:
+            capacity_limited[row] = True
+            unmet_row_mm_day[row] = unmet * column_mm_per_q / (dt_days * W)
+
+    new_row_mean = np.mean(result, axis=1)
+    effective_scale = new_row_mean / (raw_row_mean + 1e-12)
+    achieved_fraction = np.divide(
+        new_row_mean,
+        target_row_dq,
+        out=np.ones_like(new_row_mean),
+        where=target_row_dq > 1e-12,
+    )
+    return result.astype(np.float32), {
+        "effective_scale": effective_scale.astype(np.float32),
+        "target_achieved_fraction": achieved_fraction.astype(np.float32),
+        "capacity_limited": capacity_limited,
+        "unmet_row_mm_day": unmet_row_mm_day.astype(np.float32),
+    }
+
 # Discrete moving storm/wave systems. Unlike ROSSBY_MODES (a standing sinusoid
 # that only ever translates -- same wavenumber and amplitude forever, which is
 # what makes it look mechanically repetitive no matter how long you watch it),
@@ -918,6 +1020,22 @@ def flux_divergence_spherical(
     dG_dphi = dG_di / dphi_di
 
     return (dFx_dlam + dG_dphi) / (float(radius_m) * cos_phi)
+
+
+def _normalize_positive_driver(field: np.ndarray) -> np.ndarray:
+    """Normalize a non-negative diagnostic without imposing an SI-scale floor.
+
+    Spherical divergence is expressed per second and naturally has magnitudes
+    near 1e-8. Adding the legacy dimensionless ``1e-6`` epsilon to its mean
+    suppresses the signal by orders of magnitude. Exact-zero fields remain
+    zero; every nonzero field is normalized by its own mean, making the
+    diagnostic invariant to the units used by the derivative operator.
+    """
+    values = np.maximum(np.asarray(field, dtype=np.float64), 0.0)
+    mean_value = float(np.mean(values, dtype=np.float64))
+    if not np.isfinite(mean_value) or mean_value <= np.finfo(np.float64).tiny:
+        return np.zeros_like(values, dtype=np.float32)
+    return (values / mean_value).astype(np.float32)
 
 
 def _streamfunction_from_vorticity(omega: np.ndarray) -> np.ndarray:
@@ -2746,8 +2864,7 @@ def generate_precipitation(
         _div_q = flux_divergence_spherical(
             q, u, v, np.radians(lat_deg.astype(np.float64)), radius_m=float(pp.radius_m)
         )
-        conv = np.clip(-_div_q, 0.0, None).astype(np.float32, copy=False)
-        conv = conv / (np.mean(conv) + 1e-6)
+        conv = _normalize_positive_driver(-_div_q)
         _lap_c = _laplacian_numba if NUMBA_AVAILABLE else _laplacian
         conv = np.clip(conv + 0.15 * _lap_c(conv), 0.0, 3.0)
     elif NUMBA_AVAILABLE:
@@ -3000,26 +3117,48 @@ def generate_precipitation(
         ZONAL_BLEND_MAX = 0.3
         CV_REF = 0.5  # row-CV at which the blend reaches full strength (saturates at 1.0 above this)
         target_profile = _zonal_precip_target_profile(lat_deg)  # (H,), mean(unweighted)=1.0
-        # dtype=float64 accumulation: headless vs. threaded/blocked call paths can
-        # feed this reduction the same float32 values in a different summation
-        # order (chunk boundaries), which float32 accumulation is sensitive enough
-        # to for the two paths to disagree at the ~1e-4 level once rescaled back
-        # across the whole row (see test_headless_matches_threaded_call_pattern).
-        # Accumulating in float64 makes the reduction itself effectively
-        # order-invariant at float32 precision.
-        P_zonal_mean64 = np.mean(P, axis=1, dtype=np.float64)  # (H,)
-        P_zonal_mean = P_zonal_mean64.astype(np.float32)
-        P_row_std64 = np.std(P, axis=1, dtype=np.float64)  # (H,)
-        row_cv = (P_row_std64 / (np.abs(P_zonal_mean64) + 1e-6)).astype(np.float32)
-        zonal_blend_row = ZONAL_BLEND_MAX * np.clip(row_cv / CV_REF, 0.0, 1.0)
         target_row_mm_day = target_profile * np.float32(target_mean_mm_day)  # (H,)
-        flat_scale = float(np.clip(target_mean_mm_day / (float(np.mean(P, dtype=np.float64)) + 1e-6), 0.2, 3.0))
-        raw_zonal_scale = target_row_mm_day / (P_zonal_mean + 1e-6)
-        scale_row = np.clip(
-            flat_scale + zonal_blend_row * (raw_zonal_scale - flat_scale), 0.15, 5.0
-        ).astype(np.float32)
         dq_before = dq.copy()
-        dq = np.clip(dq * scale_row[:, None], 0.0, q)
+        if pp.moisture_budget_precip_rescale:
+            budget_dq_cap = np.minimum(0.85 * q, dq_before + 0.15 * q)
+            drybelt_land_protection = np.clip(
+                1.0 - 0.995 * drybelt_window[:, None] * land_f,
+                0.005,
+                1.0,
+            )
+            dynamic_affinity = np.where(
+                land_f > 0.5,
+                np.clip(subsidence_suppression, 0.005, 1.0),
+                1.0,
+            )
+            dq, budget_diag = _moisture_budget_precip_rescale(
+                dq,
+                q,
+                target_row_mm_day,
+                dt_days=dt,
+                column_mm_per_q=column_mm_per_q,
+                allocation_affinity=drybelt_land_protection * dynamic_affinity,
+            )
+            scale_row = budget_diag["effective_scale"]
+        else:
+            # dtype=float64 accumulation: headless vs. threaded/blocked call paths can
+            # feed this reduction the same float32 values in a different summation
+            # order (chunk boundaries), which float32 accumulation is sensitive enough
+            # to for the two paths to disagree at the ~1e-4 level once rescaled back
+            # across the whole row (see test_headless_matches_threaded_call_pattern).
+            # Accumulating in float64 makes the reduction itself effectively
+            # order-invariant at float32 precision.
+            P_zonal_mean64 = np.mean(P, axis=1, dtype=np.float64)  # (H,)
+            P_zonal_mean = P_zonal_mean64.astype(np.float32)
+            P_row_std64 = np.std(P, axis=1, dtype=np.float64)  # (H,)
+            row_cv = (P_row_std64 / (np.abs(P_zonal_mean64) + 1e-6)).astype(np.float32)
+            zonal_blend_row = ZONAL_BLEND_MAX * np.clip(row_cv / CV_REF, 0.0, 1.0)
+            flat_scale = float(np.clip(target_mean_mm_day / (float(np.mean(P, dtype=np.float64)) + 1e-6), 0.2, 3.0))
+            raw_zonal_scale = target_row_mm_day / (P_zonal_mean + 1e-6)
+            scale_row = np.clip(
+                flat_scale + zonal_blend_row * (raw_zonal_scale - flat_scale), 0.15, 5.0
+            ).astype(np.float32)
+            dq = np.clip(dq * scale_row[:, None], 0.0, q)
         P = dq * (column_mm_per_q / dt)
         if debug_fields is not None:
             debug_fields["zonal_rescale_factor"] = scale_row
@@ -3028,6 +3167,16 @@ def generate_precipitation(
             # rescale have to work overall" number still get one.
             debug_fields["global_rescale_factor"] = float(np.mean(scale_row))
             debug_fields["precip_rescale_dq_added"] = np.maximum(dq - dq_before, 0.0)
+            if pp.moisture_budget_precip_rescale:
+                debug_fields["precip_target_achieved_fraction"] = budget_diag[
+                    "target_achieved_fraction"
+                ]
+                debug_fields["precip_rescale_capacity_limited"] = budget_diag[
+                    "capacity_limited"
+                ]
+                debug_fields["precip_rescale_unmet_mm_day"] = budget_diag[
+                    "unmet_row_mm_day"
+                ]
         # Desert-vs-continental redistribution (2026-07 follow-up session).
         # EARLIER ATTEMPT, REVERTED: a blanket post-rescale "desert suppression"
         # multiplier (1 - k*drybelt_window*land_f) was tried to counter the zonal
@@ -3069,6 +3218,8 @@ def generate_precipitation(
         row_norm = np.mean(desert_factor, axis=1, dtype=np.float64).astype(np.float32)
         cell_weight = desert_factor / (row_norm[:, None] + 1e-6)
         dq = np.clip(dq * cell_weight, 0.0, q)
+        if pp.moisture_budget_precip_rescale:
+            dq = np.minimum(dq, budget_dq_cap)
         P = dq * (column_mm_per_q / dt)
         if debug_fields is not None:
             debug_fields["desert_redistribution_weight"] = cell_weight
@@ -3078,11 +3229,33 @@ def generate_precipitation(
         1.06,
     ).astype(np.float32, copy=False)
     dq = np.clip(dq * rain_export_factor, 0.0, q)
+    if pp.moisture_budget_precip_rescale and target_mean_mm_day > 0.0:
+        dq = np.minimum(dq, budget_dq_cap)
     P = dq * (column_mm_per_q / dt)
     if max_precip_mm_day > 0.0:
         cap = np.minimum(1.0, max_precip_mm_day / (P + 1e-9))
         dq = dq * cap
         P = P * cap
+    if (
+        debug_fields is not None
+        and pp.moisture_budget_precip_rescale
+        and target_mean_mm_day > 0.0
+    ):
+        final_row_mean = np.mean(P, axis=1, dtype=np.float64)
+        final_achieved = final_row_mean / (
+            np.asarray(target_row_mm_day, dtype=np.float64) + 1e-12
+        )
+        final_scale = np.mean(dq, axis=1, dtype=np.float64) / (
+            np.mean(dq_before, axis=1, dtype=np.float64) + 1e-12
+        )
+        debug_fields["zonal_rescale_factor"] = final_scale.astype(np.float32)
+        debug_fields["global_rescale_factor"] = float(np.mean(final_scale))
+        debug_fields["precip_target_achieved_fraction"] = final_achieved.astype(np.float32)
+        debug_fields["precip_rescale_capacity_limited"] = final_achieved < 0.999
+        debug_fields["precip_rescale_unmet_mm_day"] = np.maximum(
+            np.asarray(target_row_mm_day, dtype=np.float64) - final_row_mean,
+            0.0,
+        ).astype(np.float32)
 
     # Update humidity and soil moisture reservoirs
     humidity_next = np.clip(q - dq, 0.0, qsat)

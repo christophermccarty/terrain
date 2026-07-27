@@ -42,6 +42,25 @@ def _interior(field, lat, max_abs_lat_deg=75.0):
     return field[keep]
 
 
+def test_positive_driver_normalization_is_scale_invariant():
+    from atmosphere import _normalize_positive_driver
+
+    field = np.array([[0.0, 1.0, 3.0], [2.0, 0.0, 6.0]], dtype=np.float64)
+    normalized = _normalize_positive_driver(field)
+    normalized_si = _normalize_positive_driver(field * 1e-9)
+
+    np.testing.assert_allclose(normalized_si, normalized, rtol=1e-6, atol=0.0)
+    assert float(np.mean(normalized)) == pytest.approx(1.0)
+
+
+def test_positive_driver_normalization_keeps_calm_field_zero():
+    from atmosphere import _normalize_positive_driver
+
+    normalized = _normalize_positive_driver(np.zeros((8, 16), dtype=np.float64))
+    assert normalized.dtype == np.float32
+    assert not np.any(normalized)
+
+
 # ---------------------------------------------------------------------------
 # 1. Solid-body rotation must be exactly non-divergent
 # ---------------------------------------------------------------------------
@@ -159,6 +178,23 @@ def test_pole_rows_are_not_identically_zero():
     assert np.all(np.isfinite(div)), "pole rows must stay finite despite 1/cos(phi)"
     assert np.any(div[0] != 0.0), "north pole row is identically zero"
     assert np.any(div[-1] != 0.0), "south pole row is identically zero"
+
+
+def test_spherical_divergence_is_globally_conservative():
+    from atmosphere import flux_divergence_spherical
+
+    H, W = 90, 180
+    lat, _lon, _ = _grid(H, W)
+    rng = np.random.default_rng(20260726)
+    q = rng.uniform(0.001, 0.02, size=(H, W))
+    u = rng.normal(0.0, 12.0, size=(H, W))
+    v = rng.normal(0.0, 5.0, size=(H, W))
+
+    div = flux_divergence_spherical(q, u, v, lat, radius_m=RADIUS)
+    area_weight = np.cos(lat)[:, None]
+    net = abs(float(np.sum(div * area_weight)))
+    gross = float(np.sum(np.abs(div) * area_weight))
+    assert net / gross < 1e-4
 
 
 # ---------------------------------------------------------------------------

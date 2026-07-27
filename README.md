@@ -42,7 +42,7 @@ the GUI falls back to deterministic procedural terrain.
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 415 tests. Slow tests cover multi-decadal climate
+The suite currently collects 429 tests. Slow tests cover multi-decadal climate
 drift, conservation, circulation, seasonal behavior, and reanalysis anchors.
 
 ## Headless runs and benchmarks
@@ -73,6 +73,11 @@ weather processes.
 - `climate_averages.py` — monthly climatology, Köppen, and biomes
 - `planet_params.py` — per-planet physical and calibrated parameters
 - `scenarios.py` / `orbital_cycles.py` — curated experiments and Milankovitch forcing
+- `simulation_state.py` / `simulation_runner.py` — shared state contract and orchestration
+- `sim_grid.py` — coarsening utilities and static-terrain cache
+- `state_persistence.py` — safe NPZ persistence and legacy-save migration
+- `gui_worker.py` / `gui_view_cache.py` — threaded ownership and view-layer caches
+- `simulate.py` / `main.py` — numerical integration and Tk application shell
 - `diagnostics.py` — climate metrics, budgets, and data export
 - `optimizer/` — headless runner, scoring, sweeps, and Bayesian search
 - `testing/` — analytic, regression, integration, and long-horizon tests
@@ -84,6 +89,7 @@ weather processes.
 - `FEATURES.md` — prioritized experience and system features
 - `PLAN_PHYSICS_FIXES.md` — recent measured physics decisions
 - `docs/FINDINGS_SUMMARY.md` — durable findings promoted from local experiments
+- `docs/ARCHITECTURE.md` — module boundaries and compatibility contracts
 - `docs/REAL_TERRAIN_VALIDATION.md` — regional/zonal benchmark workflow
 
 ## Save-file security

@@ -416,10 +416,10 @@ class PlanetParams:
     See PLAN_PHYSICS_FIXES.md for the fuller sweep log, including the -8
     numbers this field was calibrated away from and why."""
 
-    spherical_metric_precip: bool = False
+    spherical_metric_precip: bool = True
     """Use the true spherical metric in the moisture-flux convergence driver.
 
-    `False` (default) keeps `_moisture_convergence_numba`, which takes raw index
+    `False` keeps `_moisture_convergence_numba`, which takes raw index
     differences: the zonal term is under-weighted by 1/cos(phi) (x2 at 60 deg,
     x3.9 at 75 deg), the meridional term lacks the cos(phi) flux weighting for
     converging meridians, and both pole rows are left identically zero.
@@ -436,16 +436,24 @@ class PlanetParams:
     (ROADMAP Theme 1); structural for high-obliquity or polar-precipitation
     worlds. See PLAN_PHYSICS_FIXES.md."""
 
-    spherical_metric_clouds: bool = False
+    moisture_budget_precip_rescale: bool = True
+    """Use bounded moisture-budget precipitation targeting instead of the
+    legacy multiplicative row rescale.
+
+    The bounded strategy treats the zonal target as aspirational, allocates
+    added rain preferentially to existing condensation systems, and refuses to
+    exceed local atmospheric-moisture/rainout capacity. Disable this flag only
+    for legacy-regression experiments."""
+
+    spherical_metric_clouds: bool = True
     """Use spherical wind divergence for cloud ascent/subsidence diagnostics.
 
     The cloud path in `simulate._evolve_temperature` historically used the
     same flat index-space derivative class as the legacy precipitation kernel.
     `True` computes divergence through `atmosphere.flux_divergence_spherical`
     with a unit scalar field. It is independently gated from
-    `spherical_metric_precip` so each redistribution can be measured and
-    calibrated separately. Default False preserves the current climate exactly
-    until real-terrain, cloud-cover, and high-latitude validation is complete."""
+    `spherical_metric_precip` so each redistribution can still be measured
+    separately. Disable either flag only for legacy-regression experiments."""
 
     moisture_advection_scale: float = 0.0
     """Blend weight [0-1] for an additional longer-range moisture transport term

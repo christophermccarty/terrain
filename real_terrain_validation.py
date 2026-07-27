@@ -171,7 +171,7 @@ def _koppen_land_percentages(state: PlanetState, land_mask: np.ndarray) -> dict[
     }
 
 
-def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, float]:
+def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, Any]:
     if (
         state.temperature is None
         or state.wind_u is None
@@ -201,11 +201,32 @@ def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, f
     scale = np.asarray(debug.get("zonal_rescale_factor", []), dtype=np.float64)
     if scale.size == 0:
         return {}
-    return {
+    budget_strategy = bool(pp.moisture_budget_precip_rescale)
+    metrics: dict[str, float | str] = {
+        "strategy": "moisture_budget" if budget_strategy else "legacy_multiplier",
         "mean": float(np.mean(scale)),
         "max": float(np.max(scale)),
-        "saturated_fraction": float(np.mean(scale >= 4.999)),
+        # Only the legacy strategy has a hard 5x multiplier ceiling. Large
+        # effective ratios under the budget strategy occur when a near-zero raw
+        # row receives bounded moisture and are not ceiling saturation.
+        "saturated_fraction": (
+            0.0 if budget_strategy else float(np.mean(scale >= 4.999))
+        ),
     }
+    capacity_limited = np.asarray(
+        debug.get("precip_rescale_capacity_limited", []), dtype=bool
+    )
+    unmet = np.asarray(debug.get("precip_rescale_unmet_mm_day", []), dtype=np.float64)
+    achieved = np.asarray(
+        debug.get("precip_target_achieved_fraction", []), dtype=np.float64
+    )
+    if capacity_limited.size:
+        metrics["capacity_limited_fraction"] = float(np.mean(capacity_limited))
+    if unmet.size:
+        metrics["mean_unmet_mm_day"] = float(np.mean(unmet))
+    if achieved.size:
+        metrics["mean_target_achieved_fraction"] = float(np.mean(achieved))
+    return metrics
 
 
 def summarize_real_terrain_climate(
@@ -251,6 +272,7 @@ def summarize_real_terrain_climate(
     H = state.elevation.shape[0]
     lat = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * 180.0
     nh_midlat = land_mask & ((lat >= 45.0) & (lat <= 65.0))[:, None]
+    polar_mask = np.broadcast_to((np.abs(lat) >= 70.0)[:, None], land_mask.shape)
     land_soil = mean_soil_moisture[land_mask]
     nh_soil = mean_soil_moisture[nh_midlat]
     zonal = _zonal_metrics(
@@ -271,6 +293,9 @@ def summarize_real_terrain_climate(
         "global": {
             "temperature_k": _area_weighted_mean(mean_temperature_k),
             "precip_mm_day": _area_weighted_mean(mean_precipitation_mm_day),
+                "polar_precip_mm_day": _area_weighted_mean(
+                    mean_precipitation_mm_day, polar_mask
+                ),
             "cloud_fraction": _area_weighted_mean(mean_cloud_fraction),
             "land_soil_moisture": _area_weighted_mean(mean_soil_moisture, land_mask),
             "ocean_temperature_k": _area_weighted_mean(mean_temperature_k, sea_mask),
@@ -463,12 +488,15 @@ def compare_validation_reports(
     scalar_tolerances = {
         "temperature_k": 2.0,
         "precip_mm_day": 0.25,
+        "polar_precip_mm_day": 0.15,
         "cloud_fraction": 0.04,
         "land_soil_moisture": 0.05,
         "land_soil_floor_fraction": 0.05,
         "nh_midlat_soil_floor_fraction": 0.05,
     }
     for name, absolute_tolerance in scalar_tolerances.items():
+        if name not in baseline_metrics["global"]:
+            continue
         got = float(current_metrics["global"][name])
         want = float(baseline_metrics["global"][name])
         if abs(got - want) > absolute_tolerance:

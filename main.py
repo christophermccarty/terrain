@@ -13,8 +13,7 @@ import pstats
 import logging
 import time
 from pathlib import Path
-from threading import Thread, Event, Lock
-from queue import Queue, Empty, Full
+from queue import Empty
 
 from terrain import (
     generate_sphere_image,
@@ -23,7 +22,7 @@ from terrain import (
     colorize,
     load_settings,
     save_settings,
-    invalidate_view_caches,
+    invalidate_view_caches as invalidate_terrain_view_caches,
     log_time,
     get_elevation_cache,
     clear_elevation_cache,
@@ -48,20 +47,23 @@ from simulate import (
 from diagnostics import ClimateDiagnostics
 from planet_params import PlanetParams, EARTH
 from scenarios import SCENARIO_BY_NAME
-from time_policy import substeps_for_mode
+from gui_worker import SimulationWorker
+from gui_view_cache import (
+    OCEAN_CURRENT_CACHE as _OCEAN_CURRENT_CACHE,
+    OCEAN_CURRENT_REFRESH_SEC as _OCEAN_CURRENT_REFRESH_SEC,
+    PRECIP_VIEW_CACHE as _PRECIP_VIEW_CACHE,
+    WIND_CACHE as _WIND_CACHE,
+    invalidate_gui_view_caches,
+)
 import dataclasses
 import graphs
 
 AUTOSAVE_PATH = Path("saves/autosave.npz")
 
-# Lightweight caches for expensive view layers
-_WIND_CACHE = {"key": None, "u": None, "v": None}
-_OCEAN_CURRENT_CACHE = {"key": None, "u": None, "v": None, "computed_at": 0.0}
-# Ocean currents evolve slowly; regenerating the field on every simulation step
-# (uncapped while running) is far more often than needed and dominates frame
-# time. Throttle regeneration to wall-clock cadence instead of sim-day cadence.
-_OCEAN_CURRENT_REFRESH_SEC = 2.0
-_PRECIP_VIEW_CACHE = {"key": None, "P": None}
+def invalidate_view_caches() -> None:
+    """Invalidate terrain-owned and GUI-owned render caches together."""
+    invalidate_terrain_view_caches()
+    invalidate_gui_view_caches()
 
 
 def _cache_saved_elevation(state: PlanetState, source_path: Path) -> None:
@@ -73,146 +75,29 @@ def _cache_saved_elevation(state: PlanetState, source_path: Path) -> None:
     invalidate_view_caches()
 
 
-class SimulationThread(Thread):
-    """Background thread that runs physics simulation independently of UI."""
+class SimulationThread(SimulationWorker):
+    """Compatibility facade for callers importing the worker from ``main``."""
 
-    def __init__(self, initial_state, days_per_step=1.0, wind_block_size=8, diagnostics=None,
-                 time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY,
-                 planet_params: PlanetParams = EARTH):
-        super().__init__(daemon=True)
-        self.state = initial_state
-        self.days_per_step = days_per_step
-        self.wind_block_size = wind_block_size
-        self.diagnostics = diagnostics
-        self.time_scale_mode = time_scale_mode
-        self.planet_params = planet_params
-        self.running = Event()
-        self.paused = Event()
-        self.paused.set()  # Start paused
-        # The worker is the sole writer of state.  UI actions that need an
-        # authoritative snapshot (save, benchmark, close) pause first, then
-        # acquire this lock to wait for any in-flight physics cycle to finish.
-        self.state_lock = Lock()
-        # State and diagnostic components describe the same completed cycle and
-        # must remain atomic. Separate queues could accept only one of two puts,
-        # pairing a new state with stale diagnostics under UI backpressure.
-        self.frame_queue = Queue(maxsize=1)
-        self.error_queue = Queue(maxsize=1)
-
-    def run(self):
-        """Main simulation loop (runs in background thread)."""
-        self.running.set()
-        while self.running.is_set():
-            if self.paused.is_set():
-                time.sleep(0.05)  # Sleep when paused (50ms)
-                continue
-
-            try:
-                # Re-check paused after acquiring the lock: a UI pause request
-                # may have arrived between the loop check and lock acquisition.
-                with self.state_lock:
-                    if self.paused.is_set():
-                        continue
-                    mode = self.time_scale_mode
-                    substeps = substeps_for_mode(mode, self.planet_params)
-
-                    new_state = self.state
-                    temp_components: dict = {}
-                    for step_days, do_wind in substeps:
-                        new_state, temp_components = simulate_step(
-                            new_state,
-                            days=step_days,
-                            wind_block_size=self.wind_block_size,
-                            update_wind=do_wind,
-                            debug_log=False,
-                            track_components=self.diagnostics is not None,
-                            time_scale=mode,
-                            planet_params=self.planet_params,
-                        )
-
-                        # Record diagnostics each sub-step for correct time-averaging
-                        if self.diagnostics is not None:
-                            self.diagnostics.record_step(
-                                new_state,
-                                new_state.day_of_year,
-                                days_elapsed=step_days,
-                                component_contributions=temp_components
-                            )
-
-                    self.state = new_state
-
-                    # Push one atomic frame. If the UI is behind, replace the
-                    # stale queued frame so the size-1 queue really keeps latest.
-                    frame = (new_state, temp_components)
-                    try:
-                        self.frame_queue.put_nowait(frame)
-                    except Full:
-                        try:
-                            self.frame_queue.get_nowait()
-                        except Empty:
-                            pass
-                        try:
-                            self.frame_queue.put_nowait(frame)
-                        except Full:
-                            pass
-
-            except Exception as e:
-                LOG.exception("Simulation thread error")
-                try:
-                    self.error_queue.put_nowait(str(e))
-                except Full:
-                    pass
-                self.paused.set()  # Auto-pause on error
-
-    def pause(self):
-        """Pause simulation."""
-        self.paused.set()
-
-    def pause_and_get_state(self):
-        """Pause and return the latest state after any active cycle completes."""
-        self.paused.set()
-        with self.state_lock:
-            state = self.state
-        # The caller now owns this latest snapshot directly.  Discard queued
-        # frames so the UI cannot subsequently replace it with an older state.
-        try:
-            while True:
-                self.frame_queue.get_nowait()
-        except Empty:
-            pass
-        return state
-
-    def snapshot_state(self):
-        """Return a synchronized state snapshot without changing pause state."""
-        was_paused = self.paused.is_set()
-        state = self.pause_and_get_state()
-        if not was_paused and self.running.is_set():
-            self.resume()
-        return state
-
-    def resume(self):
-        """Resume simulation."""
-        self.paused.clear()
-
-    def stop(self):
-        """Stop simulation thread."""
-        self.running.clear()
-
-    def update_days_per_step(self, days):
-        """Update simulation speed (legacy; kept for backward compatibility)."""
-        self.days_per_step = days
-
-    def update_time_scale(self, mode: TimeScaleMode):
-        """Switch time-scale mode (affects sub-stepping strategy)."""
-        self.time_scale_mode = mode
-
-    def update_wind_block_size(self, block_size):
-        """Update wind resolution."""
-        self.wind_block_size = block_size
-
-    def update_planet_params(self, planet_params: PlanetParams):
-        """Swap the live planet parameters (single-attribute swap, GIL-safe)."""
-        self.planet_params = planet_params
+    def __init__(
+        self,
+        initial_state,
+        days_per_step=1.0,
+        wind_block_size=8,
+        diagnostics=None,
+        time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY,
+        planet_params: PlanetParams = EARTH,
+    ):
+        # Resolve main.simulate_step at call time so existing tests and plugins
+        # that monkeypatch that compatibility symbol keep working.
+        super().__init__(
+            initial_state,
+            days_per_step=days_per_step,
+            wind_block_size=wind_block_size,
+            diagnostics=diagnostics,
+            time_scale_mode=time_scale_mode,
+            planet_params=planet_params,
+            step_function=lambda *args, **kwargs: simulate_step(*args, **kwargs),
+        )
 
 
 def main() -> None:

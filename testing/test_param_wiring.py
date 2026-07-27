@@ -100,7 +100,9 @@ PLANET_PARAM_CASES = [
     ("ekman_strength", 0.0),
     ("cloud_greenhouse_factor", 0.0),
     ("wv_greenhouse_factor", 0.0),
-    ("spherical_metric_clouds", True),
+    ("moisture_budget_precip_rescale", False),
+    ("spherical_metric_precip", False),
+    ("spherical_metric_clouds", False),
     ("deep_ocean_exchange_rate", 5e-4),
     ("soil_deep_gain_rate", 0.001),  # default 0.0 (inert) -- see planet_params.py docstring
     ("soil_deep_drain_rate", 0.05),

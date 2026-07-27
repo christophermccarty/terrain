@@ -38,8 +38,10 @@ longer and/or higher-resolution run.
 - continental-minus-desert precipitation separation;
 - temperature bias and precipitation ratio in six ERA5/CRU-inspired zonal
   reference bands;
+- area-weighted precipitation poleward of 70°;
 - Köppen land fractions;
-- precipitation rescale mean, maximum, and saturation fraction;
+- precipitation strategy, effective correction, moisture-capacity limitation,
+  unmet target, and legacy-ceiling saturation;
 - a composite reference-error score.
 
 ## Baseline versus realism
@@ -50,16 +52,32 @@ comparison gate detects material drift from a reviewed state. The reference
 targets and `reference_error_score` independently show whether a change moves
 toward observations.
 
-The initial baseline exposes the known structural issues clearly:
+The production precipitation correction is moisture-budget bounded. Unlike the
+legacy row multiplier, it:
 
-- 25% of latitude rows hit the precipitation rescale ceiling;
-- Atacama and Sahara are too wet;
-- the US Midwest is too dry;
-- tropical precipitation is too strong;
-- mean cloud fraction is too low.
+- scales excess precipitation down but treats deficient zonal targets as
+  aspirational;
+- allocates added condensation preferentially to existing rain systems;
+- protects dynamically subsiding dry-belt land from artificial target filling;
+- caps added rainout at 15% of local specific humidity per call and total
+  rainout at 85%;
+- reports capacity-limited rows and unmet target precipitation explicitly.
 
-This is why the next physics work should address the precipitation
-production/rescale mechanism rather than merely retuning regional constants.
+On the compact two-year real-terrain gate, this reduced the composite reference
+error from 0.438 to 0.376. On a five-year spinup plus three-year evaluation it
+reduced error from 0.419 to 0.349. Tropical zonal rain moved from roughly
+3,700-3,800 mm/year to 1,969 mm/year, cloud fraction increased, and US Midwest
+rain improved. Sahara remains too wet, so the new mechanism removes the old
+multiplier-ceiling failure but does not claim to complete regional calibration.
+Set `moisture_budget_precip_rescale=False` only for legacy comparison runs.
+
+Precipitation convergence and cloud ascent/subsidence now use spherical flux
+divergence by default. Their normalization is scale-invariant, so the physical
+per-second divergence is not suppressed by a dimensionless epsilon. The
+compact and 5+3-year gates showed only a 2-3% reference-score cost, accepted in
+exchange for correct latitude metrics, nonzero polar rows, and globally
+conservative divergence. Set `spherical_metric_precip=False` or
+`spherical_metric_clouds=False` only for legacy A/B runs.
 
 ## Updating the baseline
 

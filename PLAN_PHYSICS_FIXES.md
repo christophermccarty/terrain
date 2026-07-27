@@ -1,6 +1,26 @@
 # Plans: A9 spherical metric, and the US Midwest divergence bug
 
 ---
+## EXECUTION LOG (2026-07-26) — spherical precipitation and cloud metrics shipped
+
+`spherical_metric_precip` and `spherical_metric_clouds` are now production
+defaults. The analytic operator already had the correct
+`1/(a cos(phi)) [dFx/dlambda + d(Fy cos(phi))/dphi]` form and finite pole
+handling, but both gated call sites divided SI-scale divergence (naturally
+around `1e-8 s^-1`) by `mean + 1e-6`. That dimensionally incompatible epsilon
+nearly erased the corrected signal. `_normalize_positive_driver` now normalizes
+by the field's own mean, preserves exact calm fields as zero, and is invariant
+to unit scaling.
+
+Closed-form, pole-row, scale-invariance, and area-weighted global-conservation
+tests pass. On the compact real-terrain gate, enabling both corrected operators
+changes the reference error from 0.376 to 0.384; on the five-year spinup plus
+three-year evaluation, 0.349 to 0.358. The small score cost was accepted to
+remove the coordinate error and support high-obliquity/polar worlds. Both flags
+remain available as `False` only for legacy A/B runs. Polar precipitation is
+now a tracked validation metric.
+
+---
 ## EXECUTION LOG (2026-07-26) — the 40-50N land/ocean partition ceiling
 
 Direct follow-up to the "Still open" note at the bottom of the 2026-07-25 Plan 1 section

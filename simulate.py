@@ -7,36 +7,33 @@ with configurable time scales. Default unit is one day.
 from __future__ import annotations
 
 import logging
-import dataclasses
-import json
 import numpy as np
-from typing import NamedTuple
-from pathlib import Path
-from datetime import datetime
-from enum import Enum
+from simulation_state import PlanetState, TimeScaleMode
+from simulation_runner import initialize_state, run_multiple_steps
+from sim_grid import (
+    _coarsen,
+    _coarsen_elevation_cached,
+    _coarsen_many,
+    _pad_edge_inplace,
+    clear_grid_caches,
+)
+from state_persistence import (
+    STATE_SCHEMA_VERSION,
+    _load_state_npz,
+    _save_state_npz,
+    auto_save,
+    load_state,
+    save_state,
+)
 
 LOG = logging.getLogger("planetsim")
 
 
-class TimeScaleMode(Enum):
-    """Time integration strategy for different simulation speeds.
-
-    DAILY   — 1 day per UI frame, full physics (highest accuracy).
-    WEEKLY  — 7 days per UI frame, 7 × 1-day sub-steps (same physics).
-    MONTHLY — ~30 days per UI frame, 5 × 6-day sub-steps, no wind evolution
-              (faster; weather variability is parameterized away).
-    ANNUAL  — ~365 days per UI frame, 52 × 7-day sub-steps, no wind or storms
-              (fastest; only slow climate variables evolve accurately).
-    """
-    DAILY = "daily"
-    WEEKLY = "weekly"
-    MONTHLY = "monthly"
-    ANNUAL = "annual"
-import pickle
 from atmosphere import (
     generate_wind_field, generate_precipitation,
     evolve_wind, evolve_wind_aloft, _upsample_bilinear_many,
     _update_jet_index, _update_jet_blocking, flux_divergence_spherical,
+    _normalize_positive_driver,
 )
 from temperature import (
     temperature_kelvin_for_lat,
@@ -71,77 +68,6 @@ except ImportError:
 
 # Cache for diagnostic/relaxation wind to avoid recomputing every step.
 _RELAX_CACHE = {"key": None, "u": None, "v": None}
-
-
-def _pad_edge_inplace(buf: np.ndarray, H: int, W: int) -> None:
-    """Edge-replicate `buf`'s [..., H:, :]/[..., :, W:] margins from its [..., :H, :W] data.
-
-    `buf`'s last two axes are (Hp, Wp) with Hp >= H, Wp >= W; the leading axes (if any)
-    are left untouched. Row-fill must run before column-fill so the corner block picks
-    up the already-row-replicated values -- this reproduces `np.pad(..., mode="edge")`
-    exactly (same corner = original[..., H-1, W-1]) without allocating the intermediate
-    unpadded array `np.pad` requires.
-    """
-    Hp, Wp = buf.shape[-2], buf.shape[-1]
-    if Hp > H:
-        buf[..., H:, :W] = buf[..., H - 1:H, :W]
-    if Wp > W:
-        buf[..., :, W:] = buf[..., :, W - 1:W]
-
-
-def _coarsen(arr: np.ndarray, Hc: int, Wc: int, bs: int) -> np.ndarray:
-    """Downsample (H,W) → (Hc,Wc) by block-averaging.
-
-    Avoids np.pad when the grid divides evenly (the common case for standard
-    block sizes), which eliminates a full-array copy per field per step. When it
-    doesn't divide evenly (e.g. the real 512x1024 Earth grid at block_size=3),
-    writes directly into a single (Hc*bs, Wc*bs) buffer instead of padding a
-    separate already-materialized array, saving one full-size allocation+copy.
-    """
-    a: np.ndarray = arr if arr.dtype == np.float32 else arr.astype(np.float32)
-    H, W = a.shape
-    Hp, Wp = Hc * bs, Wc * bs
-    if Hp == H and Wp == W:
-        buf = a
-    else:
-        buf = np.empty((Hp, Wp), dtype=np.float32)
-        buf[:H, :W] = a
-        _pad_edge_inplace(buf, H, W)
-    return buf.reshape(Hc, bs, Wc, bs).mean(axis=(1, 3)).astype(np.float32, copy=False)
-
-
-def _coarsen_many(fields: dict[str, np.ndarray], Hc: int, Wc: int, bs: int) -> dict[str, np.ndarray]:
-    """Batched `_coarsen`: downsample multiple same-shape (H,W) fields in one pass.
-
-    Stacks inputs into one (K,H,W) array and does a single reshape+mean instead of K
-    separate `_coarsen` calls — mirrors `_upsample_bilinear_many`'s batching approach
-    for the opposite (upsample) direction. Every field must share the same (H, W)
-    shape; callers with mixed shapes should group fields accordingly first.
-
-    When the grid doesn't divide evenly (the common case: real terrain at the
-    default block_size=3), fields are written directly into a single (K, Hc*bs,
-    Wc*bs) buffer instead of stacking into an unpadded (K,H,W) array and then
-    `np.pad`-ing a second, larger array from it — one allocation instead of two.
-    """
-    if not fields:
-        return {}
-    keys = list(fields.keys())
-    values = list(fields.values())
-    K = len(values)
-    H, W = values[0].shape
-    Hp, Wp = Hc * bs, Wc * bs
-    if Hp == H and Wp == W:
-        stack = np.stack(
-            [f if f.dtype == np.float32 else f.astype(np.float32) for f in values],
-            axis=0,
-        )
-    else:
-        stack = np.empty((K, Hp, Wp), dtype=np.float32)
-        for i, f in enumerate(values):
-            stack[i, :H, :W] = f if f.dtype == np.float32 else f.astype(np.float32)
-        _pad_edge_inplace(stack, H, W)
-    out = stack.reshape(K, Hc, bs, Wc, bs).mean(axis=(2, 4)).astype(np.float32, copy=False)
-    return {k: out[i] for i, k in enumerate(keys)}
 
 
 # A single generate_precipitation() call can only "rain out" the moisture
@@ -353,38 +279,6 @@ def _evolve_temperature_substepped(
     return T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water
 
 
-# Cache for coarsened elevation. Elevation is static terrain — the same array
-# object is threaded unchanged through every simulate_step call for the life
-# of a run (see `new_state = PlanetState(..., elevation=state.elevation, ...)`
-# at the end of simulate_step) — but it was being re-coarsened from scratch up
-# to 3x per step (temp/precip block_size, wind_block_size, precip block_size),
-# a measurable share of profiled per-step cost at production resolution.
-# Mirrors masks.py's id()+content-fingerprint cache pattern (same risk: id()
-# can be reused after garbage collection, so a cheap fingerprint guards against
-# stale hits) rather than inventing a new scheme.
-_ELEV_COARSEN_CACHE: dict[tuple[int, int, int, int], np.ndarray] = {}
-_ELEV_COARSEN_CACHE_FP: dict[tuple[int, int, int, int], tuple[float, float, float]] = {}
-
-
-def _coarsen_elevation_cached(elevation: np.ndarray, Hc: int, Wc: int, bs: int) -> np.ndarray:
-    """Like `_coarsen`, but cached for the (elevation, Hc, Wc, bs) combination.
-
-    Only safe for arrays whose Python object identity is stable across calls
-    (i.e. `state.elevation`) — never use this for per-step-mutated fields.
-    """
-    key = (id(elevation), Hc, Wc, bs)
-    elev_r = np.asarray(elevation, dtype=np.float32).ravel()
-    n = elev_r.size
-    fp = (float(elev_r[0]), float(elev_r[-1]), float(elev_r.sum())) if n >= 2 else (0.0, 0.0, 0.0)
-    cached = _ELEV_COARSEN_CACHE.get(key)
-    if cached is not None and cached.shape == (Hc, Wc) and _ELEV_COARSEN_CACHE_FP.get(key) == fp:
-        return cached
-    result = _coarsen(elevation, Hc, Wc, bs)
-    result.flags.writeable = False  # catch accidental in-place mutation of the cached array
-    _ELEV_COARSEN_CACHE[key] = result
-    _ELEV_COARSEN_CACHE_FP[key] = fp
-    return result
-
 # Cache for ocean heat transport adjustment.
 # Ocean dynamics are slow (decorrelation time ~30 days), so we recompute
 # only once per ocean_update_interval_days and reuse the cached ΔT array.
@@ -525,77 +419,6 @@ def _apply_diffusion_numba(T: np.ndarray, thermal_diff: float, days: float,
         T_curr = T_new
 
     return T_curr
-
-
-class PlanetState(NamedTuple):
-    """Current planet state snapshot."""
-    day_of_year: float  # Fractional day (0-365.2422)
-    elevation: np.ndarray  # (H, W) terrain elevation [0,1]
-    total_days: float = 0.0  # Unwrapped simulation time (days since start)
-    temperature: np.ndarray | None = None  # (H, W) surface temperature (K)
-    air_temperature: np.ndarray | None = None  # (H, W) troposphere temperature (K)
-    wind_u: np.ndarray | None = None  # (H, W) eastward wind (m/s)
-    wind_v: np.ndarray | None = None  # (H, W) northward wind (m/s)
-    precipitation: np.ndarray | None = None  # (H, W) precipitation (mm/day)
-    humidity: np.ndarray | None = None  # (H, W) specific humidity [kg/kg]
-    soil_moisture: np.ndarray | None = None  # (H, W) bucket soil moisture [0,1]
-    cloud_cover: np.ndarray | None = None  # (H, W) cloud fraction [0,1]
-    cloud_water: np.ndarray | None = None  # (H, W) cloud liquid water [kg/kg]
-    snow_depth: np.ndarray | None = None  # (H, W) snow depth [m]
-    ice_cover: np.ndarray | None = None  # (H, W) sea ice fraction [0,1]
-    # Carbon cycle fields (Phase 3)
-    co2_atmosphere: float = 400.0  # Atmospheric CO2 concentration [ppm] (global mean)
-    co2_ocean: np.ndarray | None = None  # (H, W) dissolved CO2 in ocean [ppm equivalent]
-    vegetation_biomass: np.ndarray | None = None  # (H, W) carbon in vegetation [kg C/m²]
-    # Climate averaging fields (Phase 1 - Biome Stability)
-    climate_temp_avg: np.ndarray | None = None  # (H, W) 10-year rolling average temperature [K]
-    climate_precip_avg: np.ndarray | None = None  # (H, W) 10-year rolling average precip [mm/day]
-    climate_sample_days: float = 0.0  # Days accumulated in climate average
-    biome_type: np.ndarray | None = None  # (H, W) stable biome classification (0-4: ocean, desert, grass, forest, tundra)
-    biome_last_update_day: float = 0.0  # Total days when biomes were last reclassified
-    # Monthly climate statistics for Köppen classification
-    monthly_temp: np.ndarray | None = None  # (12, H, W) monthly mean temperature [K]
-    monthly_precip: np.ndarray | None = None  # (12, H, W) monthly mean precipitation [mm/day]
-    monthly_sample_count: np.ndarray | None = None  # (12,) sample count per month
-    koppen_type: np.ndarray | None = None  # (H, W) Köppen climate classification (0-19)
-    ice_sheet_age: np.ndarray | None = None  # (H, W) days each land cell has continuously met EF criteria
-    # Feature 1: cloud radiative feedback
-    # (cloud_cover already exists above — used as prev_cloud_cover each step)
-    # Feature 3: salinity / AMOC freshwater
-    salinity: np.ndarray | None = None  # (H, W) practical salinity [PSU]; ocean only
-    # Feature 4: CH4 / permafrost carbon
-    ch4_atmosphere: float = 1900.0  # global mean atmospheric CH4 [ppb]
-    permafrost_carbon: np.ndarray | None = None  # (H, W) frozen soil carbon [kgC/m²]
-    # Feature 5: deep ocean 2-layer
-    T_deep_ocean: np.ndarray | None = None  # (H, W) abyssal ocean temperature [K]
-    # Feature 6: sea ice thickness
-    ice_thickness: np.ndarray | None = None  # (H, W) sea ice thickness [m]; 0 on land/open ocean
-    # Feature 7: jet stream dynamics (persistent meander index + blocking events)
-    jet_index_nh: float = 0.0   # NH persistent meander/waviness index, roughly [-2, 2]
-    jet_index_sh: float = 0.0   # SH persistent meander/waviness index
-    jet_block_lon_nh: float = -1.0        # active NH blocking ridge longitude [deg]; -1 = inactive
-    jet_block_days_left_nh: float = 0.0   # days remaining in the active NH block
-    jet_block_total_days_nh: float = 0.0  # total drawn duration of the active NH block (for ramp envelope)
-    jet_block_lon_sh: float = -1.0
-    jet_block_days_left_sh: float = 0.0
-    jet_block_total_days_sh: float = 0.0
-    # Feature 8: 1.5-layer atmosphere (real prognostic upper-level wind)
-    wind_u_aloft: np.ndarray | None = None  # (H, W) upper-level eastward wind (m/s)
-    wind_v_aloft: np.ndarray | None = None  # (H, W) upper-level northward wind (m/s)
-    # Planet identity this save belongs to (None = EARTH, for saves predating this field)
-    planet_params: PlanetParams | None = None
-    # 2-layer soil-moisture bucket (Feature: soil desiccation-bistability fix, Jul 2026):
-    # soil_moisture (above) is now the fast-draining surface layer; this is the
-    # slow-draining deep/root-zone reservoir. See atmosphere.generate_precipitation.
-    soil_moisture_deep: np.ndarray | None = None
-    # Rolling wind-speed average for ocean_co2_flux's piston velocity (Jul 2026 fix):
-    # Wanninkhof's k∝u² is calibrated for time-averaged wind, not the instantaneous
-    # per-step value. See carbon_cycle.ocean_co2_flux docstring.
-    wind_speed_avg: np.ndarray | None = None
-    # Optional routed land-surface water (hydrology.py; disabled by default).
-    surface_water_mm: np.ndarray | None = None
-    river_discharge_mm_day: np.ndarray | None = None
-    runoff_to_ocean_mm_day: np.ndarray | None = None
 
 
 def simulate_step(
@@ -2174,18 +1997,13 @@ def simulate_multiple_steps(
     Returns:
         List of states at each step (including initial)
     """
-    states = [initial_state]
-    components_list = [{}]  # Empty dict for initial state
-    current = initial_state
-    n_steps = int(np.ceil(total_days / step_days))
-    for _ in range(n_steps):
-        dt = min(step_days, total_days - (len(states) - 1) * step_days)
-        if dt <= 0:
-            break
-        current, comps = simulate_step(current, days=dt, **kwargs)
-        states.append(current)
-        components_list.append(comps)
-    return states, components_list
+    return run_multiple_steps(
+        initial_state,
+        total_days,
+        step_days,
+        step_function=simulate_step,
+        step_kwargs=kwargs,
+    )
 
 
 def create_initial_state(
@@ -2203,26 +2021,12 @@ def create_initial_state(
     Returns:
         Initialized state with all fields computed
     """
-    # Seed atmospheric composition from the planet's parameters. Previously
-    # only the optimizer's headless runner applied co2_initial_ppm, so GUI and
-    # test runs silently started every planet at the PlanetState defaults
-    # (Earth-2020 values) regardless of PlanetParams.
-    _pp_init = kwargs.get("planet_params") or EARTH
-    state = PlanetState(
-        day_of_year=day_of_year,
-        total_days=0.0,
-        elevation=elevation,
-        temperature=None,
-        wind_u=None,
-        wind_v=None,
-        precipitation=None,
-        humidity=None,
-        co2_atmosphere=float(_pp_init.co2_initial_ppm),
-        ch4_atmosphere=float(_pp_init.ch4_initial_ppb),
-        planet_params=_pp_init,
+    return initialize_state(
+        elevation,
+        day_of_year,
+        step_function=simulate_step,
+        step_kwargs=kwargs,
     )
-    new_state, _ = simulate_step(state, days=0.0, **kwargs)
-    return new_state
 
 
 def _evolve_temperature(
@@ -2429,6 +2233,8 @@ def _evolve_temperature(
             lat_cloud,
             radius_m=_pp.radius_m,
         )
+        ascent = _normalize_positive_driver(-div)
+        subsidence = _normalize_positive_driver(div)
     else:
         # Legacy flat-index operator. Row indices increase southward while v
         # is northward-positive, so physical meridional derivative is -d/drow.
@@ -2436,10 +2242,10 @@ def _evolve_temperature(
             0.5 * (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1))
             - np.gradient(v, axis=0)
         )
-    ascent = np.clip(-div, 0.0, None)
-    subsidence = np.clip(div, 0.0, None)
-    ascent = ascent / (np.mean(ascent) + 1e-6)
-    subsidence = subsidence / (np.mean(subsidence) + 1e-6)
+        ascent = np.clip(-div, 0.0, None)
+        subsidence = np.clip(div, 0.0, None)
+        ascent = ascent / (np.mean(ascent) + 1e-6)
+        subsidence = subsidence / (np.mean(subsidence) + 1e-6)
     gx = 0.5 * (np.roll(elev_c, -1, axis=1) - np.roll(elev_c, 1, axis=1))
     # Physical northward terrain slope; row index increases toward the south.
     gy = -np.gradient(elev_c, axis=0)
@@ -2928,226 +2734,10 @@ def clear_simulation_caches() -> None:
 
     _RELAX_CACHE.clear()
     _RELAX_CACHE.update({"key": None, "u": None, "v": None})
-    _ELEV_COARSEN_CACHE.clear()
-    _ELEV_COARSEN_CACHE_FP.clear()
+    clear_grid_caches()
     _OCEAN_ADJ_CACHE.clear()
     _OCEAN_ADJ_CACHE.update({"adj": None, "last_update_day": -9999.0})
     _CARBON_SLOW_CACHE.clear()
     _CARBON_SLOW_CACHE.update({"key": None, "last_update_day": -9999.0, "biome": None})
     clear_all_caches()
     clear_temperature_cache()
-
-
-# ============================================================================
-# State Serialization Functions
-# Enable saving and loading simulation states for experiments
-# ============================================================================
-
-STATE_SCHEMA_VERSION = 1
-
-
-def _save_state_npz(state: PlanetState, filepath: Path) -> None:
-    """Write a non-executable, versioned NumPy/JSON state archive."""
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    arrays: dict[str, np.ndarray] = {}
-    scalars: dict[str, float | int | bool | str] = {}
-    none_fields: list[str] = []
-    planet_params_data: dict | None = None
-
-    for field in PlanetState._fields:
-        value = getattr(state, field)
-        if isinstance(value, np.ndarray):
-            arrays[field] = value
-        elif value is None:
-            none_fields.append(field)
-        elif field == "planet_params":
-            planet_params_data = dataclasses.asdict(value)
-        elif isinstance(value, (float, int, bool, str)):
-            scalars[field] = value
-        else:
-            raise TypeError(f"Cannot safely serialize PlanetState.{field}: {type(value)!r}")
-
-    metadata = {
-        "format": "planetsim-npz",
-        "schema_version": STATE_SCHEMA_VERSION,
-        "scalars": scalars,
-        "none_fields": none_fields,
-        "planet_params": planet_params_data,
-    }
-    arrays["__metadata__"] = np.asarray(json.dumps(metadata, separators=(",", ":")))
-
-    temp_path = filepath.with_name(filepath.name + ".tmp.npz")
-    try:
-        np.savez_compressed(temp_path, **arrays)
-        temp_path.replace(filepath)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
-
-    file_size_mb = filepath.stat().st_size / 1e6
-    print(f"State saved safely to {filepath} ({file_size_mb:.1f} MB)")
-
-
-def _load_state_npz(filepath: Path) -> PlanetState:
-    """Load and validate a non-executable NumPy/JSON state archive."""
-    with np.load(filepath, allow_pickle=False) as archive:
-        if "__metadata__" not in archive.files:
-            raise ValueError("Safe state archive is missing __metadata__")
-        raw_metadata = archive["__metadata__"]
-        if raw_metadata.ndim != 0 or raw_metadata.dtype.kind not in ("U", "S"):
-            raise ValueError("Safe state metadata must be a scalar JSON string")
-        metadata = json.loads(str(raw_metadata.item()))
-        if metadata.get("format") != "planetsim-npz":
-            raise ValueError("Not a PlanetSim safe state archive")
-        version = int(metadata.get("schema_version", -1))
-        if version > STATE_SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported save schema v{version} "
-                f"(this build supports up to v{STATE_SCHEMA_VERSION})"
-            )
-        if version < 1:
-            raise ValueError(f"Unsupported save schema v{version}")
-
-        known_fields = set(PlanetState._fields)
-        scalars = metadata.get("scalars", {})
-        none_fields = set(metadata.get("none_fields", []))
-        archive_fields = set(archive.files) - {"__metadata__"}
-        unknown = (set(scalars) | none_fields | archive_fields) - known_fields
-        if unknown:
-            raise ValueError(f"Safe state contains unknown fields: {sorted(unknown)}")
-
-        values = dict(PlanetState._field_defaults)
-        values.update(scalars)
-        values.update({field: None for field in none_fields})
-        for field in archive_fields:
-            values[field] = np.array(archive[field], copy=True)
-
-    pp_data = metadata.get("planet_params")
-    if pp_data is not None:
-        # JSON has no tuple type; restore tuple-valued dataclass defaults so
-        # loaded parameters retain their declared immutable representation.
-        pp_data = dict(pp_data)
-        for field in dataclasses.fields(PlanetParams):
-            if isinstance(field.default, tuple) and isinstance(pp_data.get(field.name), list):
-                pp_data[field.name] = tuple(pp_data[field.name])
-        values["planet_params"] = PlanetParams(**pp_data)
-    else:
-        values["planet_params"] = None
-    if "day_of_year" not in values or "elevation" not in values:
-        raise ValueError("Safe state is missing day_of_year or elevation")
-
-    elevation = np.asarray(values["elevation"])
-    if elevation.ndim != 2:
-        raise ValueError(f"elevation must be 2D, got {elevation.shape}")
-    H, W = elevation.shape
-    for field, value in values.items():
-        if not isinstance(value, np.ndarray) or field == "elevation":
-            continue
-        if field in ("monthly_temp", "monthly_precip"):
-            expected = (12, H, W)
-        elif field == "monthly_sample_count":
-            expected = (12,)
-        else:
-            expected = (H, W)
-        if value.shape != expected:
-            raise ValueError(
-                f"PlanetState.{field} has shape {value.shape}; expected {expected}"
-            )
-
-    state = PlanetState(**values)
-    print(f"State loaded safely from {filepath} (day {state.total_days:.1f})")
-    return state
-
-
-def save_state(state: PlanetState, filepath: str | Path) -> None:
-    """Save PlanetState to disk using a versioned pickle envelope.
-
-    Args:
-        state: PlanetState to save
-        filepath: Path to save file (will create parent directories if needed)
-
-    Example:
-        >>> save_state(current_state, "saves/state_day365.pkl")
-    """
-    filepath = Path(filepath)
-    if filepath.suffix.lower() == ".npz":
-        _save_state_npz(state, filepath)
-        return
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-
-    envelope = {
-        "schema_version": STATE_SCHEMA_VERSION,
-        "planet_params": state.planet_params,
-        "state": state,
-    }
-    with open(filepath, 'wb') as f:
-        pickle.dump(envelope, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    file_size_mb = filepath.stat().st_size / 1e6
-    print(f"State saved to {filepath} ({file_size_mb:.1f} MB)")
-
-
-def load_state(filepath: str | Path) -> PlanetState:
-    """Load PlanetState from disk.
-
-    Accepts both the versioned envelope (schema v1+) and legacy raw pickles.
-
-    Args:
-        filepath: Path to saved state file
-
-    Returns:
-        Loaded PlanetState
-
-    Example:
-        >>> state = load_state("saves/state_day365.pkl")
-    """
-    filepath = Path(filepath)
-
-    if not filepath.exists():
-        raise FileNotFoundError(f"State file not found: {filepath}")
-    if filepath.suffix.lower() == ".npz":
-        return _load_state_npz(filepath)
-
-    with open(filepath, 'rb') as f:
-        obj = pickle.load(f)
-
-    if isinstance(obj, dict) and "schema_version" in obj:
-        version = int(obj["schema_version"])
-        if version > STATE_SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported save schema v{version} "
-                f"(this build supports up to v{STATE_SCHEMA_VERSION})"
-            )
-        state = obj["state"]
-        if state.planet_params is None and obj.get("planet_params") is not None:
-            state = state._replace(planet_params=obj["planet_params"])
-    else:
-        state = obj
-
-    print(f"State loaded from {filepath} (day {state.total_days:.1f})")
-    return state
-
-
-def auto_save(state: PlanetState, save_dir: str | Path = "saves",
-              every_n_days: float = 365) -> None:
-    """Automatically save state at regular intervals.
-
-    Args:
-        state: Current PlanetState
-        save_dir: Directory to save states (default: "saves")
-        every_n_days: Save frequency in simulation days (default: 365)
-
-    Example:
-        >>> # In simulation loop
-        >>> auto_save(state, every_n_days=100)  # Save every 100 days
-    """
-    save_dir = Path(save_dir)
-    save_dir.mkdir(exist_ok=True)
-
-    day_num = int(state.total_days)
-    if day_num % int(every_n_days) == 0 and day_num > 0:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"state_day{day_num:06d}_{timestamp}.pkl"
-        save_state(state, save_dir / filename)
-
-
