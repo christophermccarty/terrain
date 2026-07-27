@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import copy
+
+import numpy as np
+import pytest
+
+from planet_params import EARTH
+from real_terrain_validation import (
+    DEFAULT_BASELINE_PATH,
+    RealTerrainValidationConfig,
+    compare_validation_reports,
+    load_bundled_earth_dem,
+    load_validation_report,
+    run_real_terrain_validation,
+    summarize_real_terrain_climate,
+)
+from regional_validation import EARTH_PRECIP_REGIONS, region_mask
+from simulate import PlanetState
+
+
+def test_bundled_dem_downsampling_is_deterministic_and_geographic():
+    first = load_bundled_earth_dem(64, 128)
+    second = load_bundled_earth_dem(64, 128)
+    np.testing.assert_array_equal(first, second)
+    assert first.shape == (64, 128)
+    assert first.dtype == np.float32
+    assert 0.0 < float(np.mean(first == 0.0)) < 0.9
+
+    land = first > 0.0
+    missing = [
+        region.name
+        for region in EARTH_PRECIP_REGIONS
+        if not np.any(region_mask(first.shape, region, cell_mask=land))
+    ]
+    assert not missing
+
+
+def test_climate_summary_contains_global_regional_and_zonal_metrics():
+    shape = (180, 360)
+    elevation = np.ones(shape, dtype=np.float32)
+    elevation[:12] = 0.0
+    state = PlanetState(day_of_year=80.0, elevation=elevation, planet_params=EARTH)
+    temperature = np.full(shape, 288.0, dtype=np.float32)
+    precipitation = np.full(shape, 1.0, dtype=np.float32)
+    cloud = np.full(shape, 0.5, dtype=np.float32)
+    soil = np.full(shape, 0.4, dtype=np.float32)
+
+    metrics = summarize_real_terrain_climate(
+        state,
+        mean_temperature_k=temperature,
+        mean_precipitation_mm_day=precipitation,
+        mean_cloud_fraction=cloud,
+        mean_soil_moisture=soil,
+        planet_params=EARTH,
+    )
+
+    assert metrics["global"]["temperature_k"] == pytest.approx(288.0)
+    assert metrics["global"]["precip_mm_day"] == pytest.approx(1.0)
+    assert set(metrics["regional_precip_mm_year"]) == {
+        region.name for region in EARTH_PRECIP_REGIONS
+    }
+    assert metrics["regional_precip_mm_year"]["US Midwest"] == pytest.approx(
+        EARTH.orbital_period_days
+    )
+    assert "40-50N" in metrics["zonal"]
+    assert np.isfinite(metrics["reference_error_score"])
+
+
+def test_baseline_comparison_reports_material_regression():
+    baseline = {
+        "config": {"height": 64},
+        "metrics": {
+            "global": {
+                "temperature_k": 288.0,
+                "precip_mm_day": 2.7,
+                "cloud_fraction": 0.5,
+                "land_soil_moisture": 0.4,
+                "land_soil_floor_fraction": 0.0,
+                "nh_midlat_soil_floor_fraction": 0.0,
+            },
+            "regional_precip_mm_year": {"Sahara": 150.0},
+            "regional_soil_moisture": {"Sahara": 0.2},
+            "zonal": {
+                "0-10N": {"temperature_c": 26.0, "precip_mm_year": 1900.0}
+            },
+        },
+    }
+    current = copy.deepcopy(baseline)
+    current["metrics"]["global"]["temperature_k"] = 294.0
+    current["metrics"]["regional_precip_mm_year"]["Sahara"] = 400.0
+
+    failures = compare_validation_reports(current, baseline)
+    assert any("temperature_k" in failure for failure in failures)
+    assert any("Sahara" in failure for failure in failures)
+
+
+def test_tracked_real_terrain_baseline_is_valid():
+    report = load_validation_report(DEFAULT_BASELINE_PATH)
+    assert report["config"] == {
+        "block_size": 4,
+        "evaluation_years": 1.0,
+        "height": 64,
+        "precip_block_size": 1,
+        "spinup_years": 1.0,
+        "start_day": 80.0,
+        "time_scale": "MONTHLY",
+        "width": 128,
+        "wind_block_size": 4,
+    }
+    assert np.isfinite(report["metrics"]["reference_error_score"])
+
+
+@pytest.mark.slow
+def test_compact_real_terrain_run_matches_tracked_baseline():
+    baseline = load_validation_report(DEFAULT_BASELINE_PATH)
+    config = RealTerrainValidationConfig(**baseline["config"])
+    _, current = run_real_terrain_validation(config)
+    failures = compare_validation_reports(current, baseline)
+    assert not failures, "\n".join(failures)

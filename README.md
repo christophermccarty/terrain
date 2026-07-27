@@ -42,7 +42,7 @@ the GUI falls back to deterministic procedural terrain.
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 410 tests. Slow tests cover multi-decadal climate
+The suite currently collects 415 tests. Slow tests cover multi-decadal climate
 drift, conservation, circulation, seasonal behavior, and reanalysis anchors.
 
 ## Headless runs and benchmarks
@@ -54,6 +54,7 @@ used by tests and parameter searches. Useful scripts include:
 .\.venv\Scripts\python.exe scripts\benchmark_headless.py
 .\.venv\Scripts\python.exe scripts\profile_simulate_step.py
 .\.venv\Scripts\python.exe scripts\check_real_terrain_koppen.py --help
+.\.venv\Scripts\python.exe scripts\run_real_terrain_validation.py --compare
 ```
 
 At the 512×1024 production grid, DAILY and WEEKLY modes prioritize fidelity
@@ -83,6 +84,7 @@ weather processes.
 - `FEATURES.md` — prioritized experience and system features
 - `PLAN_PHYSICS_FIXES.md` — recent measured physics decisions
 - `docs/FINDINGS_SUMMARY.md` — durable findings promoted from local experiments
+- `docs/REAL_TERRAIN_VALIDATION.md` — regional/zonal benchmark workflow
 
 ## Save-file security
 

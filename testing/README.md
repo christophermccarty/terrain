@@ -2,7 +2,7 @@
 
 This folder is a standard pytest suite (`pytest.ini` + `conftest.py` fixtures at the repo
 root/`testing/`), not a collection of standalone scripts. As of 2026-07-26, it holds
-roughly 50 `test_*.py` modules and collects 410 tests. Use pytest collection as the
+roughly 50 `test_*.py` modules and collects 415 tests. Use pytest collection as the
 authoritative count because the suite changes frequently:
 
 ```powershell
@@ -17,6 +17,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pytest testing/                 # full suite (includes @slow tests; can take ~10+ min)
 .\.venv\Scripts\python.exe -m pytest testing/ -m "not slow"    # fast subset — use this for routine iteration
 .\.venv\Scripts\python.exe -m pytest testing/test_foo.py -q    # a single file
+.\.venv\Scripts\python.exe scripts\run_real_terrain_validation.py --compare
 ```
 
 Long-running benchmark/integration tests are marked `@pytest.mark.slow` (see `pytest.ini`) and
@@ -42,6 +43,8 @@ diagnostic scripts**, not pytest suites — pytest collects zero tests from them
   gate assertions
 - `results/high_latitude/` — generated JSON outputs from diagnostic runs
 - `reports/` — test and diagnostic writeups
+- `fixtures/real_terrain_validation_baseline.json` — compact real-DEM regression baseline;
+  it guards reviewed behavior while the separate reference score measures realism
 
 ### Rule Going Forward
 

@@ -1,0 +1,205 @@
+{
+  "config": {
+    "block_size": 4,
+    "evaluation_years": 1.0,
+    "height": 64,
+    "precip_block_size": 1,
+    "spinup_years": 1.0,
+    "start_day": 80.0,
+    "time_scale": "MONTHLY",
+    "width": 128,
+    "wind_block_size": 4
+  },
+  "metrics": {
+    "continental_minus_desert_precip_mm_year": 338.9331664722954,
+    "global": {
+      "cloud_fraction": 0.09680396939093633,
+      "land_soil_floor_fraction": 0.0,
+      "land_soil_moisture": 0.47167720892295806,
+      "nh_midlat_soil_floor_fraction": 0.0,
+      "ocean_temperature_k": 293.3081541387577,
+      "precip_mm_day": 3.350208604530638,
+      "temperature_k": 291.7310094184778
+    },
+    "koppen_land_percent": {
+      "arid": 20.539938769830226,
+      "humid_temperate_continental": 27.497912607848594,
+      "polar": 37.07208460896187,
+      "tropical": 14.890064013359309
+    },
+    "precip_rescale": {
+      "max": 5.0,
+      "mean": 2.719907909631729,
+      "saturated_fraction": 0.25
+    },
+    "reference_error_score": 0.4384035523871708,
+    "regional_precip_mm_year": {
+      "Atacama": 169.08803271646707,
+      "Canadian Prairies": 372.71776876140154,
+      "Central Europe": 702.8722499720278,
+      "Kalahari": 75.31168193064154,
+      "Sahara": 285.9193922584969,
+      "US Midwest": 471.5285875890626
+    },
+    "regional_soil_moisture": {
+      "Atacama": 0.5597412652439542,
+      "Canadian Prairies": 0.5347835992773375,
+      "Central Europe": 0.5108350840707621,
+      "Kalahari": 0.5467328213983114,
+      "Sahara": 0.5037673020804371,
+      "US Midwest": 0.5243307395527761
+    },
+    "regional_target_error_fraction": {
+      "Atacama": 2.3817606543293413,
+      "Canadian Prairies": 0.054564462477196915,
+      "Central Europe": 0.0,
+      "Kalahari": 0.0,
+      "Sahara": 0.4295969612924844,
+      "US Midwest": 0.32847141241093736
+    },
+    "zonal": {
+      "0-10N": {
+        "precip_mm_year": 3828.645136306495,
+        "precip_ratio": 1.9143225681532474,
+        "temperature_bias_c": 0.051696018377981545,
+        "temperature_c": 26.55169601837798
+      },
+      "0-10S": {
+        "precip_mm_year": 3805.7009472479713,
+        "precip_ratio": 2.537133964831981,
+        "temperature_bias_c": 1.0881577392419786,
+        "temperature_c": 26.58815773924198
+      },
+      "10-20N": {
+        "precip_mm_year": 1249.0547235185293,
+        "precip_ratio": 0.6939192908436274,
+        "temperature_bias_c": -0.20463814073133335,
+        "temperature_c": 25.295361859268667
+      },
+      "40-50N": {
+        "precip_mm_year": 842.8631381430429,
+        "precip_ratio": 1.4047718969050715,
+        "temperature_bias_c": 5.915979763865494,
+        "temperature_c": 14.915979763865494
+      },
+      "40-50S": {
+        "precip_mm_year": 707.2353992007467,
+        "precip_ratio": 0.8840442490009334,
+        "temperature_bias_c": 6.028142055869182,
+        "temperature_c": 18.028142055869182
+      },
+      "50-60N": {
+        "precip_mm_year": 831.9465395465206,
+        "precip_ratio": 1.6638930790930413,
+        "temperature_bias_c": 4.49927380614821,
+        "temperature_c": 8.49927380614821
+      }
+    }
+  },
+  "planet": {
+    "eccentricity": 0.0167,
+    "obliquity_deg": 23.44,
+    "orbital_period_days": 365.2422,
+    "solar_constant": 1361.0
+  },
+  "planet_params": {
+    "acc_bonus_far": 20.0,
+    "acc_bonus_near": 8.0,
+    "aerosol_optical_depth": 0.0,
+    "amoc_bonus_far": 9.0,
+    "amoc_bonus_near": 3.0,
+    "amoc_cutoff_lat": 80.0,
+    "bg_ar_frac": 0.0093,
+    "bg_n2_frac": 0.7808,
+    "bg_o2_frac": 0.2095,
+    "ch4_baseline_ppb": 700.0,
+    "ch4_initial_ppb": 1900.0,
+    "cloud_greenhouse_factor": 0.12,
+    "cloud_water_feedback": 0.0,
+    "co2_baseline_ppm": 280.0,
+    "co2_climate_feedback": 0.8,
+    "co2_initial_ppm": 415.0,
+    "co2_wind_averaging_days": 30.0,
+    "cp_dry": 1004.0,
+    "deep_ocean_depth_m": 3700.0,
+    "deep_ocean_exchange_rate": 9.13e-05,
+    "deep_ocean_heat_capacity_ratio": 0.013513513513513514,
+    "eccentricity": 0.0167,
+    "eddy_heat_flux_coeff": 0.006,
+    "ekman_strength": 0.3,
+    "enable_milankovitch_cycles": false,
+    "enable_surface_hydrology": false,
+    "epsilon_equator": 0.68,
+    "epsilon_pole": 0.7,
+    "ferrel_v_centre_deg": 44.0,
+    "ferrel_v_land_shift_deg": -4.0,
+    "gas_constant_dry": 287.0,
+    "has_liquid_water_ocean": true,
+    "humidity_advection_cfl": false,
+    "ice_albedo_strength": 0.3,
+    "jet_block_duration_range_days": [
+      10.0,
+      40.0
+    ],
+    "jet_block_pressure_amp_pa": 180.0,
+    "jet_block_radius_km": 3200.0,
+    "jet_block_trigger_rate_per_day": 0.015,
+    "jet_gradient_ref_k": 40.0,
+    "jet_lat_shift_per_index": 6.0,
+    "jet_meander_noise_amp": 0.35,
+    "jet_meander_tau_days": 10.0,
+    "jet_speed_scale_per_index": 0.25,
+    "jet_wave_amp_scale_per_index": 0.5,
+    "k_airsea": 0.001,
+    "mean_molar_mass": 0.029,
+    "milankovitch_eccentricity_amplitude": 0.02,
+    "milankovitch_obliquity_amplitude_deg": 1.2,
+    "milankovitch_time_scale": 1.0,
+    "moisture_advection_scale": 0.0,
+    "obliquity_deg": 23.44,
+    "ocean_fraction": 0.71,
+    "ocean_gyre_strength": 0.0,
+    "ocean_lag_days": 50.0,
+    "ocean_transport_coeff": 0.3,
+    "orbital_period_days": 365.2422,
+    "perihelion_day": 3.0,
+    "pgf_continentality_amp": 0.0,
+    "polar_cooling_scale": 0.3,
+    "precip_substep_days": 0.0,
+    "radius_m": 6371000.0,
+    "river_routing_fraction": 0.55,
+    "river_routing_passes": 8,
+    "rotation_direction": 1,
+    "runoff_fraction": 0.35,
+    "runoff_soil_threshold": 0.75,
+    "salinity_amoc_scale": 1.0,
+    "salinity_reference_psu": 35.0,
+    "sidereal_day_hours": 23.9345,
+    "soil_deep_drain_rate": 0.002,
+    "soil_deep_evap_weight": 0.5,
+    "soil_deep_gain_rate": 0.0,
+    "solar_constant": 1361.0,
+    "spherical_metric_clouds": false,
+    "spherical_metric_precip": false,
+    "storm_pressure_amp_pa": 110.0,
+    "surface_gravity": 9.81,
+    "surface_pressure_pa": 101325.0,
+    "temperature_substep_days": 0.0,
+    "thermal_diffusivity": 0.04,
+    "trade_wave_pressure_amp_pa": 65.0,
+    "vernal_equinox_day": 80.0,
+    "wind_prognostic_substep_days": 0.0,
+    "wind_upper_damping": 0.05,
+    "wind_upper_hadley_edge_deg": 24.0,
+    "wind_upper_pgf_amp": 90.0,
+    "wv_greenhouse_factor": 0.1
+  },
+  "schema_version": 1,
+  "simulation": {
+    "evaluation_cycles": 12,
+    "final_total_days": 730.4843999999996,
+    "sampled_days": 365.24219999999997,
+    "spinup_cycles": 12,
+    "wall_seconds": 3.3607034000451677
+  }
+}

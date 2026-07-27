@@ -16,15 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Versioned reference bands (°C / mm yr⁻¹) from ERA5/CRU climatology summaries
-# used elsewhere in the test suite (see test_latitude_band_regression.py).
+from real_terrain_validation import EARTH_ZONAL_REFERENCE
+
+# Shared with the real-terrain platform so manual, synthetic, and real-DEM
+# validation cannot silently use different climatology anchors.
 ERA5_CRU_REFERENCE = {
-    "0-10N": {"t_c": 26.5, "p_mm_yr": 2000},
-    "10-20N": {"t_c": 25.5, "p_mm_yr": 1800},
-    "40-50N": {"t_c": 9.0, "p_mm_yr": 600},
-    "50-60N": {"t_c": 4.0, "p_mm_yr": 500},
-    "0-10S": {"t_c": 25.5, "p_mm_yr": 1500},
-    "40-50S": {"t_c": 12.0, "p_mm_yr": 800},
+    name: {"t_c": values["t_c"], "p_mm_yr": values["p_mm_yr"]}
+    for name, values in EARTH_ZONAL_REFERENCE.items()
 }
 
 
@@ -95,10 +93,6 @@ def test_zonal_precipitation_within_factor_of_three(spun_state):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason="Mid-latitude precip on synthetic terrain needs multi-year spinup (known SH deficit)",
-    strict=False,
-)
 def test_midlatitude_precip_reanalysis_anchor(spun_state):
     lat_edges = {"40-50N": (40.0, 50.0), "40-50S": (-50.0, -40.0)}
     bands = _zonal_band_means(spun_state, lat_edges=lat_edges)
