@@ -9,7 +9,7 @@
   "wind_block_size": 8,
   "show_jet_stream": true,
   "auto_save_state": false,
-  "last_state_path": "D:\\dev\\planetsim\\saves\\earth.pkl",
+  "last_state_path": "D:\\dev\\planetsim\\saves\\earth.npz",
   "planet_preset": "Earth",
   "planet_solar_constant": 1361.0,
   "planet_obliquity_deg": 23.44,

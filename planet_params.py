@@ -61,6 +61,22 @@ class PlanetParams:
     planet-relative rather than an Earth day-number convention.
     """
 
+    enable_milankovitch_cycles: bool = False
+    """Evolve obliquity, eccentricity, and precession over simulated time."""
+
+    milankovitch_time_scale: float = 1.0
+    """Orbital-cycle years elapsed per simulated orbital year.
+
+    Use 1 for real pacing or a larger value (for example 10,000) to make
+    multi-millennial cycles observable during an interactive run.
+    """
+
+    milankovitch_obliquity_amplitude_deg: float = 1.2
+    """Sinusoidal obliquity amplitude around `obliquity_deg`."""
+
+    milankovitch_eccentricity_amplitude: float = 0.02
+    """Sinusoidal eccentricity amplitude around `eccentricity`."""
+
     # ------------------------------------------------------------------ #
     # Rotation
     # ------------------------------------------------------------------ #
@@ -420,6 +436,17 @@ class PlanetParams:
     (ROADMAP Theme 1); structural for high-obliquity or polar-precipitation
     worlds. See PLAN_PHYSICS_FIXES.md."""
 
+    spherical_metric_clouds: bool = False
+    """Use spherical wind divergence for cloud ascent/subsidence diagnostics.
+
+    The cloud path in `simulate._evolve_temperature` historically used the
+    same flat index-space derivative class as the legacy precipitation kernel.
+    `True` computes divergence through `atmosphere.flux_divergence_spherical`
+    with a unit scalar field. It is independently gated from
+    `spherical_metric_precip` so each redistribution can be measured and
+    calibrated separately. Default False preserves the current climate exactly
+    until real-terrain, cloud-cover, and high-latitude validation is complete."""
+
     moisture_advection_scale: float = 0.0
     """Blend weight [0-1] for an additional longer-range moisture transport term
     in `atmosphere.generate_precipitation` (`_advect_scalar_flux_eulerian`),
@@ -535,6 +562,26 @@ class PlanetParams:
     can "rescue" evaporation via root uptake when the surface is dry, at reduced
     efficiency, without needing to dominate when the surface is already adequately
     moist. 0.5 is a starting point pending calibration against real terrain."""
+
+    enable_surface_hydrology: bool = False
+    """Enable experimental runoff, lake storage, and D8 river routing.
+
+    Disabled by default until multi-decadal real-terrain water budgets and
+    precipitation feedbacks are calibrated. When enabled, the model records
+    `surface_water_mm`, `river_discharge_mm_day`, and
+    `runoff_to_ocean_mm_day` in PlanetState."""
+
+    runoff_soil_threshold: float = 0.75
+    """Surface-soil saturation above which precipitation generates runoff."""
+
+    runoff_fraction: float = 0.35
+    """Maximum fraction of precipitation converted to runoff at saturation."""
+
+    river_routing_passes: int = 8
+    """Number of vectorized D8 routing passes per climate step."""
+
+    river_routing_fraction: float = 0.55
+    """Fraction of available water sent downhill during each routing pass."""
 
     # ------------------------------------------------------------------ #
     # Cloud radiative feedback (Feature 1)

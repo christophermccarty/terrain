@@ -7,6 +7,8 @@ with configurable time scales. Default unit is one day.
 from __future__ import annotations
 
 import logging
+import dataclasses
+import json
 import numpy as np
 from typing import NamedTuple
 from pathlib import Path
@@ -34,7 +36,7 @@ import pickle
 from atmosphere import (
     generate_wind_field, generate_precipitation,
     evolve_wind, evolve_wind_aloft, _upsample_bilinear_many,
-    _update_jet_index, _update_jet_blocking,
+    _update_jet_index, _update_jet_blocking, flux_divergence_spherical,
 )
 from temperature import (
     temperature_kelvin_for_lat,
@@ -590,6 +592,10 @@ class PlanetState(NamedTuple):
     # Wanninkhof's k∝u² is calibrated for time-averaged wind, not the instantaneous
     # per-step value. See carbon_cycle.ocean_co2_flux docstring.
     wind_speed_avg: np.ndarray | None = None
+    # Optional routed land-surface water (hydrology.py; disabled by default).
+    surface_water_mm: np.ndarray | None = None
+    river_discharge_mm_day: np.ndarray | None = None
+    runoff_to_ocean_mm_day: np.ndarray | None = None
 
 
 def simulate_step(
@@ -598,6 +604,7 @@ def simulate_step(
     *,
     block_size: int = 3,
     wind_block_size: int | None = None,
+    precip_block_size: int | None = None,
     update_wind: bool = True,
     # Small relaxation toward a diagnostic wind (includes tropical trades + mid-lat storm-track structure).
     # This helps recover easterly trades, westerly mid-lats, and calmer doldrums in a single-layer model.
@@ -645,6 +652,7 @@ def simulate_step(
     thermal_diffusion: float | None = None,    # None → pp.thermal_diffusivity
     latent_cooling_coeff: float = 0.015,  # Deprecated no-op (found by test_param_wiring.py, 2026-07-04): accepted but never read anywhere in the codebase; kept for config compatibility
     enable_carbon_cycle: bool = True,
+    apply_greenhouse_forcing: bool = True,
     co2_climate_feedback: float | None = None,  # None → pp.co2_climate_feedback
     debug_log: bool = False,
     track_components: bool = False,
@@ -678,12 +686,22 @@ def simulate_step(
         days: Time step in days (default 1.0)
         block_size: Coarse resolution for simulation (larger = faster, less accurate)
         wind_block_size: Coarse resolution used for wind evolution. If None, uses `block_size`.
+        precip_block_size: Precipitation resolution divisor (1 or 2). None uses
+            half resolution only for grids with at least 256 latitude rows.
         update_wind: Whether to recompute wind field
 
     Returns:
         New state with updated day_of_year and atmospheric fields
     """
-    pp = planet_params if planet_params is not None else EARTH
+    base_pp = planet_params or state.planet_params or EARTH
+    if base_pp.enable_milankovitch_cycles:
+        from orbital_cycles import orbital_params_at_time
+
+        pp = orbital_params_at_time(base_pp, state.total_days)
+    else:
+        pp = base_pp
+    if precip_block_size not in (None, 1, 2):
+        raise ValueError("precip_block_size must be None, 1, or 2")
 
     # Resolve parameters that default to None → pp.<field> (allows per-planet tuning
     # while still permitting explicit overrides from the optimizer or tests).
@@ -899,14 +917,16 @@ def simulate_step(
         ).astype(np.float32, copy=False)
 
     # ------------------------------------------------------
-    # CO2 Greenhouse Forcing (if carbon cycle enabled)
+    # CO2/CH4 greenhouse forcing is independent of reservoir evolution.
+    # `enable_carbon_cycle=False` means "hold concentrations fixed"; historically
+    # it also removed radiative forcing, making fixed-CO2 experiments inert.
     # ------------------------------------------------------
     # CRITICAL FIX: CO2 forcing must be applied to BASE TEMPERATURE before temperature evolution,
     # not added to final temperature afterward (which would cause runaway warming).
     # The forcing represents the equilibrium temperature offset that the simulation should relax toward.
     co2_temp_offset = 0.0
     _co2_ref = pp.co2_baseline_ppm if pp.co2_baseline_ppm > 1.0 else CO2_PREINDUSTRIAL
-    if enable_carbon_cycle and _fb.get('co2_greenhouse', True):
+    if apply_greenhouse_forcing and _fb.get('co2_greenhouse', True):
         co2_forcing = co2_radiative_forcing(state.co2_atmosphere, _co2_ref)
         co2_temp_offset = co2_temperature_response(co2_forcing, co2_climate_feedback)
         # Feature 4: CH4 radiative forcing added to equilibrium temperature offset
@@ -1393,6 +1413,8 @@ def simulate_step(
             round(float(pp.sidereal_day_hours), 4),
             round(float(pp.radius_m), 1),
             round(float(pp.pgf_continentality_amp), 4),
+            round(float(getattr(pp, "ferrel_v_centre_deg", 48.0)), 4),
+            round(float(getattr(pp, "ferrel_v_land_shift_deg", 0.0)), 4),
         )
         cache = _RELAX_CACHE
         if cache["key"] == key and cache["u"] is not None and cache["v"] is not None:
@@ -1752,7 +1774,7 @@ def simulate_step(
         # the half-resolution cell size (~0.7°) still resolves the subtropical dry belt
         # adequately. For small grids (H < 256) the subtropical band spans too few rows
         # at half resolution, so full-resolution precipitation is used instead.
-        _pbs = 2 if H >= 256 else 1
+        _pbs = (2 if H >= 256 else 1) if precip_block_size is None else precip_block_size
         _Hcp = max(1, H // _pbs)
         _Wcp = max(1, W // _pbs)
         if _pbs > 1 and H >= 4 and W >= 4:
@@ -1808,6 +1830,40 @@ def simulate_step(
         humidity_next = None
         soil_next = None
         soil_deep_next = None
+
+    if pp.enable_surface_hydrology and P_full is not None and soil_next is not None:
+        from hydrology import route_surface_water
+
+        _, _hydro_land = get_masks(state.elevation)
+        _threshold = float(np.clip(pp.runoff_soil_threshold, 0.0, 0.999))
+        _saturation_excess = np.clip(
+            (soil_next - _threshold) / max(1.0 - _threshold, 1e-6),
+            0.0,
+            1.0,
+        )
+        _runoff_mm_day = (
+            np.maximum(P_full, 0.0)
+            * _saturation_excess
+            * float(np.clip(pp.runoff_fraction, 0.0, 1.0))
+            * _hydro_land.astype(np.float32)
+        )
+        (
+            surface_water_mm_new,
+            river_discharge_new,
+            runoff_to_ocean_new,
+        ) = route_surface_water(
+            state.elevation,
+            _runoff_mm_day,
+            state.surface_water_mm,
+            dt_days=float(days),
+            routing_passes=max(0, int(pp.river_routing_passes)),
+            routing_fraction=float(np.clip(pp.river_routing_fraction, 0.0, 1.0)),
+        )
+    else:
+        surface_water_mm_new = state.surface_water_mm
+        river_discharge_new = state.river_discharge_mm_day
+        runoff_to_ocean_new = state.runoff_to_ocean_mm_day
+
     # NOTE: latent cooling from precipitation is already applied inside
     # _evolve_temperature (via evaporation) and generate_precipitation.
     # Applying it again here was a double-count and has been removed.
@@ -2089,7 +2145,12 @@ def simulate_step(
         # Feature 8: 1.5-layer atmosphere upper-level wind
         wind_u_aloft=u2_full,
         wind_v_aloft=v2_full,
-        planet_params=pp,
+        # Preserve the scenario baseline; `pp` may be a time-varying effective
+        # Milankovitch snapshot and must not become the next cycle's baseline.
+        planet_params=base_pp,
+        surface_water_mm=surface_water_mm_new,
+        river_discharge_mm_day=river_discharge_new,
+        runoff_to_ocean_mm_day=runoff_to_ocean_new,
     )
 
     # Return state and components (empty dict if not tracking)
@@ -2357,9 +2418,24 @@ def _evolve_temperature(
         base_q = np.where(sea_mask, 0.012, 0.008).astype(np.float32, copy=False)
         q = base_q * (0.5 + 0.7 * temp_norm)
     rh = np.clip(q / qsat, 0.0, 1.5)
-    # Row indices increase southward while v is northward-positive, so the
-    # physical meridional derivative is -d(v)/d(row).
-    div = 0.5 * (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1)) - np.gradient(v, axis=0)
+    if _pp.spherical_metric_clouds:
+        lat_cloud = (
+            0.5 - (np.arange(Hc, dtype=np.float64) + 0.5) / float(Hc)
+        ) * np.pi
+        div = flux_divergence_spherical(
+            np.ones_like(u, dtype=np.float32),
+            u,
+            v,
+            lat_cloud,
+            radius_m=_pp.radius_m,
+        )
+    else:
+        # Legacy flat-index operator. Row indices increase southward while v
+        # is northward-positive, so physical meridional derivative is -d/drow.
+        div = (
+            0.5 * (np.roll(u, -1, axis=1) - np.roll(u, 1, axis=1))
+            - np.gradient(v, axis=0)
+        )
     ascent = np.clip(-div, 0.0, None)
     subsidence = np.clip(div, 0.0, None)
     ascent = ascent / (np.mean(ascent) + 1e-6)
@@ -2870,6 +2946,119 @@ def clear_simulation_caches() -> None:
 STATE_SCHEMA_VERSION = 1
 
 
+def _save_state_npz(state: PlanetState, filepath: Path) -> None:
+    """Write a non-executable, versioned NumPy/JSON state archive."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {}
+    scalars: dict[str, float | int | bool | str] = {}
+    none_fields: list[str] = []
+    planet_params_data: dict | None = None
+
+    for field in PlanetState._fields:
+        value = getattr(state, field)
+        if isinstance(value, np.ndarray):
+            arrays[field] = value
+        elif value is None:
+            none_fields.append(field)
+        elif field == "planet_params":
+            planet_params_data = dataclasses.asdict(value)
+        elif isinstance(value, (float, int, bool, str)):
+            scalars[field] = value
+        else:
+            raise TypeError(f"Cannot safely serialize PlanetState.{field}: {type(value)!r}")
+
+    metadata = {
+        "format": "planetsim-npz",
+        "schema_version": STATE_SCHEMA_VERSION,
+        "scalars": scalars,
+        "none_fields": none_fields,
+        "planet_params": planet_params_data,
+    }
+    arrays["__metadata__"] = np.asarray(json.dumps(metadata, separators=(",", ":")))
+
+    temp_path = filepath.with_name(filepath.name + ".tmp.npz")
+    try:
+        np.savez_compressed(temp_path, **arrays)
+        temp_path.replace(filepath)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    file_size_mb = filepath.stat().st_size / 1e6
+    print(f"State saved safely to {filepath} ({file_size_mb:.1f} MB)")
+
+
+def _load_state_npz(filepath: Path) -> PlanetState:
+    """Load and validate a non-executable NumPy/JSON state archive."""
+    with np.load(filepath, allow_pickle=False) as archive:
+        if "__metadata__" not in archive.files:
+            raise ValueError("Safe state archive is missing __metadata__")
+        raw_metadata = archive["__metadata__"]
+        if raw_metadata.ndim != 0 or raw_metadata.dtype.kind not in ("U", "S"):
+            raise ValueError("Safe state metadata must be a scalar JSON string")
+        metadata = json.loads(str(raw_metadata.item()))
+        if metadata.get("format") != "planetsim-npz":
+            raise ValueError("Not a PlanetSim safe state archive")
+        version = int(metadata.get("schema_version", -1))
+        if version > STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported save schema v{version} "
+                f"(this build supports up to v{STATE_SCHEMA_VERSION})"
+            )
+        if version < 1:
+            raise ValueError(f"Unsupported save schema v{version}")
+
+        known_fields = set(PlanetState._fields)
+        scalars = metadata.get("scalars", {})
+        none_fields = set(metadata.get("none_fields", []))
+        archive_fields = set(archive.files) - {"__metadata__"}
+        unknown = (set(scalars) | none_fields | archive_fields) - known_fields
+        if unknown:
+            raise ValueError(f"Safe state contains unknown fields: {sorted(unknown)}")
+
+        values = dict(PlanetState._field_defaults)
+        values.update(scalars)
+        values.update({field: None for field in none_fields})
+        for field in archive_fields:
+            values[field] = np.array(archive[field], copy=True)
+
+    pp_data = metadata.get("planet_params")
+    if pp_data is not None:
+        # JSON has no tuple type; restore tuple-valued dataclass defaults so
+        # loaded parameters retain their declared immutable representation.
+        pp_data = dict(pp_data)
+        for field in dataclasses.fields(PlanetParams):
+            if isinstance(field.default, tuple) and isinstance(pp_data.get(field.name), list):
+                pp_data[field.name] = tuple(pp_data[field.name])
+        values["planet_params"] = PlanetParams(**pp_data)
+    else:
+        values["planet_params"] = None
+    if "day_of_year" not in values or "elevation" not in values:
+        raise ValueError("Safe state is missing day_of_year or elevation")
+
+    elevation = np.asarray(values["elevation"])
+    if elevation.ndim != 2:
+        raise ValueError(f"elevation must be 2D, got {elevation.shape}")
+    H, W = elevation.shape
+    for field, value in values.items():
+        if not isinstance(value, np.ndarray) or field == "elevation":
+            continue
+        if field in ("monthly_temp", "monthly_precip"):
+            expected = (12, H, W)
+        elif field == "monthly_sample_count":
+            expected = (12,)
+        else:
+            expected = (H, W)
+        if value.shape != expected:
+            raise ValueError(
+                f"PlanetState.{field} has shape {value.shape}; expected {expected}"
+            )
+
+    state = PlanetState(**values)
+    print(f"State loaded safely from {filepath} (day {state.total_days:.1f})")
+    return state
+
+
 def save_state(state: PlanetState, filepath: str | Path) -> None:
     """Save PlanetState to disk using a versioned pickle envelope.
 
@@ -2881,6 +3070,9 @@ def save_state(state: PlanetState, filepath: str | Path) -> None:
         >>> save_state(current_state, "saves/state_day365.pkl")
     """
     filepath = Path(filepath)
+    if filepath.suffix.lower() == ".npz":
+        _save_state_npz(state, filepath)
+        return
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     envelope = {
@@ -2913,6 +3105,8 @@ def load_state(filepath: str | Path) -> PlanetState:
 
     if not filepath.exists():
         raise FileNotFoundError(f"State file not found: {filepath}")
+    if filepath.suffix.lower() == ".npz":
+        return _load_state_npz(filepath)
 
     with open(filepath, 'rb') as f:
         obj = pickle.load(f)

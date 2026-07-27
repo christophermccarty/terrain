@@ -48,16 +48,30 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# (name, lat_n, lat_s, lon_w, lon_e) -- lon in [-180, 180], lat in [-90, 90]
+from regional_validation import EARTH_PRECIP_REGIONS  # noqa: E402
+
+# Tuple compatibility is retained for the script's long-standing helper API;
+# canonical coordinates and targets live in regional_validation.py so tests,
+# diagnostics, and the future GUI panel cannot silently drift apart.
+def _region_tuple(region):
+    return (
+        region.name,
+        region.lat_n,
+        region.lat_s,
+        region.lon_w,
+        region.lon_e,
+    )
+
+
 DESERT_BOXES = [
-    ("Sahara", 30.0, 15.0, -10.0, 30.0),
-    ("Kalahari", -20.0, -28.0, 15.0, 25.0),
-    ("Atacama", -20.0, -28.0, -71.0, -68.0),
+    _region_tuple(region)
+    for region in EARTH_PRECIP_REGIONS
+    if region.group == "desert"
 ]
 CONTINENTAL_BOXES = [
-    ("Canadian Prairies", 55.0, 50.0, -110.0, -100.0),
-    ("US Midwest", 45.0, 38.0, -100.0, -90.0),
-    ("Central Europe", 53.0, 47.0, 5.0, 20.0),
+    _region_tuple(region)
+    for region in EARTH_PRECIP_REGIONS
+    if region.group == "continental"
 ]
 # Open-ocean control boxes for --wind-diagnostics: baseline p_anom/convergence
 # magnitude away from any land effect, for comparison against the desert/

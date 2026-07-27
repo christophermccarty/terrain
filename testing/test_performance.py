@@ -93,3 +93,35 @@ def test_carbon_cycle_overhead(flat_ocean_state):
     assert overhead < 5.0, (
         f"Carbon cycle is {overhead:.1f}× slower when enabled (expected < 5×)"
     )
+
+
+def test_precipitation_resolution_is_explicitly_ab_testable(mixed_initial_state):
+    """The production shortcut must have a full-resolution comparison path."""
+    from simulate import simulate_step
+
+    full, _ = simulate_step(
+        mixed_initial_state,
+        days=1.0,
+        block_size=4,
+        wind_block_size=4,
+        precip_block_size=1,
+    )
+    half, _ = simulate_step(
+        mixed_initial_state,
+        days=1.0,
+        block_size=4,
+        wind_block_size=4,
+        precip_block_size=2,
+    )
+
+    assert np.all(np.isfinite(full.precipitation))
+    assert np.all(np.isfinite(half.precipitation))
+    assert full.precipitation.shape == half.precipitation.shape
+    assert not np.array_equal(full.precipitation, half.precipitation)
+
+
+def test_invalid_precipitation_resolution_rejected(mixed_initial_state):
+    from simulate import simulate_step
+
+    with pytest.raises(ValueError, match="precip_block_size"):
+        simulate_step(mixed_initial_state, precip_block_size=3)

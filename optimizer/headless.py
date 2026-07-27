@@ -28,26 +28,8 @@ if str(ROOT) not in sys.path:
 
 from planet_params import PlanetParams, EARTH
 from simulate import PlanetState, simulate_step, create_initial_state, TimeScaleMode
+from time_policy import cycle_days, substeps_for_mode
 from optimizer.scoring import ClimateMetrics
-
-
-# ---------------------------------------------------------------------------
-# Sub-step dispatch table (mirrors main.py SimulationThread.run)
-# ---------------------------------------------------------------------------
-
-_SUBSTEPS: dict[TimeScaleMode, list[tuple[float, bool]]] = {
-    TimeScaleMode.DAILY:   [(1.0, True)],
-    TimeScaleMode.WEEKLY:  [(1.0, True)] * 7,
-    TimeScaleMode.MONTHLY: [(6.0, False)] * 5,
-    TimeScaleMode.ANNUAL:  [(7.0, False)] * 52,
-}
-
-_DAYS_PER_CYCLE: dict[TimeScaleMode, float] = {
-    TimeScaleMode.DAILY:   1.0,
-    TimeScaleMode.WEEKLY:  7.0,
-    TimeScaleMode.MONTHLY: 30.0,
-    TimeScaleMode.ANNUAL:  364.0,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +64,14 @@ def _advance_one_cycle(
     **kwargs,
 ) -> PlanetState:
     """Advance state by one cycle (1 day / 1 week / 1 month / 1 year)."""
-    for step_days, do_wind in _SUBSTEPS[mode]:
+    for step_days, do_wind in substeps_for_mode(mode, planet_params):
         state, _ = simulate_step(
             state,
             days=step_days,
             update_wind=do_wind,
             planet_params=planet_params,
             track_components=False,
+            time_scale=mode,
             **kwargs,
         )
     return state
@@ -246,7 +229,7 @@ def run_simulation(
     state = state._replace(co2_atmosphere=planet_params.co2_initial_ppm)
 
     # --- Spinup ---
-    cycle_days_spinup = _DAYS_PER_CYCLE[spinup_time_scale]
+    cycle_days_spinup = cycle_days(spinup_time_scale, planet_params)
     n_spinup = max(1, round(spinup_years * planet_params.orbital_period_days / cycle_days_spinup))
     for _ in range(n_spinup):
         state = _advance_one_cycle(
@@ -254,7 +237,7 @@ def run_simulation(
         )
 
     # --- Evaluation ---
-    cycle_days_eval = _DAYS_PER_CYCLE[eval_time_scale]
+    cycle_days_eval = cycle_days(eval_time_scale, planet_params)
     total_eval_days = eval_years * planet_params.orbital_period_days
     n_eval = max(1, round(total_eval_days / cycle_days_eval))
     sample_interval = max(1, n_eval // eval_snapshots)
@@ -381,7 +364,7 @@ def run_long_simulation(
     state = state._replace(co2_atmosphere=planet_params.co2_initial_ppm)
 
     # MONTHLY spinup for initial equilibration
-    cycle_days_monthly = _DAYS_PER_CYCLE[TimeScaleMode.MONTHLY]
+    cycle_days_monthly = cycle_days(TimeScaleMode.MONTHLY, planet_params)
     n_spinup = max(1, round(spinup_years * planet_params.orbital_period_days / cycle_days_monthly))
     for _ in range(n_spinup):
         state = _advance_one_cycle(

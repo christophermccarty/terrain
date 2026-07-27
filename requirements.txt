@@ -3,5 +3,6 @@ scipy>=1.10
 numba>=0.57
 Pillow>=9.0
 matplotlib>=3.7
+pandas>=2.0
 pytest>=7.0
 opensimplex>=0.4

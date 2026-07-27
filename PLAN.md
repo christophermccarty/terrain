@@ -1,6 +1,6 @@
 # PlanetSim — Development Plan
 
-> Last updated: 2026-07-03
+> Last updated: 2026-07-26
 > Branch: main
 
 Two related planning docs exist alongside this one, both now historical/archived —
@@ -39,7 +39,7 @@ This file (PLAN.md) is the live source of truth going forward.
 | masks.py | Solid; fingerprint cache; canonical mask source for the whole codebase |
 | diagnostics.py | Earth reference comparisons; used directly by several pytest gate tests |
 | optimizer/ | Full package: headless.py, scoring.py, sweep.py, bayesian.py, runner.py, results.py, configs/ |
-| **Testing** | 230 tests collected across 29 files; full non-slow suite: 139+ passed (see Phase 6) |
+| **Testing** | 410 tests collected across roughly 50 modules; see `testing/README.md` for current commands |
 
 **Remaining known wiring/dead-code items:** none currently — both `xfail` tests from earlier in
 this document were fixed 2026-07-01 (see "Next Up" #3 below for detail; the earlier bullets here

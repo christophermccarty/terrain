@@ -14,7 +14,7 @@ import logging
 import time
 from pathlib import Path
 from threading import Thread, Event, Lock
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 from terrain import (
     generate_sphere_image,
@@ -34,7 +34,7 @@ from atmosphere import generate_wind_field, render_wind_arrows, render_jet_strea
 from temperature import generate_temperature_overlay, temperature_kelvin_for_lat
 from ocean import generate_ocean_currents
 from masks import get_masks
-from terrain import precipitation_to_rgb, cloud_cover_to_rgb
+from terrain import precipitation_to_rgb, cloud_cover_to_rgb, surface_water_to_rgb
 from simulate import (
     PlanetState,
     create_initial_state,
@@ -46,11 +46,13 @@ from simulate import (
     clear_simulation_caches,
 )
 from diagnostics import ClimateDiagnostics
-from planet_params import PlanetParams, EARTH, MARS
+from planet_params import PlanetParams, EARTH
+from scenarios import SCENARIO_BY_NAME
+from time_policy import substeps_for_mode
 import dataclasses
 import graphs
 
-AUTOSAVE_PATH = Path("saves/autosave.pkl")
+AUTOSAVE_PATH = Path("saves/autosave.npz")
 
 # Lightweight caches for expensive view layers
 _WIND_CACHE = {"key": None, "u": None, "v": None}
@@ -91,8 +93,11 @@ class SimulationThread(Thread):
         # authoritative snapshot (save, benchmark, close) pause first, then
         # acquire this lock to wait for any in-flight physics cycle to finish.
         self.state_lock = Lock()
-        self.state_queue = Queue(maxsize=1)  # Only keep latest state
-        self.component_queue = Queue(maxsize=1)  # Track temperature components
+        # State and diagnostic components describe the same completed cycle and
+        # must remain atomic. Separate queues could accept only one of two puts,
+        # pairing a new state with stale diagnostics under UI backpressure.
+        self.frame_queue = Queue(maxsize=1)
+        self.error_queue = Queue(maxsize=1)
 
     def run(self):
         """Main simulation loop (runs in background thread)."""
@@ -108,21 +113,8 @@ class SimulationThread(Thread):
                 with self.state_lock:
                     if self.paused.is_set():
                         continue
-                    # Select sub-stepping strategy based on time scale mode.
-                    # Each entry is (step_days, update_wind):
-                    #   DAILY   — 1 × 1-day full physics (most accurate)
-                    #   WEEKLY  — 7 × 1-day full physics (7 simulated days per frame)
-                    #   MONTHLY — 5 × 6-day steps, no wind (≈30 days; ~5× faster than 30 daily)
-                    #   ANNUAL  — 52 × 7-day steps, no wind (≈364 days; stable large-step physics)
                     mode = self.time_scale_mode
-                    if mode == TimeScaleMode.WEEKLY:
-                        substeps = [(1.0, True)] * 7
-                    elif mode == TimeScaleMode.MONTHLY:
-                        substeps = [(6.0, False)] * 5
-                    elif mode == TimeScaleMode.ANNUAL:
-                        substeps = [(7.0, False)] * 52
-                    else:  # DAILY (default)
-                        substeps = [(1.0, True)]
+                    substeps = substeps_for_mode(mode, self.planet_params)
 
                     new_state = self.state
                     temp_components: dict = {}
@@ -149,15 +141,27 @@ class SimulationThread(Thread):
 
                     self.state = new_state
 
-                    # Push final state to UI (non-blocking, drop if UI busy)
+                    # Push one atomic frame. If the UI is behind, replace the
+                    # stale queued frame so the size-1 queue really keeps latest.
+                    frame = (new_state, temp_components)
                     try:
-                        self.state_queue.put_nowait(new_state)
-                        self.component_queue.put_nowait(temp_components)
-                    except Exception:
-                        pass  # Drop frame if queue full
+                        self.frame_queue.put_nowait(frame)
+                    except Full:
+                        try:
+                            self.frame_queue.get_nowait()
+                        except Empty:
+                            pass
+                        try:
+                            self.frame_queue.put_nowait(frame)
+                        except Full:
+                            pass
 
             except Exception as e:
-                LOG.error(f"Simulation thread error: {e}")
+                LOG.exception("Simulation thread error")
+                try:
+                    self.error_queue.put_nowait(str(e))
+                except Full:
+                    pass
                 self.paused.set()  # Auto-pause on error
 
     def pause(self):
@@ -171,12 +175,11 @@ class SimulationThread(Thread):
             state = self.state
         # The caller now owns this latest snapshot directly.  Discard queued
         # frames so the UI cannot subsequently replace it with an older state.
-        for queue in (self.state_queue, self.component_queue):
-            try:
-                while True:
-                    queue.get_nowait()
-            except Empty:
-                pass
+        try:
+            while True:
+                self.frame_queue.get_nowait()
+        except Empty:
+            pass
         return state
 
     def snapshot_state(self):
@@ -258,7 +261,9 @@ def main() -> None:
         "co2_climate_feedback", "ocean_transport_coeff", "ice_albedo_strength",
         "thermal_diffusivity", "polar_cooling_scale",
     ]
-    PLANET_PRESETS = {"Earth": EARTH, "Mars": MARS}
+    PLANET_PRESETS = {
+        name: scenario.planet_params for name, scenario in SCENARIO_BY_NAME.items()
+    }
 
     root = tk.Tk()
     root.title(f"Sphere {size}x{size} (262,144 cells)")
@@ -351,13 +356,19 @@ def main() -> None:
             "Ocean Currents",
             "Wind Particles",
             "Cloud Cover",
+            "Surface Water",
         ),
     )
     view_combo.pack(side="left", padx=(4, 0))
     ttk.Checkbutton(view_row, text="Jet Stream", variable=show_jet_stream_var).pack(side="left", padx=(8, 0))
 
     # Diagnostics
-    diagnostics = ClimateDiagnostics(track_history=True)
+    # Keep ten Earth-years of interactive history. Long headless experiments
+    # can still construct ClimateDiagnostics without a limit for full exports.
+    diagnostics = ClimateDiagnostics(
+        track_history=True,
+        max_history_days=10.0 * EARTH.orbital_period_days,
+    )
     graphs_enabled_var = tk.BooleanVar(value=False)
     graphs_controller = graphs.GraphsController(
         root,
@@ -626,14 +637,22 @@ def main() -> None:
         use_sim_data = sim_state is not None
         day = int(sim_state.day_of_year) if sim_state is not None else 80
         tdays = float(sim_state.total_days) if sim_state is not None else float(day)
+        period_days = float((sim_state.planet_params or current_planet_params).orbital_period_days)
         wu = sim_state.wind_u if use_sim_data else None
         wv = sim_state.wind_v if use_sim_data else None
-        ckey = (tex.shape, "oc_particles")
+        ckey = (tex.shape, "oc_particles", period_days)
         _now_field_t = time.perf_counter()
         _stale = (_OCEAN_CURRENT_CACHE["key"] != ckey
                   or _now_field_t - _OCEAN_CURRENT_CACHE["computed_at"] >= _OCEAN_CURRENT_REFRESH_SEC)
         if _stale:
-            u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
+            u, v = generate_ocean_currents(
+                tex,
+                wind_u=wu,
+                wind_v=wv,
+                day_of_year=day,
+                time_days=tdays,
+                orbital_period_days=period_days,
+            )
             _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v, "computed_at": _now_field_t})
         else:
             u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
@@ -927,7 +946,8 @@ def main() -> None:
                 sim_state = sim_thread.pause_and_get_state()
             save_state(sim_state, _current_state_path)
             _refresh_save_info()
-            total_years = sim_state.total_days / 365.2422
+            period_days = float((sim_state.planet_params or current_planet_params).orbital_period_days)
+            total_years = sim_state.total_days / period_days
             messagebox.showinfo("Save State", f"State saved to {_current_state_path.name}.\nSimulation day {sim_state.total_days:.0f} ({total_years:.2f} years)")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
@@ -946,9 +966,13 @@ def main() -> None:
         path_str = filedialog.asksaveasfilename(
             title="Save State As",
             initialdir=str(saves_dir),
-            initialfile=_current_state_path.name,
-            defaultextension=".pkl",
-            filetypes=[("Planet State", "*.pkl"), ("All files", "*.*")],
+            initialfile=_current_state_path.with_suffix(".npz").name,
+            defaultextension=".npz",
+            filetypes=[
+                ("Safe Planet State", "*.npz"),
+                ("Legacy Pickle State", "*.pkl"),
+                ("All files", "*.*"),
+            ],
         )
         if not path_str:
             return
@@ -974,11 +998,24 @@ def main() -> None:
         path_str = filedialog.askopenfilename(
             title="Open State",
             initialdir=str(saves_dir),
-            filetypes=[("Planet State", "*.pkl"), ("All files", "*.*")],
+            filetypes=[
+                ("Planet State", "*.npz *.pkl"),
+                ("Safe Planet State", "*.npz"),
+                ("Legacy Pickle State", "*.pkl"),
+                ("All files", "*.*"),
+            ],
         )
         if not path_str:
             return
         chosen_path = Path(path_str)
+        if chosen_path.suffix.lower() in (".pkl", ".pickle") and not messagebox.askyesno(
+            "Open Trusted State?",
+            "Legacy pickle state files can execute "
+            "code while loading.\n\nOpen this file only if you created it "
+            "yourself or fully trust its source.\n\nContinue?",
+            icon="warning",
+        ):
+            return
         # Stop and discard the thread so Start recreates it from the loaded state
         if sim_thread and sim_thread.is_alive():
             sim_thread.stop()
@@ -992,10 +1029,11 @@ def main() -> None:
             _sim_ever_started = True
             _restore_loaded_state_context(sim_state, chosen_path)
             clear_simulation_caches()
-            total_years = sim_state.total_days / 365.2422
+            period_days = float((sim_state.planet_params or current_planet_params).orbital_period_days)
+            total_years = sim_state.total_days / period_days
             sim_status_var.set("Stopped")
-            year = int(sim_state.total_days // 365.2422) + 1
-            month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+            year = int(sim_state.total_days // period_days) + 1
+            month = int((sim_state.day_of_year / period_days) * 12) + 1
             sim_cycle_var.set(f"Y{year} M{month}")
             _refresh_save_info()
             root.title(f"Sphere {size}x{size} - {chosen_path.name}")
@@ -1336,7 +1374,7 @@ def main() -> None:
     ttk.Label(planet_tab, text="Preset:").pack(anchor="w")
     planet_preset_combo = ttk.Combobox(
         planet_tab, textvariable=planet_preset_var,
-        values=["Earth", "Mars", "Custom"], state="readonly", width=10,
+        values=[*PLANET_PRESETS, "Custom"], state="readonly", width=24,
     )
     planet_preset_combo.pack(fill="x", pady=(0, 8))
 
@@ -1397,9 +1435,12 @@ def main() -> None:
     profiler = cProfile.Profile()
     profiler.enable()
     
-    # Try to load default heightmap, fall back to procedural if not found
-    default_heightmap_path = r"D:\dev\planetsim\images\16_bit_dem_small_512.tif" #desktop location
-    # default_heightmap_path = r"C:\dev\planetsim\images\16_bit_dem_small_512.tif" #laptop location
+    # Resolve the bundled DEM relative to this source file so a fresh clone works
+    # regardless of drive letter, checkout directory, or current working directory.
+    # If the asset is absent/corrupt, the existing fallback below generates terrain.
+    default_heightmap_path = (
+        Path(__file__).resolve().parent / "images" / "16_bit_dem_small_512.tif"
+    )
     try:
         with log_time(f"Loading default heightmap from {default_heightmap_path}"):
             heightmap_img = Image.open(default_heightmap_path)
@@ -1558,7 +1599,7 @@ def main() -> None:
                     _update_wind_particles()
                 return
             with log_time("Render globe"):
-                if view_name in ("Biomes", "Cloud Cover", "Precipitation"):
+                if view_name in ("Biomes", "Cloud Cover", "Precipitation", "Surface Water"):
                     # Compute equirectangular composite then project onto sphere
                     if use_sim_data and sim_state is not None and sim_state.elevation is not None:
                         tex = sim_state.elevation
@@ -1593,6 +1634,22 @@ def main() -> None:
                         if use_sim_data and sim_state is not None and sim_state.cloud_cover is not None:
                             overlay, alpha = cloud_cover_to_rgb(sim_state.cloud_cover)
                             comb = (1.0 - alpha[..., None]) * base_rgb + alpha[..., None] * overlay
+                        else:
+                            comb = base_rgb
+                    elif view_name == "Surface Water":
+                        if (
+                            use_sim_data
+                            and sim_state is not None
+                            and sim_state.surface_water_mm is not None
+                        ):
+                            overlay, alpha = surface_water_to_rgb(
+                                sim_state.surface_water_mm,
+                                sim_state.river_discharge_mm_day,
+                            )
+                            comb = (
+                                (1.0 - alpha[..., None]) * base_rgb
+                                + alpha[..., None] * overlay
+                            )
                         else:
                             comb = base_rgb
                     else:  # Precipitation -- cloud layer, then precip color on top (see map-mode
@@ -1789,6 +1846,19 @@ def main() -> None:
                     arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
                 else:
                     arr = (base_rgb * 255).astype(np.uint8)
+            elif view_var.get() == "Surface Water":
+                if use_sim_data and sim_state.surface_water_mm is not None:
+                    overlay, alpha = surface_water_to_rgb(
+                        sim_state.surface_water_mm,
+                        sim_state.river_discharge_mm_day,
+                    )
+                    comb = (
+                        (1.0 - alpha[..., None]) * base_rgb
+                        + alpha[..., None] * overlay
+                    )
+                    arr = (np.clip(comb, 0.0, 1.0) * 255).astype(np.uint8)
+                else:
+                    arr = (base_rgb * 255).astype(np.uint8)
             elif view_var.get() == "Wind Arrows":
                 if use_sim_data and sim_state.wind_u is not None and sim_state.wind_v is not None:
                     u, v = sim_state.wind_u, sim_state.wind_v
@@ -1841,7 +1911,10 @@ def main() -> None:
             if _auto_save_enabled and _current_state_path.exists():
                 try:
                     sim_state = load_state(_current_state_path)
-                    total_years = sim_state.total_days / 365.2422
+                    period_days = float(
+                        (sim_state.planet_params or current_planet_params).orbital_period_days
+                    )
+                    total_years = sim_state.total_days / period_days
                     sim_status_var.set(f"Loaded Y{total_years:.1f}")
                     LOG.info(f"Autosave loaded: day {sim_state.total_days:.0f} ({total_years:.2f} years)")
                     _restore_loaded_state_context(sim_state, _current_state_path)
@@ -1865,8 +1938,9 @@ def main() -> None:
         sim_running = True
         sim_paused = False
         sim_status_var.set("Running")
-        year = int(sim_state.total_days // 365.2422) + 1
-        month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+        period_days = float((sim_state.planet_params or current_planet_params).orbital_period_days)
+        year = int(sim_state.total_days // period_days) + 1
+        month = int((sim_state.day_of_year / period_days) * 12) + 1
         sim_cycle_var.set(f"Y{year} M{month}")
         # If particle view is selected, start animation loop (both map and globe).
         nonlocal particle_anim_running
@@ -2007,14 +2081,27 @@ def main() -> None:
             elif view == "Ocean Currents":
                 day = int(sim_state.day_of_year) if (use_sim_data and sim_state is not None) else 80
                 tdays = float(sim_state.total_days) if (use_sim_data and sim_state is not None) else float(day)
-                ckey = (tex.shape, "oc_particles")
+                period_days = float(
+                    (
+                        (sim_state.planet_params if sim_state is not None else None)
+                        or current_planet_params
+                    ).orbital_period_days
+                )
+                ckey = (tex.shape, "oc_particles", period_days)
                 _now_field_t = time.perf_counter()
                 _stale = (_OCEAN_CURRENT_CACHE["key"] != ckey
                           or _now_field_t - _OCEAN_CURRENT_CACHE["computed_at"] >= _OCEAN_CURRENT_REFRESH_SEC)
                 if _stale:
                     wu = sim_state.wind_u if (use_sim_data and sim_state is not None) else None
                     wv = sim_state.wind_v if (use_sim_data and sim_state is not None) else None
-                    u, v = generate_ocean_currents(tex, wind_u=wu, wind_v=wv, day_of_year=day, time_days=tdays)
+                    u, v = generate_ocean_currents(
+                        tex,
+                        wind_u=wu,
+                        wind_v=wv,
+                        day_of_year=day,
+                        time_days=tdays,
+                        orbital_period_days=period_days,
+                    )
                     _OCEAN_CURRENT_CACHE.update({"key": ckey, "u": u, "v": v, "computed_at": _now_field_t})
                 else:
                     u, v = _OCEAN_CURRENT_CACHE["u"], _OCEAN_CURRENT_CACHE["v"]
@@ -2099,6 +2186,27 @@ def main() -> None:
                 latlon_var.set(f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, clouds {cloud * 100:.0f}%, T {T_celsius:.1f}°C")
                 tt_lines = [hdr, f"Clouds:  {cloud * 100:.0f}%", f"Air T:   {T_celsius:.1f}°C"]
 
+            elif view == "Surface Water":
+                storage = (
+                    float(sim_state.surface_water_mm[int(y), int(x)])
+                    if use_sim_data and sim_state.surface_water_mm is not None
+                    else 0.0
+                )
+                discharge = (
+                    float(sim_state.river_discharge_mm_day[int(y), int(x)])
+                    if use_sim_data and sim_state.river_discharge_mm_day is not None
+                    else 0.0
+                )
+                latlon_var.set(
+                    f"lat {lat:6.2f}°, lon {lon:7.2f}°{px_str}, "
+                    f"water {storage:.1f} mm, flow {discharge:.1f} mm/day"
+                )
+                tt_lines = [
+                    hdr,
+                    f"Stored: {storage:.1f} mm",
+                    f"Flow:   {discharge:.1f} mm/day",
+                ]
+
             else:  # Terrain and fallback
                 if use_sim_data and sim_state.temperature is not None:
                     _T_disp = sim_state.air_temperature if sim_state.air_temperature is not None else sim_state.temperature
@@ -2123,28 +2231,37 @@ def main() -> None:
 
         if sim_thread:
             try:
-                # Non-blocking get - pull latest state if available
-                new_state = sim_thread.state_queue.get_nowait()
+                error_message = sim_thread.error_queue.get_nowait()
+            except Empty:
+                error_message = None
+            if error_message is not None:
+                sim_status_var.set("Paused after error")
+                messagebox.showerror(
+                    "Simulation Error",
+                    f"The simulation was paused because a physics step failed:\n\n"
+                    f"{error_message}\n\nSee the application log for the traceback.",
+                )
+            try:
+                # One packet keeps state and diagnostics from the same cycle.
+                new_state, temp_components = sim_thread.frame_queue.get_nowait()
                 sim_state = new_state
 
-                # Also try to get temperature components (for diagnostics)
-                try:
-                    temp_components = sim_thread.component_queue.get_nowait()
-                except Empty:
-                    temp_components = None
-
                 # Update UI with new state
-                year = int(sim_state.total_days // 365.2422) + 1
-                month = int((sim_state.day_of_year / 365.2422) * 12) + 1
+                period_days = float((sim_state.planet_params or current_planet_params).orbital_period_days)
+                year = int(sim_state.total_days // period_days) + 1
+                month = int((sim_state.day_of_year / period_days) * 12) + 1
                 sim_cycle_var.set(f"Y{year} M{month}")
                 if not sim_paused:
                     sim_status_var.set(f"Day: {sim_state.day_of_year:.0f}")
 
                 # Update year-progress bar
-                _pct = (sim_state.day_of_year / 365.2422) * 100.0
+                _pct = (sim_state.day_of_year / period_days) * 100.0
                 cycle_progress_var.set(_pct)
                 _mn = _MONTH_NAMES[(month - 1) % 12]
-                cycle_detail_var.set(f"Day {sim_state.day_of_year:>3.0f}/365  {_mn}  ({_pct:>5.1f}%)")
+                cycle_detail_var.set(
+                    f"Day {sim_state.day_of_year:>3.0f}/{period_days:.0f}  "
+                    f"{_mn}  ({_pct:>5.1f}%)"
+                )
 
                 # Update display
                 render()
@@ -2177,6 +2294,11 @@ def main() -> None:
     step = np.deg2rad(5.0)
     def on_key(e):
         nonlocal yaw, pitch, roll
+        # Do not hijack arrows or letter keys while the user edits a control.
+        if e.widget.winfo_class() in {
+            "Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox", "Scale"
+        }:
+            return
         if e.keysym == "Left":
             yaw -= step
         elif e.keysym == "Right":
@@ -2260,18 +2382,45 @@ def main() -> None:
     menubar.add_cascade(label="File", menu=file_menu)
 
     simulation_menu = tk.Menu(menubar, tearoff=0)
-    simulation_menu.add_command(label="Export Data...", command=export_data)
-    simulation_menu.add_command(label="Run Benchmark", command=run_benchmark)
+    simulation_menu.add_command(label="Start / Resume", command=start_simulation, accelerator="F5")
+    simulation_menu.add_command(label="Pause", command=pause_simulation, accelerator="F6")
+    simulation_menu.add_separator()
+    simulation_menu.add_command(label="Export Data...", command=export_data, accelerator="Ctrl+E")
+    simulation_menu.add_command(label="Run Benchmark", command=run_benchmark, accelerator="Ctrl+B")
     menubar.add_cascade(label="Simulation", menu=simulation_menu)
 
     terrain_menu = tk.Menu(menubar, tearoff=0)
     terrain_menu.add_command(label="Regenerate Terrain", command=do_regen)
     menubar.add_cascade(label="Terrain", menu=terrain_menu)
 
+    def _show_keyboard_help() -> None:
+        messagebox.showinfo(
+            "Keyboard Shortcuts",
+            "F5  Start or resume simulation\n"
+            "F6  Pause simulation\n"
+            "Ctrl+O  Open state\n"
+            "Ctrl+S  Save state\n"
+            "Ctrl+Shift+S  Save state as\n"
+            "Ctrl+E  Export diagnostics\n"
+            "Ctrl+B  Run benchmark\n"
+            "Arrow keys  Rotate globe\n"
+            "A / D  Roll globe\n"
+            "R  Reset globe rotation\n"
+            "Esc  Exit",
+        )
+
+    help_menu = tk.Menu(menubar, tearoff=0)
+    help_menu.add_command(label="Keyboard Shortcuts", command=_show_keyboard_help)
+    menubar.add_cascade(label="Help", menu=help_menu)
+
     root.config(menu=menubar)
     root.bind("<Control-o>", lambda e: _do_load_state())
     root.bind("<Control-s>", lambda e: _do_save_state())
     root.bind("<Control-Shift-S>", lambda e: _do_save_state_as())
+    root.bind("<Control-e>", lambda e: export_data())
+    root.bind("<Control-b>", lambda e: run_benchmark())
+    root.bind("<F5>", lambda e: start_simulation())
+    root.bind("<F6>", lambda e: pause_simulation())
 
     def _on_window_resize(event):
         nonlocal _resize_job

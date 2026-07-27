@@ -101,3 +101,25 @@ def test_grid_search_forwards_custom_planet_and_reference(monkeypatch):
         reference=custom_reference,
     )
     assert captured == [(777.0, (210.0, 220.0, 1.0))]
+
+
+def test_live_diagnostics_history_respects_time_window():
+    from diagnostics import ClimateDiagnostics
+
+    diagnostics = ClimateDiagnostics(max_history_days=10.0)
+    diagnostics.total_days = 25.0
+    diagnostics.history = [
+        {"total_days": 5.0},
+        {"total_days": 15.0},
+        {"total_days": 25.0},
+    ]
+    diagnostics.component_history = [
+        {"total_days": 14.0},
+        {"total_days": 16.0},
+        {"total_days": 25.0},
+    ]
+
+    diagnostics._trim_live_history()
+
+    assert [row["total_days"] for row in diagnostics.history] == [15.0, 25.0]
+    assert [row["total_days"] for row in diagnostics.component_history] == [16.0, 25.0]

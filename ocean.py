@@ -534,6 +534,7 @@ def generate_ocean_currents(
     wind_v: np.ndarray | None = None,
     day_of_year: int = 0,
     time_days: float | None = None,
+    orbital_period_days: float = 365.2422,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate a dynamic surface ocean current field for visualization.
 
@@ -552,7 +553,8 @@ def generate_ocean_currents(
     )
 
     # Seasonal modulation (small amplitude).
-    seasonal = 0.9 + 0.1 * np.sin(2.0 * np.pi * (float(day_of_year) / 365.2422))
+    period_days = max(float(orbital_period_days), 1e-6)
+    seasonal = 0.9 + 0.1 * np.sin(2.0 * np.pi * (float(day_of_year) / period_days))
     u = base_u * seasonal
     v = base_v * seasonal
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +73,7 @@ def save_results(
 
     # Sidecar
     meta = {
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "n_results": len(rows),
         **(metadata or {}),
     }

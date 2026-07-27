@@ -100,6 +100,7 @@ PLANET_PARAM_CASES = [
     ("ekman_strength", 0.0),
     ("cloud_greenhouse_factor", 0.0),
     ("wv_greenhouse_factor", 0.0),
+    ("spherical_metric_clouds", True),
     ("deep_ocean_exchange_rate", 5e-4),
     ("soil_deep_gain_rate", 0.001),  # default 0.0 (inert) -- see planet_params.py docstring
     ("soil_deep_drain_rate", 0.05),
@@ -149,6 +150,24 @@ def test_pgf_continentality_amp_wired_in_diagnostic_wind():
         "state under update_wind=False (MONTHLY/ANNUAL mode) after "
         f"{N_STEPS} steps -- parameter may be dead/unwired, or the "
         "_diag_wind_cached cache key needs updating again"
+    )
+
+
+@pytest.mark.parametrize(
+    "field,perturbed",
+    [
+        ("ferrel_v_centre_deg", 40.0),
+        ("ferrel_v_land_shift_deg", -12.0),
+    ],
+)
+def test_ferrel_params_invalidate_diagnostic_wind_cache(field, perturbed):
+    """Sequential parameter experiments must not reuse another run's wind."""
+    changed_pp = dataclasses.replace(EARTH, **{field: perturbed})
+    baseline = _run(EARTH, update_wind=False)
+    changed = _run(changed_pp, update_wind=False)
+    assert _states_differ(baseline, changed), (
+        f"PlanetParams.{field} did not change diagnostic-mode state; "
+        "_RELAX_CACHE may be missing a parameter-dependent key"
     )
 
 

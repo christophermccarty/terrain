@@ -296,6 +296,29 @@ def precipitation_to_rgb(precip_mm_day: np.ndarray) -> tuple[np.ndarray, np.ndar
     return rgb, alpha
 
 
+def surface_water_to_rgb(
+    storage_mm: np.ndarray,
+    discharge_mm_day: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a blue/cyan overlay for lakes, runoff storage, and river flow."""
+    storage = np.maximum(np.asarray(storage_mm, dtype=np.float32), 0.0)
+    signal = np.log1p(storage) / np.log1p(500.0)
+    if discharge_mm_day is not None:
+        discharge = np.maximum(np.asarray(discharge_mm_day, dtype=np.float32), 0.0)
+        signal = np.maximum(signal, np.log1p(discharge) / np.log1p(250.0))
+    signal = np.clip(signal, 0.0, 1.0)
+    rgb = np.stack(
+        [
+            0.08 + 0.02 * signal,
+            0.45 + 0.35 * signal,
+            0.75 + 0.25 * signal,
+        ],
+        axis=-1,
+    )
+    alpha = np.where(signal > 0.0, 0.25 + 0.70 * np.sqrt(signal), 0.0)
+    return rgb.astype(np.float32), alpha.astype(np.float32)
+
+
 def generate_sphere_image(size: int = 512, radius: float = 0.9, rot=(0.0, 0.0, 0.0), *, view: str = "Terrain", seed: int = 42, octaves: int = 4, freq: float = 1.2, lac: float = 2.0, gain: float = 0.5, day_of_year: int = 1) -> Image.Image:
     """Render a fully lit sphere by sampling the cached terrain. radius<1 zooms out.
 

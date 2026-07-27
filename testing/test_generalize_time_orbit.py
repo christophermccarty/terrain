@@ -172,3 +172,58 @@ def test_precipitation_substeps_advance_fractional_dates(monkeypatch):
         planet_params=EARTH,
     )
     assert seen == pytest.approx(np.arange(11.0, 17.0))
+
+
+@pytest.mark.parametrize("pp", [EARTH, MARS])
+def test_slow_mode_cycles_match_planet_orbit_exactly(pp):
+    from simulate import TimeScaleMode
+    from time_policy import cycle_days, substeps_for_mode
+
+    annual = substeps_for_mode(TimeScaleMode.ANNUAL, pp)
+    monthly = substeps_for_mode(TimeScaleMode.MONTHLY, pp)
+
+    assert len(annual) == 52
+    assert len(monthly) == 5
+    assert cycle_days(TimeScaleMode.ANNUAL, pp) == pytest.approx(
+        pp.orbital_period_days, rel=0.0, abs=1e-10
+    )
+    assert 12.0 * cycle_days(TimeScaleMode.MONTHLY, pp) == pytest.approx(
+        pp.orbital_period_days, rel=0.0, abs=1e-10
+    )
+    assert all(not update_wind for _, update_wind in annual + monthly)
+
+
+def test_daily_and_weekly_cycles_remain_literal_days():
+    from simulate import TimeScaleMode
+    from time_policy import cycle_days
+
+    assert cycle_days(TimeScaleMode.DAILY, MARS) == pytest.approx(1.0)
+    assert cycle_days(TimeScaleMode.WEEKLY, MARS) == pytest.approx(7.0)
+
+
+def test_ocean_current_seasonality_uses_planet_orbit(monkeypatch):
+    import ocean
+
+    def constant_currents(H, W, **_kwargs):
+        return (
+            np.ones((H, W), dtype=np.float32),
+            np.zeros((H, W), dtype=np.float32),
+        )
+
+    monkeypatch.setattr(ocean, "get_major_ocean_currents", constant_currents)
+    elevation = np.zeros((4, 8), dtype=np.float32)
+
+    earth_u, _ = ocean.generate_ocean_currents(
+        elevation,
+        day_of_year=EARTH.orbital_period_days / 4.0,
+        time_days=0.0,
+        orbital_period_days=EARTH.orbital_period_days,
+    )
+    mars_u, _ = ocean.generate_ocean_currents(
+        elevation,
+        day_of_year=MARS.orbital_period_days / 4.0,
+        time_days=0.0,
+        orbital_period_days=MARS.orbital_period_days,
+    )
+
+    np.testing.assert_allclose(earth_u, mars_u, atol=1e-6, rtol=0.0)

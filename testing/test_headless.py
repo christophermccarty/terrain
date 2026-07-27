@@ -31,16 +31,11 @@ if str(ROOT) not in sys.path:
 
 def _threaded_style_steps(state, mode, wind_block_size: int, n_cycles: int):
     """Replicates `SimulationThread.run()`'s inner loop exactly (see main.py)."""
-    from simulate import simulate_step, TimeScaleMode
+    from simulate import simulate_step
+    from planet_params import EARTH
+    from time_policy import substeps_for_mode
 
-    if mode == TimeScaleMode.WEEKLY:
-        substeps = [(1.0, True)] * 7
-    elif mode == TimeScaleMode.MONTHLY:
-        substeps = [(6.0, False)] * 5
-    elif mode == TimeScaleMode.ANNUAL:
-        substeps = [(7.0, False)] * 52
-    else:
-        substeps = [(1.0, True)]
+    substeps = substeps_for_mode(mode, EARTH)
 
     for _ in range(n_cycles):
         for step_days, do_wind in substeps:
@@ -52,6 +47,7 @@ def _threaded_style_steps(state, mode, wind_block_size: int, n_cycles: int):
                 debug_log=False,
                 track_components=False,
                 time_scale=mode,
+                planet_params=EARTH,
             )
     return state
 

@@ -74,11 +74,33 @@ def _jet_latitudes_from_profiles(
 
 
 class ClimateDiagnostics:
-    def __init__(self, track_history: bool = True):
+    def __init__(
+        self,
+        track_history: bool = True,
+        max_history_days: float | None = None,
+    ):
         self.history: List[Dict[str, Any]] = []
         self.track_history = track_history
         self.component_history: List[Dict[str, Any]] = []  # Per-component contributions
         self.total_days: float = 0.0  # Track total simulation time (doesn't wrap)
+        if max_history_days is not None and max_history_days <= 0.0:
+            raise ValueError("max_history_days must be positive or None")
+        self.max_history_days = max_history_days
+
+    def _trim_live_history(self) -> None:
+        """Discard records older than the configured rolling time window."""
+        if self.max_history_days is None:
+            return
+        cutoff = self.total_days - float(self.max_history_days)
+        for records in (self.history, self.component_history):
+            first_kept = 0
+            while (
+                first_kept < len(records)
+                and float(records[first_kept].get("total_days", 0.0)) < cutoff
+            ):
+                first_kept += 1
+            if first_kept:
+                del records[:first_kept]
 
     @staticmethod
     def _lat_deg_for_H(H: int) -> np.ndarray:
@@ -492,6 +514,7 @@ class ClimateDiagnostics:
             comp_stats['day_of_year'] = day_of_year
             comp_stats['total_days'] = self.total_days
             self.component_history.append(comp_stats)
+        self._trim_live_history()
     
     def export_time_series(self, filename: Optional[str] = None, format: str = 'csv') -> str:
         """Export time series data to CSV or JSON.

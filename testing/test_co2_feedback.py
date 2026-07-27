@@ -29,6 +29,39 @@ def _long_run(co2_ppm: float, years: int = 30, spinup_years: float = 1.0,
                                H=H, W=W, sample_every=5)
 
 
+def test_fixed_co2_keeps_greenhouse_forcing_active():
+    """Disabling reservoir evolution must not make concentration radiatively inert."""
+    from planet_params import PlanetParams
+    from simulate import create_initial_state, simulate_step
+
+    pp = PlanetParams(co2_initial_ppm=560.0)
+    elevation = np.zeros((8, 16), dtype=np.float32)
+    initial = create_initial_state(elevation, day_of_year=80.0, planet_params=pp)
+
+    forced, _ = simulate_step(
+        initial,
+        days=1.0,
+        block_size=2,
+        wind_block_size=2,
+        planet_params=pp,
+        enable_carbon_cycle=False,
+        apply_greenhouse_forcing=True,
+    )
+    unforced, _ = simulate_step(
+        initial,
+        days=1.0,
+        block_size=2,
+        wind_block_size=2,
+        planet_params=pp,
+        enable_carbon_cycle=False,
+        apply_greenhouse_forcing=False,
+    )
+
+    assert forced.co2_atmosphere == pytest.approx(560.0)
+    assert unforced.co2_atmosphere == pytest.approx(560.0)
+    assert float(np.mean(forced.temperature)) > float(np.mean(unforced.temperature))
+
+
 # ---------------------------------------------------------------------------
 # Directional CO2 response
 # ---------------------------------------------------------------------------
