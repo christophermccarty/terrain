@@ -91,6 +91,51 @@ relative to its climate influence.
   outside PlanetParams/EARTH definitions, with an allowlist. This is how the
   hardcoded storm radius and `% 365` cache bugs (both fixed 2026-07-03) would
   have been caught automatically.
+- **Manual audit performed 2026-07-27** (canvas-review Phase 4 item), ranked
+  by fix priority — no code changed yet, this is the inventory that audit
+  test above should encode:
+  - **HIGH — max terrain elevation hardcoded at 8848m (Everest) in FOUR
+    separate places with at least three different formulas**:
+    `temperature.elevation_to_alt_km` (piecewise, both its loaded-heightmap
+    and procedural-terrain branches), `climate_averages.compute_biome_type`
+    (two sites, a *different*, simpler linear `elevation * 8848.0`, not the
+    same curve as `elevation_to_alt_km`), `main.py:1968` (a third,
+    power-curve formula), and `terrain.py` (comments/lookup assuming the same
+    ceiling). Mars's real max elevation (Olympus Mons, ~21.9km) is 2.5x
+    Earth's — loading Mars terrain today silently rescales it to Earth's
+    height range. Fixing this needs a `PlanetParams.max_elevation_km` (or
+    equivalent) field threaded through all four sites, plus ideally
+    unifying the two independently-drifted elevation-to-meters curves so
+    they can't diverge further. Not attempted this session: real, moderate
+    invasive-ness (4 files, several call sites, GUI included) and deserves
+    its own tested pass with Mars-terrain validation, not a side effect of
+    an audit.
+  - **HIGH — lapse rate hardcoded at 6.5 K/km in five call sites**:
+    `simulate._evolve_temperature` (x2), `temperature.generate_temperature_overlay`,
+    and `climate_averages.compute_biome_type` (x2, as `-6.5`). Earth's
+    environmental lapse rate is itself only a convenient approximation;
+    Mars's is meaningfully different (~2.5 K/km, driven by lower gravity and
+    the CO2 atmosphere's different heat capacity) and currently unreachable
+    — Mars terrain gets Earth's cooling-per-km applied verbatim. Needs a
+    `PlanetParams.lapse_rate_k_per_km: float = 6.5` field (Earth default is
+    an exact no-op) threaded through the same five sites. Smaller blast
+    radius than the elevation-ceiling item above (no GUI-only callers found)
+    but still spans three modules; also deferred this session for the same
+    reason — a real physics change deserving a dedicated real-terrain +
+    Mars-preset validation pass, not bundled with a documentation-only audit.
+  - **LOW — `0.622` (Rd/Rv epsilon, water-vapor physics) hardcoded in four
+    sites** (`atmosphere.py` x2, `simulate.py` x2). This ratio depends on
+    atmosphere composition (M_water/M_dry_air); Mars's CO2 atmosphere gives
+    a genuinely different value (~0.41 vs Earth's 0.622). Low priority in
+    practice because `MARS.has_liquid_water_ocean=False` already gates
+    essentially all humidity/water-cycle physics off for Mars in this model
+    — this constant is currently inert for the one non-Earth preset that
+    exists, so fixing it has no visible effect until a water-bearing
+    exoplanet preset exists to exercise it.
+  - No hardcoded gravity constant (9.81 m/s²) was found anywhere in
+    `ocean.py`/`atmosphere.py`/`carbon_cycle.py` — Ekman/wind-driven ocean
+    physics doesn't reference gravity explicitly, so there is no equivalent
+    gap there.
 - **Tidally-locked regime.** Substellar-point insolation instead of
   diurnal-mean-by-latitude; the temperature LUT machinery mostly supports
   this (day length → ∞). Big payoff for exoplanets (most known rocky planets

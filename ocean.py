@@ -662,14 +662,24 @@ def evolve_salinity(
     ice_delta: np.ndarray,
     dt_days: float = 1.0,
     pp=None,
+    river_input_mm_day: np.ndarray | None = None,
 ) -> np.ndarray:
     """Evolve ocean surface salinity [PSU] by one time step.
 
     Tendencies (PSU/day):
-      E–P balance  : evaporation concentrates, rain dilutes
+      E–P balance   : evaporation concentrates, rain dilutes
+      River input   : freshwater arriving at river mouths dilutes salinity
+                      locally, same as rain (see `river_input_mm_day` below)
       Brine rejection: freezing ice expels salt; melting injects freshwater
       Restoring     : slow drift back toward reference (deep mixing proxy), τ=2yr
-    """
+
+    `river_input_mm_day`: optional (H, W) freshwater flux [mm/day-equivalent
+    depth] arriving at each *ocean* cell from `hydrology.route_surface_water`'s
+    `ocean_river_input_mm_day` -- i.e. runoff that fell on land, upstream, and
+    reached the coast via river routing, concentrated at the actual river-mouth
+    cell(s) rather than spread evenly over the ocean. None (the default, and
+    what every caller passes when `enable_surface_hydrology=False`) means no
+    river freshwater source, matching pre-hydrology behavior exactly."""
     from planet_params import EARTH
     if pp is None:
         pp = EARTH
@@ -699,7 +709,15 @@ def evolve_salinity(
     else:
         precip_dilution = np.zeros_like(sal)
 
-    ep_tendency = (evap_rate - precip_dilution) * float(dt_days)
+    # River input: same physical quantity as precipitation (freshwater depth
+    # per day over this cell), so the same 0.001 dilution scale applies --
+    # this is a real depth of water landing on the cell, not a separate unit.
+    if river_input_mm_day is not None:
+        river_dilution = river_input_mm_day.astype(np.float32, copy=False) * 0.001
+    else:
+        river_dilution = np.zeros_like(sal)
+
+    ep_tendency = (evap_rate - precip_dilution - river_dilution) * float(dt_days)
 
     # Brine rejection: freezing (ice_delta > 0) → salt expelled to ocean
     # Melting (ice_delta < 0) → freshwater → salinity decreases

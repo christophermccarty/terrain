@@ -86,6 +86,7 @@ class SimulationThread(SimulationWorker):
         diagnostics=None,
         time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY,
         planet_params: PlanetParams = EARTH,
+        precip_block_size: int | None = None,
     ):
         # Resolve main.simulate_step at call time so existing tests and plugins
         # that monkeypatch that compatibility symbol keep working.
@@ -96,6 +97,7 @@ class SimulationThread(SimulationWorker):
             diagnostics=diagnostics,
             time_scale_mode=time_scale_mode,
             planet_params=planet_params,
+            precip_block_size=precip_block_size,
             step_function=lambda *args, **kwargs: simulate_step(*args, **kwargs),
         )
 
@@ -122,6 +124,13 @@ def main() -> None:
         # Wind model resolution decoupled from temp/precip resolution.
         # Larger => fewer wind cells => faster, but more approximate.
         "wind_block_size": 8,
+        # Precipitation resolution: False (default) lets simulate.py halve the
+        # precip grid automatically for H>=256 (~2x faster); True forces full
+        # resolution. Measured cost/benefit (2026-07 A/B, 512x1024, 3yr real
+        # terrain): full-res eliminates near-total soil-moisture floor-pinning
+        # (27% of land -> ~0%) and wets named regional boxes 16-33%, at a 2.8x
+        # slowdown. See docs/FINDINGS_SUMMARY.md.
+        "precip_full_res": False,
         "show_jet_stream": True,
         "planet_preset": "Earth",
         "planet_solar_constant": EARTH.solar_constant,
@@ -943,6 +952,7 @@ def main() -> None:
             elev,
             day_of_year=80.0,
             wind_block_size=int(wind_block_size_var.get()),
+            precip_block_size=_precip_block_size(),
             planet_params=current_planet_params,
         )
         sim_running = False
@@ -1031,6 +1041,23 @@ def main() -> None:
         add(frm, "WindBS", wind_block_size_var, width=4)
         return frm
     wind_controls = add_wind_controls(sim_tab)
+
+    # Precipitation fidelity toggle (Simulation tab). Default (unchecked) keeps
+    # simulate.py's automatic half-resolution precip for large grids (H>=256,
+    # ~2x faster); checking this forces full resolution. Read once at sim-state
+    # init / thread-start time, same convention as wind_block_size above (not
+    # live-traced into a running thread).
+    precip_full_res_var = tk.BooleanVar(
+        value=bool(settings.get("precip_full_res", default_settings["precip_full_res"]))
+    )
+    ttk.Checkbutton(
+        sim_tab,
+        text="Full-res precipitation (slower, ~2.8x; more accurate soil moisture)",
+        variable=precip_full_res_var,
+    ).pack(fill="x", pady=2)
+
+    def _precip_block_size() -> int | None:
+        return 1 if precip_full_res_var.get() else None
 
     # Terrain parameter inputs (Terrain tab)
     seed_var = tk.IntVar(value=int(settings["seed"]))
@@ -1816,6 +1843,7 @@ def main() -> None:
                 diagnostics=diagnostics,
                 time_scale_mode=time_scale_options.get(time_scale_var.get(), TimeScaleMode.DAILY),
                 planet_params=current_planet_params,
+                precip_block_size=_precip_block_size(),
             )
             sim_thread.start()
 
@@ -2242,6 +2270,7 @@ def main() -> None:
             "wind_arrows": int(wind_arrows_var.get()),
             "wind_scale": float(wind_scale_var.get()),
             "wind_block_size": int(wind_block_size_var.get()),
+            "precip_full_res": bool(precip_full_res_var.get()),
             "show_jet_stream": bool(show_jet_stream_var.get()),
             "auto_save_state": bool(_auto_save_enabled),
             "last_state_path": str(_current_state_path),

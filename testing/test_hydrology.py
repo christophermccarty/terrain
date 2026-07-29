@@ -26,7 +26,7 @@ def test_runoff_routing_conserves_area_weighted_water():
     _, land = get_masks(elevation, use_cache=False)
     runoff = np.where(land, 2.0, 0.0).astype(np.float32)
 
-    storage, throughflow, ocean_outflow = route_surface_water(
+    storage, throughflow, ocean_outflow, ocean_river_input = route_surface_water(
         elevation,
         runoff,
         None,
@@ -39,9 +39,41 @@ def test_runoff_routing_conserves_area_weighted_water():
     water_in = float(np.sum(runoff * weights))
     water_left = float(np.sum(storage * weights))
     water_out = float(np.sum(ocean_outflow * weights))
+    water_received = float(np.sum(ocean_river_input * weights))
     assert water_left + water_out == pytest.approx(water_in, rel=2e-6)
     assert float(np.max(throughflow)) > 0.0
     assert water_out > 0.0
+    # ocean_outflow (reported at the draining land cell) and ocean_river_input
+    # (reported at the receiving ocean cell) must carry the same total flux --
+    # they're two views of the same water, not independent quantities.
+    assert water_received == pytest.approx(water_out, rel=2e-6)
+
+
+def test_ocean_river_input_lands_at_receiving_cell_not_source():
+    """ocean_river_input_mm_day must be indexed at the ocean neighbor that
+    actually receives the flow, not at the draining land cell (that's what
+    ocean_outflow_mm_day is for) -- the two must not just have the same total,
+    they must be spatially distinct."""
+    H, W = 5, 5
+    elevation = np.full((H, W), 0.8, dtype=np.float32)
+    elevation[:, -1] = 0.0  # ocean column on the east edge
+    runoff = np.zeros_like(elevation)
+    runoff[2, 3] = 5.0  # land cell directly west of the ocean column
+
+    storage, throughflow, ocean_outflow, ocean_river_input = route_surface_water(
+        elevation, runoff, None, dt_days=1.0, routing_passes=4, routing_fraction=1.0
+    )
+
+    assert ocean_outflow[2, 3] > 0.0
+    assert ocean_river_input[2, 3] == 0.0  # source cell is land, not the receiver
+    # D8 ties (three ocean neighbors all at elevation 0.0) are broken by the
+    # implementation's fixed neighbor-scan order, not guaranteed to be due
+    # east -- check the flow landed in *some* ocean cell adjacent to the
+    # source, not a specific one. (Totals aren't compared as plain mm sums
+    # here since source and receiver rows can have different area weights --
+    # see test_runoff_routing_conserves_area_weighted_water for the
+    # area-weighted conservation check.)
+    assert float(ocean_river_input[1:4, 4].sum()) > 0.0
 
 
 def test_closed_depression_retains_surface_water():
@@ -52,12 +84,13 @@ def test_closed_depression_retains_surface_water():
     runoff = np.zeros_like(elevation)
     runoff[3, 4] = 10.0
 
-    storage, _, ocean_outflow = route_surface_water(
+    storage, _, ocean_outflow, ocean_river_input = route_surface_water(
         elevation, runoff, None, dt_days=1.0, routing_passes=12
     )
 
     assert storage[3, 4] == pytest.approx(10.0)
     assert float(np.sum(ocean_outflow)) == 0.0
+    assert float(np.sum(ocean_river_input)) == 0.0
 
 
 def test_hydrology_state_is_gated_and_persistent(mixed_elev):

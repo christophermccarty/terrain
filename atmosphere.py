@@ -140,13 +140,76 @@ _PRECIP_TARGET_LAT_BREAKS_DEG = np.array(
 _PRECIP_TARGET_MM_DAY = np.array(
     [5.48, 4.93, 2.74, 1.64, 2.47, 2.19, 1.37, 0.82, 0.55, 0.27], dtype=np.float64)
 
+# The raw table above is only sampled every 10 degrees; plain linear
+# interpolation draws a dead-straight ramp between each pair, and the 10-20
+# deg segment (ITCZ edge -> subtropical dry belt, 4.93 -> 2.74 mm/day) is by
+# far the steepest -- roughly 4x the slope of its neighbors. Combined with
+# `moisture_budget_precip_rescale` enforcing this target tightly on every row
+# regardless of the underlying terrain, that single steep linear segment
+# produced a razor-sharp, perfectly latitude-aligned rainforest/desert
+# boundary in the Koppen map (reported 2026-07-28, ~4yr into a MONTHLY
+# real-terrain run) -- visible identically across every continent since the
+# target has no longitude dependence at all. Real Earth's ITCZ-to-
+# subtropical-high transition is smeared over roughly 20-25 degrees (monsoon
+# systems, ocean-basin contrasts, and the ITCZ's own seasonal migration
+# average out to a much gentler zonal-mean curve than this coarse 10-degree
+# table implies). Pre-smoothing the profile with a Gaussian (sigma matched to
+# that real-world transition width) spreads the same total precip drop over a
+# wider latitude band instead of concentrating it in one 10-degree segment,
+# without changing the overall equator-to-pole shape or the calibration this
+# table encodes -- `_zonal_precip_target_profile` still renormalizes to a
+# row-mean of 1.0 on the actual simulation grid, so the global calibration
+# point this table anchors is untouched.
+_PRECIP_TARGET_FINE_RES_DEG = 0.1
+_PRECIP_TARGET_SMOOTH_SIGMA_DEG = 4.0
+
+
+def _build_smoothed_precip_target_profile() -> tuple[np.ndarray, np.ndarray]:
+    """Precompute a Gaussian-smoothed version of `_PRECIP_TARGET_MM_DAY` over a fine
+    |latitude| grid -- see the comment above `_PRECIP_TARGET_FINE_RES_DEG` for why."""
+    fine_lat = np.arange(0.0, 90.0 + _PRECIP_TARGET_FINE_RES_DEG, _PRECIP_TARGET_FINE_RES_DEG)
+    fine_shape = np.interp(fine_lat, _PRECIP_TARGET_LAT_BREAKS_DEG, _PRECIP_TARGET_MM_DAY)
+
+    # Mirror across the equator (x=0) so the kernel has real data on both
+    # sides of that boundary instead of falling off toward zero there.
+    mirrored_shape = np.concatenate([fine_shape[:0:-1], fine_shape])
+
+    sigma_samples = _PRECIP_TARGET_SMOOTH_SIGMA_DEG / _PRECIP_TARGET_FINE_RES_DEG
+    radius_samples = int(math.ceil(4.0 * sigma_samples))
+    kernel_x = np.arange(-radius_samples, radius_samples + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (kernel_x / sigma_samples) ** 2)
+    kernel /= kernel.sum()
+
+    # Reflect-pad both ends (equator side already mirrored above; the polar
+    # end is reflected about 90 deg) so the convolution doesn't lose
+    # energy/flatten toward zero near either boundary.
+    pad_lo = mirrored_shape[radius_samples:0:-1]
+    pad_hi = mirrored_shape[-2:-radius_samples - 2:-1]
+    padded = np.concatenate([pad_lo, mirrored_shape, pad_hi])
+    smoothed_mirrored = np.convolve(padded, kernel, mode="valid")
+
+    # Pull the 0..90 deg half back out (mirrored_shape[len(fine_lat)-1:] is
+    # the 0..90 deg portion by construction above).
+    half_start = len(fine_lat) - 1
+    smoothed_shape = smoothed_mirrored[half_start:half_start + len(fine_lat)]
+    return fine_lat, smoothed_shape.astype(np.float64)
+
+
+_PRECIP_TARGET_FINE_LAT_DEG, _PRECIP_TARGET_FINE_SHAPE = _build_smoothed_precip_target_profile()
+
 
 def _zonal_precip_target_profile(lat_deg: np.ndarray) -> np.ndarray:
     """Earth-like zonal precip *shape* by |lat|, normalized to an unweighted row-mean
     of 1.0 (matching the plain `np.mean(P)` convention the old scalar rescale used) so
-    `profile * target_mean_mm_day` reproduces the exact same global calibration point."""
+    `profile * target_mean_mm_day` reproduces the exact same global calibration point.
+
+    Sampled from a pre-smoothed fine-resolution curve (see
+    `_build_smoothed_precip_target_profile`) rather than linearly interpolating the
+    raw 10-degree breakpoint table directly -- the raw table's steepest segment
+    (10-20 deg) was sharp enough to draw a razor-straight biome boundary on the
+    actual simulation grid; see that function's docstring."""
     abs_lat = np.abs(np.asarray(lat_deg, dtype=np.float64))
-    shape = np.interp(abs_lat, _PRECIP_TARGET_LAT_BREAKS_DEG, _PRECIP_TARGET_MM_DAY)
+    shape = np.interp(abs_lat, _PRECIP_TARGET_FINE_LAT_DEG, _PRECIP_TARGET_FINE_SHAPE)
     shape = shape / (float(np.mean(shape)) + 1e-12)
     return shape.astype(np.float32)
 
@@ -159,6 +222,7 @@ def _moisture_budget_precip_rescale(
     dt_days: float,
     column_mm_per_q: float,
     allocation_affinity: np.ndarray | None = None,
+    target_cell_weight: np.ndarray | None = None,
     max_total_removal_fraction: float = 0.85,
     max_added_removal_fraction: float = 0.15,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -169,6 +233,19 @@ def _moisture_budget_precip_rescale(
     remaining atmospheric moisture and a per-step rainout cap. The target is
     therefore aspirational: dry/moisture-limited rows may remain below it
     instead of receiving an arbitrarily large multiplier.
+
+    `target_cell_weight`, if given, reshapes `target_row_mm_day` (a single
+    scalar per row) into a per-cell target via `target_row * weight`, where
+    `weight` must average to 1.0 across each row (row *totals* -- and
+    therefore the zonal calibration every latitude-band test checks -- are
+    unaffected by construction). Without it (`None`, the default), every
+    cell in a row shares the exact same target, reproducing this function's
+    original row-uniform behavior byte-for-byte -- existing callers are
+    unaffected. See its caller in `generate_precipitation` for why: a
+    row-uniform target has zero longitude/terrain dependence, so the
+    latitude at which a row's classification threshold gets crossed is
+    identical for every column regardless of real terrain -- see
+    razor-sharp-biome-line-precip-target-smoothing-2026-07-28 memory.
     """
     dq64 = np.asarray(dq, dtype=np.float64)
     q64 = np.maximum(np.asarray(q, dtype=np.float64), 0.0)
@@ -183,6 +260,12 @@ def _moisture_budget_precip_rescale(
         allocation = np.clip(np.asarray(allocation_affinity, dtype=np.float64), 0.0, None)
         if allocation.shape != dq64.shape:
             raise ValueError("allocation_affinity must match dq shape")
+    if target_cell_weight is None:
+        cell_weight = None
+    else:
+        cell_weight = np.asarray(target_cell_weight, dtype=np.float64)
+        if cell_weight.shape != dq64.shape:
+            raise ValueError("target_cell_weight must match dq shape")
     if dt_days <= 0.0 or column_mm_per_q <= 0.0:
         raise ValueError("dt_days and column_mm_per_q must be positive")
 
@@ -195,6 +278,27 @@ def _moisture_budget_precip_rescale(
 
     for row in range(H):
         target_total = max(float(target_row_dq[row]), 0.0) * W
+        target_cell_row = (
+            None if cell_weight is None else target_row_dq[row] * cell_weight[row]
+        )
+        if target_cell_row is not None:
+            # Always squeeze cells raining above their own (terrain-shaped)
+            # share back down to it, regardless of whether the row in
+            # aggregate lands in the trim or fill branch below. Gating this
+            # solely on the row's aggregate trim/fill status (the previous
+            # behavior) left individual over-share cells -- e.g. subsiding
+            # desert land sitting in an otherwise moisture-limited row --
+            # completely untouched whenever their row's *aggregate* fell in
+            # the fill branch, which became common once
+            # `_zonal_precip_target_profile`'s smoothing raised subtropical
+            # row targets; that was a real desert-precipitation regression,
+            # not just a reshaping no-op. The reclaimed amount isn't
+            # discarded -- it lowers `current_total` below, so the fill step
+            # further down has more room to redistribute it toward cells
+            # still below their own share.
+            excess_over_own = np.maximum(result[row] - target_cell_row, 0.0)
+            if np.any(excess_over_own > 0.0):
+                result[row] -= excess_over_own
         current_total = float(np.sum(result[row]))
         if current_total > target_total and current_total > 0.0:
             result[row] *= target_total / current_total
@@ -206,6 +310,20 @@ def _moisture_budget_precip_rescale(
         total_cap = max_total_removal_fraction * q64[row]
         per_step_cap = result[row] + max_added_removal_fraction * q64[row]
         capacity = np.maximum(np.minimum(total_cap, per_step_cap) - result[row], 0.0)
+        if target_cell_row is not None:
+            # Hard per-cell fill ceiling at each cell's own (terrain-shaped)
+            # share -- without this, `affinity`'s super-linear existing-
+            # condensation term can still out-vote `shortfall`'s (soft,
+            # priority-only) deprioritization and push an already-wetter
+            # desert-land cell's fill past its own share, even though it
+            # never gets more than its capacity-limited allotment overall.
+            # Since `target_cell_row` sums to exactly `target_total` across
+            # the row (cell_weight's row-mean=1.0 construction), capping
+            # every cell here can only ever leave moisture unplaced (reported
+            # via `capacity_limited`/`unmet_row_mm_day`), never invent extra
+            # target -- consistent with this function's "aspirational target"
+            # contract.
+            capacity = np.minimum(capacity, np.maximum(target_cell_row - result[row], 0.0))
         available = float(np.sum(capacity))
         if available <= 1e-15:
             capacity_limited[row] = True
@@ -219,6 +337,18 @@ def _moisture_budget_precip_rescale(
         # longitudinal contrasts.
         affinity_floor = max(float(np.mean(result[row])) * 0.05, 1e-12)
         affinity = (result[row] + affinity_floor) ** 2 * allocation[row]
+        if target_cell_row is not None:
+            # Additionally prioritize cells that are furthest below their own
+            # (terrain-shaped) share of the target, not just cells that
+            # already happen to be raining -- ties the fill order directly to
+            # the per-cell target shape instead of only to existing
+            # condensation, so a capacity-limited row's shortfall lands
+            # preferentially on cells whose *own* target is low (e.g.
+            # subsiding/arid terrain) rather than spreading evenly across
+            # every column regardless of local terrain.
+            shortfall_floor = max(float(np.mean(target_cell_row)) * 0.05, 1e-12)
+            shortfall = np.maximum(target_cell_row - result[row], 0.0) + shortfall_floor
+            affinity = affinity * shortfall
         amount_left = requested
         active_capacity = capacity.copy()
         for _ in range(6):
@@ -692,6 +822,30 @@ def _ddx_periodic(field: np.ndarray) -> np.ndarray:
         np.concatenate([field[:, 1:], field[:, :1]], axis=1)
         - np.concatenate([field[:, -1:], field[:, :-1]], axis=1)
     )
+
+
+def _zonal_gaussian_smooth(field: np.ndarray, sigma_deg: float) -> np.ndarray:
+    """Smooth `field` along longitude (axis=1) with a periodic Gaussian kernel.
+
+    FFT-based circular convolution (numpy-only, no scipy dependency) --
+    the longitude axis genuinely wraps, so a periodic kernel is exact here
+    rather than an edge-effect approximation. `sigma_deg` is in degrees of
+    longitude; converted to grid cells internally so it's resolution-
+    independent. A `sigma_deg` of ~0 (below one grid cell) returns `field`
+    unchanged rather than dividing by a near-zero kernel width.
+    """
+    W = field.shape[1]
+    sigma_cells = sigma_deg / 360.0 * float(W)
+    if sigma_cells <= 0.5:
+        return field
+    idx = np.arange(W)
+    dist = np.minimum(idx, W - idx).astype(np.float64)
+    kernel = np.exp(-0.5 * (dist / sigma_cells) ** 2)
+    kernel /= kernel.sum()
+    field_hat = np.fft.rfft(field.astype(np.float64), axis=1)
+    kernel_hat = np.fft.rfft(kernel)
+    smoothed = np.fft.irfft(field_hat * kernel_hat[None, :], n=W, axis=1)
+    return smoothed.astype(np.float32, copy=False)
 
 
 def _advect_scalar(
@@ -1465,7 +1619,20 @@ def evolve_wind(
     # outflow and triggering runaway SH sea-ice cooling (SH pole → 201 K).
     # The land-sea contrast is already partially encoded in the temperature field T via
     # land/ocean differential heating in simulate.py's _evolve_temperature.
-        
+
+    # Smooth (2026-07-28, tropical-speckle-fix): `generate_wind_field`'s
+    # diagnostic path already does `pressure + 0.2*laplacian(pressure)` before
+    # differentiating it, but this prognostic path differentiated `p_anom`
+    # (which includes raw/unsmoothed `p_terrain = pgf_terrain_scale *
+    # elevation`) directly via central differences with no diffusion term.
+    # That was dormant while MONTHLY/ANNUAL used the diagnostic path, but
+    # became a real, sustained (not just transient) source of grid-scale
+    # precip roughness -- salt-and-pepper desert-classified speckle inside the
+    # tropical rainforest belt (Amazon/Congo/Indonesia) -- once
+    # `wind_prognostic_substep_days` defaulting to 1.0 routed MONTHLY/ANNUAL
+    # through this prognostic solver instead.
+    p_anom = p_anom + 0.2 * _laplacian(p_anom)
+
     dp_dx = _ddx_periodic(p_anom) / (dx + 1e-3)
     # Axis 0 is north→south (index increases southward), so physical northward gradient is negated.
     dp_dy = -np.gradient(p_anom, axis=0) / dy
@@ -2674,12 +2841,99 @@ def generate_precipitation(
     else:
         div = _ddx_periodic(u) - np.gradient(v, axis=0)
         _div_pos_early = np.clip(div, 0.0, None)
-        _subsidence_norm_early = np.clip(_div_pos_early / (np.mean(_div_pos_early) + 1e-6), 0.0, 2.5)
+        # Cap each cell's contribution to the normalizer's reference mean (not
+        # the numerator -- genuinely-more-subsiding cells still rank higher).
+        # `wind_prognostic_substep_days` defaulting to 1.0 (2026-07-28, see
+        # razor-sharp-biome-line-precip-target-smoothing memory) routes MONTHLY/
+        # ANNUAL wind through the real prognostic evolve_wind solver instead of
+        # generate_wind_field's smoothed diagnostic snapshot. The prognostic
+        # divergence field has a much heavier tail (p90/p99 measured 0.222/0.243
+        # -> 0.281/0.429) even though its bulk barely moves, which inflates this
+        # array's global mean ~37% and dilutes subsidence_suppression EVERYWHERE
+        # -- including over real deserts whose own local divergence never
+        # changed (2026-07-29, desert-wetting-regression memory: Sahara/Kalahari/
+        # Atacama all measurably wetter after the substep-days flip, isolated via
+        # scripts/run_real_terrain_validation.py --param sweeps to this mechanism
+        # specifically, not the target-smoothing or coastal-fog work from the
+        # same day). 0.02 was chosen empirically against that validation script
+        # (real desert-local div, 0.16-0.28, still saturates distinctly above
+        # it); lower caps close the desert gap further but monotonically cost
+        # already-under-target continental interior too (US Midwest 715->648
+        # mm/yr across the sweep), so this is a real trade-off, not a free lever
+        # -- deliberately not pushed past 0.02.
+        _div_pos_norm_ref = np.minimum(_div_pos_early, 0.02)
+        _subsidence_norm_early = np.clip(_div_pos_early / (np.mean(_div_pos_norm_ref) + 1e-6), 0.0, 2.5)
         subsidence_suppression = np.clip(
             1.0 - 0.34 * _subsidence_norm_early - 0.45 * drybelt_window[:, None],
             0.08,
             1.0,
         ).astype(np.float32, copy=False)
+        # `ascent`/`conv`/`orog` (computed further down, reusing `div` cached
+        # here) each get a `+0.15*laplacian(...)` smoothing pass; this raw-div-
+        # derived driver was the one that skipped it (2026-07-28,
+        # tropical-speckle-fix memory) -- dormant while MONTHLY/ANNUAL used the
+        # smoothed diagnostic wind, but a real, sustained source of grid-scale
+        # speckle in `land_evap`/`precip_potential` once the prognostic solver
+        # (unsmoothed `p_anom`, see `evolve_wind`) took over by default.
+        _lap_early = _laplacian_numba if NUMBA_AVAILABLE else _laplacian
+        subsidence_suppression = np.clip(
+            subsidence_suppression + 0.15 * _lap_early(subsidence_suppression), 0.08, 1.0
+        ).astype(np.float32, copy=False)
+        # ITCZ row-to-row/column-to-column shape consistency (2026-07-29, see
+        # PlanetParams.itcz_zonal_smooth_deg docstring for the full mechanism
+        # and root-cause measurement). Longitude-only Gaussian smoothing of
+        # the shared `subsidence_suppression` signal, applied before the
+        # coastal-fog gate (deliberately narrow, would be washed out by a
+        # wide smooth) but after the local Laplacian pass above (a much
+        # smaller-scale smooth that doesn't address the Rossby-wave-period
+        # noise this targets). 0.0 default is an exact no-op.
+        _itcz_smooth_deg = float(getattr(pp, "itcz_zonal_smooth_deg", 0.0))
+        if _itcz_smooth_deg > 0.0:
+            subsidence_suppression = np.clip(
+                _zonal_gaussian_smooth(subsidence_suppression, _itcz_smooth_deg), 0.08, 1.0
+            ).astype(np.float32, copy=False)
+        # Coastal-fog/cold-current desert suppression (2026-07-27,
+        # coastal-fog-desert memory; reconstructed from that memory's writeup
+        # after an accidental `git checkout` discarded the uncommitted
+        # original -- functionally faithful, not guaranteed byte-identical).
+        # Real Atacama/Namib-class deserts are this dry despite sitting on a
+        # coast because eastern-boundary-current upwelling (Humboldt,
+        # Benguela, California, Canary) cools coastal SST enough to trap
+        # moisture under a marine fog inversion instead of releasing it as
+        # rain -- a mechanism this model has no ocean-current/upwelling
+        # physics for at all (`ocean.calculate_ocean_heat_transport` models
+        # western-boundary-current *warming* but has no eastern-boundary
+        # *cooling* counterpart). Implemented as a diagnostic gate on
+        # `subsidence_suppression` (and therefore both `land_evap` and
+        # `precip_potential`, which both read it) rather than real SST-driven
+        # physics -- building genuine upwelling coupling was judged too large
+        # a lift for the coastal-fog session alone.
+        #
+        # `_west_coast_land`: land cells with ocean immediately to their west
+        # (`np.roll(sea_mask, 1, axis=1)` -- the real eastern-boundary-current
+        # coastlines above are all west coasts), decayed over the two cells
+        # inland (east) the same "1-2 cells downstream" pattern
+        # `ocean.calculate_ocean_heat_transport`'s western-boundary-current
+        # enhancement already uses. An immediate-coastline-only mask was
+        # tried first and measured to touch only 13% of the Atacama named
+        # box's land cells (Atacama moved <3 mm/yr across the full strength
+        # range); decaying 2 cells inland raised coverage to ~40% of cells at
+        # meaningful weight (mean 0.28).
+        _ocean_west = np.roll(sea_mask, 1, axis=1)
+        _coast_core = (land_mask & _ocean_west).astype(np.float32)
+        _west_coast_land = np.clip(
+            _coast_core
+            + 0.6 * np.roll(_coast_core, 1, axis=1)  # 1 cell inland
+            + 0.3 * np.roll(_coast_core, 2, axis=1),  # 2 cells inland
+            0.0,
+            1.0,
+        )
+        _fog_gate = np.clip(
+            1.0 - float(pp.coastal_upwelling_fog_strength) * _west_coast_land * drybelt_window[:, None],
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+        subsidence_suppression = (subsidence_suppression * _fog_gate).astype(np.float32, copy=False)
         if _sc is not None:
             div.flags.writeable = False
             subsidence_suppression.flags.writeable = False
@@ -3119,6 +3373,23 @@ def generate_precipitation(
         target_profile = _zonal_precip_target_profile(lat_deg)  # (H,), mean(unweighted)=1.0
         target_row_mm_day = target_profile * np.float32(target_mean_mm_day)  # (H,)
         dq_before = dq.copy()
+        # Terrain-shaped per-cell target weight (mean=1.0 per row by
+        # construction, so it reshapes each row's target -- and thus the
+        # moisture-budget fill order below -- without touching the row's
+        # *total*, which is what the latitude-band calibration tests check).
+        # Reused for the post-hoc desert/continental redistribution further
+        # down; computed once here so the moisture-budget path (which needs
+        # it earlier, to shape the target itself rather than only redistribute
+        # an already-fixed row total) and the legacy path share one formula.
+        # See DESERT_REDISTRIBUTION_STRENGTH's comment below for the full
+        # rationale and history of this specific weight.
+        DESERT_REDISTRIBUTION_STRENGTH = 0.9
+        _desert_factor = np.clip(
+            1.0 - DESERT_REDISTRIBUTION_STRENGTH * (1.0 - subsidence_suppression) * land_f,
+            0.05, 1.0,
+        ).astype(np.float32, copy=False)
+        _row_norm = np.mean(_desert_factor, axis=1, dtype=np.float64).astype(np.float32)
+        cell_weight = _desert_factor / (_row_norm[:, None] + 1e-6)
         if pp.moisture_budget_precip_rescale:
             budget_dq_cap = np.minimum(0.85 * q, dq_before + 0.15 * q)
             drybelt_land_protection = np.clip(
@@ -3138,6 +3409,7 @@ def generate_precipitation(
                 dt_days=dt,
                 column_mm_per_q=column_mm_per_q,
                 allocation_affinity=drybelt_land_protection * dynamic_affinity,
+                target_cell_weight=cell_weight,
             )
             scale_row = budget_diag["effective_scale"]
         else:
@@ -3210,16 +3482,22 @@ def generate_precipitation(
         # step touches nothing, unlike the row-level zonal correction above (which
         # needed the heterogeneity gating specifically because it changes each
         # row's *magnitude*, not just its internal shape).
-        DESERT_REDISTRIBUTION_STRENGTH = 0.9
-        desert_factor = np.clip(
-            1.0 - DESERT_REDISTRIBUTION_STRENGTH * (1.0 - subsidence_suppression) * land_f,
-            0.05, 1.0,
-        ).astype(np.float32, copy=False)
-        row_norm = np.mean(desert_factor, axis=1, dtype=np.float64).astype(np.float32)
-        cell_weight = desert_factor / (row_norm[:, None] + 1e-6)
-        dq = np.clip(dq * cell_weight, 0.0, q)
-        if pp.moisture_budget_precip_rescale:
-            dq = np.minimum(dq, budget_dq_cap)
+        #
+        # `cell_weight` itself is computed once, earlier (before the
+        # moisture-budget-rescale branch above), because the budget path now
+        # reuses it as `target_cell_weight` to shape the *target* each cell
+        # chases (razor-sharp-biome-line-precip-target-smoothing-2026-07-28
+        # memory) rather than only redistributing an already-fixed row total
+        # after the fact. Applying this post-hoc multiply on top of that would
+        # double-apply the same signal and re-introduce the asymmetric-clipping
+        # problem that motivated moving it upstream (`budget_dq_cap` bounds how
+        # much a cell's rain can *increase* relative to its pre-rescale value,
+        # but not how much this step can *decrease* it -- stacking both passes
+        # would bias the net result toward drying, not just reshaping). Only
+        # the legacy (non-budget) path still needs it applied here, since that
+        # path has no other terrain-aware mechanism at all.
+        if not pp.moisture_budget_precip_rescale:
+            dq = np.clip(dq * cell_weight, 0.0, q)
         P = dq * (column_mm_per_q / dt)
         if debug_fields is not None:
             debug_fields["desert_redistribution_weight"] = cell_weight

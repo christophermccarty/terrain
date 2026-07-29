@@ -55,13 +55,23 @@ def route_surface_water(
     dt_days: float,
     routing_passes: int = 8,
     routing_fraction: float = 0.55,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Route runoff downhill and return storage, throughflow, and ocean outflow.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Route runoff downhill and return storage, throughflow, ocean outflow
+    (by draining land cell), and ocean river input (by receiving ocean cell).
 
     This is a deliberately compact D8 routing model, not a channel hydraulics
     solver. Depressions retain water as lakes; cells with a downhill path pass a
     fraction of their available volume per routing pass. Longitude is periodic
     and latitude edges are clamped.
+
+    `ocean_outflow_mm_day` is indexed at the *land* cell the water drains from
+    (matches this function's original, still-used-for-display convention).
+    `ocean_river_input_mm_day` is indexed at the *ocean* cell(s) that actually
+    receive that flow (the D8 receiver), for feeding a river-mouth freshwater
+    flux into ocean salinity -- distinct because a coastal land cell can be
+    hydrologically empty (mask-wise 0) while still being the correct place to
+    report outflow *from*, and one ocean cell can receive flow from several
+    different draining land neighbors.
     """
     elev = np.asarray(elevation, dtype=np.float64)
     runoff = np.asarray(runoff_mm_day, dtype=np.float64)
@@ -86,6 +96,7 @@ def route_surface_water(
             np.where(land_mask, np.maximum(previous, 0.0), 0.0).astype(np.float32),
             np.zeros_like(elev, dtype=np.float32),
             np.zeros_like(elev, dtype=np.float32),
+            np.zeros_like(elev, dtype=np.float32),
         )
 
     H, W = elev.shape
@@ -100,6 +111,7 @@ def route_surface_water(
     )
     throughflow_volume = np.zeros_like(storage_volume)
     ocean_outflow_volume = np.zeros_like(storage_volume)
+    ocean_river_input_volume = np.zeros_like(storage_volume)
     receiver_row, receiver_col, drains = _receiver_indices(elev)
     source_can_drain = land_mask & drains
 
@@ -116,20 +128,32 @@ def route_surface_water(
         storage_volume -= moved
         throughflow_volume += moved
 
+        # np.bincount is an exact match for np.add.at here (both accumulate
+        # duplicate-index contributions rather than overwriting), but is far
+        # faster at this array size -- np.add.at's per-element safety checks
+        # made it the dominant cost of this function (measured: enabling
+        # hydrology cost 2.7x wall time on a 512x1024 real-terrain run before
+        # this change, almost entirely from the two add.at calls below).
         to_land = source_can_drain & receiver_is_land
-        np.add.at(
-            storage_volume.reshape(flat_size),
-            receiver_flat[to_land],
-            moved[to_land],
-        )
+        if np.any(to_land):
+            storage_volume.reshape(flat_size)[:] += np.bincount(
+                receiver_flat[to_land], weights=moved[to_land], minlength=flat_size
+            )
         to_ocean = source_can_drain & ~receiver_is_land
         ocean_outflow_volume[to_ocean] += moved[to_ocean]
+        if np.any(to_ocean):
+            ocean_river_input_volume.reshape(flat_size)[:] += np.bincount(
+                receiver_flat[to_ocean], weights=moved[to_ocean], minlength=flat_size
+            )
 
     safe_area = np.maximum(area_weight, 1e-9)
     dt_safe = max(float(dt_days), 1e-9)
     storage_mm = np.where(land_mask, storage_volume / safe_area, 0.0)
     throughflow_mm_day = np.where(
         land_mask, throughflow_volume / safe_area / dt_safe, 0.0
+    )
+    ocean_river_input_mm_day = np.where(
+        sea_mask, ocean_river_input_volume / safe_area / dt_safe, 0.0
     )
     ocean_outflow_mm_day = np.where(
         land_mask, ocean_outflow_volume / safe_area / dt_safe, 0.0
@@ -138,4 +162,5 @@ def route_surface_water(
         storage_mm.astype(np.float32),
         throughflow_mm_day.astype(np.float32),
         ocean_outflow_mm_day.astype(np.float32),
+        ocean_river_input_mm_day.astype(np.float32),
     )

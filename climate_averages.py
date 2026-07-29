@@ -13,6 +13,8 @@ where biomes were changing daily due to instantaneous weather fluctuations.
 Updated to support Köppen classification for more realistic climate zones.
 """
 
+import math
+
 import numpy as np
 from typing import NamedTuple
 
@@ -246,9 +248,25 @@ def update_monthly_statistics(
         monthly_precip = state.monthly_precip.copy()
         monthly_sample_count = state.monthly_sample_count.copy()
 
-    # EMA window is expressed in this planet's orbital months.
-    alpha = dt_days / (window_years * orbital_month_days)
-    alpha = min(alpha, 1.0)
+    # EMA window is expressed in this planet's orbital months. Uses the exact
+    # continuous-time relaxation (matching atmosphere._update_jet_index's own
+    # `1 - exp(-dt/tau)` idiom) rather than the Euler-forward `dt/window`
+    # linear approximation: the two agree closely for small dt_days (DAILY/
+    # WEEKLY, unchanged in practice), but the linear form saturates at exactly
+    # 1.0 -- full replacement, zero retained memory -- whenever a single call's
+    # dt_days spans the whole window, which is exactly what happens every call
+    # in MONTHLY/ANNUAL mode (dt_days == orbital_month_days). That silently
+    # turned "1-year rolling average per month" into "this year's single
+    # instantaneous monthly sample, no cross-year averaging at all", so every
+    # year's Köppen classification reflected whatever transient weather/eddy
+    # pattern the wind solver happened to produce that one month -- visible as
+    # fine-grained speckle in the tropics once MONTHLY mode's wind gained
+    # real spatial variance (see wind_prognostic_substep_days). The exact form
+    # instead asymptotes to a genuine ~63%-new/37%-retained blend per
+    # window_years, so MONTHLY mode gets the same multi-year smoothing DAILY/
+    # WEEKLY already got "for free" from their many small sub-window steps.
+    tau_days = window_years * orbital_month_days
+    alpha = 1.0 - math.exp(-dt_days / tau_days)
 
     # Update current month's statistics
     monthly_temp[month] = (1.0 - alpha) * monthly_temp[month] + alpha * state.temperature.astype(np.float32)

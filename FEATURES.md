@@ -45,22 +45,40 @@ draining downslope with a residence time, lake formation in closed basins, and d
 ocean cells feeding `evolve_salinity`. Flow accumulation is a static precompute, so the
 per-step cost is one sparse gather — cheap enough for the MONTHLY hot path.
 
-### 2. Dynamic ice sheets with a real mass balance
-**Effort: medium-large. Touches: `simulate.py`, new `cryosphere.py`, `PlanetParams`.**
+### 2. Dynamic ice sheets with a real mass balance -- **Shipped 2026-07-28, default off**
 
-Today land ice is only `ice_sheet_age`, a counter that increments while Köppen says EF and
-decays otherwise. There is no accumulation/ablation budget, no ice thickness on land, no flow,
-and no sea-level coupling. Sea *ice* has thickness (Feature 6); land ice does not.
+`PlanetParams.enable_land_ice_dynamics` (default `False`, exact no-op) adds
+`PlanetState.land_ice_thickness` (mass balance: gains `snow_depth`'s former 10 m-cap overflow,
+loses to a degree-day ablation term) and a mass-conservative flux-form flow (thickness-weighted
+diffusion, substepped for CFL stability -- see `simulate._land_ice_flow_step`), plus a derived
+`PlanetState.sea_level_change_m` eustatic diagnostic. Real-terrain-tested (`saves/earth.pkl`,
+10yr, seeded Antarctic/Greenland-scale reservoirs): numerically stable, spatially selective (zero
+ice at desert/continental latitudes), sea-level diagnostic tracks ice volume correctly. Full
+writeup, including a real CFL-stability bug found and fixed via the real-terrain check, in
+`PLAN_PHYSICS_FIXES.md`'s 2026-07-28 entry.
 
-Adding a surface mass balance (snowfall accumulation − melt/ablation, with a simple
-shallow-ice or even purely local thickness model) unlocks:
-- The **ice-age proof-of-concept scenario** that `PLAN_PHYSICS.md` has wanted since Effort 2E
-  and that has never been run.
-- A real **ice-albedo feedback with memory**, rather than one mediated by a Köppen
-  reclassification that only updates every 30 simulated days.
-- **Sea-level change**, and with it the option of isostatic rebound later.
+**Deliberately not done this pass** (still real gaps, not oversights):
+- **Flow doesn't follow terrain slope** -- diffuses thickness only, not ice-surface elevation,
+  because `elevation` has no single canonical meters conversion in this codebase (the
+  `max_elevation_km`-hardcoded-four-ways gap ROADMAP.md already tracks); adding a fifth
+  conversion here would have compounded that gap rather than fixed it.
+- **No albedo coupling** -- `land_ice_thickness` doesn't yet feed into surface albedo the way
+  `ice_sheet_age`'s EF-threshold does.
+- **No calving -> `evolve_salinity` coupling** -- ice lost at a coastline is discarded from the
+  land reservoir, not credited as ocean freshwater input (the way hydrology's `runoff` is).
+- **No mask/coastline feedback** -- `sea_level_change_m` is a real, tested, computed number, but
+  it doesn't yet shift `masks.get_masks`'s land/sea split. That function has ~54 call sites
+  across 22 files; threading an effective sea-level-adjusted elevation through all of them safely
+  was judged too large for this session.
+- **`ice_flow_diffusivity`'s default (2.0e-3) is uncalibrated** -- the real-terrain check showed
+  a seeded 2000 m Antarctic-scale reservoir losing ~50% of its volume in 10 simulated years via
+  flow-driven marginal loss, almost certainly too fast for a "stable ice sheet" target. Needs a
+  dedicated multi-century calibration pass before the gate could default on.
 
-Pairs directly with item 3.
+All four are natural follow-ups, not blockers -- the core mass-balance/thickness/flow/sea-level
+mechanism is real and tested. Once flow is calibrated, the **ice-age proof-of-concept scenario**
+`PLAN_PHYSICS.md` has wanted since Effort 2E (pairs with item 3, the Milankovitch runner) and a
+real **ice-albedo feedback with memory** both become reachable follow-ups.
 
 ### 3. Milankovitch scenario runner + an `experiments/` directory
 **Effort: small-medium. Touches: new `experiments/`, `scripts/`.**

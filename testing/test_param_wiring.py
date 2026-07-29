@@ -104,7 +104,7 @@ PLANET_PARAM_CASES = [
     ("spherical_metric_precip", False),
     ("spherical_metric_clouds", False),
     ("deep_ocean_exchange_rate", 5e-4),
-    ("soil_deep_gain_rate", 0.001),  # default 0.0 (inert) -- see planet_params.py docstring
+    ("soil_deep_gain_rate", 0.001),  # default 0.0005 -- see planet_params.py docstring
     ("soil_deep_drain_rate", 0.05),
     # A fresh state's surface soil starts at 0.55 (well above the eventual 0.05
     # floor), so soil_deep_evap_weight's max(soil, weight*soil_deep) only picks
@@ -112,6 +112,8 @@ PLANET_PARAM_CASES = [
     # value -- needs a large perturbation (not e.g. 0.0) to actually exercise
     # the code path in this short/fresh-start test.
     ("soil_deep_evap_weight", 5.0),
+    ("abyssal_overturning_coeff", 0.05),  # default 0.0 (exact no-op)
+    ("coastal_upwelling_fog_strength", 0.9),  # default 0.5
 ]
 
 
@@ -144,8 +146,17 @@ def test_pgf_continentality_amp_wired_in_diagnostic_wind():
     # index/other cache-key inputs) silently returned the *first* call's
     # stale cached wind -- this test would have caught that as a false
     # "unwired" failure.
-    changed_pp = dataclasses.replace(EARTH, pgf_continentality_amp=8.0)
-    baseline = _run(EARTH, update_wind=False)
+    # wind_prognostic_substep_days must be pinned to 0.0 on both sides: its
+    # default flipped to 1.0 (2026-07-28, razor-sharp-biome-line fix), which
+    # makes update_wind=False runs take the *prognostic* evolve_wind path
+    # instead of generate_wind_field -- pgf_continentality_amp only affects
+    # the latter, so without pinning this the gate would silently defeat the
+    # test's own stated purpose of isolating the diagnostic wind code path.
+    baseline_pp = dataclasses.replace(EARTH, wind_prognostic_substep_days=0.0)
+    changed_pp = dataclasses.replace(
+        EARTH, pgf_continentality_amp=8.0, wind_prognostic_substep_days=0.0
+    )
+    baseline = _run(baseline_pp, update_wind=False)
     changed = _run(changed_pp, update_wind=False)
     assert _states_differ(baseline, changed), (
         "PlanetParams.pgf_continentality_amp=0.0 vs 8.0 produced a byte-identical "

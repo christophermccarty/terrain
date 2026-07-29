@@ -421,6 +421,42 @@ def _apply_diffusion_numba(T: np.ndarray, thermal_diff: float, days: float,
     return T_curr
 
 
+def _land_ice_flow_step(thickness: np.ndarray, land_mask: np.ndarray, k: float, dt: float) -> np.ndarray:
+    """One explicit substep of mass-conservative, thickness-weighted diffusion.
+
+    Flux-form (not `D * laplacian(H)`) so each interior face flux appears
+    with opposite sign in the neighbor's own update and cancels exactly --
+    the scheme conserves total thickness except at grid boundaries. Diffusivity
+    `D = k * thickness` is evaluated per-cell and averaged onto each face, so
+    thick ice spreads faster than thin ice (see
+    `PlanetParams.ice_flow_diffusivity`). Periodic in longitude, clamped
+    (mirrored) in latitude -- the same stencil `masks.get_continentality`
+    uses. `land_mask` pins ice at ocean cells to zero every substep, so flux
+    that would cross a coastline is discarded from the land reservoir (a
+    simplified calving proxy) rather than transported onto/into the ocean.
+    """
+    D = k * thickness
+
+    e_ = np.roll(thickness, -1, axis=1)
+    d_e = 0.5 * (D + np.roll(D, -1, axis=1))
+    flux_e = d_e * (e_ - thickness)
+
+    w_ = np.roll(thickness, 1, axis=1)
+    d_w = 0.5 * (D + np.roll(D, 1, axis=1))
+    flux_w = d_w * (w_ - thickness)
+
+    n_ = np.concatenate([thickness[:1, :], thickness[:-1, :]], axis=0)
+    d_n = 0.5 * (D + np.concatenate([D[:1, :], D[:-1, :]], axis=0))
+    flux_n = d_n * (n_ - thickness)
+
+    s_ = np.concatenate([thickness[1:, :], thickness[-1:, :]], axis=0)
+    d_s = 0.5 * (D + np.concatenate([D[1:, :], D[-1:, :]], axis=0))
+    flux_s = d_s * (s_ - thickness)
+
+    updated = thickness + (flux_e + flux_w + flux_n + flux_s) * dt
+    return np.where(land_mask, np.clip(updated, 0.0, None), 0.0).astype(np.float32, copy=False)
+
+
 def simulate_step(
     state: PlanetState,
     days: float = 1.0,
@@ -1659,8 +1695,22 @@ def simulate_step(
 
         _, _hydro_land = get_masks(state.elevation)
         _threshold = float(np.clip(pp.runoff_soil_threshold, 0.0, 0.999))
+        # Trigger on soil_deep, not the fast surface bucket: the surface layer
+        # sits chronically pinned near its 0.05 floor across nearly all real
+        # terrain (see the high-latitude soil-desiccation fix), so a
+        # surface-only threshold never crosses 0.75 -- measured directly on a
+        # 10yr real-terrain continuation, this left runoff/river_discharge/
+        # surface_water_mm bit-exactly zero everywhere. soil_deep (post
+        # soil_deep_gain_rate fix) has the real spatial spread instead
+        # (p50~0.12, p75~0.33, p90~0.78 on that same continuation), so it's
+        # the field that can actually distinguish "wet enough for rivers"
+        # from "not." Falls back to soil_next if soil_deep_next is
+        # unavailable (e.g. soil_deep_gain_rate=0 and dry-planet/no-ocean
+        # configs that never populate it) so this doesn't silently disable
+        # runoff entirely in that configuration.
+        _runoff_wetness = soil_deep_next if soil_deep_next is not None else soil_next
         _saturation_excess = np.clip(
-            (soil_next - _threshold) / max(1.0 - _threshold, 1e-6),
+            (_runoff_wetness - _threshold) / max(1.0 - _threshold, 1e-6),
             0.0,
             1.0,
         )
@@ -1674,6 +1724,7 @@ def simulate_step(
             surface_water_mm_new,
             river_discharge_new,
             runoff_to_ocean_new,
+            _ocean_river_input_mm_day,
         ) = route_surface_water(
             state.elevation,
             _runoff_mm_day,
@@ -1682,10 +1733,29 @@ def simulate_step(
             routing_passes=max(0, int(pp.river_routing_passes)),
             routing_fraction=float(np.clip(pp.river_routing_fraction, 0.0, 1.0)),
         )
+        # Open-water evaporation from standing surface water -- without this,
+        # closed/flat-terrain basins have no sink at all and grow unboundedly
+        # (see PlanetParams.lake_evap_mm_day docstring for the measured
+        # runaway this fixes). Applied post-routing so it acts on the
+        # storage actually left behind this step, not double-counted against
+        # what already flowed onward.
+        if T_full is not None:
+            _lake_evap_factor = np.clip((T_full - 273.15) / 20.0, 0.1, 2.0).astype(np.float32, copy=False)
+            _lake_evap_mm = float(pp.lake_evap_mm_day) * _lake_evap_factor * float(days)
+            surface_water_mm_new = np.maximum(surface_water_mm_new - _lake_evap_mm, 0.0).astype(np.float32, copy=False)
+        # Hard safety backstop -- see PlanetParams.surface_water_cap_mm docstring
+        # for why evaporation alone cannot bound this for continent-scale basins.
+        surface_water_mm_new = np.minimum(
+            surface_water_mm_new, float(pp.surface_water_cap_mm)
+        ).astype(np.float32, copy=False)
     else:
         surface_water_mm_new = state.surface_water_mm
         river_discharge_new = state.river_discharge_mm_day
         runoff_to_ocean_new = state.runoff_to_ocean_mm_day
+        # Not persisted state -- recomputed fresh each step from route_surface_water
+        # above, consumed immediately by evolve_salinity below. None when hydrology
+        # is disabled (evolve_salinity treats that as no river freshwater input).
+        _ocean_river_input_mm_day = None
 
     # NOTE: latent cooling from precipitation is already applied inside
     # _evolve_temperature (via evaporation) and generate_precipitation.
@@ -1724,6 +1794,7 @@ def simulate_step(
         salinity_new = evolve_salinity(
             _sal_prev, T_full, state.elevation,
             P_full, delta_ice, dt_days=float(days), pp=pp,
+            river_input_mm_day=_ocean_river_input_mm_day,
         )
     else:
         salinity_new: np.ndarray | None = state.salinity
@@ -1750,8 +1821,98 @@ def simulate_step(
         _sublim = _snow_prev * 0.001
         _snow_new = _snow_prev + (_snowfall - _melt - _sublim) * float(days)
         snow_depth_new = np.where(_land_snow, np.clip(_snow_new, 0.0, 10.0), 0.0).astype(np.float32, copy=False)
+
+        # ------------------------------------------------------
+        # Land ice mass balance, thickness, and flow (Phase 5 canvas item)
+        # ------------------------------------------------------
+        # Nested inside the snow block (not a duplicated top-level `if`) so
+        # `_land_snow`/`_snow_new`/`_T_air_c` are guaranteed to already be
+        # defined. See PlanetParams.enable_land_ice_dynamics for the full
+        # design rationale (why thickness is water-equivalent, why flow
+        # ignores terrain slope, what is deliberately NOT coupled yet).
+        _land_ice_prev = (
+            state.land_ice_thickness if state.land_ice_thickness is not None
+            else np.zeros((H, W), dtype=np.float32)
+        )
+        if pp.enable_land_ice_dynamics:
+            # Mass balance: gain the overflow the snow-depth cap above would
+            # otherwise silently discard; lose mass to a degree-day
+            # ablation term with its own (typically higher) factor.
+            _ice_gain = np.clip(_snow_new - 10.0, 0.0, None).astype(np.float32, copy=False)
+            _ice_melt = (
+                np.clip(_T_air_c, 0.0, None).astype(np.float32, copy=False)
+                * (float(pp.ice_melt_degree_day_mm) * 1e-3)
+            )
+            _land_ice_mb = _land_ice_prev + (_ice_gain - _ice_melt) * float(days)
+            _land_ice_mb = np.where(
+                _land_snow, np.clip(_land_ice_mb, 0.0, None), 0.0
+            ).astype(np.float32, copy=False)
+
+            # Flow: substepped for CFL stability, same convention as
+            # eddy_heat_flux_coeff/abyssal_overturning_coeff (their r_limit
+            # is 0.4 for a 1-D meridional-only stencil; halved here since
+            # this is a full 4-neighbor 2-D stencil, stable over a
+            # narrower range of the same r = k*H*dt).
+            _flow_k = float(pp.ice_flow_diffusivity)
+            if _flow_k > 0.0 and np.any(_land_ice_mb > 0.0):
+                _h_max = float(np.max(_land_ice_mb))
+                _ice_r_limit = 0.2
+                _max_ice_sub = 60
+                _n_ice_sub = max(1, int(np.ceil(_flow_k * _h_max * float(days) / _ice_r_limit)))
+                if _n_ice_sub > _max_ice_sub:
+                    # Bound worst-case per-step cost by capping substep count
+                    # *and* shrinking the effective diffusivity to match, so
+                    # r = k_eff*h_max*dt_sub stays exactly at the stability
+                    # limit regardless of thickness/dt. An earlier version
+                    # capped substep count alone without touching k, which
+                    # silently violated the CFL condition it was meant to
+                    # enforce -- caught on a real-terrain check seeding a
+                    # 2000 m Antarctic-scale reservoir, which overflowed to
+                    # NaN within one MONTHLY (dt=30.44) step at 512x1024.
+                    _flow_k_eff = _flow_k * (_max_ice_sub / _n_ice_sub)
+                    _n_ice_sub = _max_ice_sub
+                else:
+                    _flow_k_eff = _flow_k
+                _dt_ice_sub = float(days) / _n_ice_sub
+                _land_ice_flowed = _land_ice_mb
+                for _ in range(_n_ice_sub):
+                    _land_ice_flowed = _land_ice_flow_step(
+                        _land_ice_flowed, _land_snow, _flow_k_eff, _dt_ice_sub
+                    )
+            else:
+                _land_ice_flowed = _land_ice_mb
+
+            land_ice_thickness_new = np.clip(
+                _land_ice_flowed, 0.0, float(pp.land_ice_max_thickness_m)
+            ).astype(np.float32, copy=False)
+
+            # Eustatic sea-level diagnostic: land-ice volume (water-
+            # equivalent, so no density conversion needed) spread over the
+            # ocean's area. land_ice_thickness starts every run's history
+            # at zero, so this is cumulative sea-level *change* since
+            # dynamics were enabled, not an absolute sea level.
+            _lat_rad_full = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * np.pi
+            _w_full = np.cos(_lat_rad_full)
+            _w_sum = float(np.sum(_w_full)) + 1e-12
+            _total_area_m2 = 4.0 * np.pi * (float(pp.radius_m) ** 2)
+            _ice_vol_m3 = float(
+                np.sum(np.mean(land_ice_thickness_new, axis=1) * _w_full) / _w_sum
+            ) * _total_area_m2
+            _ocean_frac = float(
+                np.sum(np.mean((~_land_snow).astype(np.float64), axis=1) * _w_full) / _w_sum
+            )
+            _ocean_area_m2 = max(_ocean_frac * _total_area_m2, 1.0)
+            sea_level_change_m_new = float(-_ice_vol_m3 / _ocean_area_m2)
+        else:
+            land_ice_thickness_new = _land_ice_prev
+            sea_level_change_m_new = state.sea_level_change_m
     else:
         snow_depth_new = _snow_prev
+        land_ice_thickness_new = (
+            state.land_ice_thickness if state.land_ice_thickness is not None
+            else np.zeros((H, W), dtype=np.float32)
+        )
+        sea_level_change_m_new = state.sea_level_change_m
 
     # Debug logging if requested
     if debug_log:
@@ -1974,6 +2135,8 @@ def simulate_step(
         surface_water_mm=surface_water_mm_new,
         river_discharge_mm_day=river_discharge_new,
         runoff_to_ocean_mm_day=runoff_to_ocean_new,
+        land_ice_thickness=land_ice_thickness_new,
+        sea_level_change_m=sea_level_change_m_new,
     )
 
     # Return state and components (empty dict if not tracking)
@@ -2318,10 +2481,36 @@ def _evolve_temperature(
     _cw_ref = 0.08        # kg/kg reference cloud water <-> cloud_fraction=1
     _S_cond = _k_cond * rh_core * ascent_term
     _sink_rate = _k_base_sink + _k_rain_sink * rain_deplete + _k_evap_sink * (1.0 - rh)
+    # Cold-start: a genuinely fresh state has no cloud_water history. Seeding it
+    # at 0.0 (as if driest-possible) makes the very first several days' blended
+    # cloud_fraction crater toward 0 regardless of the actual diagnostic value,
+    # since cloud_water_new needs several sink-timescales to climb from zero to
+    # its equilibrium -- measured to collapse a 5-day fresh-start mean cloud
+    # fraction from ~0.25 (diagnostic-only) to 0.075 at cloud_water_feedback=0.5.
+    # Seed instead from the *current* diagnosed cloud_fraction (backing out the
+    # cloud_water value that would reproduce it via the cw_ref scaling below) so
+    # the first blended step is consistent with the diagnostic, not a cold pipe.
     _prev_cw = (prev_cloud_water.astype(np.float32, copy=False) if prev_cloud_water is not None
-                else np.zeros_like(cloud_fraction))
+                else cloud_fraction * _cw_ref)
+    # Exact solution of dcw/dt = S_cond - sink_rate*cw (not a forward-Euler-style
+    # `prev*exp(-sink*dt) + S_cond*dt`, which only approximates this ODE for
+    # small dt). At MONTHLY/ANNUAL cadence (dt ~ 30 days) with sink_rate of a
+    # few per day, sink_rate*dt >> 1, so the decay term for the *old* value
+    # correctly vanishes but the source term `S_cond*dt` was still being added
+    # un-decayed -- growing linearly with dt instead of saturating at the
+    # steady state S_cond/sink_rate. Measured: a 60yr MONTHLY real-terrain
+    # spinup drove mean cloud_cover to 0.59 (w=0.5) / 0.79 (w=1.0) from a 0.25
+    # baseline, reproducing the exact runaway this feature's calibration note
+    # above says was already fixed -- that check only ran a short DAILY-cadence
+    # continuation, where sink_rate*dt << 1 and the bug is invisible. The exact
+    # solution below reduces to the original formula in that same small-dt
+    # limit (verified: both are cw0*(1-sink*dt) + S_cond*dt to first order) but
+    # stays correctly bounded at any cadence, since cw_eq is itself bounded
+    # (~0.084 kg/kg at the highest physically-reachable S_cond/lowest
+    # sink_rate, essentially cw_ref) rather than growing with dt.
+    _cw_eq = _S_cond / _sink_rate
     cloud_water_new = np.clip(
-        _prev_cw * np.exp(-_sink_rate * days) + _S_cond * days, 0.0, 5.0 * _cw_ref
+        _cw_eq + (_prev_cw - _cw_eq) * np.exp(-_sink_rate * days), 0.0, 5.0 * _cw_ref
     ).astype(np.float32, copy=False)
     _w_cw = float(_pp.cloud_water_feedback)
     if _w_cw > 0.0:
@@ -2555,6 +2744,29 @@ def _evolve_temperature(
         ocean_f = sea_mask.astype(np.float32)
         T_sst = (T_sst - dT_mixed * ocean_f).astype(np.float32, copy=False)
         T_deep_out = (T_deep_ocean + dT_mixed * cap_ratio * ocean_f).astype(np.float32, copy=False)
+
+    # --- Abyssal overturning (meridional mixing of the deep-ocean layer) ---
+    # See PlanetParams.abyssal_overturning_coeff docstring: this model's deep
+    # ocean otherwise has zero lateral transport at all, unlike the real
+    # global overturning conveyor. Same Laplacian-diffusion-with-substepping
+    # pattern as Feature 7 below, but applied globally (real overturning
+    # isn't confined to mid-latitudes the way baroclinic eddies are) and only
+    # where liquid ocean exists.
+    _abyssal_k = float(_pp.abyssal_overturning_coeff)
+    if _abyssal_k > 0.0 and T_deep_out is not None and _pp.has_liquid_water_ocean:
+        _ocean_f_ab = sea_mask.astype(np.float32)
+        _abyssal_r_limit = 0.4
+        _n_abyssal_sub = max(1, int(np.ceil(_abyssal_k * float(days) / _abyssal_r_limit)))
+        _dt_abyssal_sub = float(days) / _n_abyssal_sub
+        for _ in range(_n_abyssal_sub):
+            _T_deep_lap_y = np.zeros_like(T_deep_out)
+            _T_deep_lap_y[1:-1, :] = T_deep_out[:-2, :] - 2.0 * T_deep_out[1:-1, :] + T_deep_out[2:, :]
+            _T_deep_lap_y[0, :] = T_deep_out[1, :] - T_deep_out[0, :]
+            _T_deep_lap_y[-1, :] = T_deep_out[-2, :] - T_deep_out[-1, :]
+            _T_deep_lap_y = np.clip(_T_deep_lap_y, -20.0, 20.0).astype(np.float32, copy=False)
+            T_deep_out = (
+                T_deep_out + _abyssal_k * _T_deep_lap_y * _ocean_f_ab * _dt_abyssal_sub
+            ).astype(np.float32, copy=False)
 
     # --- Feature 7: Meridional eddy heat flux ---
     # Baroclinic eddies and storm tracks transport heat poleward proportional

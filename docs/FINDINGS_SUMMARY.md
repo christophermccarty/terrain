@@ -5,7 +5,7 @@ local, generated, or overnight experiments. Raw logs and large result artifacts
 remain intentionally ignored. Detailed measurement tables for the most recent
 wind work are tracked in `PLAN_PHYSICS_FIXES.md`.
 
-Last updated: 2026-07-26.
+Last updated: 2026-07-27.
 
 ## Rules learned from prior investigations
 
@@ -37,6 +37,39 @@ The shipped correction keeps equal-and-opposite mixed-layer exchange over ocean
 only and restores atmospheric relaxation toward the surface. The previously
 blanket-slow Earth benchmark and polar-balance tests now run in the routine
 suite so this class of regression cannot remain hidden.
+
+### High-latitude soil desiccation
+
+Land soil moisture at 45-65°N/S sat pinned at its 0.05 floor for 84-100% of
+cells across every longitude, uniformly across desert and continental-interior
+boxes alike — a genuine stable attractor under current physics, confirmed by
+continuing a real-terrain save several years and observing no recovery. The
+single-layer soil bucket is documented as bistable with no stable middle
+ground, and the balance landed on the collapsed branch almost everywhere at
+this latitude.
+
+Fixed by enabling `PlanetParams.soil_deep_gain_rate` (0.0 → 0.0005), a
+deep-soil-layer knob shipped inert in an earlier session after being found
+ineffective — before a later, separate fix (gating desert `land_evap` by
+`subsidence_suppression`) gave raw precipitation the desert-vs-continental
+differentiation the deep layer needed to inherit. Real-terrain A/B: `soil_deep`
+now separates desert boxes (0.05-0.25) from continental-interior boxes
+(0.30-0.44) for the first time, with every named box moving modestly toward
+its Earth precipitation target and no reordering. See `PLAN_PHYSICS_FIXES.md`
+for the full measurement table.
+
+### Half-resolution precipitation shortcut
+
+At the production resolution (512x1024), the automatic half-resolution
+precipitation path (used for H>=256) leaves zonal-band climate structure
+essentially unaffected but is a major contributor to soil-moisture
+floor-pinning: 27% of global land sits at the 0.05 floor at half-resolution
+versus ~0% at full resolution, and named regional boxes come out
+systematically 4-33% drier. Full resolution costs 2.8x wall time. Rather
+than change the default, a GUI toggle ("Full-res precipitation") now lets
+users opt into full resolution when regional/soil-moisture realism matters
+more than speed; the automatic half-resolution default is unchanged. See
+`PLAN_PHYSICS_FIXES.md` for the full measurement table.
 
 ### Mid-latitude continental precipitation
 

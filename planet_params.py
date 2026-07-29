@@ -537,23 +537,44 @@ class PlanetParams:
     # sidesteps the trap entirely: the deep layer's equilibrium reflects each
     # region's real long-run precip rate directly, decoupled from whichever branch
     # the bistable surface layer happens to be on.
-    soil_deep_gain_rate: float = 0.0
+    soil_deep_gain_rate: float = 0.0005
     """Fraction of precipitation that feeds the deep layer directly per day
     [1/day], independent of the surface layer's own state (see NOTE above).
-    Default kept at 0.0 (exact no-op, matching moisture_advection_scale /
-    pgf_continentality_amp's convention): calibrated directly against real
-    terrain (2026-07) and found the deep layer amplifies whatever desert-vs-
-    continental-interior precip differentiation already exists in its input,
-    rather than creating it -- a controlled 20yr real-terrain comparison
-    (deep layer on vs off) showed no measurable net effect at conservative
-    gain rates, and pushing the gain rate up 20x made a desert box (Sahara)
-    *wetter* (up to ~354 mm/yr, above its own realism target) without
-    reliably helping continental interior. The real bottleneck is upstream --
-    desert vs. continental-interior precipitation isn't reliably
-    differentiated by the model in the first place (see known-physics-gaps.md)
-    -- fixing that is a precondition for this knob to be useful, not
-    something this knob can produce on its own. Left wired and tested as
-    infrastructure for whoever picks that up."""
+
+    Was 0.0 (exact no-op) through 2026-07: a controlled real-terrain
+    comparison at that time found the deep layer amplified whatever desert-
+    vs-continental-interior differentiation already existed in its input
+    rather than creating it, because desert land_evap wasn't yet gated by
+    subsidence/dry-belt suppression -- so raw precipitation itself barely
+    differentiated desert from continental interior (both were governed by
+    the same locally-saturating humidity), and the deep layer just amplified
+    that flat signal (pushing Sahara to ~354 mm/yr without helping
+    continental interior). See known-physics-gaps.md item 3 UPDATE 2.
+
+    That precondition changed: `desert_evapotranspiration_fix` (UPDATE 4 in
+    the same doc) gated `land_evap` by `subsidence_suppression`, which made
+    raw precipitation itself reliably differentiate desert from continental
+    interior (measured on `saves/earth.pkl`, 10yr real-terrain, instantaneous
+    2nd-half: Sahara/Kalahari/Atacama 110-217 mm/yr vs. Canadian Prairies/US
+    Midwest/Central Europe 392-694 mm/yr). Since this knob feeds the deep
+    layer directly from precipitation, it now inherits that differentiation
+    instead of erasing it -- confirmed at 0.0005: `soil_deep` settles at
+    ~0.05-0.25 for desert boxes vs. ~0.30-0.44 for continental-interior boxes
+    (Atacama at 0.25 is the one overlap, a known separate gap -- see its
+    memory note below), materially above the single-layer surface bucket's
+    universal 0.05 floor pin (see NOTE above) for every box alike. Named-box
+    precip moved modestly in the right direction (desert boxes +5-25 mm/yr,
+    within measurement noise of their <200 target; continental-interior
+    +15-80 mm/yr, closing part of the remaining gap to Earth targets) with
+    no reordering of any box relative to any other. This was the root-cause
+    precondition the pre-2026-07 investigation was missing, not a case where
+    the deep-layer mechanism itself needed redesigning.
+
+    Atacama (0.25) not clearing Kalahari (0.09-0.14) is expected, not a
+    regression: the model has no coastal-fog/cold-current desert mechanism
+    (known-physics-gaps.md), so Atacama has never cleanly separated from
+    continental-interior boxes on any metric tried, at any prior calibration
+    step, in this project's history."""
 
     soil_deep_drain_rate: float = 0.002
     """Slow baseflow/groundwater drain rate for the deep layer [1/day]. Unlike
@@ -579,8 +600,18 @@ class PlanetParams:
     `surface_water_mm`, `river_discharge_mm_day`, and
     `runoff_to_ocean_mm_day` in PlanetState."""
 
-    runoff_soil_threshold: float = 0.75
-    """Surface-soil saturation above which precipitation generates runoff."""
+    runoff_soil_threshold: float = 0.3
+    """`soil_moisture_deep` saturation above which precipitation generates
+    runoff. Checks the deep/root-zone layer, not the fast surface bucket --
+    the surface layer sits chronically pinned near its 0.05 floor across
+    nearly all real terrain (see the 2026-07 high-latitude soil-desiccation
+    fix), so a surface-only threshold near 0.75 never triggers in practice
+    (confirmed: bit-exactly zero runoff/river_discharge/surface_water_mm on a
+    10yr real-terrain continuation prior to this fix). 0.3 sits around the
+    75th percentile of `soil_moisture_deep` measured on that same real-terrain
+    continuation (p50~0.12, p75~0.33, p90~0.78), so roughly the wettest
+    quarter of land generates runoff -- continental interior and tropics, not
+    deserts."""
 
     runoff_fraction: float = 0.35
     """Maximum fraction of precipitation converted to runoff at saturation."""
@@ -590,6 +621,127 @@ class PlanetParams:
 
     river_routing_fraction: float = 0.55
     """Fraction of available water sent downhill during each routing pass."""
+
+    coastal_upwelling_fog_strength: float = 0.5
+    """Strength [0-1] of coastal-fog/cold-current desert suppression (see
+    `atmosphere.generate_precipitation`'s comment for the mechanism and why
+    it's a diagnostic gate rather than real ocean-upwelling physics). Applies
+    an additional multiplicative suppression to `subsidence_suppression`
+    (and therefore both `land_evap` and `precip_potential`) at west-coast
+    land cells (coast + ~2 cells inland, decaying) within the subtropical
+    dry-belt latitude window (`DRYBELT_CENTER_DEG` ~28 deg) -- targets
+    Atacama/Namib/Baja California/Western-Sahara-analogue deserts
+    specifically, the model's long-standing "no coastal-fog mechanism" gap.
+
+    Calibrated 2026-07 on real terrain (`saves/earth.pkl`, 10yr, instantaneous
+    2nd-half mm/yr): Atacama 123 (strength=0) -> 116 (0.3) -> 111 (0.5) -> 106
+    (0.7) -> 102 (0.9), monotonic and controlled. Sahara/Kalahari/Canadian
+    Prairies/US Midwest/Central Europe all stay within measurement noise
+    (<3%) across the whole range -- the coastal+drybelt-latitude gating is
+    spatially selective, as intended. **A real, honest, partial win, not a
+    fix**: even at strength=1.0 this would not get Atacama near its <50
+    mm/yr Earth target (the box's land cells only average ~0.28 coastal-mask
+    weight, and the mechanism competes with the row-mean-preserving desert
+    redistribution downstream) -- matches this project's repeated prior
+    finding that Atacama has never cleanly separated from other deserts on
+    any metric tried. 0.5 shipped as a moderate default given the
+    monotonic, side-effect-free improvement; 0.0 remains an exact no-op for
+    anyone who wants the pre-2026-07 behavior."""
+
+    itcz_zonal_smooth_deg: float = 8.0
+    """Longitude-direction Gaussian smoothing [degrees] applied to
+    `subsidence_suppression` right after its own local Laplacian pass, before
+    it gates `precip_potential`/`land_evap` or feeds the desert/continental
+    redistribution weight (`atmosphere._zonal_gaussian_smooth`).
+
+    Root cause (2026-07-29, real-terrain transect audit): adjacent longitude
+    columns only 5 degrees apart can show completely different ITCZ shapes at
+    the same latitude band -- e.g. one an unbroken rainforest belt 18N-6.5S,
+    the other a dry notch straddling the equator flanked by two wet peaks --
+    even though real terrain/elevation is nearly identical between them (this
+    is deep Congo-basin rainforest either way). Traced to the wind model's own
+    divergence field: near the equator, Coriolis-based damping vanishes
+    (f -> 0) and the deterministic Rossby-mode standing waves
+    (`ROSSBY_MODES`, wavenumbers 3/5/7 -- spatial half-periods of
+    60/36/25.7 degrees) are the least-damped forcing left, so their
+    interference pattern dominates the local divergence signal instead of any
+    real geography. Averaged into the 10yr EMA climatology via
+    `subsidence_suppression`'s desert/continental redistribution, this bakes
+    an essentially arbitrary synoptic-noise pattern into a supposedly
+    persistent biome map: tropical savanna (Aw/Am) reads as ~5-6x
+    underrepresented and hot steppe (BSh) ~2x overrepresented on real terrain
+    (see test-npz-koppen-audit-2026-07-29 memory), because land that should
+    grade smoothly from rainforest to savanna instead either stays wet enough
+    to read as rainforest or falls straight into steppe with no transition.
+
+    Applied only to the shared `subsidence_suppression` array (not a
+    downstream copy) so both the direct precip_potential/land_evap
+    suppression and the redistribution weight see the same smoothed signal --
+    splitting them risked the two consumers disagreeing on where the ITCZ
+    sits. Applied *after* the existing `+0.15*laplacian(...)` pass (a ~1-2
+    cell local smooth) and *before* the coastal-fog gate (a deliberately
+    narrow ~2-3 cell west-coast feature that a wide zonal smoothing would
+    wash out if applied after it).
+
+    0.0 is an exact no-op (`_zonal_gaussian_smooth` returns `field` unchanged
+    below half a grid cell of sigma).
+
+    Calibrated 2026-07-29 on real terrain (`saves/test.npz`, 512x1024,
+    5yr MONTHLY continuation from a 23.8yr base, instantaneous 2nd-half /
+    10yr EMA): swept 0/4/8/12/16 degrees. The 15E/20E transect discontinuity
+    (the actual reported bug) is fully resolved by 8 degrees -- both columns
+    track each other closely at every latitude instead of one reading as an
+    unbroken rainforest block and the other as a dry notch flanked by two wet
+    peaks -- with diminishing returns beyond that (named-box precip is nearly
+    flat from 8 to 16 degrees, confirming 8 is past the knee of the curve,
+    not an arbitrary stopping point). Area-weighted Koppen breakdown moved
+    cleanly toward Earth's real values in the same run: arid_pct
+    22.1% -> 14.6% (real ~19-20%), tropical_pct (Af/Am/Aw) 8.9% -> 12.3%
+    (real ~20%, was measured separately at 3.4% on the pre-fix 23.8yr save in
+    test-npz-koppen-audit-2026-07-29 -- a large relative improvement, though
+    still short of Earth's share). Sahara and the continental-interior boxes
+    (Canadian Prairies/US Midwest/Central Europe) are essentially unaffected
+    (<3% change). **Real, honest cost**: Atacama gets substantially wetter
+    (195 -> 448 mm/yr in the same run) -- its own aridity signature is a
+    narrow coastal strip that this same longitude-direction smoothing
+    competes with, and per coastal_upwelling_fog_strength's own docstring
+    Atacama has never cleanly separated from other deserts on any metric
+    tried in this project's history, so this asymmetric trade-off (clear win
+    on the reported tropical-belt bug, a real cost to an already-fragile,
+    already-off-target desert box) was accepted rather than searching for a
+    sigma that protects Atacama, which the 4-16 degree sweep did not find."""
+
+    surface_water_cap_mm: float = 50_000.0
+    """Hard ceiling [mm] on `surface_water_mm` per cell (50 m -- deeper than
+    any real lake, a safety backstop not a physical mechanism). This compact
+    D8 router has no channel-capacity concept: a real-terrain test found a
+    continent-scale drainage basin (Amazon/Congo-like) funneling into a
+    single grid cell grew past 1.9 KILOMETERS of area-averaged depth over 10
+    years, essentially linearly, and neither more routing passes (8->16) nor
+    a near-total per-pass routing fraction (0.55->0.99) meaningfully reduced
+    it -- ruling out "not enough passes to traverse the basin" as the cause.
+    `lake_evap_mm_day` alone cannot bound this either: it is utterly
+    negligible next to a continent's real discharge concentrated in one
+    cell with no lateral spreading or channel-velocity limit. This cap is a
+    blunt but necessary backstop until (if ever) a real flow-accumulation-
+    aware channel capacity is implemented; excess is simply discarded (not
+    conserved), so it is not a substitute for fixing the underlying
+    limitation, only a guard against literal km-scale numbers reaching the
+    UI/save files."""
+
+    lake_evap_mm_day: float = 4.0
+    """Open-water evaporation demand [mm/day] applied to `surface_water_mm`
+    wherever it is > 0, scaled by a simple temperature factor. Without this,
+    standing water has no sink at all: a real-terrain test found flat,
+    near-equatorial river-delta terrain (Amazon/Congo-scale drainage basins,
+    D8's strict "must have a strictly lower neighbor" rule finding no exit)
+    accumulating to 611 METERS of area-averaged depth after just 12 years of
+    continuation -- an unbounded runaway, not a real lake reaching
+    equilibrium. Real lakes and floodplains lose water to evaporation; this
+    is that term. 4.0 mm/day is a representative open-water pan-evaporation
+    magnitude (roughly 1.5 m/year at full strength), scaled down (never to
+    zero -- lakes still evaporate somewhat even when cool) in cold climates
+    via `clip((T-273.15)/20, 0.1, 2.0)`."""
 
     # ------------------------------------------------------------------ #
     # Cloud radiative feedback (Feature 1)
@@ -609,17 +761,55 @@ class PlanetParams:
     it later doesn't cold-start from zero memory), but only feeds back into
     `cloud_fraction` (and therefore albedo/greenhouse) when > 0.
 
-    Calibrated (Jul 2026) against real terrain (saves/earth.pkl): makes
-    cloud cover measurably smoother day-to-day as intended -- std of
-    day-to-day cloud_cover change drops ~23% from w=0 to w=1 (0.00098 ->
-    0.00075), with mean cloud cover drifting down only modestly (0.171 ->
-    0.157). An earlier, uncalibrated version of this mechanism (missing a
-    baseline droplet-settling sink) instead inflated mean cloud cover
-    (0.17->0.56 at w=0.5) via saturation -- see
-    simulate._evolve_temperature's calibration note. Default stays 0.0
-    (opt-in): this is a first-pass calibration with only a short real-
-    terrain check behind it, not the multi-decade climate-drift/ECS
-    re-validation a default flip would warrant."""
+    First calibrated Jul 2026 against a short real-terrain check (std of
+    day-to-day cloud_cover change dropping ~23% from w=0 to w=1, mean cloud
+    cover drifting down only modestly, 0.171->0.157) -- but default was kept
+    at 0.0 pending the multi-decade climate-drift/ECS re-validation a
+    default flip would warrant.
+
+    That re-validation (2026-07-27) found two real bugs in the mechanism,
+    both now fixed, and then a calibration reason the default should stay
+    0.0 regardless.
+
+    Bug 1: `simulate._evolve_temperature`'s cloud-water update was a
+    forward-Euler-style `prev*exp(-sink*dt) + S_cond*dt`, correct only for
+    small dt. At MONTHLY/ANNUAL cadence (dt ~30d) with sink_rate*dt >> 1, the
+    source term `S_cond*dt` grows linearly with dt instead of saturating at
+    the true steady state -- a 60yr MONTHLY synthetic spinup drove mean
+    cloud_cover to 0.59 (w=0.5) / 0.79 (w=1.0) from a 0.25 baseline,
+    reproducing the exact runaway an earlier session thought it had already
+    fixed (that check only ran a short DAILY-cadence continuation, where the
+    bug is invisible). Fixed by replacing the update with the exact solution
+    of the underlying ODE (dcw/dt = S_cond - sink_rate*cw), which reduces to
+    the original formula in the small-dt limit but stays correctly bounded at
+    any cadence. Re-ran the 60yr sweep after the fix: mean cloud_cover
+    0.252->0.222->0.206->0.178 for w=0/0.3/0.5/1.0, smooth and bounded: no
+    runaway. ECS unaffected: the 50yr-ANNUAL 2xCO2 pair
+    (`test_ecs_equilibrium_magnitude`'s own config) gives dT=1.769/1.778/
+    1.778/1.786 K for the same four weights, under 1% spread.
+
+    Bug 2: a fresh state cold-starts `cloud_water` at 0.0, so the first
+    several days' blended `cloud_fraction` crater toward 0 while
+    `cloud_water` climbs from zero to its equilibrium -- measured to collapse
+    `test_cloud_feedback.py`'s 5-day fresh-start mean cloud fraction from
+    ~0.124 (w=0) to 0.075 at w=0.5. Fixed by seeding `cloud_water` from the
+    current diagnostic `cloud_fraction` (via the `cw_ref` scaling) whenever
+    `prev_cloud_water` is None, instead of zero.
+
+    With both bugs fixed, re-measured whether a nonzero default is actually
+    a net improvement -- it is not. Even after the cold-start fix, mean
+    cloud_cover on the same 5-day fixture still declines monotonically with
+    w (0.124 -> 0.118 -> 0.112 -> 0.108 -> ~0.10 for w=0/0.1/0.2/0.3/0.5).
+    `test_cloud_feedback.py`'s own long-standing comment already flags this
+    model's cloud fraction as a KNOWN GAP -- ~0.16 is roughly 4x below
+    Earth's observed ~0.67 global mean -- and *any* nonzero blend weight
+    measurably worsens that existing low bias, even at w=0.1. The
+    smoothing benefit (real, and unaffected by any of this) doesn't outweigh
+    making an already-documented realism gap worse. **Default stays 0.0**:
+    both mechanism bugs are fixed and the infrastructure is tested and ready,
+    but this is the same "no scoped win available" conclusion this project
+    reached before for `moisture_advection_scale` and (pre-fix)
+    `soil_deep_gain_rate` -- correct now, not yet worth turning on."""
 
     # ------------------------------------------------------------------ #
     # Water vapor greenhouse (Feature 2)
@@ -703,6 +893,94 @@ class PlanetParams:
     storm-track window peaked at 45°.  0.006 adds ~0.5 K of mid-latitude
     warming per year of spinup relative to a run with the coefficient at 0.
     Set 0.0 to disable."""
+
+    # ------------------------------------------------------------------ #
+    # Abyssal overturning (Phase 5 canvas item)
+    # ------------------------------------------------------------------ #
+    abyssal_overturning_coeff: float = 0.0
+    """Meridional eddy-diffusion coefficient [K/day per K/cell²] applied to
+    `T_deep_ocean`, representing the real global overturning conveyor
+    (North Atlantic/Southern Ocean deep-water formation spreading and mixing
+    abyssal temperature worldwide) that this model otherwise completely
+    lacks: `deep_ocean_exchange_rate` only exchanges each ocean cell's deep
+    layer *vertically* with its own local mixed layer -- there is no lateral
+    transport between deep-ocean cells at different latitudes at all. Real
+    deep ocean is remarkably globally uniform (~2-4C) precisely because of
+    this overturning; a purely-local-vertical model instead lets deep
+    temperature slowly drift toward each cell's own surface climate
+    (measured: tau_eff ~2219yr, equilibrium ~25C rather than ~2-4C -- see
+    known-physics-gaps.md). Applied as the same Laplacian-diffusion-with-
+    substepping pattern as `eddy_heat_flux_coeff`, but globally (not
+    storm-track-windowed) and only where liquid ocean exists. 0.0 (default)
+    is an exact no-op pending real-terrain/long-run calibration."""
+
+    # ------------------------------------------------------------------ #
+    # Land ice mass balance, thickness, and flow (Phase 5 canvas item)
+    # ------------------------------------------------------------------ #
+    enable_land_ice_dynamics: bool = False
+    """Enable prognostic land-ice thickness: mass balance (accumulation minus
+    degree-day ablation), a simplified shallow-ice-approximation flow, and a
+    derived eustatic sea-level diagnostic (`PlanetState.sea_level_change_m`).
+
+    Before this, land ice was only `ice_sheet_age`, a Koppen-EF-classification
+    counter with no mass, thickness, or flow at all -- and the snow-depth
+    bucket (`snow_depth`, meters SWE) silently discarded any accumulation
+    beyond its 10 m cap. When enabled, that discarded overflow instead feeds
+    `PlanetState.land_ice_thickness` (also meters water-equivalent --
+    deliberately the same convention as `snow_depth`, to avoid introducing a
+    free ice-density parameter into an already-simplified single-layer
+    model). Disabled by default pending real-terrain calibration, matching
+    this project's convention for new structural mechanisms
+    (`abyssal_overturning_coeff`, pre-fix `soil_deep_gain_rate`); the numeric
+    fields below have real, reasoned defaults regardless, so re-enabling
+    doesn't require re-deriving them from scratch.
+
+    Deliberately NOT coupled to albedo or `evolve_salinity` this pass (unlike
+    `ice_sheet_age`'s 0.80 albedo and the hydrology feature's ocean-runoff
+    coupling) -- kept out to keep this addition self-contained; both are
+    natural follow-ups once real-terrain thickness/flow behavior has been
+    checked. Flow also does not follow terrain slope: `elevation` is a
+    normalised [0, 1] field with no single canonical meters conversion
+    anywhere in this codebase (see ROADMAP.md's "max_elevation_km hardcoded
+    four different ways, three different formulas" item) -- adding a fifth
+    conversion would compound a known, already-flagged gap rather than fix
+    it, so flow here is plain thickness-gradient diffusion (spreads existing
+    ice domes outward toward their margins) rather than true downhill
+    transport."""
+
+    ice_melt_degree_day_mm: float = 6.0
+    """Degree-day ablation factor [mm w.e./degC/day] for exposed land ice,
+    applied above 0 degC air temperature. Distinct from (and higher than)
+    `snow_depth`'s fixed 3.0 mm/degC/day melt factor: bare glacier ice is
+    darker and denser than fresh snow and empirically melts faster once
+    exposed (real-world degree-day factors: ~2-4 for fresh snow, ~5-8 for
+    bare ice) -- this uses a representative mid-range value."""
+
+    ice_flow_diffusivity: float = 2.0e-3
+    """Flow strength [1/day per m of local thickness per cell^2] for land
+    ice. Applied as a mass-conservative flux-form diffusion of thickness
+    itself (not ice-surface elevation -- see `enable_land_ice_dynamics` for
+    why), with a per-cell diffusivity of `this * local_thickness` so thick
+    ice spreads faster than thin ice: a one-parameter linearisation of the
+    real Glen's-law H^(n+2) dependence (real n~3 gives H^5; this uses H^1
+    for numerical simplicity and stability), the same kind of deliberate
+    diffusive proxy `eddy_heat_flux_coeff`/`abyssal_overturning_coeff`
+    already use for their own transport processes. Substepped for CFL
+    stability the same way. Ice that diffuses into an adjacent ocean cell is
+    discarded from the land reservoir (a simplified calving proxy) rather
+    than credited to `evolve_salinity`'s freshwater input -- consistent with
+    this feature's scope boundary above -- but that mass loss is still
+    correctly reflected in the sea-level diagnostic, since it reads current
+    total land-ice volume directly rather than tracking flux history. 0.0
+    disables flow, leaving pure local mass balance."""
+
+    land_ice_max_thickness_m: float = 4000.0
+    """Hard ceiling [m w.e.] on `land_ice_thickness` (~Antarctica's real
+    ~4.8 km maximum, rounded down for the water-equivalent convention used
+    here) -- a safety backstop bounding both physically-implausible
+    unbounded growth and the flow diffusion's substep count, not a physical
+    mechanism. Mirrors `surface_water_cap_mm`'s role for the hydrology
+    feature."""
 
     # ------------------------------------------------------------------ #
     # Discrete moving storm systems
@@ -842,39 +1120,46 @@ class PlanetParams:
     (wind_drag_base/wind_drag_elev_scale), since the upper troposphere is
     nearly frictionless compared to the boundary layer."""
 
-    wind_prognostic_substep_days: float = 0.0
-    """Opt-in: run the real prognostic `evolve_wind`/`evolve_wind_aloft`
-    integration (in inner chunks of this many days) instead of the cached
-    diagnostic `generate_wind_field` snapshot during MONTHLY/ANNUAL
-    (`update_wind=False`) substeps. `0.0` (default) is an exact no-op —
-    MONTHLY/ANNUAL behave identically to today, at today's speed.
-    DAILY/WEEKLY (`update_wind=True`) already run the real prognostic wind
-    every step and are unaffected by this field either way.
+    wind_prognostic_substep_days: float = 1.0
+    """Run the real prognostic `evolve_wind`/`evolve_wind_aloft` integration
+    (in inner chunks of this many days) instead of the cached diagnostic
+    `generate_wind_field` snapshot during MONTHLY/ANNUAL (`update_wind=False`)
+    substeps. `0.0` disables this and is an exact no-op -- MONTHLY/ANNUAL
+    behave like the pre-2026-07-28 default (fast, diagnostic-wind-only) at
+    today's speed. DAILY/WEEKLY (`update_wind=True`) already run the real
+    prognostic wind every step and are unaffected by this field either way.
 
-    Why this exists: MONTHLY/ANNUAL's diagnostic wind is a memoryless
-    per-call snapshot solve, structurally different from DAILY/WEEKLY's
-    momentum-carrying prognostic integration -- small systematic
-    differences between the two compound over the multi-year EMA that
-    feeds Köppen biome classification, so switching speeds (or running the
-    same span at different speeds) can diverge into different long-run
-    biome outcomes even after the two paths were unified to share the same
-    storm/Rossby/blocking forcing (see speed-switch-biome-consistency
-    session notes). This field trades MONTHLY/ANNUAL's speed for
-    DAILY-consistent wind by re-running the *same*, untouched,
-    already-tuned `evolve_wind` code path internally, in `dt_days`-sized
-    chunks, instead of asking a single diagnostic snapshot to stand in for
-    a whole month/year.
+    Why this is now the default (2026-07-28, razor-sharp-biome-line session):
+    `generate_wind_field`'s diagnostic wind is a smooth, mostly-analytic
+    snapshot with almost no real per-cell terrain-driven divergence at a
+    given latitude (measured: `subsidence_suppression` longitude std ~0.011
+    across a real-terrain band that should show real heterogeneity, versus
+    ~0.36 -- a 33x difference -- once this substepping is enabled). Without
+    it, no amount of terrain-aware precip-rescale logic (see
+    `_moisture_budget_precip_rescale`'s `target_cell_weight`) has any
+    longitude signal to work with, producing a Koppen rainforest/desert
+    boundary that sits at the *exact same latitude* for every column
+    regardless of real terrain -- confirmed both as the mechanism and as the
+    fix: enabling this at `1.0` moved the measured transition-latitude spread
+    across a real-terrain longitude band from a single fixed value to 7.6-24.8
+    degrees (std 2.6 deg) over a 12-month averaged run. Measured compute cost
+    at 512x1024/`wind_block_size=8` was much smaller than originally feared
+    (~6%, 27.7s -> 29.4s for 3 MONTHLY cycles) -- benchmark again at your own
+    grid size if this matters for a latency-sensitive context (optimizer
+    sweeps, long spinups), since `evolve_wind`'s internal physics is tuned
+    around ~1-day steps and cost could scale differently elsewhere. Set to
+    `0.0` to restore the old fast/diagnostic-only MONTHLY/ANNUAL behavior.
 
-    This was a deliberate re-opening of a previously-resolved design
-    question (PLAN.md Open Question 1: "cached relaxation target ...
-    chosen for speed") and has a real, non-trivial performance cost:
-    `evolve_wind`'s internal physics is tuned around ~1-day steps, so
-    preserving that fidelity at finer substep sizes costs roughly the same
-    compute MONTHLY/ANNUAL were designed to avoid -- benchmark before
-    relying on it in any latency-sensitive context (optimizer sweeps,
-    long spinups). Recommended starting point if enabling: 1.0-3.0 (see
-    `scripts/check_real_terrain_koppen.py` sweep results for the
-    fidelity/speed tradeoff curve)."""
+    This was originally a deliberate re-opening of a previously-resolved
+    design question (PLAN.md Open Question 1: "cached relaxation target ...
+    chosen for speed"), shipped opt-in in an earlier session and evaluated
+    there against a different, broader biome-map-divergence metric (found
+    "not the dominant driver" for that metric specifically -- see
+    wind-prognostic-substep-gate-2026-07 memory) -- that finding is about a
+    different question than this one (longitude variation of a specific
+    latitude-band boundary) and doesn't contradict it. See
+    razor-sharp-biome-line-precip-target-smoothing-2026-07-28 memory for the
+    full investigation and validation."""
 
     precip_substep_days: float = 0.0
     """Override `simulate.py`'s `_PRECIP_SUBSTEP_DAYS` (1.0) chunk

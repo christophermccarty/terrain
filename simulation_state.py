@@ -69,3 +69,5 @@ class PlanetState(NamedTuple):
     surface_water_mm: np.ndarray | None = None
     river_discharge_mm_day: np.ndarray | None = None
     runoff_to_ocean_mm_day: np.ndarray | None = None
+    land_ice_thickness: np.ndarray | None = None
+    sea_level_change_m: float = 0.0

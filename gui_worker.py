@@ -31,6 +31,7 @@ class SimulationWorker(Thread):
         time_scale_mode: TimeScaleMode = TimeScaleMode.DAILY,
         planet_params: PlanetParams = EARTH,
         *,
+        precip_block_size: int | None = None,
         step_function: Callable = simulate_step,
     ):
         super().__init__(daemon=True)
@@ -40,6 +41,10 @@ class SimulationWorker(Thread):
         self.diagnostics = diagnostics
         self.time_scale_mode = time_scale_mode
         self.planet_params = planet_params
+        # None = automatic (half-res for H>=256, see simulate.generate_precipitation);
+        # 1 = full-resolution precipitation (slower, see the "Full-res precip"
+        # GUI toggle in main.py's Simulation tab).
+        self.precip_block_size = precip_block_size
         self._step_function = step_function
         self.running = Event()
         self.paused = Event()
@@ -70,6 +75,7 @@ class SimulationWorker(Thread):
                             new_state,
                             days=step_days,
                             wind_block_size=self.wind_block_size,
+                            precip_block_size=self.precip_block_size,
                             update_wind=do_wind,
                             debug_log=False,
                             track_components=self.diagnostics is not None,
@@ -146,6 +152,9 @@ class SimulationWorker(Thread):
 
     def update_wind_block_size(self, block_size):
         self.wind_block_size = block_size
+
+    def update_precip_block_size(self, block_size):
+        self.precip_block_size = block_size
 
     def update_planet_params(self, planet_params: PlanetParams):
         self.planet_params = planet_params

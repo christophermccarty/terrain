@@ -385,7 +385,16 @@ class ClimateDiagnostics:
             albedo_mean = np.sum(np.mean(albedo_est, axis=1) * weights)
         else:
             albedo_mean = 0.3  # Default Earth-like
-        
+
+        # 11. Land Ice / Sea Level (Phase 5 canvas item)
+        if state.land_ice_thickness is not None:
+            LI = state.land_ice_thickness
+            land_ice_mean_m = np.sum(np.mean(LI, axis=1) * weights)
+            land_ice_max_m = np.max(LI)
+        else:
+            land_ice_mean_m = land_ice_max_m = 0.0
+        sea_level_change_m = getattr(state, "sea_level_change_m", 0.0) or 0.0
+
         return {
             # Temperature metrics
             "global_mean_temp": global_mean_T,
@@ -467,7 +476,12 @@ class ClimateDiagnostics:
             
             # Albedo
             "albedo_mean": albedo_mean,
-            
+
+            # Land ice / sea level (Phase 5 canvas item)
+            "land_ice_mean_m": land_ice_mean_m,
+            "land_ice_max_m": land_ice_max_m,
+            "sea_level_change_m": sea_level_change_m,
+
             # Raw data for plotting
             "latitudes": lat,
             "zonal_means": T_zonal

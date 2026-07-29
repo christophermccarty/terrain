@@ -110,9 +110,20 @@ def test_monthly_daily_tight_agreement():
 # ones. See PlanetParams.wind_prognostic_substep_days docstring.
 # ---------------------------------------------------------------------------
 
-def test_wind_prognostic_gate_off_matches_default():
-    """wind_prognostic_substep_days=0.0 (the field's default) must be an exact
-    no-op — same result as not setting it at all."""
+def test_wind_prognostic_gate_off_differs_from_default():
+    """`wind_prognostic_substep_days=0.0` explicitly restores the old, fast,
+    diagnostic-wind-only MONTHLY/ANNUAL behavior -- and must remain a real,
+    working escape hatch back to it, not silently dead code.
+
+    The field's default flipped 0.0 -> 1.0 in the razor-sharp-biome-line fix
+    (2026-07-28, see that memory): MONTHLY/ANNUAL now run real prognostic
+    wind by default, since the old diagnostic wind had almost no per-cell
+    terrain-driven divergence at a given latitude, producing a Koppen
+    rainforest/desert boundary locked to a single latitude regardless of
+    terrain. This test used to assert 0.0 matched "the default" (true only
+    while 0.0 *was* the default); it now asserts the opposite -- 0.0 must
+    still produce a genuinely different (the old, cheaper) result than
+    today's default, confirming the escape hatch isn't a no-op by accident."""
     import dataclasses
     from planet_params import EARTH
 
@@ -120,22 +131,34 @@ def test_wind_prognostic_gate_off_matches_default():
     m_default = _run("monthly", spinup_years=0.3)
     m_explicit_off = _run("monthly", spinup_years=0.3, planet_params=pp_explicit_off)
 
-    assert m_default.global_mean_t == m_explicit_off.global_mean_t
-    assert m_default.mean_precip == m_explicit_off.mean_precip
+    assert not m_explicit_off.has_nan and not m_explicit_off.has_inf
+    assert (
+        m_default.global_mean_t != m_explicit_off.global_mean_t
+        or m_default.mean_precip != m_explicit_off.mean_precip
+    ), (
+        "wind_prognostic_substep_days=0.0 produced byte-identical output to "
+        "today's default (1.0) -- the gate may be dead/unwired"
+    )
 
 
 def test_wind_prognostic_gate_tightens_monthly_daily_agreement():
     """Opting into wind_prognostic_substep_days should bring MONTHLY's global
-    mean T closer to DAILY's than the default diagnostic-wind path does --
+    mean T closer to DAILY's than the old diagnostic-wind path does --
     quantifying that the gate is actually closing the cross-speed divergence,
-    not just changing the numbers arbitrarily."""
+    not just changing the numbers arbitrarily.
+
+    `wind_prognostic_substep_days=1.0` is now `EARTH`'s default (2026-07-28),
+    so "gate off" must be requested explicitly here rather than read off the
+    default -- unlike before the flip, `_run("monthly", ...)` alone no longer
+    means gate-off."""
     import dataclasses
     from planet_params import EARTH
 
+    pp_gate_off = dataclasses.replace(EARTH, wind_prognostic_substep_days=0.0)
     pp_gate_on = dataclasses.replace(EARTH, wind_prognostic_substep_days=1.0)
 
     m_daily = _run("daily", spinup_years=0.5)
-    m_monthly_off = _run("monthly", spinup_years=0.5)
+    m_monthly_off = _run("monthly", spinup_years=0.5, planet_params=pp_gate_off)
     m_monthly_on = _run("monthly", spinup_years=0.5, planet_params=pp_gate_on)
 
     diff_off = abs(m_monthly_off.global_mean_t - m_daily.global_mean_t)
