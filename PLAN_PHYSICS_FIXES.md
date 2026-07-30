@@ -1,6 +1,134 @@
 # Plans: A9 spherical metric, and the US Midwest divergence bug
 
 ---
+## EXECUTION LOG (2026-07-30) — SE US / East China / S Japan misclassified as Hot Steppe: root-caused and fixed
+
+Direct follow-up to the same user reference-Koppen-map comparison that surfaced the 45-55N
+handoff gap below: the user separately reported the southeastern US, Eastern China, and southern
+Japan all rendering as "Hot Steppe" (BSh) against the reference map's Cfa (humid subtropical).
+
+**Root cause**: `atmosphere.generate_precipitation`'s `drybelt_window` (a Gaussian centered at
+`DRYBELT_CENTER_DEG`~28 deg, sigma 8 deg -- covers roughly 20-36N/S) is pure `|latitude|`. It feeds
+two separate mechanisms -- the flat `-0.45*drybelt_window` term in `subsidence_suppression`, and
+`drybelt_land_protection` in the moisture-budget rescale (`1 - 0.995*drybelt_window*land_f`) --
+both intended to keep real subsiding-air deserts (Sahara, Mexico/SW US, Kalahari/Namib, Atacama)
+dry against the budget-rescale's aggressive deficit-filling (see
+moisture-budget-desert-ceiling-fix-2026-07-28 memory). Neither term has any way to distinguish
+those from SE US/East China/S Japan, which sit in the same latitude band but in reality escape the
+subtropical high via warm-current/monsoon moisture pump (Gulf Stream, Kuroshio) -- real subtropical
+highs sit over the *eastern* ocean basins, driving subsidence down *western* continental margins
+and pumping moisture up *eastern* ones. Measured directly on `saves/test.npz` (512x1024):
+`subsidence_suppression` was 0.14-0.28 for the three reported regions, AT OR BELOW Sahara's own
+0.24 -- the model was suppressing real Cfa climates as hard as an actual desert, confirmed against
+a 5-year real-terrain Koppen breakdown: SE US 94% BSh, East China 99% BSh, S Japan 87% BSh.
+
+**Fix**: `PlanetParams.monsoon_east_margin_exemption` (new, default 1.5). `atmosphere.py` computes
+`monsoon_margin_factor` once (cached alongside land/sea masks) -- an ocean-to-the-east adjacency
+test decayed ~20 cells inland (geometric decay, rate 0.88/cell), deliberately wider than
+`_west_coast_land`'s 2-cell fog-gate reach since monsoon moisture penetrates whole river basins
+(Yangtze, Mississippi/Gulf watershed), not just a coastal fog band. Applied as a **post-hoc**
+addition to `subsidence_suppression`, recovering up to the full `0.45*drybelt_window` penalty --
+placement matters here: an earlier attempt baked the exemption into the *pre-smoothing* formula
+and measured almost no effect (SE US moved only 0.197->0.219 at full strength), because
+`itcz_zonal_smooth_deg`'s wide 32-degree-radius periodic longitude smoothing averaged the
+improvement away against the much larger swath of unexempted ocean/non-coastal land sharing the
+same latitude circle. Moving it after that smoothing pass (same reason `_fog_gate` already sits
+there) fixed this. `drybelt_land_protection` gets the same `monsoon_margin_factor`-gated reduction
+directly, since it's an independent formula the smoothing doesn't touch.
+
+**Real-terrain validation** (`saves/test.npz`, 5yr MONTHLY continuation, named-box Koppen
+breakdown): swept 0.0/1.0/1.5/1.6/2.5.
+
+| region | baseline (0.0) | 1.0 | 1.5 (shipped) | 2.5 |
+|---|---|---|---|---|
+| SE US | 94% BSh | 49% BSh / 45% Cfa | 30% BSh / 61% Cfa | 15% BSh / 77% Cfa |
+| East China | 99% BSh | 55% BSh / 25% Cfa | 39% BSh / 35% Cfa / 19% Af | 22% BSh / 44% Cfa / 31% Af |
+| S Japan | 87% BSh | **100% Cfa** | 100% Cfa | 100% Cfa |
+| Sahara | 58% BSh (unrelated pre-existing gap) | 58% | 57% | 55% |
+| Kalahari | 91% BSh | 84% BSh | 84% BSh | 83% BSh |
+| Atacama / US Midwest / Central Europe | -- | unchanged | unchanged | US Midwest: 4% BSh appears |
+
+S Japan is fully fixed by 1.0. SE US crosses to majority-Cfa by 1.5. East China only ever reaches a
+*plurality* Cfa (never full majority) in this sweep, and pushing to 2.5 starts overshooting it into
+Af (tropical rainforest) while introducing the first hint of continental-interior bleed (US Midwest
+0%->4% BSh, previously clean through 1.6) -- 1.5 sits just below that collateral cost. **Real,
+accepted partial cost**: Kalahari's own BSh share drifted 91%->84% at every nonzero strength tested
+(flat across the sweep, not progressive) -- its box's eastern edge sits within this mechanism's
+inland decay reach of southern Africa's real Indian Ocean/Mozambique-Channel coast, the same
+category of directionally-correct-but-imperfect trade-off `coastal_upwelling_fog_strength` already
+accepted for Atacama. Sahara/Atacama/US Midwest/Central Europe all held within measurement noise at
+the shipped 1.5 default.
+
+Added `SE US`/`East China`/`S Japan` as a new `monsoon_subtropical` region group in
+`regional_validation.py` (real-Earth target ranges, ~1100-2200 mm/yr depending on region) so this
+gap is directly measurable going forward via `scripts/check_real_terrain_koppen.py`; the shipped
+fix does not reach those absolute targets (it fixes the *classification*, moving instantaneous
+precip from ~450 to ~500-585 mm/yr in the same 5yr run, not to the full real-world magnitude) --
+flagged as a known remaining gap, not silently claimed as closed.
+
+Full fast suite: **365 passed, 0 failed (before fixture regen), 11 xfailed, 2 xpassed** (3396s) --
+the single failure was `test_golden_state.py` itself, expected since this is a deliberate default
+physics change; regenerated via `scripts/generate_golden_state.py` and reverified passing.
+
+---
+## EXECUTION LOG (2026-07-30) — 45-55N winter-temperature handoff gap: root-caused and fixed
+
+Direct follow-up to a real-world-vs-reference-map comparison the user requested (comparing
+`saves/test.npz`'s rendered Koppen map against `Koppen_classification_world_map_1991-2020_-3C_borderless.png`).
+Alongside the already-known/already-fixed ITCZ issue (see the 2026-07-29 entry below), that
+comparison surfaced a second, more severe, previously-undocumented finding: mid-latitude Europe
+and Russia were rendering as Dwd (extreme continental) across huge swaths where the reference map
+shows a normal Cfb/Dfb band.
+
+**Measured directly, not assumed**: Berlin, Moscow, Winnipeg, Novosibirsk, and Kiev (all 50-55N)
+all showed `monthly_temp` coldest-month values of -37 to -39C (real Earth: 0 to -18C depending on
+maritime/continental exposure). Instantaneous (non-EMA) temperature at the same cells was normal
+(-6 to -10C), confirming this was a real, systematic feature of the climatology, not a stale-EMA
+snapshot artifact.
+
+**Root cause**: `simulate.py`'s land-temperature preprocessing block has two heat-transport bonus
+terms, each independently tuned specifically so it would NOT disturb the other's already-validated
+range: `_midlat_storm_bonus_1d` (a 27K plateau 22-42N, decaying to exactly zero at 50N -- capped
+there on purpose to avoid touching `test_2x_co2_less_ice`'s ice-forming latitudes) and
+`_atm_land_transport_1d` (only starts ramping at 42N, explicitly tuned so latitudes <=50N change by
+<1K). Computing their sum across latitude reveals a real trough, not a smooth handoff: total bonus
+falls from 27K at 42N to just 3.4K at 50N, before `_atm_land_transport_1d` alone slowly climbs back
+through the 50s. That trough sits almost exactly on 45-55N -- the same failure mode the code's own
+comment already describes as `_midlat_storm_bonus_1d`'s original motivation, meaning the fix for
+the *first* version of this bug (pre-existing, committed in `547faff`) left this narrower gap
+between itself and the term above it.
+
+**Fix**: a third trapezoid term, `_handoff_bonus_1d` -- zero outside 44-66 degrees (so it cannot
+touch the already-good 22-42 plateau, and decays to zero well before the 65-90 degree ice-forming
+latitudes the original design was protecting), peaking at 20K around 50-52 degrees, computed and
+swept numerically (not guessed) to bring the combined total to a smooth 18-27K band across 38-70
+degrees instead of dropping to single digits.
+
+**Verification**: continuing `saves/test.npz` forward ~14 months under the fix, all five cities
+flip from Dwd to the correct Dfb (confirmed both via the live 10yr EMA `koppen_type` field and a
+fresh `classify_koppen` call on the just-updated `monthly_temp`), with coldest-month temperatures
+moving from -37/-39C to -21/-26C -- still somewhat colder than real values but no longer in
+impossible-extreme territory. Real-terrain named-box check (5yr MONTHLY continuation,
+`scripts/check_real_terrain_koppen.py`): 45-50N/S coldest-month land T moved into the -5 to -20C
+target range (was outside it); Canadian Prairies (357->451), US Midwest (492->573), and Central
+Europe (421->514) all improved toward their Earth targets as a side effect (warmer land drives more
+evaporation/thermal-low moisture inflow); Sahara/Kalahari/Atacama barely moved (<20 mm/yr). The
+ice-sensitivity guard the original code was explicitly protecting (`test_2x_co2_less_ice`,
+`test_ecs_sensitivity.py`) re-ran clean: 13 passed, 1 xfailed.
+
+**One real, attributed test-threshold shift**: `test_latitude_band_temperature_bias_reasonable`'s
+aggregate metric (a 64x128 synthetic 2yr-DAILY-spinup fixture, independent of the real-terrain
+measurements above) moved 11.5->11.6C mean bias and 41.0->41.1C max bias -- a direct, measured
+consequence of legitimately warming the 45-55N band, the same class of deliberate shift this test's
+own comment history already documents twice for other fixes. Widened to 11.8/41.3 with the full
+before/after numbers and mechanism documented inline, following that same precedent rather than
+padding blindly.
+
+Full fast suite green after regenerating golden-state: **366 passed, 0 failed, 11 xfailed, 2
+xpassed** (3583s).
+
+---
+## EXECUTION LOG (2026-07-29) — ITCZ row-to-row shape inconsistency: root-caused and fixed, shipped at 8 degrees
 ## EXECUTION LOG (2026-07-29) — ITCZ row-to-row shape inconsistency: root-caused and fixed, shipped at 8 degrees
 
 User reported a concrete, measurable version of the tropical-belt gap this file's own item 3b and the ITCZ sessions

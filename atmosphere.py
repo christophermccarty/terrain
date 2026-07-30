@@ -2771,13 +2771,48 @@ def generate_precipitation(
     if _sc is not None and "land_mask" in _sc:
         land_mask, sea_mask = _sc["land_mask"], _sc["sea_mask"]
         land_f, sea_f = _sc["land_f"], _sc["sea_f"]
+        monsoon_margin_factor = _sc["monsoon_margin_factor"]
     else:
         land_mask, sea_mask = _derive_land_sea_masks(elev)
         land_f = land_mask.astype(np.float32)
         sea_f = sea_mask.astype(np.float32)
+        # East-coast/monsoon-margin proxy (2026-07-30, se-us-east-asia-drybelt
+        # fix): real subtropical highs sit over the EASTERN ocean basins
+        # (Azores/Bermuda high off NW Africa, NE Pacific high off California),
+        # so their clockwise (NH; mirrored SH) circulation drives dry subsiding
+        # air down the WESTERN continental margins (Sahara, Mexico/SW US,
+        # Kalahari/Namib, Atacama, Australian interior -- everything
+        # `coastal_upwelling_fog_strength` above already targets) while pumping
+        # warm moist air up the EASTERN continental margins from the western
+        # boundary currents (Gulf Stream -> SE US, Kuroshio -> East China/
+        # Japan). `drybelt_window` below has no way to tell these apart --
+        # it's pure |latitude|, so it was suppressing SE US/East China/S Japan
+        # (measured: subsidence_suppression as low as 0.14-0.28, at or below
+        # actual Sahara's 0.24 on `saves/test.npz`) as hard as real deserts at
+        # the same latitude, misclassifying all three as BSh/BSk against the
+        # reference Koppen map (real classification: Cfa). This mask mirrors
+        # `_west_coast_land` below (ocean-adjacency test) but decays much
+        # further inland -- monsoon moisture penetrates whole river basins
+        # (Yangtze, Mississippi/Gulf watershed), not just a coastal fog band --
+        # and is applied as a REDUCTION of `drybelt_window`'s penalty (see
+        # `monsoon_east_margin_exemption`), not real monsoon-circulation
+        # physics, the same diagnostic-gate pattern the fog mechanism uses.
+        _ocean_east = np.roll(sea_mask, -1, axis=1)
+        _coast_core_east = (land_mask & _ocean_east).astype(np.float32)
+        _monsoon_decay_cells = 20
+        _monsoon_decay_rate = np.float32(0.88)
+        monsoon_margin_factor = np.zeros_like(_coast_core_east)
+        _shifted = _coast_core_east
+        _weight = np.float32(1.0)
+        for _ in range(_monsoon_decay_cells + 1):
+            monsoon_margin_factor += _weight * _shifted
+            _shifted = np.roll(_shifted, -1, axis=1)
+            _weight *= _monsoon_decay_rate
+        monsoon_margin_factor = np.clip(monsoon_margin_factor, 0.0, 1.0) * land_f
         if _sc is not None:
             for _k, _v in (("land_mask", land_mask), ("sea_mask", sea_mask),
-                           ("land_f", land_f), ("sea_f", sea_f)):
+                           ("land_f", land_f), ("sea_f", sea_f),
+                           ("monsoon_margin_factor", monsoon_margin_factor)):
                 _v.flags.writeable = False
                 _sc[_k] = _v
 
@@ -2934,6 +2969,29 @@ def generate_precipitation(
             1.0,
         ).astype(np.float32, copy=False)
         subsidence_suppression = (subsidence_suppression * _fog_gate).astype(np.float32, copy=False)
+        # East-coast/monsoon-margin exemption (2026-07-30, se-us-east-asia-
+        # drybelt fix; see `monsoon_margin_factor` above for the mechanism).
+        # Applied post-hoc, AFTER `itcz_zonal_smooth_deg`'s wide (32-deg
+        # radius) periodic longitude smoothing rather than folded into the
+        # per-cell formula upstream of it -- measured directly: baking the
+        # exemption into the pre-smoothing formula let the zonal smooth
+        # average it away against the much larger swath of unexempted ocean
+        # and non-coastal land sharing the same latitude circle (SE US
+        # subsidence_suppression moved only 0.197->0.219 at full strength=1.0
+        # that way, on `saves/test.npz`). Adding it back afterward, mirroring
+        # where `_fog_gate` sits for the identical reason, recovers up to the
+        # full `0.45*drybelt_window` penalty this cell would otherwise carry,
+        # scaled by how much of a real east-facing monsoon margin the cell
+        # actually is (`monsoon_margin_factor`) and by
+        # `monsoon_east_margin_exemption` itself (0.0 = exact no-op).
+        _monsoon_recover = (
+            0.45 * drybelt_window[:, None]
+            * monsoon_margin_factor
+            * float(pp.monsoon_east_margin_exemption)
+        )
+        subsidence_suppression = np.clip(
+            subsidence_suppression + _monsoon_recover, 0.08, 1.0
+        ).astype(np.float32, copy=False)
         if _sc is not None:
             div.flags.writeable = False
             subsidence_suppression.flags.writeable = False
@@ -3393,7 +3451,9 @@ def generate_precipitation(
         if pp.moisture_budget_precip_rescale:
             budget_dq_cap = np.minimum(0.85 * q, dq_before + 0.15 * q)
             drybelt_land_protection = np.clip(
-                1.0 - 0.995 * drybelt_window[:, None] * land_f,
+                1.0 - 0.995 * drybelt_window[:, None] * land_f * (
+                    1.0 - float(pp.monsoon_east_margin_exemption) * monsoon_margin_factor
+                ),
                 0.005,
                 1.0,
             )

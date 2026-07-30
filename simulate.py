@@ -864,7 +864,41 @@ def simulate_step(
     _midlat_rise = np.clip((_abs_lat_deg_land - 22.0) / 20.0, 0.0, 1.0)
     _midlat_fall = np.clip((50.0 - _abs_lat_deg_land) / 8.0, 0.0, 1.0)
     _midlat_storm_bonus_1d = 27.0 * _midlat_rise * _midlat_fall
-    T_base_land = T_base_land + (_atm_land_transport_1d + _midlat_storm_bonus_1d)[:, None].astype(np.float32, copy=False)
+
+    # 45-55°N handoff-gap fix (2026-07-30, real-terrain audit): the two terms above
+    # were each independently tuned so *neither* one, in isolation, disturbs the
+    # other's already-validated latitude range -- `_midlat_storm_bonus_1d` decays
+    # to exactly zero at 50° (by design, to protect test_2x_co2_less_ice), and
+    # `_atm_land_transport_1d` only starts ramping at 42° and stays under 1K through
+    # 50° (by design, per its own comment above). But summing the two reveals a real
+    # trough, not a smooth handoff: their combined total falls from a 27K plateau at
+    # 42° to just 3.4K at 50°, before `_atm_land_transport_1d` alone slowly climbs
+    # back through the 50s. That trough sits almost exactly on 45-55°N -- verified
+    # directly on real terrain (`saves/test.npz`, 512x1024): Berlin, Moscow,
+    # Winnipeg, Novosibirsk, and Kiev (all 50-55°N) all showed coldest-month means of
+    # -37 to -39°C (real Earth: 0 to -18°C depending on maritime/continental
+    # exposure), spuriously classifying most of Europe/Russia/the Canadian Prairies
+    # as Dwd (extreme continental, requires coldest month < -38°C -- in reality a
+    # climate confined to the remotest Siberian cold pole) instead of Cfb/Dfb. This
+    # is the exact failure mode the comment above already describes as the
+    # motivation for `_midlat_storm_bonus_1d` -- the trough the two trapezoids leave
+    # between themselves reproduces it almost unchanged.
+    #
+    # Fix: a third, narrow trapezoid that is exactly zero outside 44-66° (so it
+    # cannot touch the already-validated 22-42° plateau, and decays back to zero
+    # well before the 65-90° ice-forming latitudes `_midlat_storm_bonus_1d`'s own
+    # cutoff was chosen to protect), peaking at 20K right in the 50-52° trough
+    # floor. Combined total across 38-70° is a smooth 18-27K band instead of
+    # dropping to single digits -- verified by direct computation before touching
+    # any test, not assumed from the shape alone. See test_2x_co2_less_ice /
+    # test_ecs_sensitivity.py for the ice-sensitivity guard this must not break.
+    _handoff_rise = np.clip((_abs_lat_deg_land - 44.0) / 6.0, 0.0, 1.0)
+    _handoff_fall = np.clip((66.0 - _abs_lat_deg_land) / 16.0, 0.0, 1.0)
+    _handoff_bonus_1d = 20.0 * _handoff_rise * _handoff_fall
+
+    T_base_land = T_base_land + (
+        _atm_land_transport_1d + _midlat_storm_bonus_1d + _handoff_bonus_1d
+    )[:, None].astype(np.float32, copy=False)
 
     # Evapotranspiration/convective cooling (2026-07, root-cause fix for the summer
     # overheating _land_cap_1d above only ever patched post-hoc): real land loses

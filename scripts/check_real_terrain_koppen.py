@@ -73,6 +73,11 @@ CONTINENTAL_BOXES = [
     for region in EARTH_PRECIP_REGIONS
     if region.group == "continental"
 ]
+MONSOON_BOXES = [
+    _region_tuple(region)
+    for region in EARTH_PRECIP_REGIONS
+    if region.group == "monsoon_subtropical"
+]
 # Open-ocean control boxes for --wind-diagnostics: baseline p_anom/convergence
 # magnitude away from any land effect, for comparison against the desert/
 # continental boxes above.
@@ -254,8 +259,8 @@ def main() -> None:
     print(f"Continuing {args.save} forward {args.days:.0f} days ({args.time_scale}, {n_steps} steps)")
     if overrides:
         print(f"PlanetParams overrides: {overrides}")
-    all_boxes = DESERT_BOXES + CONTINENTAL_BOXES
-    wind_boxes = DESERT_BOXES + CONTINENTAL_BOXES + OCEAN_BOXES
+    all_boxes = DESERT_BOXES + CONTINENTAL_BOXES + MONSOON_BOXES
+    wind_boxes = DESERT_BOXES + CONTINENTAL_BOXES + MONSOON_BOXES + OCEAN_BOXES
     instantaneous_samples: dict[str, list[float]] = {box[0]: [] for box in all_boxes}
     # field name -> box name -> list of per-step box-mean samples
     wind_samples: dict[str, dict[str, list[float]]] = {
@@ -307,6 +312,16 @@ def main() -> None:
     print()
     print("=== Continental-interior box precip (want high, ~350-450 mm/yr) ===")
     for box in CONTINENTAL_BOXES:
+        name = box[0]
+        inst = instantaneous_samples[name]
+        inst_str = f"{np.mean(inst) * 365.25:.0f} mm/yr (instantaneous, 2nd half)" if inst else "no land in box"
+        ema = _box_ema_precip_mm_yr(state, land_mask, box)
+        ema_str = f"{ema:.0f} mm/yr (10yr EMA)" if ema is not None else "n/a"
+        print(f"  {name}: {inst_str}  |  {ema_str}")
+
+    print()
+    print("=== Monsoon/eastern-margin humid-subtropical box precip (want high, Cfa climates) ===")
+    for box in MONSOON_BOXES:
         name = box[0]
         inst = instantaneous_samples[name]
         inst_str = f"{np.mean(inst) * 365.25:.0f} mm/yr (instantaneous, 2nd half)" if inst else "no land in box"

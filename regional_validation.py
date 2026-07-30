@@ -39,6 +39,24 @@ EARTH_PRECIP_REGIONS: tuple[ClimateRegion, ...] = (
         "Central Europe", 53.0, 47.0, 5.0, 20.0,
         "continental", 550.0, 750.0,
     ),
+    # Monsoon/eastern-margin humid subtropics: sit inside the same
+    # DRYBELT_CENTER_DEG~28 latitude window as Sahara/Kalahari/Atacama
+    # above, but escape the subtropical high in reality via monsoon/warm-
+    # current moisture -- see se-us-east-asia-drybelt-latitude-bug memory.
+    # Real Koppen for all three is Cfa (humid subtropical); target ranges
+    # are approximate regional climatology, not precise station data.
+    ClimateRegion(
+        "SE US", 33.0, 27.0, -90.0, -80.0,
+        "monsoon_subtropical", 1100.0, 1500.0,
+    ),
+    ClimateRegion(
+        "East China", 30.0, 23.0, 110.0, 120.0,
+        "monsoon_subtropical", 1300.0, 1800.0,
+    ),
+    ClimateRegion(
+        "S Japan", 34.0, 31.0, 130.0, 134.0,
+        "monsoon_subtropical", 1600.0, 2200.0,
+    ),
 )
 
 

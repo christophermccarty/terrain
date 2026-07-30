@@ -648,6 +648,51 @@ class PlanetParams:
     monotonic, side-effect-free improvement; 0.0 remains an exact no-op for
     anyone who wants the pre-2026-07 behavior."""
 
+    monsoon_east_margin_exemption: float = 1.5
+    """Strength of the exemption that reduces `drybelt_window`'s flat
+    subtropical dry-belt latitude penalty at east-coast/monsoon land cells
+    (SE US, East China, S Japan -- real Cfa/humid-subtropical climates that
+    sit inside the same ~20-36 deg latitude window as Sahara/Kalahari/
+    Atacama). See `atmosphere.generate_precipitation`'s `monsoon_margin_factor`
+    and `_monsoon_recover` comments for the full mechanism. 0.0 is an exact
+    no-op (pre-2026-07-30 behavior). Not capped at 1.0 like
+    `coastal_upwelling_fog_strength` -- unlike that gate, this one only ever
+    *removes* a penalty (the result is still clipped into
+    `subsidence_suppression`'s normal [0.08, 1.0] range), so there's no
+    "over-application" failure mode the same way, and the real-terrain sweep
+    below found continued (if diminishing) benefit past 1.0.
+
+    Root cause (2026-07-30, real-terrain audit following the user's own
+    reference-Koppen-map comparison): `drybelt_window` is pure |latitude| --
+    it cannot distinguish real subsiding-air deserts (western continental
+    margins, under the eastern lobe of a subtropical high: Sahara, Mexico/SW
+    US, Kalahari/Namib, Atacama) from eastern continental margins at the same
+    latitude, which in reality escape the high via warm-current/monsoon
+    moisture pump (Gulf Stream -> SE US, Kuroshio -> East China/S Japan).
+    Measured directly on `saves/test.npz` (512x1024): `subsidence_suppression`
+    was 0.14-0.28 for SE US/East China/S Japan, AT OR BELOW Sahara's own 0.24
+    -- the model was suppressing real Cfa climates as hard as an actual
+    desert. 5-year real-terrain continuation, named-box Koppen breakdown
+    (baseline -> this default):
+        SE US:       94% BSh -> 30% BSh / 61% Cfa
+        East China:  99% BSh -> 39% BSh / 35% Cfa / 19% Af / 7% Aw
+        S Japan:     87% BSh -> 100% Cfa
+    Sahara/Kalahari/Atacama/US Midwest/Central Europe all held within
+    measurement noise (Kalahari's own BSh share drifted 91%->84%, its closest
+    real east coast -- Mozambique Channel -- sits within this mechanism's
+    inland decay reach of the box's eastern edge; accepted as a minor,
+    directionally-correct cost, the same category of trade-off
+    `coastal_upwelling_fog_strength` already accepted for Atacama).
+
+    Swept 0.0/1.0/1.5/1.6/2.5: SE US and S Japan are already decisively fixed
+    by 1.0-1.5; East China only reaches a plurality (not majority) Cfa at any
+    strength tried, and pushing to 2.5 started overshooting it into Af
+    (tropical rainforest, 31%) while introducing the first hint of
+    continental-interior bleed (US Midwest showed 4% BSh, was 0% through
+    1.6). 1.5 sits before that collateral cost appears -- a real, measured
+    partial win for East China specifically, full for S Japan, majority for
+    SE US, not a complete fix for all three."""
+
     itcz_zonal_smooth_deg: float = 8.0
     """Longitude-direction Gaussian smoothing [degrees] applied to
     `subsidence_suppression` right after its own local Laplacian pass, before
