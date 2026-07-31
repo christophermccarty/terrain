@@ -3528,6 +3528,76 @@ def generate_precipitation(
             1.0 - DESERT_REDISTRIBUTION_STRENGTH * (1.0 - subsidence_suppression) * land_f,
             0.05, 1.0,
         ).astype(np.float32, copy=False)
+        # Raw-precip-shape blend (2026-07-31 follow-up to the itcz-seasonal-
+        # target-deficit fix): `_desert_factor` above only differentiates via
+        # `subsidence_suppression`, which is ~uniformly near 1.0 across the
+        # whole ITCZ zone (no subsidence signal to speak of that close to the
+        # equator) -- so inside the tropics `cell_weight` was previously a
+        # near-exact no-op, even though `global_rescale_factor` averages ~5x
+        # on real terrain (2026-07-31 baseline measurement), meaning the
+        # aspirational-fill mechanism supplies most of a typical row's final
+        # rain and therefore does most of the work of shaping *where* it
+        # lands. `precip_potential` (this cell's pre-rescale raw signal) has
+        # already been independently verified to correctly rank wet vs dry
+        # areas (known-physics-gaps.md item 3b UPDATE 3: continental interior
+        # consistently 2.5-3x desert every year, pre-rescale) -- and unlike
+        # `subsidence_suppression` it varies meaningfully *within* the ITCZ
+        # too (real per-cell wind-convergence differences, e.g. a Congo-basin
+        # convergence hotspot vs. a savanna-margin cell at the same latitude).
+        # Blending its own row-relative shape into the target gives the
+        # aspirational fill a genuine per-cell signal everywhere, not only in
+        # the subtropics. Mean-preserving by construction (renormalized below
+        # exactly like `_desert_factor` alone was), so row totals -- and the
+        # orographic/cloud-cover tests that a purely per-row target would
+        # break -- are unaffected; `precip_raw_shape_weight=0.0` is an exact
+        # no-op (recovers the original `_desert_factor`-only cell_weight
+        # byte-for-byte).
+        # Normalized against the row's LAND-only mean (weighted by `land_f`),
+        # not the whole row: precip_potential runs much higher over open
+        # ocean than land almost everywhere (abundant moisture, no dry-belt/
+        # subsidence gating), so a whole-row mean would make every land
+        # cell's raw_shape read as "below average" purely from sharing a row
+        # with ocean -- diluting/inverting the intended land-internal
+        # contrast (measured directly: an earlier whole-row-mean version of
+        # this blend collapsed Canadian Prairies/US Midwest/Central Europe
+        # ~65-75% and made Kalahari/Atacama *wetter*, because land's
+        # relative weight-share was being bid away by ocean's typically
+        # higher raw signal in the same row, not reshaped within land).
+        _land_pp_sum = np.sum(precip_potential * land_f, axis=1, dtype=np.float64)
+        _land_f_sum = np.sum(land_f, axis=1, dtype=np.float64)
+        _land_pp_row_mean = (_land_pp_sum / (_land_f_sum + 1e-6)).astype(np.float32)
+        _raw_shape = np.clip(
+            precip_potential / (_land_pp_row_mean[:, None] + 1e-6), 0.2, 3.0
+        ).astype(np.float32, copy=False)
+        _raw_shape_w = float(pp.precip_raw_shape_weight)
+        if _raw_shape_w > 0.0:
+            # Gated by `itcz_window` (real-terrain measurement, 2026-07-31):
+            # an ungated version -- applying this blend at every latitude --
+            # nearly doubled `arid_pct` (19.5%->28.4% at w=1.0) and, worse,
+            # *decreased* Aw (8.8%->6.4%) instead of increasing it: cells
+            # below their row's land-mean raw signal were being pushed
+            # straight past Koppen's aridity threshold into BW/BS instead of
+            # landing in the Aw "real dry season, not full desert" band. Two
+            # of three continental-interior boxes also lost significant
+            # precip (US Midwest 610->400, Canadian Prairies 462->377
+            # mm/yr) -- collateral damage to latitudes where
+            # `subsidence_suppression`-based `_desert_factor` was already
+            # doing its job correctly (this project's own hard-won
+            # desert-vs-continental ranking work, see
+            # moisture-budget-desert-ceiling-fix-2026-07-28 and
+            # ferrel-land-ocean-split-2026-07-26). This mechanism was
+            # motivated specifically by `subsidence_suppression` being a
+            # near-no-op *inside the ITCZ*, not by any deficiency at
+            # mid-latitudes -- gating by `itcz_window` confines it to where
+            # the gap it targets actually exists, leaving the
+            # already-validated mid-latitude mechanism untouched.
+            _raw_shape_w_row = (_raw_shape_w * itcz_window).astype(np.float32)[:, None]
+            # Ocean cells keep a neutral factor of 1.0 in the blend -- their
+            # share of the row's target is untouched, exactly like
+            # `_desert_factor` alone -- so only land is reshaped, and only
+            # relative to other land in the same row.
+            _raw_shape_applied = np.where(land_f > 0.5, _raw_shape, 1.0).astype(np.float32, copy=False)
+            _desert_factor = _desert_factor * (1.0 - _raw_shape_w_row + _raw_shape_w_row * _raw_shape_applied)
         _row_norm = np.mean(_desert_factor, axis=1, dtype=np.float64).astype(np.float32)
         cell_weight = _desert_factor / (_row_norm[:, None] + 1e-6)
         if pp.moisture_budget_precip_rescale:

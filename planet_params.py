@@ -904,6 +904,118 @@ class PlanetParams:
     remaining gap is the moisture-budget rescale's other structural limits
     (see `known-physics-gaps.md` item 3b), not further tuning of this knob."""
 
+    precip_raw_shape_weight: float = 0.0
+    """Strength [0-1] of blending `precip_potential`'s own row-relative raw
+    shape into `atmosphere.generate_precipitation`'s per-cell target weight
+    (`cell_weight`/`target_cell_weight`), on top of the existing
+    `subsidence_suppression`-based desert/continental redistribution.
+
+    Direct follow-up to `itcz_seasonal_target_response`'s own flagged
+    limitation (see its docstring): real-terrain measurement
+    (2026-07-31, `saves/test.npz`) found `global_rescale_factor` averaging
+    ~5x on a 5yr MONTHLY continuation -- i.e. the moisture-budget
+    aspirational-fill mechanism supplies most of a typical row's final rain,
+    not raw local physics, so *where* that fill lands is what actually
+    determines the spatial pattern. The existing `cell_weight` only shapes
+    that via `subsidence_suppression`, which is ~uniformly near 1.0 across
+    the whole ITCZ zone (deserts are defined by subsidence; the deep tropics
+    aren't), making `cell_weight` a near-exact no-op inside the tropics --
+    exactly where the Af (rainforest) vs. Aw/Am (savanna/monsoon) distinction
+    needs real per-cell differentiation and currently has none.
+
+    `precip_potential` (this cell's own pre-rescale raw signal) has already
+    been independently verified to correctly rank wet vs. dry areas
+    (`known-physics-gaps.md` item 3b UPDATE 3: continental interior
+    consistently 2.5-3x desert every year, pre-rescale) and, unlike
+    `subsidence_suppression`, varies meaningfully *within* the tropics too
+    (e.g. a real Congo-basin convergence hotspot vs. a savanna-margin cell at
+    the same latitude). Blending in its row-relative shape gives the
+    aspirational fill a genuine per-cell target everywhere, not only in the
+    subtropics.
+
+    Implementation: `_desert_factor *= (1 - w + w*raw_shape)`, then
+    renormalized to row-mean 1.0 exactly like the existing desert-factor-only
+    path -- mean-preserving by construction, so row totals (and therefore the
+    orographic-uplift/cloud-cover tests a purely per-row target would break)
+    are unaffected regardless of `w`. `0.0` is an exact no-op (recovers the
+    prior `cell_weight` byte-for-byte).
+
+    `raw_shape` is normalized against the row's LAND-ONLY mean
+    (`precip_potential` weighted by `land_f`), not the whole row, and is only
+    ever applied to land cells (ocean cells stay at a neutral factor of 1.0
+    in the blend, same as `_desert_factor` alone). **An earlier version of
+    this fix normalized against the whole row (land+ocean) and applied to
+    every cell -- WRONG, found via real-terrain measurement**:
+    `precip_potential` runs far higher over open ocean than land almost
+    everywhere (abundant moisture, no dry-belt/subsidence gating), so a
+    whole-row mean read every land cell as "below average" purely for
+    sharing a row with ocean, letting ocean bid weight-share away from land
+    entirely rather than reshaping *within* land. Measured directly at
+    weight=0.3 on `saves/test.npz`: Canadian Prairies/US Midwest/Central
+    Europe collapsed ~65-75% and Kalahari/Atacama got *wetter*, both
+    backwards. The land-only-mean, land-only-applied version fixes this by
+    construction: ocean's share of every row's target is provably unchanged
+    for any `w`.
+
+    Additionally gated by `itcz_window` (`effective_w = w * itcz_window[row]`)
+    -- the blend is intended to fill the gap where `subsidence_suppression`
+    is a no-op (inside the ITCZ), not to touch mid-latitudes where it's
+    already doing its job. Confirmed necessary by real-terrain measurement:
+    an earlier ungated version (flat `w` at every latitude) degraded
+    Canadian Prairies/US Midwest by 18-34% even though those boxes sit far
+    outside the true tropics -- `precip_potential`'s land-relative shape at
+    those latitudes evidently still favors *other* cells in the same row
+    over the Prairies/Midwest specifically, actively fighting the
+    already-validated mid-latitude desert/continental ranking work
+    (`ferrel_v_land_shift_deg`, `moisture-budget-desert-ceiling-fix`).
+    Gating by `itcz_window` confines the effect to where it was actually
+    aimed and fully protects those boxes (confirmed flat within noise at
+    w=0.6/1.0 after gating).
+
+    **HONEST RESULT (2026-07-31, `saves/test.npz`, 512x1024, 5yr MONTHLY
+    continuation, area-weighted land Koppen): this mechanism does not achieve
+    its goal, even gated, and should not be enabled.**
+
+        w      Af      Am     Aw     arid(BW+BS)  Sahara  Kalahari  Atacama  Prairies  Midwest  Cent.Eur
+        0.0    14.52%  1.30%  8.81%  19.53%       571     493       437      462       610      532
+        0.6    14.52%  1.22%  8.19%  20.63%       546     478       436      467       611      533
+        1.0    13.74%  1.40%  7.85%  21.73%       529     471       433      467       612      532
+
+    Gating successfully protects continental interior (Prairies/Midwest/
+    Central Europe all flat within noise) and desert boxes improve modestly
+    (Sahara -7%, Kalahari -4%) -- but **Aw moves the WRONG direction**
+    (8.81%->7.85%, a ~11% *decrease*, not the increase this whole line of
+    work was chasing) while **arid_pct climbs** (19.53%->21.73%), entirely
+    within the gated (tropical) zone since continental interior is provably
+    untouched. Root cause (consistent with, though not independently
+    isolated cell-by-cell from, `climate_averages.classify_koppen`'s own
+    logic): Koppen's B-climate aridity threshold `P_threshold` scales with
+    `pct_summer` concentration (jumping from `20*T+140` to `20*T+280` once a
+    cell's rain is >=70% one-season-concentrated) -- redistributing an
+    already latitude-band-scarce raw signal (recall `global_rescale_factor`
+    averages ~5x; most of a row's rain is synthetic fill, not raw physics)
+    pushes already-marginal cells' *totals* down at the same time their
+    seasonality (via `itcz_seasonal_target_response`) is rising, so they
+    cross into full BW/BS aridity rather than landing in the in-between Aw
+    band this project has been trying to grow. This is the third,
+    independently-discovered failure mode against the same underlying
+    "per-row vs. per-cell target resolution" gap named in
+    `known-physics-gaps.md` item 3b (after the reverted flat-multiplier
+    desert-suppression attempt and the reverted moisture-transport
+    strengthening attempts) -- redistribution mechanisms in this codebase
+    keep hitting the same wall: with raw production this scarce, any
+    within-row reshaping mostly moves cells *between* Aw and full aridity,
+    not from Af into Aw. **Shipped as tested, wired, but inert infrastructure
+    (default `0.0`, verified exact no-op) following this project's
+    established convention (`moisture_advection_scale`,
+    `cloud_water_feedback`, `abyssal_overturning_coeff`) for a real,
+    correctly-implemented mechanism that measured net-negative for its
+    intended purpose.** A future attempt at this exact gap would need to
+    raise raw tropical-belt production itself (not just reshape a scarce
+    signal) -- already attempted and failed via 4+ different mechanisms in
+    `known-physics-gaps.md` item 3b UPDATES 3-9 (moisture transport, soil
+    bucket, evapotranspiration gating, wind convergence)."""
+
     surface_water_cap_mm: float = 50_000.0
     """Hard ceiling [mm] on `surface_water_mm` per cell (50 m -- deeper than
     any real lake, a safety backstop not a physical mechanism). This compact
