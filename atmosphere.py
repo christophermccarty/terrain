@@ -214,6 +214,38 @@ def _zonal_precip_target_profile(lat_deg: np.ndarray) -> np.ndarray:
     return shape.astype(np.float32)
 
 
+@lru_cache(maxsize=32)
+def _itcz_window_annual_mean(
+    H: int,
+    itcz_seasonal_response: float,
+    obliquity_deg: float,
+    half_width_deg: float,
+    n_samples: int = 48,
+) -> tuple:
+    """Time-average of `itcz_window` (see `generate_precipitation`) over one full
+    seasonal cycle, per row -- the reference the seasonal-target-deficit fix
+    (`PlanetParams.itcz_seasonal_target_response`) compares each month's actual
+    `itcz_window` against.
+
+    Independent of `orbital_period_days`/`vernal_equinox_day`: `equinox_phase`
+    advances linearly with `day_of_year`, so a uniform grid over phase [0, 2pi)
+    is exactly equivalent (by substitution) to a uniform grid over one full
+    orbital period regardless of its length in days or phase offset -- both
+    cancel out of the average. Cached (grid resolution + two scalar params
+    only, no simulation state) since this would otherwise redo a 48-point
+    sweep every precipitation step."""
+    lat_deg = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * 180.0
+    obliquity_rad = math.radians(obliquity_deg)
+    acc = np.zeros(H, dtype=np.float64)
+    for i in range(n_samples):
+        phase = 2.0 * math.pi * i / n_samples
+        decl_rad = math.asin(math.sin(obliquity_rad) * math.sin(phase))
+        center = itcz_seasonal_response * math.degrees(decl_rad)
+        acc += np.exp(-(((lat_deg - center) / half_width_deg) ** 2))
+    acc /= n_samples
+    return tuple(acc.tolist())
+
+
 def _moisture_budget_precip_rescale(
     dq: np.ndarray,
     q: np.ndarray,
@@ -2763,7 +2795,14 @@ def generate_precipitation(
     elev = elevation.astype(np.float32, copy=False)
     lat_deg = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * 180.0
     abs_lat_deg = np.abs(lat_deg)
-    itcz_window = np.exp(-((abs_lat_deg / ITCZ_HALF_WIDTH_DEG) ** 2)).astype(np.float32, copy=False)
+    # Seasonal ITCZ migration (2026-07-30, real-terrain-vs-reference-map audit): the belt's
+    # *center*, not just its width, follows the sub-solar latitude in reality (thermal-inertia-
+    # damped, not the full solar declination swing) -- this is what carves a wet season (ITCZ
+    # overhead) and a dry season (ITCZ displaced to the other hemisphere) out of savanna
+    # latitudes. `itcz_seasonal_response` is the damping fraction; 0.0 recovers the exact prior
+    # static-equator behavior. See its PlanetParams docstring for the root-cause measurement.
+    _itcz_center_deg = float(pp.itcz_seasonal_response) * math.degrees(pp.solar_declination(day_of_year))
+    itcz_window = np.exp(-(((lat_deg - _itcz_center_deg) / ITCZ_HALF_WIDTH_DEG) ** 2)).astype(np.float32, copy=False)
     storm_window = np.exp(-((abs_lat_deg - STORM_TRACK_CENTER_DEG) / 15.0) ** 2).astype(np.float32, copy=False)
     drybelt_window = np.exp(-((abs_lat_deg - DRYBELT_CENTER_DEG) / 8.0) ** 2).astype(np.float32, copy=False)
 
@@ -3430,6 +3469,49 @@ def generate_precipitation(
         CV_REF = 0.5  # row-CV at which the blend reaches full strength (saturates at 1.0 above this)
         target_profile = _zonal_precip_target_profile(lat_deg)  # (H,), mean(unweighted)=1.0
         target_row_mm_day = target_profile * np.float32(target_mean_mm_day)  # (H,)
+        if pp.itcz_seasonal_target_response > 0.0 and pp.itcz_seasonal_response > 0.0:
+            # Seasonal deficit-vs-target fix (2026-07-31, direct follow-up to
+            # itcz_seasonal_response): that fix gave `itcz_window` a real wet/dry
+            # seasonal cycle, but `target_row_mm_day` above is still a pure |lat|
+            # shape with zero day_of_year dependence -- every month this rescale
+            # was pulling a savanna-latitude row back toward the SAME annual-mean
+            # target regardless of season, i.e. refilling exactly the dip the
+            # other fix introduced (this was flagged, not fixed, in that fix's
+            # own docstring). Fix: let the target itself track the same seasonal
+            # signal, so a real dry-season month reads as "near its own target"
+            # instead of "in deficit" and doesn't get force-filled.
+            #
+            # Mean-preserving by construction: the modulation is
+            # `1 + k*(itcz_window(day) - itcz_window_annual_mean)`, and
+            # `itcz_window_annual_mean` is the actual time-average of
+            # `itcz_window` over a full seasonal cycle (see
+            # `_itcz_window_annual_mean`), so the modulation's own time-average
+            # is exactly 1.0 -- the row's calibrated annual-mean target (and
+            # therefore every existing latitude-band/desert/continental
+            # calibration built on it) is unaffected in the long run; only the
+            # within-year distribution changes. Self-limiting at high latitude
+            # (both `itcz_window(day)` and its mean shrink together there) and
+            # self-gating at `itcz_seasonal_response=0.0` (itcz_window is then
+            # time-invariant, so it always equals its own mean and this is an
+            # exact no-op even if `itcz_seasonal_target_response` is nonzero).
+            _itcz_window_mean = np.asarray(
+                _itcz_window_annual_mean(
+                    H,
+                    float(pp.itcz_seasonal_response),
+                    float(pp.obliquity_deg),
+                    float(ITCZ_HALF_WIDTH_DEG),
+                ),
+                dtype=np.float64,
+            )
+            _seasonal_target_mod = 1.0 + float(pp.itcz_seasonal_target_response) * (
+                itcz_window.astype(np.float64) - _itcz_window_mean
+            )
+            _seasonal_target_mod = np.clip(_seasonal_target_mod, 0.05, None)
+            target_row_mm_day = (
+                target_row_mm_day.astype(np.float64) * _seasonal_target_mod
+            ).astype(np.float32)
+            if debug_fields is not None:
+                debug_fields["itcz_seasonal_target_modulation"] = _seasonal_target_mod.astype(np.float32)
         dq_before = dq.copy()
         # Terrain-shaped per-cell target weight (mean=1.0 per row by
         # construction, so it reshapes each row's target -- and thus the

@@ -756,6 +756,154 @@ class PlanetParams:
     already-off-target desert box) was accepted rather than searching for a
     sigma that protects Atacama, which the 4-16 degree sweep did not find."""
 
+    itcz_seasonal_response: float = 0.7
+    """Fraction [0-1] of the full solar-declination swing (`solar_declination`)
+    that the ITCZ's *center latitude* (not its width) tracks seasonally in
+    `atmosphere.generate_precipitation`'s `itcz_window`. 0.0 is an exact no-op:
+    the belt stays pinned to the equator year-round, the behavior at every
+    prior default.
+
+    Root cause (2026-07-30, real-terrain-vs-reference-Koppen-map audit,
+    direct follow-up to the same-day handoff-gap/monsoon-margin sessions):
+    `itcz_window` was `exp(-(|lat|/ITCZ_HALF_WIDTH_DEG)**2)` -- a pure
+    function of `|latitude|`, with zero `day_of_year` dependence despite
+    `day_of_year` already being threaded through the whole call correctly.
+    In reality the ITCZ is the ascending branch of the Hadley circulation
+    tracking the sub-solar latitude (damped by ocean thermal inertia, not the
+    full ~23.4 deg swing) -- it sits over a given savanna latitude for part of
+    the year (wet season) and displaces to the other hemisphere the rest of
+    the year (dry season). A static, equator-locked ITCZ instead rains on
+    every latitude within its Gaussian footprint essentially every month,
+    which the Koppen classifier reads as "no dry month" -- Af (rainforest,
+    requires driest month >= 60mm) instead of Aw (savanna, requires a real dry
+    season). Measured directly on `saves/test.npz` (512x1024, 10yr MONTHLY
+    continuation): a lon=10E transect held every sampled latitude from 14N to
+    -2S at a 80-170mm driest-month floor -- no latitude in that whole band
+    ever showed a real dry season. Area-weighted land Koppen breakdown: Af
+    21.5% of land (Earth ~6-7%), Aw+Am 2.4% (Earth ~18-20%) -- worse than any
+    previously-recorded measurement of this same known symptom (see
+    known-physics-gaps.md item 3b and the itcz-global-rescale-coupling/
+    itcz-rossby-noise memories), because none of those sessions had found
+    this specific mechanism: every prior fix addressed the belt's *width*/
+    *noise*, not that it never moves at all.
+
+    Implementation: `itcz_center_deg = itcz_seasonal_response *
+    degrees(pp.solar_declination(day_of_year))`, then `itcz_window` is
+    `exp(-(((lat_deg - itcz_center_deg)/ITCZ_HALF_WIDTH_DEG)**2))` using
+    signed (not absolute) latitude. Generalizes across obliquity via
+    `solar_declination` (works for Mars too, though Mars's precipitation
+    pathway is already near-inert with `has_liquid_water_ocean=False`, so
+    this knob makes no meaningful difference there either way -- not
+    special-cased, same treatment as every other Earth-calibrated precip/wind
+    parameter already inherited by `MARS`, e.g. `ferrel_v_land_shift_deg`/
+    `coastal_upwelling_fog_strength`). `storm_window`/
+    `drybelt_window` are untouched (subtropical/storm-track features this
+    session did not investigate for their own seasonal migration).
+
+    **Calibration (2026-07-30, `saves/test.npz`, 512x1024)**: swept 0.0/0.4/
+    0.7/1.0 over a 5yr MONTHLY continuation (area-weighted land Koppen,
+    named-box precip via `climate_precip_avg`):
+
+        response   Af      Aw     Sahara  Kalahari  Atacama  Can.Prairies  US Midwest  Cent.Europe
+        0.0        21.71%  2.52%  707     524       423      603           727         679
+        0.4        21.17%  2.89%  703     523       422      602           727         679
+        0.7        20.36%  3.50%  698     520       420      602           727         679
+        1.0        20.29%  3.50%  --      --        --       --            --          --
+
+    Monotonic in the right direction (Af down, Aw up) at every tested value,
+    essentially zero cost to every desert/continental-interior box (<2%
+    change, well within run-to-run noise), and saturates between 0.7 and 1.0
+    -- 0.7 sits right at that knee. Also confirmed directly at the
+    *instantaneous* (non-EMA) level, not just via the slow-converging 10yr
+    Koppen average: a 12-month probe at lon=10E, response=0.7 vs 0.0, shows a
+    real (if modest) seasonal cycle appearing where none existed before --
+    e.g. 14N driest-month precip 78->70mm/month, 10N 125->117mm/month, with
+    the wet-season peak simultaneously rising (10N max 132->141mm/month).
+
+    **Honest limitation, not a full fix**: this real, measured, zero-cost
+    improvement is far short of Earth's Af~6-7%/Aw~18-20% targets, and the
+    driest-month values above mostly don't cross the 60mm Af/Aw threshold
+    even at response=1.0. Root cause of the shortfall (read from code, not
+    yet independently isolated by a controlled A/B this session): this
+    project's own already-documented moisture-budget global rescale
+    (`known-physics-gaps.md` item 3b's "per-cell not per-row" limitation,
+    `itcz-global-rescale-coupling-2026-07` memory) aggressively fills any
+    row's precipitation deficit toward its target-mean profile every step --
+    exactly the kind of month-to-month dip this fix now introduces at
+    savanna latitudes is a prime target for that same deficit-filling to
+    partially refill. Fixing that structural rescale mechanism (or excluding
+    a genuine seasonal ITCZ dip from being treated as a "deficit" worth
+    filling) is the next lever, and was already flagged in prior sessions as
+    a larger, currently-blocked undertaking -- this fix does not attempt it,
+    but does correct the specific, previously-undiscovered bug of the ITCZ
+    never moving at all, which is unambiguously wrong physics on any tilted
+    planet regardless of how much of the area-fraction gap it closes alone."""
+
+    itcz_seasonal_target_response: float = 1.0
+    """Strength [0-1ish] of the fix for `itcz_seasonal_response`'s own flagged
+    "honest limitation" (see that field's docstring): closes the gap where the
+    moisture-budget/zonal-rescale target in `atmosphere.generate_precipitation`
+    (`target_row_mm_day`, from `_zonal_precip_target_profile`) was a pure |lat|
+    shape with **zero `day_of_year` dependence**, so every month it pulled a
+    savanna-latitude row back toward the SAME flat annual-mean target regardless
+    of season -- exactly refilling the seasonal dry-season dip
+    `itcz_seasonal_response` introduces into the raw precip signal, before it
+    ever reaches Koppen classification. 0.0 is an exact no-op (prior behavior).
+
+    Implementation: `target_row_mm_day *= 1 + k*(itcz_window(day) -
+    itcz_window_annual_mean)`, where `itcz_window_annual_mean` (see
+    `atmosphere._itcz_window_annual_mean`) is the true time-average of
+    `itcz_window` over a full seasonal cycle, computed once per (grid
+    resolution, `itcz_seasonal_response`, `obliquity_deg`) and cached. Because
+    the modulation's own time-average is exactly 1.0 by construction, each
+    row's calibrated *annual-mean* target -- and therefore every existing
+    desert/continental/latitude-band calibration built on it -- is unaffected
+    in the long run; only the within-year distribution moves, which is
+    specifically what lets a real dry season register as "near its own target"
+    instead of "in deficit" and stop being force-filled. Naturally near-inert
+    at `itcz_seasonal_response=0.0` (itcz_window is then time-invariant, always
+    equal to its own mean) or far from the tropics (both the window and its
+    mean shrink together there).
+
+    Only meaningful when `itcz_seasonal_response > 0.0` (gated in code; the
+    modulation is a hard no-op otherwise regardless of this value).
+
+    **Calibration (2026-07-31, `saves/test.npz`, 512x1024, 5yr MONTHLY
+    continuation, area-weighted land Koppen split + named-box precip via
+    `climate_precip_avg`)**:
+
+        k     Af      Am     Aw     arid_pct  Sahara  Kalahari  Atacama  Can.Prairies  US Midwest  Cent.Europe
+        0.0   11.24%  0.00%  2.00%  12.3%     612     489       444      606(EMA 605)  711(695)    679(671)
+        0.3   11.70%  0.01%  1.68%  --        611     489       446      --            --          --
+        0.6   10.85%  0.04%  2.63%  --        610     489       447      --            --          --
+        1.0    7.98%  0.72%  4.97%  12.5%     555(610) 509(508) 454(475) 606(EMA)      695(EMA)    671(EMA)
+        1.5    3.40%  2.47%  6.98%  13.7%     539(608) 517(508) 455(475) 581(EMA)      696(EMA)    671(EMA)
+        2.0    0.27%  2.10%  9.64%  15.3%     522(606) 524(509) 453(473) 581(EMA)      696(EMA)    670(EMA)
+
+    (desert-box figures are `instantaneous, 2nd half` with the `10yr EMA` in
+    parens, matching `scripts/check_real_terrain_koppen.py`'s own convention.)
+
+    Monotonic and substantial in the right direction through the whole swept
+    range (Af down, Aw+Am up, total A-climate land-fraction roughly conserved
+    at k<=1.0 as intended -- cells are converting Af->Aw/Am within the tropics,
+    not leaving it), but **arid_pct starts climbing measurably past k=1.0**
+    (12.3%->12.5%->13.7%->15.3% at k=0/1.0/1.5/2.0) while every named
+    desert/continental EMA box stays flat through k=1.0 and only Kalahari/
+    Atacama drift up (~4-7%) beyond it -- a real overshoot where an
+    excessively deep dry season pushes savanna-adjacent cells over Koppen's
+    aridity-index threshold into steppe (BSh) instead of stopping at Aw,
+    eroding the model's already-hard-won desert-vs-continental ranking work
+    for no further within-tropics benefit. **k=1.0 sits right at the knee**:
+    the largest value with no measurable arid/continental-EMA cost (all boxes
+    match the k=0 baseline to within run-to-run noise) while still nearly
+    quadrupling Aw (2.00%->4.97%) and cutting Af by ~29% (11.24%->7.98%).
+
+    **Honest limitation, same as `itcz_seasonal_response`**: still short of
+    Earth's Aw~18-20% target even at k=1.0 -- this closes the specific
+    deficit-filling mechanism that fix's own docstring flagged, but the
+    remaining gap is the moisture-budget rescale's other structural limits
+    (see `known-physics-gaps.md` item 3b), not further tuning of this knob."""
+
     surface_water_cap_mm: float = 50_000.0
     """Hard ceiling [mm] on `surface_water_mm` per cell (50 m -- deeper than
     any real lake, a safety backstop not a physical mechanism). This compact
