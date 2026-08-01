@@ -5,7 +5,7 @@ local, generated, or overnight experiments. Raw logs and large result artifacts
 remain intentionally ignored. Detailed measurement tables for the most recent
 wind work are tracked in `PLAN_PHYSICS_FIXES.md`.
 
-Last updated: 2026-07-27.
+Last updated: 2026-08-01.
 
 ## Rules learned from prior investigations
 
@@ -83,35 +83,46 @@ center. `ferrel_v_land_shift_deg` then permits an additional land-only shift so
 continental convergence can move without over-wetting the ocean-dominated
 40–50°N zonal mean. The current defaults are 44° and −4° respectively.
 
-### Spherical moisture-convergence operator
+### Spherical moisture-convergence operator (shipped as default, 2026-07-26)
 
-The legacy precipitation kernel omits spherical metric factors and leaves pole
-rows at zero. A closed-form tested spherical operator now exists behind
-`spherical_metric_precip`, but remains disabled because enabling it increases
-high-latitude precipitation while worsening an independent precipitation
-rescale-saturation problem. Fix the target/rescale mechanism before changing
-this default.
+The legacy precipitation kernel omitted spherical metric factors and left pole
+rows at zero. `spherical_metric_precip` and `spherical_metric_clouds` are now
+both `True` by default (`planet_params.py`) — a dimensionally-incompatible
+epsilon in the normalization that had nearly erased the corrected signal was
+found and fixed alongside the flip. The small real-terrain reference-error
+cost (~2-3%) was accepted to remove the coordinate error and support
+high-obliquity/polar worlds; it still compounds the separate, still-open
+precipitation rescale-saturation problem below rather than fixing it. See
+`PLAN_PHYSICS_FIXES.md`'s 2026-07-26 "spherical precipitation and cloud
+metrics shipped" entry.
 
-## Open correctness issues
+### Calendar aliasing (fixed 2026-07-26)
 
-### Calendar aliasing
+ANNUAL mode used to advance 52 × 7 = 364 days per nominal Earth year, a
+1.2422-day phase slip that produced an approximately 294-year false
+oscillation in seasonal metrics; MONTHLY mode had the same class of problem
+at 30 days per cycle. Fixed by centralizing the substep schedule into
+`time_policy.py`'s `substeps_for_mode`/`cycle_days`, both derived from
+`PlanetParams.orbital_period_days` directly (commit `dfaf41c`). Verified
+2026-08-01 via `testing/test_generalize_time_orbit.py`; see
+`docs/ACCURACY_AUDIT.md` C2.
 
-ANNUAL mode advances 52 × 7 = 364 days per nominal Earth year. The 1.2422-day
-phase slip produces an approximately 294-year false oscillation in seasonal
-metrics. MONTHLY mode has the same class of problem at 30 days per cycle.
-Substep policy must be derived from `PlanetParams.orbital_period_days`.
+### Diagnostic-wind cache key (fixed)
 
-### Carbon-cycle flag coupling
+`_RELAX_CACHE`'s key in `simulate.py` now includes `pgf_continentality_amp`,
+`ferrel_v_centre_deg`, and `ferrel_v_land_shift_deg` together, so interleaved
+parameter experiments at the same simulated time no longer reuse a stale wind
+target from before this fix.
 
-`enable_carbon_cycle=False` also disables CO₂/CH₄ radiative forcing. It does not
-mean “hold concentrations fixed.” Fixed-concentration experiments must keep
-radiative forcing active while suppressing only reservoir evolution.
+### Carbon-cycle flag coupling (fixed)
 
-### Diagnostic-wind cache key
-
-`_RELAX_CACHE` includes `pgf_continentality_amp` but omits
-`ferrel_v_centre_deg` and `ferrel_v_land_shift_deg`. Interleaved parameter
-experiments at the same simulated time can reuse stale wind targets.
+`enable_carbon_cycle=False` used to also disable CO₂/CH₄ radiative forcing,
+silently breaking any fixed-concentration experiment that expected "hold
+concentrations fixed, keep radiative physics active." `simulate_step` now takes
+an independent `apply_greenhouse_forcing: bool = True` parameter, and the
+greenhouse-forcing gate reads `apply_greenhouse_forcing`, not
+`enable_carbon_cycle` (`simulate.py:788`). See
+`testing/test_co2_feedback.py::test_fixed_co2_keeps_greenhouse_forcing_active`.
 
 ## Open structural physics gaps
 
@@ -156,13 +167,26 @@ structural errors.
 
 ### Regional mechanisms
 
-- Atacama remains too wet because cold-current/coastal-fog desert physics is
-  absent.
-- Salinity uses a temperature-derived evaporation proxy rather than the actual
-  freshwater flux.
-- Land ice has age/hysteresis but no mass balance, thickness, flow, or sea-level
-  coupling.
-- Land water has no lateral runoff, rivers, or lakes.
+- Atacama remains too wet (~207 mm/yr vs. a <50 target). A diagnostic
+  west-coast/dry-belt suppression gate (`coastal_upwelling_fog_strength`,
+  default 0.5) now exists and gave a real, isolated improvement
+  (123→102 mm/yr), but it is a proxy gate, not real simulated ocean
+  upwelling — no SST-coupled cold-current physics exists. See
+  `docs/ACCURACY_AUDIT.md` A1/D3.
+- Salinity uses a temperature-derived evaporation proxy by default. A real
+  freshwater-flux pathway (river runoff into `evolve_salinity`) exists behind
+  `PlanetParams.enable_surface_hydrology` (default `False`), so this is only
+  true while that flag is off.
+- Land ice now has a real mass-balance/thickness/flow mechanism and a
+  `sea_level_change_m` diagnostic behind `PlanetParams.enable_land_ice_dynamics`
+  (default `False`), not just age/hysteresis — but still has no albedo
+  coupling, no calving→salinity coupling, and no mask/coastline feedback. See
+  `docs/ACCURACY_AUDIT.md` E2.
+- Land water can now route lateral runoff/rivers/lakes behind
+  `PlanetParams.enable_surface_hydrology` (default `False`) — three real bugs
+  were fixed, but the router has no channel capacity/velocity concept, so
+  continent-scale basins can pool to unbounded depth (capped only by a 50m
+  safety valve). See `docs/ACCURACY_AUDIT.md` E1.
 
 ## Current validation status
 

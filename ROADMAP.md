@@ -79,10 +79,10 @@ relative to its climate influence.
   misses the shallow-tropics/deep-subpolar contrast that shapes seasonal SST
   lag; a latitude-dependent mixed-layer depth is cheap and would let the
   hand-tuned ocean seasonal-lag fractions be derived instead of prescribed.
-- **Ocean CO2 uptake with proper piston velocity.** Currently uses
-  instantaneous wind² which double-counts storm variance at daily steps; use
-  the monthly-mean wind speed (already effectively cached with the 30-day
-  ocean update).
+- ~~**Ocean CO2 uptake with proper piston velocity.**~~ **Done.** `carbon_cycle.ocean_co2_flux`
+  now consumes `state.wind_speed_avg`, a rolling EMA over
+  `PlanetParams.co2_wind_averaging_days` (default 30d) maintained in `simulate.py`, instead of
+  the instantaneous per-step wind speed. See `docs/ACCURACY_AUDIT.md` D4.
 
 ## Theme 3 — Planet generalization (toward random planets)
 
@@ -158,9 +158,9 @@ relative to its climate influence.
   conservative). Now that CH4 has a baseline-balancing natural source
   (2026-07-03), the perturbation fluxes could be raised toward realistic
   magnitudes with the optimizer verifying stability.
-- **CLIMATE_SENSITIVITY constant cleanup.** carbon_cycle.py's default 1.4
-  K/(W/m²) disagrees with PlanetParams' 0.8 default; callers all pass
-  explicitly today, but the constant is a trap for new code.
+- ~~**CLIMATE_SENSITIVITY constant cleanup.**~~ **Done.** `carbon_cycle.CLIMATE_SENSITIVITY`
+  is now `0.8`, matching `PlanetParams.co2_climate_feedback`'s default (see the comment at
+  `carbon_cycle.py:145`).
 - **Ocean carbonate chemistry.** A single well-mixed ocean CO2 reservoir now;
   a 2-box (surface/deep) split with a solubility pump would give realistic
   ~century-scale CO2 drawdown and make the ECS experiments more meaningful.

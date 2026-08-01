@@ -1,8 +1,8 @@
 ## Testing Layout
 
 This folder is a standard pytest suite (`pytest.ini` + `conftest.py` fixtures at the repo
-root/`testing/`), not a collection of standalone scripts. As of 2026-07-26, it holds
-roughly 50 `test_*.py` modules and collects 429 tests. Use pytest collection as the
+root/`testing/`), not a collection of standalone scripts. As of 2026-08-01, it holds
+roughly 57 `test_*.py` modules and collects 446 tests. Use pytest collection as the
 authoritative count because the suite changes frequently:
 
 ```powershell

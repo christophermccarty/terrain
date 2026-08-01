@@ -541,8 +541,10 @@ validation-driven pass (see ROADMAP.md).
 - New `PlanetState` fields `wind_u_aloft`/`wind_v_aloft` (`None`-default, lazy-initialized as a
   copy of the surface wind on first use — same NamedTuple-default migration pattern as every
   other feature added this way; old saves load and step correctly, verified by a dedicated test).
-- New `PlanetParams` fields: `wind_upper_pgf_amp` (default 8.0, Mars 4.8) and `wind_upper_damping`
-  (default 0.05/day, Mars 0.08). Not added to `optimizer/configs/sweep_wind.json` — confirmed
+- New `PlanetParams` fields: `wind_upper_pgf_amp` (launched at 8.0, Mars 4.8 — recalibrated twice
+  since in later sessions for realistic jet magnitude/position; current default is 90.0, Mars 54.0,
+  see `planet_params.py`) and `wind_upper_damping` (default 0.05/day, Mars 0.08, unchanged). Not
+  added to `optimizer/configs/sweep_wind.json` — confirmed
   other recent PlanetParams-only physics knobs (`storm_pressure_amp_pa`, `eddy_heat_flux_coeff`,
   `ekman_strength`) aren't in any sweep config either, since that file's `param_space` entries are
   `simulate_step` kwargs, not PlanetParams fields (no PlanetParams-to-kwargs sweep path exists in
@@ -641,7 +643,7 @@ covers cross-mode stability.
 | Wind → Ekman → SST | wind → ocean drift → SST | ✅ Wired (`compute_ekman_transport` called from `_evolve_temperature`'s 30-day ocean-update block, scaled by `pp.ekman_strength`) |
 | Precip → soil → vegetation | P → soil_moisture → NPP | ✅ Active |
 | Cloud ↔ precipitation | cloud_fraction ↔ precip | ✅ Active (added 2026-07: rain depletes cloud_fraction; cloud_fraction adds a stratiform precip term) |
-| Ice → wind (pressure) | ice → surface albedo → pressure | ❌ Not modeled — still a known, low-priority gap |
+| Ice → wind (pressure) | ice → pressure anomaly → wind | ✅ Done 2026-07-01 — `evolve_wind(ice_cover=..., ice_pressure_scale=40.0)` adds `p_ice` to the pressure-anomaly field (`atmosphere.py`) |
 
 `feedback_flags` dict on `simulate_step` and `testing/test_feedback_flags.py` both exist,
 covering per-loop enable/disable testing.
@@ -752,12 +754,16 @@ PLAN_PHYSICS.md and IMPLEMENTATION_PLAN.md for the (now-archived) plans that pro
 
 - **Stratosphere / upper atmosphere** — single-layer model is intentional for performance; document the gap
 - **3D ocean** — zonal-mean 1D transport is the chosen approximation; real OGCM would require order-of-magnitude more compute
-- **Lightning / wildfire dynamics** — carbon_cycle has stubs; defer until biome model is mature
+- **Lightning-strike ignition** — `carbon_cycle.wildfire_dynamics()` is fully implemented and
+  wired into `simulate.py` (temperature/dryness-threshold triggered, cache-gated by
+  `CARBON_SLOW_UPDATE_INTERVAL_DAYS`); only a lightning-specific ignition source is absent
 - **Cloud microphysics** — cloud_cover prognostic; a basic precip↔cloud coupling was added 2026-07 (rain depletes
   cloud_fraction; cloud_fraction adds a stratiform term to precipitation potential), but there's still no explicit
   cloud water/ice content or cloud typing — this is a coupling of two diagnostics, not real microphysics
-- **Continent topology-aware gyres** — ocean currents use topology where land elevation is available but not fully geometry-driven
-- **Ice → wind (pressure) feedback** — not modeled (see Phase 2 table); low priority
+- **Continent topology-aware gyres** — `ocean.compute_gyre_currents()` (added Jul 2026) now
+  solves a real 2D wind-stress-curl-driven streamfunction for genuine gyre structure (western
+  boundary currents, subpolar gyres), wired into `simulate.py`; base heat transport is still
+  1D zonal-mean, so full geometry-driven circulation is still partial, not absent
 - **Ice-age proof-of-concept scenario** (PLAN_PHYSICS.md Effort 2E) — stretch goal, never run; `experiments/` directory doesn't exist yet
 
 ### RESOLVED (2026-07-03): NH gradient fix vs. eddy heat flux test tension

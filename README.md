@@ -42,8 +42,9 @@ the GUI falls back to deterministic procedural terrain.
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 429 tests. Slow tests cover multi-decadal climate
-drift, conservation, circulation, seasonal behavior, and reanalysis anchors.
+The suite currently collects 446 tests (verify with `--collect-only -q`, since
+this count changes frequently). Slow tests cover multi-decadal climate drift,
+conservation, circulation, seasonal behavior, and reanalysis anchors.
 
 ## Headless runs and benchmarks
 
@@ -77,7 +78,7 @@ weather processes.
 - `sim_grid.py` — coarsening utilities and static-terrain cache
 - `state_persistence.py` — safe NPZ persistence and legacy-save migration
 - `gui_worker.py` / `gui_view_cache.py` — threaded ownership and view-layer caches
-- `simulate.py` / `main.py` — numerical integration and Tk application shell
+- `main.py` — Tk application shell, rendering, and event handling
 - `diagnostics.py` — climate metrics, budgets, and data export
 - `optimizer/` — headless runner, scoring, sweeps, and Bayesian search
 - `testing/` — analytic, regression, integration, and long-horizon tests

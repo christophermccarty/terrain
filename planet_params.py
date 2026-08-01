@@ -756,6 +756,40 @@ class PlanetParams:
     already-off-target desert box) was accepted rather than searching for a
     sigma that protects Atacama, which the 4-16 degree sweep did not find."""
 
+    subsidence_divergence_regime_gate: float = 1.0
+    """Strength [0-1] of regime correction for the zonal-background part of
+    the wind-divergence signal used by `subsidence_suppression`.
+
+    Root cause (2026-08-01, ACCURACY_AUDIT.md A5/B1 follow-up): the wind
+    model's own zonal-mean divergence field peaks at ~38-45 deg N/S instead
+    of Earth's ~25-30 deg subtropical high (B1) -- real continental-interior
+    latitudes (US Midwest's own box, 38-45N) sit right in that displaced
+    peak. `_subsidence_norm_early` reads raw local wind divergence with no
+    latitude-regime awareness at all, so it registers Midwest's own spurious
+    divergence as if it were real desert subsidence: measured directly
+    (`saves/earth.pkl`, 512x1024, 2yr MONTHLY real-terrain continuation),
+    US Midwest's `subsidence_suppression` averages 0.196 -- nearly as
+    suppressed as the Sahara's own 0.446 mean -- even though Midwest sits far
+    outside `drybelt_window`'s ~28 deg peak and should see almost none of
+    this gating. Since `subsidence_suppression` gates both `land_evap` and
+    `precip_potential` (and shapes the desert/continental `cell_weight`
+    redistribution target), this directly fights A3's continental-interior
+    shortfall at the same mechanism relied on to fix A1's desert-too-wet gap.
+
+    The first version multiplied the entire local divergence signal by a
+    latitude window.  Its gate=1 sweep made Sahara 30% wetter because it also
+    erased useful local desert subsidence.  The shipped version decomposes
+    divergence into the zonal row mean plus the cell-local anomaly, attenuates
+    only the contaminated zonal background outside the true dry belt, and
+    preserves local information everywhere.  It is paired with the widened
+    subtropical regime and wet-regime raw-conversion calibration documented in
+    ACCURACY_AUDIT.md A5/B1.  On the 512x1024 two-year seasonal validation this
+    package changes Sahara/Kalahari/Atacama from 586/509/419 to 131/130/102
+    mm/yr, Midwest from 480 to 709, and raw rescale from 5.462x to 2.064x.
+
+    0.0 retains the zonal background everywhere; 1.0 applies the full regime
+    correction and is the calibrated Earth default."""
+
     itcz_seasonal_response: float = 0.7
     """Fraction [0-1] of the full solar-declination swing (`solar_declination`)
     that the ITCZ's *center latitude* (not its width) tracks seasonally in
@@ -1015,6 +1049,45 @@ class PlanetParams:
     signal) -- already attempted and failed via 4+ different mechanisms in
     `known-physics-gaps.md` item 3b UPDATES 3-9 (moisture transport, soil
     bucket, evapotranspiration gating, wind convergence)."""
+
+    moisture_budget_tropical_cap_boost: float = 0.0
+    """[0-1ish] Raises `_moisture_budget_precip_rescale`'s per-step removal caps
+    (`max_total_removal_fraction`/`max_added_removal_fraction`, normally the
+    flat constants 0.85/0.15 everywhere) specifically inside the ITCZ, gated by
+    `itcz_window` exactly like `precip_raw_shape_weight`. `0.0` is an exact
+    no-op (both caps stay their flat scalar default, byte-for-byte).
+
+    Motivated by a direct measurement this session (2026-08-01, `saves/earth.pkl`,
+    512x1024, 2yr MONTHLY real-terrain, `debug_fields["precip_rescale_capacity_limited"]`
+    zonal-mean): the moisture-budget rescale is capacity-limited (pinned at its
+    cap, still short of `target_row_mm_day`) at *every* sampled latitude, not
+    just the dry/cold ones -- including the deep tropics, which only reach
+    ~0.85-0.94 of target despite sitting on the planet's most abundant ocean
+    moisture supply. This reframes `precip_raw_shape_weight`'s and A5's
+    documented "raw production is too scarce" finding: it is not merely that
+    raw physics under-produces relative to a target that's otherwise
+    reachable -- the *aspirational-fill mechanism itself* is capped below what
+    even the tropics' own (comparatively abundant) moisture reserve could
+    supply.
+
+    This differs from the previously-reverted flat/global cap raise (see A5 in
+    `docs/ACCURACY_AUDIT.md`: "made desert/continental ranking worse --
+    draining continental interior's q faster than land_evap replenishes it").
+    That attempt raised the cap *everywhere*, including the already-fragile
+    mid-latitude/dry-belt rows where q has little margin to spare. This knob
+    only ever raises the cap where `itcz_window` is nonzero, leaving every
+    other regime's cap at exactly 0.85/0.15 -- deliberately narrower in scope
+    than the earlier attempt, to test whether the previous failure mode was
+    caused by the *global* reach of that fix rather than by cap-raising in
+    general.
+
+    Implementation: `_moisture_budget_precip_rescale` now accepts either a
+    scalar or a per-row `np.ndarray` for both cap parameters (scalar path is
+    byte-identical to the prior behavior; existing unit tests call it with
+    scalar defaults and are unaffected). `generate_precipitation` builds
+    `max_total_removal_fraction_row = clip(0.85 + boost*0.10*itcz_window, ..., 0.95)`
+    and `max_added_removal_fraction_row = clip(0.15 + boost*0.15*itcz_window, ..., 0.30)`
+    when `moisture_budget_precip_rescale` is enabled."""
 
     surface_water_cap_mm: float = 50_000.0
     """Hard ceiling [mm] on `surface_water_mm` per cell (50 m -- deeper than

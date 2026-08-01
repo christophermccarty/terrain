@@ -15,35 +15,28 @@
 
 ## Tier 1 — Recommended next
 
-### 1. Surface hydrology: runoff routing, rivers, and lakes
-**Effort: large. Touches: new module (`hydrology.py`), `simulate.py`, `masks.py`, `main.py`.**
+### 1. Surface hydrology: runoff routing, rivers, and lakes -- **Shipped 2026-07-27, default off**
+**Effort: large. Touches: `hydrology.py`, `simulate.py`, `masks.py`.**
 
-The biggest structural hole in the model. There is currently **no lateral movement of water
-on land at all** — `soil_moisture` / `soil_moisture_deep` are per-cell buckets with no
-knowledge of their neighbours. Water that falls on a cell either evaporates from that cell or
-disappears.
+`PlanetParams.enable_surface_hydrology` (default `False`) adds a D8 flow-accumulation router
+(`hydrology.py`) draining `soil_moisture`/`soil_moisture_deep` downslope into a per-cell
+surface-water store, with discharge feeding `ocean.evolve_salinity` as real freshwater flux.
+Three real bugs were found and fixed while calibrating it: salinity ignored runoff entirely,
+the runoff trigger checked the chronically-floored surface bucket instead of the deep layer,
+and standing water had no evaporative sink.
 
-Why this is the top pick:
-- **It attacks an open Part 1 problem from a new direction.** Continental interiors can
-  presently only be wetted by atmospheric transport, which is exactly the wall that has
-  consumed roughly eight sessions of work (known-physics-gaps item 3b, UPDATES 1-9). Runoff
-  gives moisture a second, physically-correct pathway that does not have to out-run the
-  RH-threshold convective trigger.
-- **It closes the freshwater budget.** `ocean.evolve_salinity` currently uses a
-  temperature-only evaporation *proxy* with a hand-calibrated coefficient because there is no
-  real freshwater flux to the ocean. River discharge would make salinity a derived quantity
-  instead of a tuned one, and would let the deferred freshwater conservation dashboard
-  actually be written.
-- **Lakes and wetlands become real evaporation sources**, which matters for continental
-  climates and for the wetland-CH4 term that is currently a toy constant.
-- **It is the highest visual payoff available.** Rivers on the biome map are the single most
-  legible "this is a real planet" cue this simulator could add.
+**Why it still defaults off**: the router has no channel-capacity or flow-velocity concept.
+A continent-scale basin (Amazon/Congo-scale) funnels its full discharge into one grid cell
+with no lateral spreading, producing area-averaged depths in the hundreds of meters (measured:
+one cell hit 611m over a 10yr continuation, growing linearly, not asymptoting). A
+`surface_water_cap_mm` (50m) hard ceiling was added as a safety valve, not a fix. See
+`docs/ACCURACY_AUDIT.md` E1 for the full writeup.
 
-Suggested shape: D8 or D-infinity flow accumulation over the existing elevation field
-(precomputed once per terrain, cached like `masks.get_masks`), a per-cell surface-water store
-draining downslope with a residence time, lake formation in closed basins, and discharge into
-ocean cells feeding `evolve_salinity`. Flow accumulation is a static precompute, so the
-per-step cost is one sparse gather — cheap enough for the MONTHLY hot path.
+**Remaining work**: actual channel hydraulics — a flow-accumulation-weighted capacity/velocity
+term, so discharge exceeding a cell's physical channel capacity spills laterally instead of
+pooling to unbounded depth. Rivers on the biome map remain the highest visual-payoff item
+available once this is solved — lakes and wetlands as real evaporation sources would also
+finally give the wetland-CH4 term (currently a toy constant) something physical to respond to.
 
 ### 2. Dynamic ice sheets with a real mass balance -- **Shipped 2026-07-28, default off**
 
@@ -116,12 +109,16 @@ A versioned gridded reference (T, P, wind at ~2°) plus spatial correlation and 
   designed to take an arbitrary `ReferenceClimate`.
 
 ### 5. Prognostic AMOC + freshwater hosing
-**Effort: medium. Touches: `ocean.py`, `PlanetParams`, `simulate.py`.**
+**Effort: medium. Touches: `simulate.py`, `PlanetParams`.**
 
-AMOC is currently a scale factor modulated by ice cover. Salinity already exists as a real
-prognostic field and (since the Jul 2026 coefficient fix) is stable at ~35.2 PSU. Making AMOC
-strength respond to high-latitude density — temperature and salinity — instead of being
-prescribed would:
+AMOC is now partially prognostic: `amoc_factor` responds to both NH sea-ice cover and a real
+North Atlantic salinity anomaly (`PlanetParams.salinity_amoc_scale`, a +1 PSU anomaly multiplies
+it by 1.15) — see `simulate.py:595-631`. What's still missing is a *temperature* density
+contribution (salinity-only today) and deriving the base `amoc_bonus_near`/`amoc_bonus_far`
+magnitudes from an actual overturning-strength calculation rather than prescribing them as
+constants; see `docs/ACCURACY_AUDIT.md` D2. Salinity itself is a real prognostic field, stable
+at ~35.3 PSU since the Jul 2026 coefficient fix. Finishing the temperature-density coupling
+would:
 - Unlock hosing experiments, AMOC bistability, and Younger-Dryas-style collapse scenarios.
 - Make the ocean module less of "the weakest module relative to its climate influence."
 - Compose with item 1 (river discharge is the natural freshwater forcing) and item 2
@@ -173,8 +170,9 @@ so much is already parameterized:
 ### 9. More view layers
 **Effort: small each. Touches: `main.py`.**
 
-Nine views exist. Several of the most heavily-debugged fields in the entire project have no
-way to be looked at: **soil moisture, humidity, salinity, sea-ice thickness, snow depth,
+Ten views exist (a "Surface Water" view was added alongside the hydrology feature above).
+Several of the most heavily-debugged fields in the entire project still have no way to be
+looked at: **soil moisture, humidity, salinity, sea-ice thickness, snow depth,
 subsidence suppression, and the pre-rescale precipitation potential**. Given how many sessions
 were spent reasoning about these fields through box-averaged CLI output, a map view is
 disproportionately useful.

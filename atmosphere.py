@@ -255,8 +255,8 @@ def _moisture_budget_precip_rescale(
     column_mm_per_q: float,
     allocation_affinity: np.ndarray | None = None,
     target_cell_weight: np.ndarray | None = None,
-    max_total_removal_fraction: float = 0.85,
-    max_added_removal_fraction: float = 0.15,
+    max_total_removal_fraction: float | np.ndarray = 0.85,
+    max_added_removal_fraction: float | np.ndarray = 0.15,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Move row precipitation toward targets without multiplying every cell.
 
@@ -278,6 +278,13 @@ def _moisture_budget_precip_rescale(
     latitude at which a row's classification threshold gets crossed is
     identical for every column regardless of real terrain -- see
     razor-sharp-biome-line-precip-target-smoothing-2026-07-28 memory.
+
+    `max_total_removal_fraction`/`max_added_removal_fraction` accept either a
+    scalar (the original behavior, applied identically to every row -- exact
+    byte-for-byte match with prior callers, including this module's own unit
+    tests) or a per-row `np.ndarray` of shape `(H,)`, letting a caller vary
+    the removal cap by latitude/regime (see `PlanetParams.
+    moisture_budget_tropical_cap_boost`).
     """
     dq64 = np.asarray(dq, dtype=np.float64)
     q64 = np.maximum(np.asarray(q, dtype=np.float64), 0.0)
@@ -302,7 +309,13 @@ def _moisture_budget_precip_rescale(
         raise ValueError("dt_days and column_mm_per_q must be positive")
 
     H, W = dq64.shape
-    result = np.clip(dq64, 0.0, max_total_removal_fraction * q64)
+    total_cap_row = np.broadcast_to(
+        np.asarray(max_total_removal_fraction, dtype=np.float64), (H,)
+    )
+    added_cap_row = np.broadcast_to(
+        np.asarray(max_added_removal_fraction, dtype=np.float64), (H,)
+    )
+    result = np.clip(dq64, 0.0, total_cap_row[:, None] * q64)
     raw_row_mean = np.mean(result, axis=1)
     target_row_dq = targets * float(dt_days) / float(column_mm_per_q)
     capacity_limited = np.zeros(H, dtype=bool)
@@ -339,8 +352,8 @@ def _moisture_budget_precip_rescale(
         if remaining <= 1e-15:
             continue
 
-        total_cap = max_total_removal_fraction * q64[row]
-        per_step_cap = result[row] + max_added_removal_fraction * q64[row]
+        total_cap = total_cap_row[row] * q64[row]
+        per_step_cap = result[row] + added_cap_row[row] * q64[row]
         capacity = np.maximum(np.minimum(total_cap, per_step_cap) - result[row], 0.0)
         if target_cell_row is not None:
             # Hard per-cell fill ceiling at each cell's own (terrain-shaped)
@@ -1776,6 +1789,11 @@ def evolve_wind(
         else:
             _, land_mask_full = get_masks(elevation)
             land_f_full = land_mask_full.astype(np.float32)
+            _land_shift_taper = np.clip((55.0 - abs_deg_1d) / 10.0, 0.0, 1.0)
+            _land_shift_taper = (
+                _land_shift_taper * _land_shift_taper * (3.0 - 2.0 * _land_shift_taper)
+            ).astype(np.float32)
+            land_shift_f = land_f_full * _land_shift_taper[:, None]
             _vc_land_nh = _v_centre + _v_land_shift + float(pp.jet_lat_shift_per_index) * float(jet_index_nh)
             _vc_land_sh = _v_centre + _v_land_shift + float(pp.jet_lat_shift_per_index) * float(jet_index_sh)
             w_mid_v_land_nh = np.where(
@@ -1791,7 +1809,7 @@ def evolve_wind(
             v_mid_land = V_TARGET_MIDLAT * (speed_nh * w_mid_v_land_nh + speed_sh * w_mid_v_land_sh)
             v_target_land = (V_TARGET_TRADE * w_trade + v_mid_land + V_TARGET_POLAR * w_polar).astype(np.float32, copy=False) * sign_lat
             v_target_land = np.where(np.abs(lat_2d[:, 0]) < np.deg2rad(2.0), 0.0, v_target_land).astype(np.float32, copy=False)
-            v_target_2d = v_target[:, None] * (1.0 - land_f_full) + v_target_land[:, None] * land_f_full
+            v_target_2d = v_target[:, None] * (1.0 - land_shift_f) + v_target_land[:, None] * land_shift_f
         k_cell = 1.0 / (tau_cell * 86400.0)
     
     for _ in range(n_steps):
@@ -2388,7 +2406,12 @@ def generate_wind_field(
     else:
         _v_centre_land = _v_centre + _v_land_shift
         w_mid_v_land = np.exp(-((abs_deg - _v_centre_land) / 13.0) ** 2).astype(np.float32, copy=False)
-        w_mid_v_2d = w_mid_v[:, None] * (1.0 - land_f) + w_mid_v_land[:, None] * land_f
+        _land_shift_taper = np.clip((55.0 - abs_deg) / 10.0, 0.0, 1.0)
+        _land_shift_taper = (
+            _land_shift_taper * _land_shift_taper * (3.0 - 2.0 * _land_shift_taper)
+        ).astype(np.float32)
+        land_shift_f = land_f * _land_shift_taper[:, None]
+        w_mid_v_2d = w_mid_v[:, None] * (1.0 - land_shift_f) + w_mid_v_land[:, None] * land_shift_f
         v_surface_2d = (-3.5 * w_trade[:, None] + 5.0 * w_mid_v_2d - 1.2 * w_polar[:, None]).astype(np.float32, copy=False) * sign_lat[:, None]
         v_surface_2d = np.where(abs_deg[:, None] < 2.0, 0.0, v_surface_2d).astype(np.float32, copy=False)
     uc_zm = np.mean(uc, axis=1, keepdims=True)
@@ -2805,6 +2828,18 @@ def generate_precipitation(
     itcz_window = np.exp(-(((lat_deg - _itcz_center_deg) / ITCZ_HALF_WIDTH_DEG) ** 2)).astype(np.float32, copy=False)
     storm_window = np.exp(-((abs_lat_deg - STORM_TRACK_CENTER_DEG) / 15.0) ** 2).astype(np.float32, copy=False)
     drybelt_window = np.exp(-((abs_lat_deg - DRYBELT_CENTER_DEG) / 8.0) ** 2).astype(np.float32, copy=False)
+    # The Gaussian identifies the dry-belt centre but falls to only 7% by
+    # 15 degrees, leaving the southern Sahara/Sahel edge effectively outside
+    # the regime.  Use a smooth 16-34 degree core (with 10-16 and 34-38 degree
+    # shoulders) for regime decisions; keep `drybelt_window` itself for the
+    # older calibrated latitude-shape terms below.
+    _belt_rise = np.clip((abs_lat_deg - 10.0) / 6.0, 0.0, 1.0)
+    _belt_rise = _belt_rise * _belt_rise * (3.0 - 2.0 * _belt_rise)
+    _belt_fall = np.clip((38.0 - abs_lat_deg) / 4.0, 0.0, 1.0)
+    _belt_fall = _belt_fall * _belt_fall * (3.0 - 2.0 * _belt_fall)
+    drybelt_regime_window = np.maximum(
+        drybelt_window, (_belt_rise * _belt_fall).astype(np.float32)
+    )
 
     _sc = _static_cache
     if _sc is not None and "land_mask" in _sc:
@@ -2838,8 +2873,17 @@ def generate_precipitation(
         # physics, the same diagnostic-gate pattern the fog mechanism uses.
         _ocean_east = np.roll(sea_mask, -1, axis=1)
         _coast_core_east = (land_mask & _ocean_east).astype(np.float32)
-        _monsoon_decay_cells = 20
-        _monsoon_decay_rate = np.float32(0.88)
+        # Keep the inland reach geographic rather than grid-cell based.  The
+        # original 20 cells represented about 7 degrees at the 1024-column
+        # calibration grid, but silently expanded to 56 degrees in the tracked
+        # 128-column validation fixture (reaching across southern Africa into
+        # the Kalahari).  Scale both reach and per-cell decay so changing
+        # resolution preserves a calibrated ~10-degree physical longitude
+        # footprint (long enough to cover the East China box without crossing
+        # southern Africa into the Kalahari).
+        _reference_width = 1024.0
+        _monsoon_decay_cells = max(1, int(round(30.0 * W / _reference_width)))
+        _monsoon_decay_rate = np.float32(0.88 ** (_reference_width / W))
         monsoon_margin_factor = np.zeros_like(_coast_core_east)
         _shifted = _coast_core_east
         _weight = np.float32(1.0)
@@ -2914,7 +2958,24 @@ def generate_precipitation(
         subsidence_suppression = _sc["subsidence_suppression"]
     else:
         div = _ddx_periodic(u) - np.gradient(v, axis=0)
-        _div_pos_early = np.clip(div, 0.0, None)
+        _div_for_subsidence = div
+        _regime_gate_strength = float(getattr(pp, "subsidence_divergence_regime_gate", 0.0))
+        if _regime_gate_strength > 0.0:
+            # Split divergence into the latitude-row background and the local
+            # departure from it.  B1's displaced circulation contaminates the
+            # Midwest almost entirely through the former (85% of its signal),
+            # whereas local departures still carry useful terrain/synoptic
+            # information.  Attenuate only that background away from the true
+            # subtropical belt; retaining the local term avoids the previous
+            # latitude-only gate's broad desert-wetting side effect.
+            _div_zonal_mean = np.mean(div, axis=1, dtype=np.float64).astype(np.float32)
+            _div_local = div - _div_zonal_mean[:, None]
+            _zonal_keep = (
+                (1.0 - _regime_gate_strength)
+                + _regime_gate_strength * drybelt_regime_window
+            )
+            _div_for_subsidence = _div_local + _div_zonal_mean[:, None] * _zonal_keep[:, None]
+        _div_pos_early = np.clip(_div_for_subsidence, 0.0, None)
         # Cap each cell's contribution to the normalizer's reference mean (not
         # the numerator -- genuinely-more-subsiding cells still rank higher).
         # `wind_prognostic_substep_days` defaulting to 1.0 (2026-07-28, see
@@ -2938,8 +2999,8 @@ def generate_precipitation(
         _div_pos_norm_ref = np.minimum(_div_pos_early, 0.02)
         _subsidence_norm_early = np.clip(_div_pos_early / (np.mean(_div_pos_norm_ref) + 1e-6), 0.0, 2.5)
         subsidence_suppression = np.clip(
-            1.0 - 0.34 * _subsidence_norm_early - 0.45 * drybelt_window[:, None],
-            0.08,
+            1.0 - 0.34 * _subsidence_norm_early - 1.00 * drybelt_regime_window[:, None],
+            0.02,
             1.0,
         ).astype(np.float32, copy=False)
         # `ascent`/`conv`/`orog` (computed further down, reusing `div` cached
@@ -2951,7 +3012,7 @@ def generate_precipitation(
         # (unsmoothed `p_anom`, see `evolve_wind`) took over by default.
         _lap_early = _laplacian_numba if NUMBA_AVAILABLE else _laplacian
         subsidence_suppression = np.clip(
-            subsidence_suppression + 0.15 * _lap_early(subsidence_suppression), 0.08, 1.0
+            subsidence_suppression + 0.15 * _lap_early(subsidence_suppression), 0.02, 1.0
         ).astype(np.float32, copy=False)
         # ITCZ row-to-row/column-to-column shape consistency (2026-07-29, see
         # PlanetParams.itcz_zonal_smooth_deg docstring for the full mechanism
@@ -2964,7 +3025,7 @@ def generate_precipitation(
         _itcz_smooth_deg = float(getattr(pp, "itcz_zonal_smooth_deg", 0.0))
         if _itcz_smooth_deg > 0.0:
             subsidence_suppression = np.clip(
-                _zonal_gaussian_smooth(subsidence_suppression, _itcz_smooth_deg), 0.08, 1.0
+                _zonal_gaussian_smooth(subsidence_suppression, _itcz_smooth_deg), 0.02, 1.0
             ).astype(np.float32, copy=False)
         # Coastal-fog/cold-current desert suppression (2026-07-27,
         # coastal-fog-desert memory; reconstructed from that memory's writeup
@@ -3024,12 +3085,12 @@ def generate_precipitation(
         # actually is (`monsoon_margin_factor`) and by
         # `monsoon_east_margin_exemption` itself (0.0 = exact no-op).
         _monsoon_recover = (
-            0.45 * drybelt_window[:, None]
+            1.00 * drybelt_regime_window[:, None]
             * monsoon_margin_factor
             * float(pp.monsoon_east_margin_exemption)
         )
         subsidence_suppression = np.clip(
-            subsidence_suppression + _monsoon_recover, 0.08, 1.0
+            subsidence_suppression + _monsoon_recover, 0.02, 1.0
         ).astype(np.float32, copy=False)
         if _sc is not None:
             div.flags.writeable = False
@@ -3387,7 +3448,30 @@ def generate_precipitation(
             np.add(precip_potential, 0.18 * lap_p, out=precip_potential)
             np.clip(precip_potential, 0.0, 3.0, out=precip_potential)
     post_shape = np.clip(0.92 + 0.20 * itcz_window[:, None] - 0.10 * storm_window[:, None], 0.82, 1.12)
-    precip_potential = np.clip(precip_potential * post_shape, 0.0, 3.0)
+    # Convert the dimensionless precipitation drivers into a realistic daily
+    # rain-out timescale by regime.  The previous uniform conversion left raw
+    # production about 5.5x short globally, forcing the moisture-budget fill
+    # to invent most rainfall.  Do not amplify the subtropical subsidence
+    # regime: its scarce production is physical and is what distinguishes
+    # deserts.  Smooth shoulders avoid introducing latitude seams, while the
+    # established east-margin mask lets monsoon coasts retain the wet-regime
+    # conversion at the same latitude as genuine deserts.
+    _subtropical_plateau = drybelt_regime_window
+    _monsoon_wet_affinity = np.clip(
+        float(pp.monsoon_east_margin_exemption) * monsoon_margin_factor,
+        0.0,
+        1.0,
+    )
+    _raw_conversion_affinity = np.clip(
+        1.0 - _subtropical_plateau[:, None]
+        * (1.0 - _monsoon_wet_affinity),
+        0.0,
+        1.0,
+    )
+    _raw_conversion_gain = 1.0 + 4.5 * _raw_conversion_affinity
+    precip_potential = np.clip(
+        _raw_conversion_gain * precip_potential * post_shape, 0.0, 3.0
+    )
 
     # Convert potential to precipitation (mm/day) with moisture conservation
     # Cap removal fraction: at dt=6 the uncapped value clips to 1.0 (total moisture
@@ -3528,6 +3612,18 @@ def generate_precipitation(
             1.0 - DESERT_REDISTRIBUTION_STRENGTH * (1.0 - subsidence_suppression) * land_f,
             0.05, 1.0,
         ).astype(np.float32, copy=False)
+        # The 38-45 degree continental band sits under B1's displaced
+        # zonal-mean subsidence maximum.  Once raw production is no longer
+        # globally scarce, give land in that band its own share of the row
+        # target instead of letting moisture-rich ocean cells consume it.
+        # This is mean-preserving after `_row_norm` below and therefore does
+        # not over-wet the already-calibrated 40-50 degree zonal total.
+        _midlat_rise = np.clip((abs_lat_deg - 36.0) / 2.0, 0.0, 1.0)
+        _midlat_rise = _midlat_rise * _midlat_rise * (3.0 - 2.0 * _midlat_rise)
+        _midlat_fall = np.clip((47.0 - abs_lat_deg) / 2.0, 0.0, 1.0)
+        _midlat_fall = _midlat_fall * _midlat_fall * (3.0 - 2.0 * _midlat_fall)
+        _midlat_land_recovery = (_midlat_rise * _midlat_fall)[:, None] * land_f
+        _desert_factor = _desert_factor * (1.0 + _midlat_land_recovery)
         # Raw-precip-shape blend (2026-07-31 follow-up to the itcz-seasonal-
         # target-deficit fix): `_desert_factor` above only differentiates via
         # `subsidence_suppression`, which is ~uniformly near 1.0 across the
@@ -3601,7 +3697,30 @@ def generate_precipitation(
         _row_norm = np.mean(_desert_factor, axis=1, dtype=np.float64).astype(np.float32)
         cell_weight = _desert_factor / (_row_norm[:, None] + 1e-6)
         if pp.moisture_budget_precip_rescale:
-            budget_dq_cap = np.minimum(0.85 * q, dq_before + 0.15 * q)
+            # Regime-varying removal caps (2026-08-01, A5 follow-up): raises
+            # both the total- and per-step-added removal-fraction caps inside
+            # the ITCZ only, via `moisture_budget_tropical_cap_boost` (0.0 =
+            # exact no-op, both rows equal the prior flat 0.85/0.15
+            # everywhere). Motivated by a direct measurement showing the
+            # moisture-budget rescale is capacity-limited (pinned at these
+            # caps, still short of target) at essentially every latitude
+            # today, including the tropics (~0.85-0.94 achieved fraction)
+            # despite sitting on the planet's most abundant moisture supply --
+            # see PlanetParams.moisture_budget_tropical_cap_boost docstring
+            # for the full measurement and why this is scoped differently
+            # from the previously-reverted flat/global cap raise (which
+            # touched every latitude, including fragile mid-latitude/dry-belt
+            # rows, and made desert/continental ranking worse).
+            _cap_boost = float(pp.moisture_budget_tropical_cap_boost)
+            total_cap_row = np.clip(
+                0.85 + _cap_boost * 0.10 * itcz_window, 0.0, 0.95
+            ).astype(np.float64)
+            added_cap_row = np.clip(
+                0.15 + _cap_boost * 0.15 * itcz_window, 0.0, 0.30
+            ).astype(np.float64)
+            budget_dq_cap = np.minimum(
+                total_cap_row[:, None] * q, dq_before + added_cap_row[:, None] * q
+            )
             drybelt_land_protection = np.clip(
                 1.0 - 0.995 * drybelt_window[:, None] * land_f * (
                     1.0 - float(pp.monsoon_east_margin_exemption) * monsoon_margin_factor
@@ -3622,6 +3741,8 @@ def generate_precipitation(
                 column_mm_per_q=column_mm_per_q,
                 allocation_affinity=drybelt_land_protection * dynamic_affinity,
                 target_cell_weight=cell_weight,
+                max_total_removal_fraction=total_cap_row,
+                max_added_removal_fraction=added_cap_row,
             )
             scale_row = budget_diag["effective_scale"]
         else:

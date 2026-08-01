@@ -2,9 +2,13 @@
 
 > Created: 2026-06-20
 > **STATUS (2026-07-01): ARCHIVED — Effort 1 (1A-1D) and Effort 2 (2A-2D) are complete and
-> verified in code. Only 2E (ice-age proof-of-concept scenario, a stretch goal) was never run —
-> `experiments/` doesn't exist. See PLAN.md's "Current State Summary" for the live status; this
-> file is kept for historical/design-rationale context only, not as an open task list.**
+> verified in code, with one caveat: 2 of Phase 1D's 4 quantitative predictions
+> (slow-rotator ≥4K colder, low-ocean-fraction ≥3K steeper gradient) remain `xfail` in
+> `testing/test_planet_physics.py`, not passing asserts — only the retrograde-asymmetry and
+> high-obliquity-seasonal-range predictions were promoted to firm passes. Only 2E (ice-age
+> proof-of-concept scenario, a stretch goal) was never run — `experiments/` doesn't exist. See
+> PLAN.md's "Current State Summary" for the live status; this file is kept for
+> historical/design-rationale context only, not as an open task list.**
 
 Two sequential efforts. Effort 1 completes first with passing tests before Effort 2 begins.
 
@@ -14,7 +18,12 @@ Two sequential efforts. Effort 1 completes first with passing tests before Effor
 
 ### Problem Summary
 
-Three physics gaps remain for non-Earth planets:
+*(Pre-fix state at the time this plan was written — all three gaps below were closed by Phase 1A/1B/1C,
+verified in code today: `simulate.py` computes `_rotation_scale`/`_ocean_frac_scale`/`_amoc_scale`/`_acc_scale`
+and an obliquity-scaled seasonal cap, and `compute_ekman_transport` is called from the ocean-update block
+gated on `pp.ekman_strength > 0.0`. See the ARCHIVED banner above.)*
+
+Three physics gaps remained for non-Earth planets:
 
 1. **AMOC/ACC hardcoded to Earth scale** — the 18 K AMOC peak and 28 K ACC peak don't scale with rotation rate or ocean coverage. A slow rotator (weak Coriolis → weak western boundary currents → weak AMOC) gets the same NH warming bonus as Earth.
 2. **Obliquity seasonal cap** — `ocean_seasonal_frac` is clipped to 0.45 regardless of obliquity, suppressing the larger polar seasonal swings that high-obliquity planets should show.
@@ -60,7 +69,8 @@ Apply identically to the full-resolution versions (`_transport_base_full`, `_amo
 
 **File:** `simulate.py`, function `_evolve_temperature`, ~line 643
 
-Current (two locations — coarse and full-resolution):
+Before (two locations — coarse and full-resolution; this is the code being replaced, not
+current — both sites now use the obliquity-scaled cap shown below):
 ```python
 ocean_seasonal_frac = np.clip(ocean_seasonal_frac, 0.03, 0.45)
 ```
@@ -71,15 +81,18 @@ _seasonal_cap = float(min(0.45 * obliq_factor, 0.85))
 ocean_seasonal_frac = np.clip(ocean_seasonal_frac, 0.03, _seasonal_cap)
 ```
 
-Effect by obliquity:
-| Obliquity | obliq_factor | Old cap | New cap |
-|-----------|-------------|---------|---------|
-| 23.44° (Earth) | 1.00 | 0.45 | 0.45 |
-| 45° | 1.39 | 0.45 | 0.62 |
-| 60° | 1.60 | 0.45 | 0.72 |
-| 90° | 2.00 (capped) | 0.45 | 0.85 |
+Effect by obliquity (note: the ratio is clipped to `[0.6, 2.0]` *before* the square root, so
+`obliq_factor` itself saturates at `sqrt(2.0) ≈ 1.41` — it never reaches the naively-computed
+values this table originally listed for 60°/90°):
+| Obliquity | obliq_ratio | obliq_factor | Old cap | New cap |
+|-----------|-------------|--------------|---------|---------|
+| 23.44° (Earth) | 1.00 | 1.00 | 0.45 | 0.45 |
+| 45° | 1.92 | 1.39 | 0.45 | 0.62 |
+| 60° | 2.56 (ratio capped at 2.0) | 1.41 | 0.45 | 0.64 |
+| 90° | 3.84 (ratio capped at 2.0) | 1.41 | 0.45 | 0.64 |
 
-**Earth validation:** `obliq_factor = 1.0` → new cap = 0.45 = old cap. Zero change.
+**Earth validation:** `obliq_factor = 1.0` → new cap = 0.45 = old cap. Zero change. High-obliquity
+planets never actually reach a 0.72 or 0.85 cap in the shipped code — both saturate at 0.64.
 
 ---
 
@@ -101,6 +114,14 @@ if wind_u is not None and wind_v is not None:
 In `simulate.py`, pass `wind_u=u_full, wind_v=v_full` to `calculate_ocean_heat_transport` at the existing call site. Scale the Ekman coefficient by `pp.surface_pressure_pa / 101325`.
 
 This is optional for Effort 1 validation — implement only if 1A+1B pass without instability.
+
+**Shipped differently than this sketch.** `calculate_ocean_heat_transport`'s signature was never
+changed (no `wind_u`/`wind_v` params, no `_ddx_ekman` helper — neither exists in the codebase).
+Ekman advection instead landed as an independent block in `simulate.py` (~line 2880), calling
+`compute_ekman_transport(u, v, elev_c, ekman_coefficient=0.03*pp.ekman_strength, ...)` directly
+and upwind-advecting `T_sst`, gated by a new `PlanetParams.ekman_strength` field (default `0.3`)
+that this plan never mentions. The end goal (Ekman transport wired into ocean heat transport) is
+achieved; only the implementation shape differs from this sketch.
 
 ---
 
@@ -133,7 +154,11 @@ Begins after Effort 1 tests pass.
 
 ### Problem Summary
 
-The ANNUAL time-scale mode exists but has never been stress-tested for multi-decade or multi-century runs. Biomes (Köppen + vegetation) respond to climate but the feedback chain hasn't been validated over long runs. There is no test that demonstrates a stable equilibrium over 50+ simulated years.
+*(Pre-fix state — Phase 2A below shipped exactly this: `testing/test_annual_stability.py` now has
+`test_annual_stability_50yr_no_nan`/`_temperature_drift`/`_co2_bounded`/`_ice_bounded`, all
+`@pytest.mark.slow`, asserting drift < 5K over 50 ANNUAL years.)*
+
+The ANNUAL time-scale mode existed but had never been stress-tested for multi-decade or multi-century runs. Biomes (Köppen + vegetation) respond to climate but the feedback chain hadn't been validated over long runs. There was no test that demonstrated a stable equilibrium over 50+ simulated years.
 
 ---
 

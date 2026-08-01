@@ -956,7 +956,12 @@ out of scope here.
 ---
 ## EXECUTION LOG (2026-07-25)
 
-### Plan 2 (A9) — Phases 1–4 complete; **gate shipped OFF by default**
+### Plan 2 (A9) — Phases 1–4 complete; **gate shipped OFF by default at the time of this entry**
+> **Superseded.** This entry's "default stays False" conclusion was later reversed — see the
+> "EXECUTION LOG (2026-07-26) — spherical precipitation and cloud metrics shipped" entry above
+> (this file is newest-first, so that entry is chronologically *after* this one despite appearing
+> earlier in the file). `spherical_metric_precip`/`spherical_metric_clouds` are both `True` in
+> current `planet_params.py`.
 - **Phase 1 done.** `testing/test_spherical_metric.py`, 5 closed-form tests, all passing.
   Solid-body rotation → exactly zero divergence; zonally-varying zonal flow → divergence scales
   as 1/cos(phi) (60°/equator ratio verified at 2.0); uniform meridional flow → −V·tan(phi)/a
@@ -1297,6 +1302,14 @@ documented rather than silently absorbed.
 ---
 
 # Recommended order
+
+**Superseded — both plans below were executed and shipped.** This file is newest-first, so the
+completed outcomes appear *above* this original plan, not below it: Plan 1 (US Midwest / Ferrel-cell
+divergence) concluded with `ferrel_v_centre_deg=44.0` and `ferrel_v_land_shift_deg=-4.0`, both still
+the current `planet_params.py` defaults; Plan 2 (spherical metric) concluded with
+`spherical_metric_precip=True` and `spherical_metric_clouds=True`, both now production defaults. The
+original recommended order is kept below for historical/design-rationale context only.
+
 1. **Plan 2 Phase 1** (analytic tests) — pure gain, no physics change, and it specifies the fix.
 2. **Plan 1 Phase 1** (analytic check of the v-profile divergence) — cheap, and either proves or
    kills the leading hypothesis before any code changes.
