@@ -506,8 +506,10 @@ directly asserting `cycle_days(ANNUAL, pp) == pp.orbital_period_days` and
 `12 * cycle_days(MONTHLY, pp) == pp.orbital_period_days` to `1e-10` absolute tolerance. No further
 action needed.
 
-### C3. 🟡 Hardcoded Earth constants block Mars/exoplanet realism (planet-generalization gap)
+### C3. 🟢 Hardcoded Earth constants block Mars/exoplanet realism — elevation + lapse rate FIXED 2026-08-02
 Not wrong *for Earth*, but actively wrong the moment a non-Earth `PlanetParams` preset is used.
+**Both headline constants are now parameterized — see the fix note at the end of this entry.**
+The inventory below is the pre-fix state, kept because it names the exact sites:
 - **Max terrain elevation** (8848m/Everest) hardcoded in **four separate places with at least three
   different formulas**: `temperature.elevation_to_alt_km` (piecewise, two branches),
   `climate_averages.compute_biome_type` (two sites, a different simpler linear formula),
@@ -521,10 +523,32 @@ Not wrong *for Earth*, but actively wrong the moment a non-Earth `PlanetParams` 
   since `MARS.has_liquid_water_ocean=False` already gates essentially all humidity physics off for
   the one non-Earth preset that currently exists; inert until a water-bearing exoplanet preset
   exists to exercise it.
-**Fix needed**: `PlanetParams.max_elevation_km` and `PlanetParams.lapse_rate_k_per_km` fields
-(Earth defaults as exact no-ops) threaded through all cited sites — each is its own dedicated,
-tested pass (4 files/several call sites for elevation; 3 modules for lapse rate), not a
-documentation-only audit. Manually inventoried 2026-07-27, not yet fixed.
+**FIXED 2026-08-02.** `PlanetParams.max_elevation_km` (Earth 8.848, **Mars 21.9** — Olympus Mons)
+and `PlanetParams.lapse_rate_k_per_km` (Earth 6.5, **Mars 2.5**) added and threaded through every
+cited site:
+- `temperature.elevation_to_alt_km` — both the loaded-heightmap and procedural branches (the loaded
+  branch's `8748.0` is now derived as `max_elevation_m - 100.0`, the 100 m consumed by its own
+  linear lowland segment).
+- `temperature.generate_temperature_overlay` — now takes an optional `planet_params`.
+- `simulate.py`'s orographic-cooling block — reads both from `_pp`.
+- `climate_averages.classify_koppen` — both its elevation-delta and legacy full-elevation branches,
+  as scalar kwargs matching that module's existing `orbital_period_days` convention; `simulate.py`
+  passes them from `pp`.
+- `main.py`'s hover-readout altitude formula — sourced from the active preset.
+**Verified**: the Earth path is **bit-identical** (`np.array_equal`) to the old hardcoded formulas on
+both branches of `elevation_to_alt_km`, so this is an exact no-op for Earth; Mars terrain now reaches
+a real 21.90 km instead of being silently rescaled to Earth's 8.85 km ceiling (2.48x).
+**Regression guard**: `testing/test_no_hardcoded_earth_constants.py` — which already existed for this
+exact class of bug — was extended with patterns for `8848`/`8748`/`8.848`/`6.5`, so these constants
+cannot be reintroduced silently. That test's `_code_lines` helper was also taught to skip
+triple-quoted strings: docstrings legitimately *describe* these values in prose, and without that the
+guard would have forced an ever-growing allowlist of documentation lines and become noise. The
+extended guard was self-tested (planted violations are caught; it is not passing by having stopped
+looking).
+**Residual, unchanged**: the **0.622 epsilon** (Rd/Rv) is still hardcoded at four sites — deliberately
+left, since `MARS.has_liquid_water_ocean=False` gates essentially all humidity physics off for the
+only non-Earth preset that exists, making it inert until a water-bearing exoplanet preset exists to
+exercise it. `terrain.py`'s references are comments/lookup prose, not computation.
 
 ---
 

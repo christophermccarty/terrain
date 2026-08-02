@@ -373,6 +373,8 @@ def classify_koppen(
     elevation: np.ndarray | None = None,  # (H, W) normalized elevation [0-1]
     elevation_baseline: np.ndarray | None = None,  # (H, W) coarse elevation the input temps already reflect
     orbital_period_days: float = 365.2422,
+    max_elevation_km: float = 8.848,   # what normalized elevation 1.0 means [km]
+    lapse_rate_k_per_km: float = 6.5,  # environmental lapse rate [K/km]
 ) -> np.ndarray:
     """Classify Köppen climate type for each grid cell.
 
@@ -426,13 +428,20 @@ def classify_koppen(
             # temperature/climate zone. Instead, apply only the delta between
             # this pixel's real elevation and the block average the physics used,
             # so peaks read colder and valleys read warmer than their neighbors.
-            elev_delta_meters = (elevation - elevation_baseline) * 8848.0
-            lapse_correction = np.where(land, -6.5 * elev_delta_meters / 1000.0, 0.0)
+            # `max_elevation_km`/`lapse_rate_k_per_km` are planet parameters
+            # (Earth defaults 8.848 km / 6.5 K/km reproduce the previous
+            # hardcoded constants exactly) -- see ACCURACY_AUDIT.md C3.
+            elev_delta_meters = (elevation - elevation_baseline) * (max_elevation_km * 1000.0)
+            lapse_correction = np.where(
+                land, -lapse_rate_k_per_km * elev_delta_meters / 1000.0, 0.0
+            )
         else:
             # No coarse baseline supplied - treat `elevation` as the full
             # lapse-rate baseline (legacy behaviour for standalone/offline use).
-            elev_meters = elevation * 8848.0
-            lapse_correction = np.where(land, -6.5 * elev_meters / 1000.0, 0.0)
+            elev_meters = elevation * (max_elevation_km * 1000.0)
+            lapse_correction = np.where(
+                land, -lapse_rate_k_per_km * elev_meters / 1000.0, 0.0
+            )
 
         lapse_correction = lapse_correction.astype(np.float32)
 

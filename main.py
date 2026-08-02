@@ -1948,6 +1948,16 @@ def main() -> None:
             lon = (x / w) * 360.0 - 180.0
             lat = 90.0 - (y / h) * 180.0
             elev_raw = float(tex[int(y), int(x)])
+            # Elevation ceiling comes from the active planet preset rather than a
+            # hardcoded Everest 8848 m (ACCURACY_AUDIT.md C3), so the hover
+            # readout reports real altitudes on non-Earth terrain instead of
+            # silently rescaling them into Earth's range. Mirrors
+            # `temperature.elevation_to_alt_km`'s two branches exactly, but keyed
+            # off the known `terrain_mode` instead of that helper's zeros-fraction
+            # autodetection (which is unreliable for a single pixel).
+            _tooltip_pp = (sim_state.planet_params if sim_state is not None and
+                           getattr(sim_state, "planet_params", None) else current_planet_params)
+            _max_elev_m = float(_tooltip_pp.max_elevation_km) * 1000.0
             if terrain_mode == "loaded":
                 pixel_display = f"norm {elev_raw:.3f}"
                 if elev_raw == 0.0:
@@ -1956,7 +1966,7 @@ def main() -> None:
                     alt_m = (elev_raw / 0.03) * 100.0
                 else:
                     normalized = (elev_raw - 0.03) / 0.97
-                    alt_m = 100.0 + (normalized ** 2.5) * 8748.0
+                    alt_m = 100.0 + (normalized ** 2.5) * (_max_elev_m - 100.0)
                 is_ocean = (elev_raw == 0.0)
             else:
                 pixel_display = ""
@@ -1965,7 +1975,7 @@ def main() -> None:
                     alt_m = 0.0
                 else:
                     elevation_above_sea = elev_raw - sea_level
-                    alt_m = (elevation_above_sea / (1.0 - sea_level)) ** 2.0 * 8848.0
+                    alt_m = (elevation_above_sea / (1.0 - sea_level)) ** 2.0 * _max_elev_m
                 is_ocean = (elev_raw <= sea_level)
 
             lat_str = f"{abs(lat):.2f}°{'N' if lat >= 0 else 'S'}"

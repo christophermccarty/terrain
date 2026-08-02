@@ -55,17 +55,31 @@ def clear_temperature_cache() -> None:
     _TEMP_BASE_CACHE.clear()
 
 
-def elevation_to_alt_km(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: float = 0.05) -> np.ndarray:
+def elevation_to_alt_km(
+    elevation: np.ndarray,
+    *,
+    assume_loaded_if_zeros_frac: float = 0.05,
+    max_elevation_km: float = 8.848,
+) -> np.ndarray:
     """Convert normalized elevation [0,1] to approximate altitude (km).
 
     This matches the UI mappings:
     - Loaded heightmaps: ocean is exactly 0.0; lowlands 0..0.03 => 0..100m (linear),
-      then a power curve up to 8848m.
-    - Procedural terrain: sea level ~0.2; quadratic rise to 8848m.
+      then a power curve up to `max_elevation_km`.
+    - Procedural terrain: sea level ~0.2; quadratic rise to `max_elevation_km`.
+
+    `max_elevation_km` (default Earth/Everest 8.848, see
+    `PlanetParams.max_elevation_km`) is what normalized elevation `1.0` means in
+    real altitude. It was previously hardcoded here, so non-Earth terrain was
+    silently rescaled into Earth's height range -- see ACCURACY_AUDIT.md C3. The
+    default reproduces the previous constants exactly (the loaded branch's
+    `8748.0` is `max_elevation_m - 100.0`, the 100 m already consumed by the
+    linear lowland branch below).
     """
     e = np.asarray(elevation, dtype=np.float32)
     if e.size == 0:
         return e
+    max_elevation_m = float(max_elevation_km) * 1000.0
     zeros_frac = float(np.mean(e == 0.0))
     if zeros_frac > assume_loaded_if_zeros_frac:
         # Loaded heightmap mapping
@@ -74,12 +88,12 @@ def elevation_to_alt_km(elevation: np.ndarray, *, assume_loaded_if_zeros_frac: f
         high = e > 0.03
         alt_m[low] = (e[low] / 0.03) * 100.0
         norm = (e[high] - 0.03) / 0.97
-        alt_m[high] = 100.0 + (norm ** 2.5) * 8748.0
+        alt_m[high] = 100.0 + (norm ** 2.5) * (max_elevation_m - 100.0)
         return alt_m / 1000.0
     # Procedural mapping (approx)
     sea_level = 0.2
     x = np.clip((e - sea_level) / (1.0 - sea_level + 1e-9), 0.0, 1.0)
-    return (x ** 2.0) * 8.848
+    return (x ** 2.0) * float(max_elevation_km)
 
 
 def _daily_mean_insolation_Q(
@@ -196,7 +210,7 @@ def temperature_to_rgb(T_kelvin: np.ndarray) -> np.ndarray:
     return rgb_flat.reshape(original_shape + (3,)).astype(np.float32)
 
 
-def generate_temperature_overlay(height: int, width: int, day_of_year: float = 1.0, epsilon_atm: float = EPSILON_ATM, block_size: int = 3, elevation: np.ndarray | None = None) -> np.ndarray:
+def generate_temperature_overlay(height: int, width: int, day_of_year: float = 1.0, epsilon_atm: float = EPSILON_ATM, block_size: int = 3, elevation: np.ndarray | None = None, planet_params=None) -> np.ndarray:
     """Return an (H,W,3) float32 RGB overlay in [0,1] for given map size.
 
     NOW USES SIMULATION PHYSICS for consistency:
@@ -226,11 +240,15 @@ def generate_temperature_overlay(height: int, width: int, day_of_year: float = 1
     T_lat = temperature_kelvin_for_lat(lat, day_of_year=day_of_year)
     T_kelvin = np.repeat(T_lat[:, None], w, axis=1).astype(np.float32)
     
-    # Apply elevation correction (lapse rate ~6.5 K/km)
+    # Apply elevation correction (lapse rate; Earth default ~6.5 K/km).
+    # `planet_params` optional so existing callers keep exact Earth behaviour --
+    # see PlanetParams.max_elevation_km / lapse_rate_k_per_km (ACCURACY_AUDIT.md C3).
     if elevation is not None and np.any(elevation > 0):
-        alt_km = elevation_to_alt_km(elevation)
-        lapse_rate = 6.5  # K/km
-        T_kelvin = T_kelvin - lapse_rate * alt_km
+        _pp = planet_params if planet_params is not None else EARTH
+        alt_km = elevation_to_alt_km(
+            elevation, max_elevation_km=float(_pp.max_elevation_km)
+        )
+        T_kelvin = T_kelvin - float(_pp.lapse_rate_k_per_km) * alt_km
     
     # Temperature already calculated by simulation system (includes all physics)
     # T_kelvin shape is (H, W) at full resolution - no need to downsample

@@ -691,6 +691,8 @@ def simulate_step(
                 elevation=state.elevation,
                 elevation_baseline=elev_baseline_for_biomes,
                 orbital_period_days=pp.orbital_period_days,
+                max_elevation_km=pp.max_elevation_km,
+                lapse_rate_k_per_km=pp.lapse_rate_k_per_km,
             )
             # Convert Köppen to legacy biome for backward compatibility
             biome_new = koppen_to_legacy_biome(koppen_new)
@@ -2642,8 +2644,11 @@ def _evolve_temperature(
     # --- Orographic cooling (lapse rate) ---
     # Previously missing: high terrain never cooled as a function of altitude.
     # Apply to equilibrium temperature so radiation relaxes toward a colder state aloft.
-    lapse_rate = 6.5  # K/km
-    alt_km = elevation_to_alt_km(elev_c)
+    # Lapse rate and the elevation->altitude ceiling both come from PlanetParams
+    # (Earth defaults 6.5 K/km and 8.848 km reproduce the previous hardcoded
+    # constants exactly) -- see ACCURACY_AUDIT.md C3.
+    lapse_rate = float(_pp.lapse_rate_k_per_km)  # K/km
+    alt_km = elevation_to_alt_km(elev_c, max_elevation_km=float(_pp.max_elevation_km))
     T_eq = T_eq - lapse_rate * alt_km
 
     # --- Ocean Temperature Bounds (SST cap + freeze-point floor) ---

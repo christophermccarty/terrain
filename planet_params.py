@@ -92,6 +92,31 @@ class PlanetParams:
     surface_gravity: float = 9.81
     """Surface gravitational acceleration [m/s²]."""
 
+    max_elevation_km: float = 8.848
+    """Highest terrain elevation [km] that normalized elevation `1.0` maps to
+    (ACCURACY_AUDIT.md C3). Earth's default is Everest (8.848 km).
+
+    Normalized elevation arrays are `[0, 1]`; converting them to a real altitude
+    (needed for lapse-rate cooling and for Koppen elevation corrections) requires
+    knowing what `1.0` means in metres. That ceiling was previously hardcoded as
+    `8848.0` in four separate places across three modules, so loading Mars
+    terrain silently rescaled Olympus Mons (~21.9 km, 2.5x Earth's max) down into
+    Earth's height range. Threaded through
+    `temperature.elevation_to_alt_km` (both its loaded-heightmap and procedural
+    branches) and `climate_averages.classify_koppen` (both its elevation-delta and
+    legacy full-elevation branches). The Earth default reproduces every previous
+    hardcoded value exactly, so this is an exact no-op for Earth."""
+
+    lapse_rate_k_per_km: float = 6.5
+    """Environmental temperature lapse rate [K per km of altitude]
+    (ACCURACY_AUDIT.md C3). Earth's default is the standard 6.5 K/km.
+
+    Previously hardcoded as `6.5` at five call sites across `simulate.py`,
+    `temperature.py` and `climate_averages.py`, making Mars's real ~2.5 K/km
+    (lower gravity + CO2 atmosphere, so a much weaker vertical temperature
+    gradient) unreachable -- Mars terrain got Earth's cooling-per-km verbatim.
+    The Earth default is an exact no-op."""
+
     # ------------------------------------------------------------------ #
     # Atmosphere
     # ------------------------------------------------------------------ #
@@ -1821,6 +1846,13 @@ MARS = PlanetParams(
     sidereal_day_hours=24.623,
     radius_m=3.3895e6,
     surface_gravity=3.71,
+    # Olympus Mons, ~21.9 km -- 2.5x Earth's ceiling. Before this was
+    # parameterized (ACCURACY_AUDIT.md C3) Mars terrain was silently rescaled
+    # into Earth's 8.848 km range.
+    max_elevation_km=21.9,
+    # ~2.5 K/km: lower gravity and a CO2 atmosphere give Mars a much weaker
+    # vertical temperature gradient than Earth's 6.5 K/km.
+    lapse_rate_k_per_km=2.5,
     surface_pressure_pa=636.0,
     mean_molar_mass=0.0435,
     gas_constant_dry=191.0,     # R_univ / M_CO2 = 8314 / 44
