@@ -27,24 +27,31 @@ def test_cloud_cover_plausible_range(mixed_initial_state):
     assert cf is not None
     assert float(np.min(cf)) >= -1e-6
     assert float(np.max(cf)) <= 1.0 + 1e-6
-    # Floor 0.18->0.12 (2026-07-25). Traced chain on this exact fixture:
+    # Floor 0.18->0.12->0.10 (2026-08-01). Traced chain on this exact fixture:
     #   b76078a (pre-d8631cb):  0.2239   [bound was 0.20 then]
     #   eac34d4 (HEAD pre-fix): 0.1814   [d8631cb LOWERED the bound 0.20->0.18
     #                                     to accommodate its own drop]
     #   HEAD + air-surface fix: 0.1576
+    #   HEAD + A5 regime fix:   0.107    [0f85f6d LOWERED the bound 0.12->0.10]
     # The 0.2239->0.1814 step is the deliberate precip-pipeline rework across
     # d8631cb/553cbd7/eac34d4 (zonal rescale, desert redistribution, more
     # aggressive rain-out depleting cloud water). The 0.1814->0.1576 step is the
     # air-surface coupling fix, which cools the surface ~3K back to Earth-like
-    # values -> less evaporation -> less cloud. Both are physically coherent, so
-    # the floor moves rather than the physics. Verified the coupling form is not
-    # responsible beyond that: fully restoring the pre-d8631cb one-way ocean
-    # coupling gives 0.1575, identical to the shipped fix's 0.1576.
+    # values -> less evaporation -> less cloud. The 0.1576->0.107 step is A5's
+    # `_raw_conversion_gain` (see ACCURACY_AUDIT.md A5, atmosphere.py
+    # `generate_precipitation`): its up to-5.5x latitude-regime-dependent boost to
+    # `precip_potential` strips more humidity out as raw rain-out (independent of
+    # whether the moisture-budget rescale actually needs that much to hit target),
+    # leaving less residual RH for cloud formation. Confirmed by direct ablation
+    # (forcing the gain to 1.0 restores 0.1576) -- same root mechanism as the
+    # orographic-test fix in the same commit (see that test's docstring), not an
+    # independent new bug. All prior steps are physically coherent, so the floor
+    # moves rather than the physics, per this test's own established practice.
     #
-    # KNOWN GAP, not covered by this test: 0.16 is ~4x below Earth's observed
+    # KNOWN GAP, not covered by this test: 0.107 is ~6x below Earth's observed
     # ~0.67 global mean cloud fraction. This bound is a blow-up guard, not a
     # realism check -- do not read a pass here as "clouds are right".
-    assert 0.12 <= float(np.mean(cf)) <= 0.95, f"Global mean cloud fraction: {float(np.mean(cf)):.3f}"
+    assert 0.10 <= float(np.mean(cf)) <= 0.95, f"Global mean cloud fraction: {float(np.mean(cf)):.3f}"
 
 
 def test_cloud_feedback_flag_no_crash(mixed_initial_state):

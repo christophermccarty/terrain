@@ -25,45 +25,54 @@ Earth DEM, longer runs, less reproducible but higher-fidelity). Targets are from
 
 ## A. Precipitation spatial pattern (the dominant, most-worked cluster)
 
-### A1. 🟡 Deserts still too wet
-**Symptom**: Sahara/Kalahari/Atacama all render wetter than Köppen's BWh/BWk cores; Atacama in
-particular has never cleanly separated from other deserts on any metric tried.
-**Current numbers** (tracked baseline): Sahara 550 mm/yr (target <200, 2.75x over), Kalahari 248
-(target <200, 1.24x over), Atacama 207 (target <50, ~4x over).
+### A1. 🟡 Deserts still too wet — Sahara/Kalahari now fixed, Atacama residual only
+**Symptom (largely resolved 2026-08-01, see A5)**: Sahara/Kalahari/Atacama used to all render
+wetter than Köppen's BWh/BWk cores. Atacama in particular has never cleanly separated from other
+deserts on any metric tried, and still hasn't.
+**Current numbers, independently re-verified 2026-08-01** (`saves/earth.pkl`, 512×1024, 2yr MONTHLY,
+seasonally-balanced 2nd-half average — see A5's sampling-window caveat): Sahara **131 mm/yr**
+(target <200 — **now in range**), Kalahari **130 mm/yr** (target <200 — **now in range**), Atacama
+**102 mm/yr** (target <50 — still ~2x over, the sole residual). This is the A5 regime-architecture
+fix's direct effect, verified by reproducing its own claimed numbers independently rather than
+trusting the write-up alone (this project's own established practice — see process note 3).
 **Controlling variables**: `atmosphere.py`'s `subsidence_suppression` (wind-divergence-derived
-aridity proxy — gates both `land_evap` and `precip_potential`), `drybelt_window` (pure `|latitude|`
-Gaussian, center ~28°), `PlanetParams.coastal_upwelling_fog_strength` (0.5, diagnostic west-coast
-gate for Atacama specifically), `desert_redistribution_weight`/`cell_weight` (mean-preserving
-per-row redistribution using `subsidence_suppression`), `_div_pos_norm_ref` cap (0.02, bounds how
-much the prognostic wind's heavier-tailed divergence field can dilute the suppression signal).
-**How to test**: `scripts/check_real_terrain_koppen.py --wind-diagnostics` for named-box precip;
-`scripts/run_real_terrain_validation.py --compare` for the tracked composite score;
-`debug_fields=True` on `atmosphere.generate_precipitation` to inspect `subsidence_suppression`
-directly over a named box (Sahara's own measured range is 0.08–0.96, mean 0.42 — the southern,
-Sahel-adjacent half of the box barely registers subsidence at all, diluting the average).
+aridity proxy — gates both `land_evap` and `precip_potential`), `drybelt_window`/`drybelt_regime_window`
+(the latter a smooth 16–34° core with shoulders, added 2026-08-01 — see A5), `PlanetParams.
+coastal_upwelling_fog_strength` (0.5, diagnostic west-coast gate for Atacama specifically),
+`desert_redistribution_weight`/`cell_weight`, `subsidence_divergence_regime_gate` (now **1.0**
+default, zonal-background/local-anomaly divergence decomposition — see A5/B1), `_div_pos_norm_ref`
+cap (0.02).
+**How to test**: `scripts/check_real_terrain_koppen.py --wind-diagnostics --days 730` (use 730+, not
+the 365 default — see A5's sampling-window caveat) for named-box precip; `scripts/
+run_real_terrain_validation.py --compare` for the tracked composite score.
 **What's been tried** (all documented, don't repeat blind): flat desert-suppression multiplier
 (reverted — fought the zonal-rescale calibration, too blunt spatially); moisture-transport
 strengthening (reverted — monotonically wets deserts *more*, not less, at any transport strength);
 mean-preserving `subsidence_suppression`-based redistribution (shipped, `k=0.9`, real improvement
-but plateaus — the bottleneck is `subsidence_suppression`'s own weak coverage over the box, not the
-redistribution coefficient); coastal-fog gate for Atacama specifically (shipped at strength 0.5,
-Atacama 123→102 mm/yr in isolation, real but small).
-**Recommended next lever**: improve `subsidence_suppression`'s own spatial resolution/strength over
-real desert cores — this is explicitly flagged as the next investigation in three separate memory
-notes and has never been attempted (every session so far tuned the *redistribution* mechanism, not
-the upstream divergence-derived signal itself). Candidate: check whether the signal is being
-diluted by `itcz_zonal_smooth_deg`'s 8° periodic-longitude smoothing (added for an unrelated ITCZ
-fix) averaging real desert-core subsidence against adjacent less-arid cells.
-**Upstream suspect**: the wind model's divergence field itself — `evolve_wind`'s prognostic solver
-vs `generate_wind_field`'s diagnostic snapshot give meaningfully different subsidence signatures
-(this is exactly what caused the 2026-07-29 "desert-wetting regression," see A5).
+but plateaued until the A5 fix); coastal-fog gate for Atacama specifically (shipped at strength 0.5,
+Atacama 123→102 mm/yr in isolation, real but small); the A5 regime-architecture fix (shipped
+2026-08-01 — closed Sahara/Kalahari, did not move Atacama, whose own aridity signature — a narrow
+coastal strip rather than a broad subsiding interior — was never well-served by any
+latitude/divergence-based mechanism tried so far, per B3's own note on the same tension).
+**Recommended next lever for the Atacama residual**: Atacama's own diagnostics (see A5's real-terrain
+wind-diagnostics table) show `div=1.70–1.79`, an outlier an order of magnitude above every other
+desert box — it's already about as suppressed as this mechanism can make it structurally distinct
+from the others. The `coastal_upwelling_fog_strength` diagnostic gate (D3) is the more promising
+remaining lever specifically for Atacama's narrow-coastal-strip signature, not another divergence-based
+mechanism; real SST-coupled upwelling physics (D3's actual recommended next step) is the honest fix.
 
-### A2. 🟡 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am)
+### A2. 🟡 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — needs re-verification
 **Symptom**: Sub-Saharan Africa and other tropical land render as near-unbroken Af (rainforest)
 with almost no savanna transition, vs. real Köppen's broad Aw/Am bands flanking a narrower Af core.
-**Current numbers** (real-terrain, 2026-07-31): Af ~8–15% of land (Earth ~6–7%, so still
-over-represented at the low end of the sweep), Aw+Am ~5–8% (Earth ~18–20%, still 2–4x
-under-represented even at the best-tuned setting).
+**Current numbers** (real-terrain, 2026-07-31, **stale — predates the 2026-08-01 A5 fix**): Af
+~8–15% of land (Earth ~6–7%, so still over-represented at the low end of the sweep), Aw+Am ~5–8%
+(Earth ~18–20%, still 2–4x under-represented even at the best-tuned setting). **Not yet
+re-measured** against the current code: A5's fix directly targeted this section's own diagnosed
+mechanism ("raw tropical-belt production itself needs to rise" — global_rescale_factor 5.46→2.06,
+with wet-regime raw production specifically recalibrated), so these numbers are very likely stale,
+but the Af/Am/Aw split still isn't in any tracked script (see "How to test" below) so no session has
+actually re-measured it yet. **This is the natural next item to check** — cheap (just needs the
+split added to the existing named-box script) and directly downstream of a fix that already landed.
 **Controlling variables**: `PlanetParams.itcz_seasonal_response` (0.7 — gives the ITCZ window real
 seasonal migration instead of being pinned at the equator year-round), `itcz_seasonal_target_response`
 (1.0 — makes the *rescale target* itself track the same seasonal dip instead of refilling it),
@@ -90,11 +99,14 @@ precipitation history and should stop future sessions from re-trying redistribut
 `global_rescale_factor` needing 5x at all? See A5.
 
 ### A3. 🟡 Continental interior still short of target (US Midwest specifically)
-**Symptom**: US Midwest chronically the hardest of the six named boxes to bring up to Earth values;
-Canadian Prairies and Central Europe are now within or above target.
-**Current numbers**: Canadian Prairies 541 mm/yr (target 400–500 — now *slightly over*, a genuine
-flip from years of being the under-target box); Central Europe 639 (target 550–750, comfortably in
-range); US Midwest 648 (target 800–1000, ~19–35% short depending on run).
+**Symptom**: US Midwest chronically the hardest of the six named boxes to bring up to Earth values.
+**Current numbers, independently re-verified 2026-08-01** (post-A5-fix, same run as A1): Canadian
+Prairies **437 mm/yr** (target 400–500 — back in range after the A5 fix, was slightly over before);
+Central Europe **502** (target 550–750 — now just *under* range, a new small side effect of the A5
+fix's wet-regime recalibration, was comfortably in range at 639 before); US Midwest **709** (target
+800–1000, ~11–30% short — better than the pre-fix 480–648, but the deficit A5's own writeup already
+flags as residual is real: not fully closed). Central Europe dipping under range is a genuine new,
+small regression from the A5 fix worth a follow-up look, not yet investigated.
 **Controlling variables**: `ferrel_v_centre_deg` (44.0, down from 48.0), `ferrel_v_land_shift_deg`
 (-4.0, decouples land Ferrel-cell center from ocean's), `PlanetParams` land-temperature bonus terms
 in `simulate.py` (`_midlat_storm_bonus_1d`, `_atm_land_transport_1d`, `_handoff_bonus_1d`), the
@@ -131,11 +143,17 @@ gate decayed ~20 cells inland, applied post-hoc after the ITCZ zonal smoothing (
 baking it in pre-smoothing measured almost no effect).
 **Residual**: S Japan fully fixed (100% Cfa); SE US majority-fixed (61% Cfa); East China only
 reaches a plurality (35% Cfa / 39% BSh / 19% Af, never a clean majority — pushing the exemption
-strength further starts overshooting into Af and bleeding into US Midwest). Also: **classification
-is fixed but magnitude is not** — absolute precip only reached ~500–585 mm/yr vs. the real
-1100–2200 mm/yr target range (`regional_validation.py`'s new `monsoon_subtropical` group). This
-corrects which side of the Köppen aridity threshold a cell lands on, not the underlying magnitude
-gap, which is the same raw-production-deficit wall as A2/A5.
+strength further starts overshooting into Af and bleeding into US Midwest). Köppen classification
+shares themselves haven't been re-measured post-A5-fix (10yr EMA lags too much to reflect it yet
+regardless — see A5's sampling note). **Magnitude update, independently re-verified 2026-08-01**
+(post-A5-fix, same run as A1/A3): SE US **772 mm/yr**, East China **578**, S Japan **1138**, vs. the
+1100–2200 target range — S Japan now clears the target range entirely (was ~838–898 before), SE US
+improved but still short (was ~500–585 before A4's original fix — wait, was 754–807 pre-A5-fix, see
+A5's own table), East China actually *dropped* (was ~744–786 pre-A5-fix) — a mixed, not uniformly
+positive, side effect of A5's wet-regime recalibration on the monsoon boxes specifically, not yet
+investigated. This corrects which side of the Köppen aridity threshold a cell lands on; the magnitude
+gap is no longer uniformly the same raw-production-deficit wall as A2/A5 (that's now largely closed)
+but East China's specific regression deserves its own look.
 **Real, accepted cost**: Kalahari's own BSh share drifted 91%→84% (the exemption's inland decay
 reach overlaps southern Africa's Indian Ocean/Mozambique-Channel coast).
 
@@ -162,17 +180,51 @@ regional architecture, not another flat multiplier or redistribution-only pass:
   resolution-invariant; its former fixed 20-cell reach meant 7° at 1024 columns but 56° in the
   tracked 128-column fixture.
 
-**Seasonally balanced 512×1024 result** (`saves/earth.pkl`, 730 days MONTHLY, second year):
-`global_rescale_factor` **5.462→2.064** (62% less synthetic fill); Sahara **586→131**,
-Kalahari **509→130**, Atacama **419→102**, and US Midwest **480→709 mm/yr**. The three general
-desert boxes now clear their `<200` target (Atacama remains above its special `<50` target), while
-the Midwest deficit is cut by roughly half without drying the Prairies (439) or creating a zonal
-precipitation increase. On the deterministic 64×128 benchmark, reference error improves
-**0.457→0.318**, arid land is **17.7%** (Earth ~19–20%), Sahara/Kalahari are **195/157**, and the
-Midwest is **979 mm/yr** (in target). Residual: the real-terrain Midwest result is still ~11% below
-the bottom of its target and the remaining 2.08× rescale is concentrated by design in regimes whose
-raw production should be low; this is a large structural closure, not a claim that all precipitation
-calibration is finished.
+**Seasonally balanced 512×1024 result** (`saves/earth.pkl`, 730 days MONTHLY, second year),
+independently reproduced 2026-08-01: `global_rescale_factor` **5.462→2.064** (62% less synthetic
+fill); Sahara **586→131**, Kalahari **509→130**, Atacama **419→102**, and US Midwest **480→709
+mm/yr**. The three general desert boxes now clear their `<200` target (Atacama remains above its
+special `<50` target), while the Midwest deficit is cut by roughly half without drying the Prairies
+(439) or creating a zonal precipitation increase. On the deterministic 64×128 benchmark, reference
+error improves **0.457→0.318**, arid land is **17.7%** (Earth ~19–20%), Sahara/Kalahari are
+**195/157**, and the Midwest is **979 mm/yr** (in target). Residual: the real-terrain Midwest result
+is still ~11% below the bottom of its target and the remaining 2.08× rescale is concentrated by
+design in regimes whose raw production should be low; this is a large structural closure, not a
+claim that all precipitation calibration is finished.
+
+**Two real bugs found and fixed 2026-08-01 in this fix's own test coverage** (the commit that
+shipped the numbers above landed with 3 failing tests; investigated and resolved, not just silenced
+— see process note 6): `_raw_conversion_gain` (the wet-regime raw-production multiplier above,
+up to 5.5×, unconditional — unlike every other lever in this document it shipped with no
+`PlanetParams` gate) pushes `remove_frac_prerescale` to its pre-existing 0.85 ceiling specifically in
+high-elevation/strongly-orographic latitude rows, clipping away most of the local windward-vs-leeward
+orographic differential exactly where it should be largest, while leaving unrelated
+wind-direction-dependent moisture-convergence effects in low-elevation rows unclipped — confirmed by
+direct ablation (forcing the gain to 1.0 restores both the old orographic-uplift-exceeds-rain-shadow
+invariant and the pre-fix cloud-fraction level). Both `orog` and `rain_shadow_suppression`
+themselves were directly verified to remain correctly signed throughout — the underlying meridional
+`gy` sign convention this project fixed in an earlier session is intact; only the aggregate
+`P.mean()` metric that used to proxy for it is now legitimately confounded by this new regime
+mechanism. Fixed by making `testing/test_derivative_signs.py`'s orographic regression test check
+`orog`/`rain_shadow_suppression` directly (immune to the confound) rather than final precipitation,
+and by moving `testing/test_cloud_feedback.py`'s cloud-fraction floor 0.12→0.10 (physically coherent
+— less raw production gets "saved" for the moisture-budget's targeted fill and more gets stripped
+out directly as rain, leaving less residual humidity for cloud formation — following this test's own
+established "the floor moves, not the physics" practice for prior deliberate recalibrations). The
+golden-state fixture (`testing/fixtures/golden_state_reference.pkl`) was regenerated against the
+now-verified-intentional physics change, per its own docstring's instructions.
+**Not yet fixed, flagged for a future session**: the `remove_frac`-saturation interaction itself is a
+real, if narrow, structural finding independent of this specific test — `orog`'s own within-run
+percentile normalization (`orog / percentile(orog, 90)`) means it provides *zero* net
+windward-vs-leeward differentiation on any spatially-uniform-slope terrain regardless of how steep
+that slope is (directly verified: 100m/300m/1000m-per-row ramps give byte-identical results), so the
+entire orographic effect in practice rests on `rain_shadow_suppression`'s much smaller ~20% uniform
+suppression term fighting against whatever else is happening in a given region. This was already true
+before A5; A5's gain just made the interaction visible by amplifying both sides enough to flip a
+previously-thin margin. A genuine fix (making `orog` differentiate on absolute terrain-relief
+magnitude, not just relative-within-run shape) is out of scope for this session but would likely
+improve real-terrain windward/leeward contrast (Cascades/Sierra Nevada rain shadows, Andes,
+Himalaya/Tibetan-Plateau lee deserts) beyond what this synthetic test alone can reveal.
 **The mechanism**: `atmosphere.py`'s raw, pre-rescale `precip_potential` chronically produces far
 below `target_mean_mm_day` — the moisture-budget rescale (`_moisture_budget_precip_rescale`)
 compensates with a per-row multiplier (`global_rescale_factor`) that averages **~5.47x** on real
@@ -645,3 +697,15 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
    `PLAN_PHYSICS_FIXES.md` (repo) remain the detailed, chronological session logs — this file is the
    rolled-up index and should be refreshed (not appended-to indefinitely) as major items close or
    new ones are found, mirroring how `test-suite-status.md` is maintained as a living snapshot.
+6. **A large physics recalibration's headline numbers being real doesn't mean it's clean — always run
+   the full test suite before trusting a "fixed" claim, including this document's own** (2026-08-01):
+   the A5 regime-architecture fix landed with genuinely reproducible, valuable real-terrain numbers
+   *and* 3 failing tests. One was benign (golden-state fixture needing regeneration after a deliberate
+   change, exactly as its own docstring anticipates). The other two were real: a new, large-effect
+   mechanism (`_raw_conversion_gain`, up to 5.5×) shipped completely unconditional — no `PlanetParams`
+   gate at all — breaking this project's own consistent convention (every other lever in this
+   document ships behind a 0.0/False-default no-op specifically so it can be validated and reverted
+   in isolation). Bisecting against recent commits (not just reasoning about the diff) was what
+   actually pinned the exact cause in minutes rather than hours. **New large-effect mechanisms should
+   still ship gated even when the calibrated value is believed correct** — the gate itself is what
+   makes an interaction bug like this one cheaply diagnosable via ablation instead of a bisect.

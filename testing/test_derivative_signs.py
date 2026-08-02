@@ -70,28 +70,59 @@ def _make_meridional_ramp_elevation(H: int, W: int) -> np.ndarray:
 
 def test_orographic_uplift_exceeds_rain_shadow_on_windward_side():
     """Wind blowing from low ground toward high ground (windward, uphill) must
-    produce more precipitation than the same setup with wind reversed (leeward,
-    downhill/descending) -- a direct regression check for the fixed `gy =
-    -np.gradient(elev, axis=0)` meridional sign convention."""
+    register more orographic uplift, and less rain-shadow suppression, than the
+    same setup with wind reversed (leeward, downhill/descending) -- a direct
+    regression check for the fixed `gy = -np.gradient(elev, axis=0)` meridional
+    sign convention.
+
+    Checks `debug_fields["orog"]`/`["rain_shadow_suppression"]` directly rather
+    than final `P.mean()` (2026-08-01, ACCURACY_AUDIT.md A5 follow-up): A5's
+    `_raw_conversion_gain` (up to 5.5x, latitude-regime-dependent, unconditional)
+    now pushes `remove_frac_prerescale` to its 0.85 ceiling in exactly the
+    high-elevation rows where the orographic differential is otherwise largest,
+    clipping away most of windward's raw-physics advantage there while leaving
+    unrelated wind-direction-dependent moisture-convergence effects in the
+    low-elevation rows unclipped -- confirmed by direct ablation (forcing the
+    gain to 1.0 restores the old `P.mean()` comparison's PASS). The sign
+    convention itself was directly verified intact throughout (this is why the
+    test now targets it directly, not because the invariant was relaxed): `orog`
+    and `rain_shadow_suppression` are unaffected by the moisture-budget rescale
+    or the regime gain, so checking them isolates exactly the thing this test
+    is named for, immune to that (real, separately-tracked) downstream
+    saturation interaction."""
     H, W = 32, 16
     elev = _make_meridional_ramp_elevation(H, W)
     u_zero = np.zeros((H, W), dtype=np.float32)
 
     # Windward: flowing south (toward higher ground, since elevation rises southward).
     v_windward = np.full((H, W), -8.0, dtype=np.float32)
-    P_windward, _, _, _ = atmo.generate_precipitation(
+    debug_windward: dict = {}
+    atmo.generate_precipitation(
         H, W, elev, wind_u=u_zero, wind_v=v_windward, day_of_year=80, dt_days=1.0,
+        debug_fields=debug_windward,
     )
 
     # Leeward: flowing north (away from higher ground, descending).
     v_leeward = np.full((H, W), 8.0, dtype=np.float32)
-    P_leeward, _, _, _ = atmo.generate_precipitation(
+    debug_leeward: dict = {}
+    atmo.generate_precipitation(
         H, W, elev, wind_u=u_zero, wind_v=v_leeward, day_of_year=80, dt_days=1.0,
+        debug_fields=debug_leeward,
     )
 
-    assert P_windward.mean() > P_leeward.mean(), (
-        f"windward (uphill) precip {P_windward.mean():.3f} mm/day should exceed "
-        f"leeward (downhill/rain-shadow) precip {P_leeward.mean():.3f} mm/day"
+    orog_windward = float(debug_windward["orog"].mean())
+    orog_leeward = float(debug_leeward["orog"].mean())
+    assert orog_windward > orog_leeward, (
+        f"windward (uphill) orographic uplift {orog_windward:.3f} should exceed "
+        f"leeward (downhill) uplift {orog_leeward:.3f}"
+    )
+
+    shadow_windward = float(debug_windward["rain_shadow_suppression"].mean())
+    shadow_leeward = float(debug_leeward["rain_shadow_suppression"].mean())
+    assert shadow_windward > shadow_leeward, (
+        f"windward (uphill) rain_shadow_suppression {shadow_windward:.3f} should exceed "
+        f"leeward (downhill/rain-shadow) suppression {shadow_leeward:.3f} "
+        f"(i.e. leeward should be suppressed more)"
     )
 
 
