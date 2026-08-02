@@ -32,7 +32,16 @@ deserts on any metric tried, and still hasn't.
 **Current numbers, independently re-verified 2026-08-01** (`saves/earth.pkl`, 512×1024, 2yr MONTHLY,
 seasonally-balanced 2nd-half average — see A5's sampling-window caveat): Sahara **131 mm/yr**
 (target <200 — **now in range**), Kalahari **130 mm/yr** (target <200 — **now in range**), Atacama
-**102 mm/yr** (target <50 — still ~2x over, the sole residual). This is the A5 regime-architecture
+**102 mm/yr** (target <50 — still ~2x over, the sole residual).
+> **Updated 2026-08-02**: the A2/A4 recalibration (`itcz_seasonal_response` 0.7→0.4,
+> `monsoon_east_margin_exemption` 1.5→3.0) deliberately spends some of this headroom — same save and
+> methodology, the deserts are now Sahara **150**, Kalahari **147**, Atacama **109** mm/yr. All still
+> inside their targets (Atacama excepted, unchanged as the residual), but the margin is thinner and
+> it is now a **binding constraint**: Kalahari's BWh core starts breaking up at
+> `monsoon_east_margin_exemption` 3.25, which is what caps that knob. Treat the desert boxes as the
+> limiting resource for any further tropical/monsoon tuning.
+
+This is the A5 regime-architecture
 fix's direct effect, verified by reproducing its own claimed numbers independently rather than
 trusting the write-up alone (this project's own established practice — see process note 3).
 **Controlling variables**: `atmosphere.py`'s `subsidence_suppression` (wind-divergence-derived
@@ -98,6 +107,27 @@ and that is now calibrated: `PlanetParams.itcz_seasonal_target_response` **1.0 �
 | k=1.7 (calibrated on the biased metric) | 10.70% | 4.23% | 7.10% | 2.61pp |
 | **k=2.0 (shipped)** | **6.82%** | 6.22% | **8.94%** | **1.37pp** |
 | Earth | 6.0% | 4.0% | 10.0% | — |
+
+**Improved again 2026-08-02 by re-sweeping the *other* ITCZ knob** (process note 7 applied to the
+corrected metric): `PlanetParams.itcz_seasonal_response` **0.7 → 0.4**, which roughly halves the
+remaining tropical error to **0.72pp** (Af 5.89% / Am 4.88% / Aw 11.16%) *and* lowers
+`reference_error_score` 0.3217→0.3178, partially repaying the zonal-magnitude cost k=2.0 accepted.
+The 0.7 value came from a 2026-07-30 sweep that read the knob as saturating past 0.7; under the
+area-weighted metric it is strongly **non-monotonic** instead (response 0.85 and 1.0 push Af back up
+to 10.6% and 14.5%), so the old "knee" was an artifact of the counting bias. A 2D grid confirmed the
+two ITCZ knobs are coupled, with a broad shallow optimum (0.3–0.45 × 2.0–2.3, tropical MAE
+0.63–0.72); 0.4 was taken with the target knob left at 2.0 so only one parameter moves.
+(Those figures isolate *this* knob, with `monsoon_east_margin_exemption` still at its old 1.5. In the
+shipped configuration, which also moves that knob to 3.0, the final tropical MAE is **0.99pp** — see
+A4; the exemption buys a large monsoon-box gain for a small tropical give-back.)
+**0.4 is also the physically better value** — Earth's zonal-mean ITCZ migrates ~±5–8° against a
+23.44° declination swing (ratio ~0.25–0.35), so 0.7 was an over-migration that merely scored well on
+a biased statistic. Cost: deserts slightly wetter (real-terrain Sahara 124→150, Kalahari 131→147,
+both still inside their <200 target). The 64×128 benchmark also shows a BSh fringe appearing on the
+Sahara box (BWh 98%→82%), but that is a **coarse-grid artifact**: re-run at 128×256 the same change
+leaves Sahara at BWh 98% / BSh 1% and Kalahari at 100% BWh. A 64×128 named box holds only a handful
+of land cells, so one reclassified cell reads as a double-digit swing — check box composition at
+128×256 before treating it as a real effect.
 
 **The bias directly caused a mis-calibration, which is worth remembering**: the unweighted metric
 reported k=2.0 as "overshooting Af down to 3.95%, below Earth's 6–7%", which is why 1.7 was chosen
@@ -261,7 +291,32 @@ latitude can also be independently corrected the same way the land side was, sin
 "2D barotropic gyres" item would let ocean circulation shape emerge from basin topology instead of
 a single global latitude constant.
 
-### A4. 🟢 SE US / East China / S Japan monsoon-margin misclassification — mostly fixed
+### A4. 🟢 SE US / East China / S Japan monsoon-margin misclassification — mostly fixed; East China residual closed 2026-08-02
+
+> **Update 2026-08-02 — `monsoon_east_margin_exemption` 1.5 → 3.0, and *neither* documented reason
+> for the 1.5 cap reproduces.** Re-tested per process note 7. The cap was justified by two collateral
+> effects at 2.5: East China overshooting into Af (31%), and the first BSh bleed into US Midwest (4%).
+> On the tracked fresh-spinup benchmark, East China shows **no Af at any strength through 7.0** (it
+> converts BWh→Cfa, the correct direction) and US Midwest's composition is **byte-stable** at
+> Cfa 75% / Cfb 12% / Dfb 12% throughout — no bleed at all. The original readings came from a
+> 512×1024 5yr continuation whose Köppen state was a lagging 10yr EMA; a fresh-spinup run isolates
+> the mechanism from that history. **Re-confirmed at 128×256** (4× the land cells per box, so one
+> reclassified cell no longer dominates): East China BWh 35% / BSh 35% / Cfa 26% → **Cfa 47%
+> plurality, still no Af**; S Japan Cfa 80% → **100%**; SE US Cfa 56% → **78%**; while US Midwest,
+> Central Europe and Atacama compositions are byte-identical and Kalahari stays 100% BWh.
+>
+> At 3.0 every headline metric improves simultaneously rather than trading: group MAE 2.246→1.969,
+> tropical MAE 1.369→0.986, `reference_error_score` 0.3217→0.2969, and the moisture-budget rescale
+> **2.463→2.008** (18% less synthetic fill — A5's own structural metric). S Japan reaches **100% Cfa**,
+> SE US 75% Cfa, and East China its **first Cfa plurality (42%)** — the specific residual this entry
+> was left open for. Real-terrain (512×1024, 730d): SE US 772→945, East China 576→780, S Japan
+> 1138→1256 mm/yr, Midwest and Central Europe flat.
+>
+> **The real binding constraint is different from the documented one, and it is the deserts**:
+> Kalahari holds 100% BWh through 3.0 and breaks at 3.25 (→92%, BSh 8%); Sahara's precip crosses its
+> 200 mm/yr ceiling by 5.0. Note `reference_error_score` keeps *falling* well past that point and is
+> **not a valid guide here** — `target_error_fraction` scores only distance *outside* a target
+> interval, so it is structurally blind to a desert degrading while it remains under 200.
 **Symptom (was)**: all three regions rendered as BSh hot steppe despite being real Köppen Cfa
 (humid subtropical) — they sit in the same latitude band as the true deserts but escape the
 subtropical high via Gulf Stream/Kuroshio monsoon moisture in reality.
@@ -355,7 +410,56 @@ out directly as rain, leaving less residual humidity for cloud formation — fol
 established "the floor moves, not the physics" practice for prior deliberate recalibrations). The
 golden-state fixture (`testing/fixtures/golden_state_reference.pkl`) was regenerated against the
 now-verified-intentional physics change, per its own docstring's instructions.
-**Not yet fixed, flagged for a future session**: the `remove_frac`-saturation interaction itself is a
+**Investigated 2026-08-02 — the orographic gap is real and larger than assumed, but the recommended
+fix above was the wrong lever. Root cause now measured, three compounding stages.** The prior text
+(kept below for the trail) proposed making `orog` sensitive to absolute terrain relief instead of
+within-run shape. That was pursued and abandoned for two measured reasons:
+
+- **Scale-invariance is a cross-planet defect, not a spatial one.** On a *fixed* DEM, any global
+  relief gain is algebraically just a retune of the 0.20 `orog` coefficient in `precip_potential` —
+  it cannot change windward/leeward contrast at all.
+- **It is also not cleanly implementable.** Across 64×128 → 512×1024, Earth's resolved land slope
+  p90 rises **3.3×** (0.0050 → 0.0165 m/m) while relief *per grid cell* falls **2.4×** the other
+  way, so no absolute normalization is simultaneously resolution-invariant and relief-sensitive.
+  Topography is self-affine; that is information loss at coarse resolution, not a code choice. A
+  fixed physical reference would have silently made the tracked benchmark and the 512×1024 GUI grid
+  disagree by ~3× — the same resolution-invariance bug class A5 itself already had to fix once.
+
+The spatially real constraint is the **`clip(…, 0, 2.0)` ceiling** immediately after the
+normalization, which binds far harder than it looks: on `saves/earth.pkl` with real simulated wind it
+truncates **19.96% of all land and 87.7% of the steepest 5%**, whose mean pre-clip `orog` is **11.3**
+against that ceiling of 2.0 — roughly 80% of the mountain signal discarded exactly in the
+Andes/Himalaya/Cascades. (It is also worse than the fixture shows: 9.5% of land truncated at 64×128
+vs 20% at 512×1024.) It is now gated as `PlanetParams.orographic_uplift_clip`, **shipped at its
+existing 2.0, i.e. a no-op**, because raising it is a measured **null result**:
+
+| range | W/L ratio, clip 2.0 | W/L ratio, clip 4.0 | Earth |
+|---|---|---|---|
+| Cascades | 1.18 | 1.20 | ~3–5× |
+| S Andes | 1.14 | 1.15 | large |
+| Himalaya | 6.32 | 6.53 | large |
+| Sierra Nevada | 1.11 | 1.10 | ~3–4× |
+
+Single-step ablation at the Cascades pair shows where the restored signal goes, and it is three
+stages, not one:
+1. **`remove_frac` saturation absorbs it** — windward cells at the hardcoded 0.85 ceiling go
+   8.9% → **90.0%** when the clip is raised, so final precipitation is identical to three digits.
+   A5 suspected this interaction; this measures it.
+2. **`orog` barely differentiates the pair anyway** — its own W/L ratio is **1.05**, and since it
+   carries only 0.20 of a six-term sum, `precip_potential`'s ratio is **0.93**, i.e. the *wrong
+   sign*, swamped by the humidity/convective/ascent terms.
+3. **The row rescale renormalizes the remainder** — `zonal_rescale_factor` for those rows is
+   **0.241** (they over-produce against their row target, achieved fraction 1.018, and get scaled
+   down ~4×): process note 9 again.
+
+**Newly quantified gap**: model Cascades windward/leeward ≈ **1.2×** vs Earth's ~3–5×. A genuine fix
+must raise `orog`'s weight/sharpness against the other five terms **and** lift the 0.85 `remove_frac`
+cap **and** survive the row rescale — three coupled changes, a calibration session of its own.
+`orographic_uplift_clip` exists as the ablation handle for that work.
+
+<details><summary>Superseded recommendation (kept for the diagnosis trail)</summary>
+
+the `remove_frac`-saturation interaction itself is a
 real, if narrow, structural finding independent of this specific test — `orog`'s own within-run
 percentile normalization (`orog / percentile(orog, 90)`) means it provides *zero* net
 windward-vs-leeward differentiation on any spatially-uniform-slope terrain regardless of how steep
@@ -367,6 +471,16 @@ previously-thin margin. A genuine fix (making `orog` differentiate on absolute t
 magnitude, not just relative-within-run shape) is out of scope for this session but would likely
 improve real-terrain windward/leeward contrast (Cascades/Sierra Nevada rain shadows, Andes,
 Himalaya/Tibetan-Plateau lee deserts) beyond what this synthetic test alone can reveal.
+
+</details>
+
+**`_raw_conversion_gain` is now gated (2026-08-02), closing process note 6's own action item**:
+`PlanetParams.precip_raw_conversion_gain`, default **4.5** = exactly the previously-hardcoded value,
+so the change is bit-identical (verified: every benchmark metric matches to all printed digits).
+`0.0` restores pre-A5 raw production exactly and is the in-place ablation that a git bisect had to
+substitute for the first time this mechanism misbehaved. Verified to work: at 0.0 the rescale factor
+jumps **2.008 → 6.408** and the continental boxes collapse (Midwest 985→881, Central Europe 826→755),
+reproducing the deficit A5 was built to close.
 **The mechanism**: `atmosphere.py`'s raw, pre-rescale `precip_potential` chronically produces far
 below `target_mean_mm_day` — the moisture-budget rescale (`_moisture_budget_precip_rescale`)
 compensates with a per-row multiplier (`global_rescale_factor`) that averages **~5.47x** on real
@@ -923,6 +1037,18 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
    especially any per-cell statistic on a lat/lon grid, where a missing `cos(lat)` is invisible,
    plausible-looking, and systematically wrong in a fixed direction. Cheap to check, and it can
    invalidate more accumulated conclusions than any physics fix.
+10. **`reference_error_score` is blind to a metric degrading *inside* its target band** (2026-08-02).
+   `target_error_fraction` scores only the distance *outside* a region's target interval, so a desert
+   drifting 130 → 199 mm/yr against a `<200` target contributes exactly zero, while a chronically
+   short box moving 576 → 780 against a 1300 floor contributes a lot. Sweeping
+   `monsoon_east_margin_exemption` on refErr alone therefore recommends 7.0, which visibly destroys
+   the Kalahari's BWh core. **Always pair refErr with a bounded-above metric** (per-box Köppen
+   composition, or the area-weighted group shares) before believing a monotone improvement in it.
+11. **A metric that cannot see the phenomenon will report a null result rather than an absence of
+   one** (2026-08-02). The tracked 64×128 fixture truncates 9.5% of land at the `orog` ceiling
+   versus 20% at 512×1024, and none of the nine named boxes is mountainous — so an orographic change
+   reads as "no effect" there by construction. The real A/B needed purpose-built windward/leeward
+   box pairs. Before concluding a mechanism does nothing, confirm the instrument resolves it.
 9. **At savanna/tropical latitudes the rescale *target* is the lever, not raw production**
    (2026-08-01, measured): a raw-production-side change there is absorbed almost entirely by a
    compensating change in the moisture-budget's synthetic fill — an attempted seasonal modulation of

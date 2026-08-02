@@ -3330,7 +3330,17 @@ def generate_precipitation(
         orog = np.clip(gx * u + gy * v, 0.0, None) + 0.25 * slope
         orog = land_f * orog
         orog = orog / (np.percentile(orog, 90.0) + 1e-6)
-        orog = np.clip(orog + 0.15 * _lap(orog.astype(np.float32)), 0.0, 2.0)
+        # This ceiling — not the percentile normalization above — is what bounds
+        # windward/leeward contrast spatially, and it binds hard: on real terrain
+        # the old fixed 2.0 truncated 87.7% of the steepest 5% of land (mean
+        # pre-clip 11.3). Raising it alone is still a null result, because the
+        # restored signal is absorbed downstream; see
+        # `PlanetParams.orographic_uplift_clip` for the full three-stage ablation.
+        orog = np.clip(
+            orog + 0.15 * _lap(orog.astype(np.float32)),
+            0.0,
+            float(pp.orographic_uplift_clip),
+        )
 
         # Rain-shadow drying: the mirror image of orographic uplift. Descending air
         # on the lee side of a range compresses and warms, lowering RH — this is why
@@ -3468,7 +3478,11 @@ def generate_precipitation(
         0.0,
         1.0,
     )
-    _raw_conversion_gain = 1.0 + 4.5 * _raw_conversion_affinity
+    # Gated 2026-08-02 (ACCURACY_AUDIT.md process note 6). The 4.5 default
+    # reproduces the hardcoded value this shipped with, so this is a no-op;
+    # `precip_raw_conversion_gain=0.0` is the in-place ablation that a git
+    # bisect had to stand in for the first time this mechanism misbehaved.
+    _raw_conversion_gain = 1.0 + float(pp.precip_raw_conversion_gain) * _raw_conversion_affinity
     precip_potential = np.clip(
         _raw_conversion_gain * precip_potential * post_shape, 0.0, 3.0
     )

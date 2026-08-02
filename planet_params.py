@@ -708,7 +708,7 @@ class PlanetParams:
     monotonic, side-effect-free improvement; 0.0 remains an exact no-op for
     anyone who wants the pre-2026-07 behavior."""
 
-    monsoon_east_margin_exemption: float = 1.5
+    monsoon_east_margin_exemption: float = 3.0
     """Strength of the exemption that reduces `drybelt_window`'s flat
     subtropical dry-belt latitude penalty at east-coast/monsoon land cells
     (SE US, East China, S Japan -- real Cfa/humid-subtropical climates that
@@ -751,7 +751,52 @@ class PlanetParams:
     continental-interior bleed (US Midwest showed 4% BSh, was 0% through
     1.6). 1.5 sits before that collateral cost appears -- a real, measured
     partial win for East China specifically, full for S Japan, majority for
-    SE US, not a complete fix for all three."""
+    SE US, not a complete fix for all three.
+
+    **RE-CALIBRATED 2026-08-02, 1.5 -> 3.0. Neither documented failure mode
+    above reproduces.** Re-tested per ACCURACY_AUDIT.md process note 7 after the
+    Koppen area-weighting fix, on the tracked deterministic 64x128 benchmark
+    (with `itcz_seasonal_response` at its own new 0.4):
+
+        exempt   groupMAE  tropMAE  refErr  rescale  SE US  E.China  S.Japan  Sahara  Kalahari  Midwest
+        1.5       2.265     0.715   0.318    2.659    725     497      630      199     159       976
+        2.0       2.164     0.768   0.311    2.370    803     563      774      199     162       977
+        2.5       2.055     0.893   0.302    2.138    879     628      911      197     166       978
+        3.0       1.969     0.986   0.297    2.008    929     665      993      196     170       985
+        3.25      1.848     1.016   0.296    1.977    943     680     1012      197     172       985
+        3.5       1.831     1.031   0.294    1.950    956     695     1031      198     174       985
+        7.0       2.250     1.299   0.278    1.667   1136     895     1273      202     201       982
+
+    All three monsoon boxes are chronically *far below* target (SE US 1100-1500,
+    East China 1300-1800, S Japan 1600-2200), which is why raising this moves
+    `reference_error_score` so much. Directly checked for the two collateral
+    effects the 1.5 cap was protecting against, and both are absent: East China
+    shows **no Af at any strength through 7.0** (it converts BWh -> Cfa, the
+    correct direction for a real Cfa climate), and US Midwest's composition is
+    byte-stable at Cfa 75% / Cfb 12% / Dfb 12% throughout -- **no BSh bleed at
+    all**. The earlier readings came from a 512x1024 5yr run whose Koppen state
+    was a lagging 10yr EMA; the fresh-spinup benchmark isolates the mechanism.
+
+    **The real binding constraint is different, and it is the deserts.** Sahara
+    holds BWh 82% / BSh 16% through 3.0 (that fringe is from
+    `itcz_seasonal_response`, not this knob -- see there) but Kalahari breaks at
+    3.25 (BWh 100% -> 92%, BSh 8%) and Sahara's own precip crosses its 200 mm/yr
+    ceiling by 5.0. 3.0 is the last value with Kalahari still 100% BWh. Note
+    `reference_error_score` keeps falling past that point and is *not* a valid
+    guide here: `target_error_fraction` scores only distance *outside* a target
+    interval, so it cannot see a desert degrading while it remains under 200.
+
+    At 3.0 every headline metric improves at once rather than trading:
+    group MAE 2.246 -> 1.969, tropical MAE 1.369 -> 0.986, refErr 0.3217 ->
+    0.2969, and the moisture-budget rescale factor 2.463 -> 2.008 (18% less
+    synthetic fill -- the A5 structural metric). Per-box Koppen: S Japan reaches
+    **100% Cfa**, SE US 75% Cfa, East China a 42% Cfa plurality (its first, and
+    the residual A4 flagged as unclosed). Real-terrain confirmation
+    (512x1024, `saves/earth.pkl`, 730d MONTHLY, seasonally balanced, jointly
+    with `itcz_seasonal_response` 0.7 -> 0.4): SE US 772 -> 945, East China
+    576 -> 780, S Japan 1138 -> 1256 mm/yr, US Midwest and Central Europe flat
+    (741 -> 735, 506 -> 508), deserts wetter but in range (Sahara 124 -> 150,
+    Kalahari 131 -> 147, Atacama 100 -> 109)."""
 
     itcz_zonal_smooth_deg: float = 8.0
     """Longitude-direction Gaussian smoothing [degrees] applied to
@@ -799,12 +844,30 @@ class PlanetParams:
     unbroken rainforest block and the other as a dry notch flanked by two wet
     peaks -- with diminishing returns beyond that (named-box precip is nearly
     flat from 8 to 16 degrees, confirming 8 is past the knee of the curve,
-    not an arbitrary stopping point). Area-weighted Koppen breakdown moved
+    not an arbitrary stopping point). Koppen breakdown moved
     cleanly toward Earth's real values in the same run: arid_pct
     22.1% -> 14.6% (real ~19-20%), tropical_pct (Af/Am/Aw) 8.9% -> 12.3%
     (real ~20%, was measured separately at 3.4% on the pre-fix 23.8yr save in
     test-npz-koppen-audit-2026-07-29 -- a large relative improvement, though
-    still short of Earth's share). Sahara and the continental-interior boxes
+    still short of Earth's share).
+
+    **Correction 2026-08-02: that Koppen sentence is void, though the 8.0 value
+    survives.** Those figures were called "area-weighted" but were plain cell
+    counts (the bias fixed 2026-08-02 -- see
+    `real_terrain_validation._koppen_land_percentages`), and correcting them
+    *inverts the sign of that argument*: area-weighted, arid land is ~29% against
+    Earth's 26.4%, so the model is over-arid and "22.1% -> 14.6%, real ~19-20%"
+    was wrong in both value and direction. Re-swept 0/4/8/12/16 on the tracked
+    64x128 benchmark under the corrected metric: raising sigma does keep lowering
+    the arid share (group MAE 2.246 at 8.0 -> 2.148 at 12 -> 2.105 at 16), but
+    only by trading away tropical accuracy (tropical MAE 1.369 -> 1.763 -> 1.994)
+    and `reference_error_score` (0.322 -> 0.324 -> 0.326), while pulling Canadian
+    Prairies further above its 400-500 target (530 -> 558 -> 577). **8.0 is kept
+    on its original and still-valid justification -- it is the sigma that
+    resolves the 15E/20E transect discontinuity, a structural bug -- not on the
+    arid-fraction number, which should not be cited for it again.**
+
+    Sahara and the continental-interior boxes
     (Canadian Prairies/US Midwest/Central Europe) are essentially unaffected
     (<3% change). **Real, honest cost**: Atacama gets substantially wetter
     (195 -> 448 mm/yr in the same run) -- its own aridity signature is a
@@ -850,7 +913,118 @@ class PlanetParams:
     0.0 retains the zonal background everywhere; 1.0 applies the full regime
     correction and is the calibrated Earth default."""
 
-    itcz_seasonal_response: float = 0.7
+    precip_raw_conversion_gain: float = 4.5
+    """Peak extra gain applied to raw pre-rescale `precip_potential` in
+    *wet* regimes, in `atmosphere.generate_precipitation`'s
+    `_raw_conversion_gain` (which evaluates to
+    `1.0 + precip_raw_conversion_gain * _raw_conversion_affinity`, so the
+    effective multiplier runs 1.0x in the fully dry subtropical regime up to
+    5.5x in fully wet regimes at this default).
+
+    This is the A5 fix's central mechanism: raw production was chronically
+    ~5.5x below `target_mean_mm_day`, forcing the moisture-budget rescale to
+    invent most of the world's rainfall, and calibrating the conversion to the
+    atmospheric residence-time deficit in wet regimes -- while deliberately NOT
+    amplifying the genuinely low-production dry belt, which is what makes
+    deserts deserts -- is what cut the global rescale factor from 5.46x to
+    ~2.0x. See ACCURACY_AUDIT.md A5.
+
+    **Why this field exists (added 2026-08-02, ACCURACY_AUDIT.md process note
+    6): 4.5 is exactly the value that was already hardcoded, so this is a
+    bit-identical no-op change.** The mechanism shipped 2026-08-01 with no
+    `PlanetParams` gate at all -- the only large-effect lever in this file to do
+    so, breaking the project's own convention that a new mechanism ships behind
+    a knob whose neutral value reproduces the prior behaviour. It then broke two
+    tests through an interaction nobody predicted (it pushes
+    `remove_frac_prerescale` into its 0.85 ceiling in strongly-orographic rows,
+    clipping the windward/leeward differential), and diagnosing that needed a
+    git bisect precisely because there was no way to ablate it in place.
+    `0.0` now restores pre-A5 raw production exactly (gain == 1.0 everywhere)
+    and is the ablation to reach for when a precipitation regression is
+    suspected of routing through this mechanism.
+
+    Not a tuning knob: 4.5 is calibrated and lowering it re-opens A5's
+    structural deficit. It is a diagnostic gate."""
+
+    orographic_uplift_clip: float = 2.0
+    """Ceiling applied to the normalized orographic-uplift term `orog` in
+    `atmosphere.generate_precipitation`. 2.0 is the value that was hardcoded
+    before 2026-08-02, so that default is an exact no-op.
+
+    **Why this is the lever for windward/leeward contrast.** ACCURACY_AUDIT.md
+    A5 flagged that `orog`'s within-run percentile normalization
+    (`orog / percentile(orog, 90)`) makes the term exactly scale-invariant --
+    100m/300m/1000m-per-row ramps give byte-identical results -- and proposed
+    making it sensitive to absolute terrain relief instead. Investigated
+    2026-08-02, and that framing turns out to be the wrong target for Earth:
+    scale-invariance is a *cross-planet* defect, and on a fixed DEM any global
+    relief gain is algebraically just a retune of the 0.20 `orog` coefficient in
+    `precip_potential` -- it cannot change the spatial contrast at all. (It is
+    also not cleanly fixable: measured across 64x128 -> 512x1024, Earth's
+    resolved land slope p90 rises 3.3x, 0.0050 -> 0.0165 m/m, while relief per
+    grid cell falls 2.4x the other way, so no absolute normalization is
+    simultaneously resolution-invariant and relief-sensitive. Topography is
+    self-affine; this is information loss at coarse resolution, not an
+    implementation choice.)
+
+    The ceiling is the spatially real constraint, and it binds far harder than
+    its innocuous look suggests. Measured on `saves/earth.pkl` (512x1024) with
+    the real simulated wind field:
+
+        clip   % of all land truncated   % of steepest-5% land truncated
+        2.0            19.96                        87.7
+        3.0            14.60                          --
+        4.0            11.50                          --
+        6.0             7.88                          --
+
+    The steepest 5% of land has a mean *pre-clip* `orog` of 11.3 against a
+    ceiling of 2.0 -- roughly 80% of the orographic signal was being discarded
+    exactly in the Andes/Himalaya/Cascades, which is precisely where A5 hoped a
+    fix would show up. The truncation is also resolution-dependent in a way the
+    tracked benchmark hides: 9.5% of land at 64x128 versus 20% at 512x1024, so
+    the fixture systematically under-represents the problem.
+
+    **Shipped at 2.0 (no-op) because raising it alone is a measured null
+    result, and the ablation identified the real binding constraint.** A/B'd on
+    real terrain (`saves/earth.pkl`, 512x1024, 730d MONTHLY, seasonally
+    balanced), windward-vs-leeward annual precipitation across four ranges,
+    clip 2.0 -> 4.0:
+
+        range        W/L ratio 2.0   W/L ratio 4.0   Earth (real)
+        Cascades          1.18            1.20         ~3-5x
+        S Andes           1.14            1.15         large
+        Himalaya          6.32            6.53         large
+        Sierra Nevada     1.11            1.10         ~3-4x
+
+    Restoring ~80% of the truncated mountain signal moves real orographic
+    contrast by under 2%. Single-step debug-field ablation at the Cascades pair
+    shows exactly where it goes, and it is three compounding stages, not one:
+
+      1. **`remove_frac` saturation absorbs it.** Windward cells at the 0.85
+         ceiling go from 8.9% (clip 2.0) to **90.0%** (clip 4.0). The extra
+         uplift is converted straight into a ceiling hit, so final precipitation
+         is *identical* to three digits either way. A5 suspected this
+         interaction; this measures it.
+      2. **`orog` barely differentiates the pair to begin with**: its own
+         windward/leeward ratio is only **1.05**, and because it carries just
+         0.20 of the six-term `precip_potential` sum, that sum's ratio is
+         **0.93** -- windward comes out *lower* than leeward, the wrong sign,
+         swamped by the humidity/convective/ascent terms.
+      3. **The row rescale renormalizes what survives**: `zonal_rescale_factor`
+         for the Cascades rows is **0.241** (they over-produce against their row
+         target, `precip_target_achieved_fraction` 1.018, and get scaled down
+         ~4x), the process-note-9 effect -- a raw-production-side change at these
+         latitudes is absorbed by a compensating change in the fill.
+
+    So the orographic gap is real and large (model ~1.2x vs Earth's ~3-5x at the
+    Cascades, newly quantified here), but **neither the percentile normalization
+    A5 proposed nor this ceiling is what binds it.** A genuine fix has to raise
+    `orog`'s weight/sharpness relative to the other five terms *and* lift the
+    0.85 `remove_frac` cap *and* survive the row rescale -- three coupled
+    changes, which is a calibration session of its own, not a one-line change.
+    This field stays as the ablation handle for that work."""
+
+    itcz_seasonal_response: float = 0.4
     """Fraction [0-1] of the full solar-declination swing (`solar_declination`)
     that the ITCZ's *center latitude* (not its width) tracks seasonally in
     `atmosphere.generate_precipitation`'s `itcz_window`. 0.0 is an exact no-op:
@@ -904,6 +1078,9 @@ class PlanetParams:
         0.7        20.36%  3.50%  698     520       420      602           727         679
         1.0        20.29%  3.50%  --      --        --       --            --          --
 
+    (**The sweep above is cell-count-biased and its "0.7" conclusion no longer
+    holds -- see the 2026-08-02 recalibration at the end of this docstring.**)
+
     Monotonic in the right direction (Af down, Aw up) at every tested value,
     essentially zero cost to every desert/continental-interior box (<2%
     change, well within run-to-run noise), and saturates between 0.7 and 1.0
@@ -931,7 +1108,58 @@ class PlanetParams:
     a larger, currently-blocked undertaking -- this fix does not attempt it,
     but does correct the specific, previously-undiscovered bug of the ITCZ
     never moving at all, which is unambiguously wrong physics on any tilted
-    planet regardless of how much of the area-fraction gap it closes alone."""
+    planet regardless of how much of the area-fraction gap it closes alone.
+
+    **RE-CALIBRATED 2026-08-02, 0.7 -> 0.4.** The 2026-07-30 sweep above chose
+    0.7 as "the knee" from Af/Aw shares computed as plain cell counts (the
+    measurement bug fixed 2026-08-02 -- see
+    `real_terrain_validation._koppen_land_percentages` and ACCURACY_AUDIT.md
+    process note 7, which says in as many words to re-run the sweeps that
+    justified a cap after a structural change). Re-swept against the corrected
+    area-weighted metric on the tracked deterministic 64x128 benchmark, with
+    `itcz_seasonal_target_response` held at its own 2026-08-02 value of 2.0:
+
+        response   Af      Am     Aw     tropMAE  groupMAE  refErr  Sahara  Midwest
+        0.0        21.86   0.10    1.40   9.455     2.315    0.316    201     974
+        0.4         5.89   4.88   11.16   0.715     2.265    0.318    199     976
+        0.7 (was)   6.82   6.22    8.94   1.369     2.246    0.322    192     982
+        0.85       10.60   5.96    5.48   3.693     2.245    0.320    190     987
+        1.0        14.51   2.67    5.21   4.877     2.351    0.317    189     996
+        (Earth: Af ~6.0%, Am ~4.0%, Aw ~10.0% of land area; tropMAE is the mean
+         absolute error against those three.)
+
+    The response is strongly non-monotonic under the corrected metric -- the old
+    unweighted numbers had read it as saturating past 0.7, which it does not --
+    and 0.4 roughly halves the tropical error (1.37pp -> 0.72pp) while also
+    *lowering* `reference_error_score` (0.3217 -> 0.3178), i.e. it partially
+    repays the zonal-magnitude cost `itcz_seasonal_target_response`'s own
+    docstring records as an accepted trade. A 2D grid over
+    (`itcz_seasonal_response`, `itcz_seasonal_target_response`) confirmed the two
+    knobs are coupled and that the optimum region is broad and shallow
+    (0.3-0.45 x 2.0-2.3, tropMAE 0.63-0.72); 0.4 with the target knob left at its
+    already-calibrated 2.0 was preferred over chasing the 0.64 minimum, so only
+    one parameter moves and attribution stays clean.
+
+    **0.4 is also the more physically defensible value**, which is why this is
+    not just metric-fitting: Earth's zonal-mean ITCZ migrates roughly +/-5-8
+    degrees against a 23.44-degree declination swing (ratio ~0.25-0.35, heavily
+    damped by ocean thermal inertia), so 0.7 was an over-migration that happened
+    to score well on a biased statistic.
+
+    **Real, accepted cost**: the deeper seasonal cycle wets the deserts slightly
+    (benchmark Sahara 192 -> 199 mm/yr, real-terrain 512x1024 124 -> 150,
+    Kalahari 131 -> 147 -- all still inside their <200 target). Verified on real
+    terrain (512x1024, `saves/earth.pkl`, 730d MONTHLY, seasonally balanced,
+    jointly with `monsoon_east_margin_exemption` 1.5 -> 3.0): area-weighted arid
+    land 30.6% -> 27.4% (Earth 26.4%) and tropical 17.7% -> 18.6% (Earth 19.0%).
+
+    On the 64x128 benchmark this also puts a BSh fringe on the Sahara box
+    (BWh 98% -> 82%). **That fringe is a coarse-grid artifact, not a real cost**:
+    re-run at 128x256 the same change leaves the Sahara at BWh 98% (BSh 1%) and
+    the Kalahari at BWh 100%, with US Midwest / Central Europe / Atacama
+    compositions byte-identical. Worth remembering as an instance of the general
+    rule -- a 64x128 named box holds only a handful of land cells, so a single
+    reclassified cell reads as a double-digit percentage swing."""
 
     itcz_seasonal_target_response: float = 2.0
     """Strength [0-1ish] of the fix for `itcz_seasonal_response`'s own flagged
