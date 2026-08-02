@@ -65,7 +65,56 @@ at any gyre strength from 0.0 to 3.0. The blocker is not the absence of cold wat
 future Atacama attempt should target that coupling pathway first and verify it transmits *before*
 building more ocean physics, or it will reproduce D5's null result.
 
-### A2. 🟡 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — Af now on-target, Aw/Am residual
+### A2. 🟢 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — resolved; the headline gap was largely a measurement bug
+> **⚠️ READ THIS BEFORE TRUSTING ANY KÖPPEN PERCENTAGE ELSEWHERE IN THIS DOCUMENT.**
+> Every Köppen land-share figure recorded here before 2026-08-02 — in A1, A2, A4, A5, B3, and the
+> memory notes they cite — was computed as a **plain cell count on an equirectangular grid**, with no
+> cos(latitude) area weighting. That systematically over-weights polar cells (a cell at 85° covers
+> ~8.7% the area of an equatorial one) and under-weights tropical ones. Corrected, the model is
+> **~4× more accurate** than those numbers implied (mean absolute error vs Earth's real group shares:
+> **8.7pp → 2.2pp**), with no physics change whatsoever:
+>
+> | group | cell-count (old) | **area-weighted** | Earth |
+> |---|---|---|---|
+> | A tropical | 12.7% | **22.0%** | 19.0% |
+> | B arid | 18.3% | **28.9%** | 26.4% |
+> | C temperate | 9.0% | 12.3% | 13.4% |
+> | D continental | 21.7% | 21.1% | 24.6% |
+> | E polar | 38.3% | **15.6%** | 16.6% |
+>
+> Because Köppen shares are a closed budget, the +21.7pp of phantom polar land was being subtracted
+> from every other group — which is precisely how the tropics appeared "2–4× under-represented" for
+> multiple sessions. **Fixed 2026-08-02** in both tracked measurement sites
+> (`real_terrain_validation._koppen_land_percentages` and
+> `scripts/check_real_terrain_koppen.py::_koppen_breakdown`).
+
+**Resolution**: the tropical band was never too small — area-weighted, A totals **22.0%** against
+Earth's 19.0% (slightly *over*, not 2–4× under). What was genuinely wrong was the *split within* it,
+and that is now calibrated: `PlanetParams.itcz_seasonal_target_response` **1.0 → 1.7 → 2.0**.
+
+| | Af | Am | Aw | MAE vs Earth |
+|---|---|---|---|---|
+| k=1.0 (start of 2026-08-01) | 19.27% | 0.24% | 3.57% | — |
+| k=1.7 (calibrated on the biased metric) | 10.70% | 4.23% | 7.10% | 2.61pp |
+| **k=2.0 (shipped)** | **6.82%** | 6.22% | **8.94%** | **1.37pp** |
+| Earth | 6.0% | 4.0% | 10.0% | — |
+
+**The bias directly caused a mis-calibration, which is worth remembering**: the unweighted metric
+reported k=2.0 as "overshooting Af down to 3.95%, below Earth's 6–7%", which is why 1.7 was chosen
+earlier the same day. Area-weighted, k=2.0 puts Af at 6.82% — essentially on target. Deserts and
+continental boxes are flat across the range (Sahara 193→192, US Midwest 980→982); `reference_error_score`
+rises 0.3195→0.3217, the same zonal-magnitude-vs-biome-accuracy trade as before, but now with a
+trustworthy biome metric on the other side of it.
+
+**Also ruled out along the way** (so it isn't re-investigated): the hypothesis that the A band was
+capped by Köppen's coldest-month ≥18°C temperature gate. It is not — pushing the coldest month up by
+a hypothetical +5°C raises *potential* A from 13.1% to only 14.5% (cell-count basis), because the
+newly-warm land is almost entirely arid. Actual A was already capturing ~97% of available warm
+non-arid land. The gate is not the constraint.
+
+<details>
+<summary>Superseded 2026-08-01 writeup (kept for the diagnosis trail — its numbers are cell-count-biased)</summary>
+
 **STATUS UPDATE 2026-08-01 (later same day)**: the regression documented below was **fixed**, and Af
 is now *inside* Earth's range for the first time in the project's history. Fix shipped:
 `PlanetParams.itcz_seasonal_target_response` **1.0 → 1.7**.
@@ -165,6 +214,8 @@ and steppe-adjacent land drier, both pulling *away* from the Aw classification b
 negative result in the current A2 entry above): gating `_raw_conversion_gain` by seasonality was the
 obvious-looking fix, but raw-production-side changes are absorbed by the moisture-budget rescale at
 these latitudes. The target side (`itcz_seasonal_target_response`) is what actually worked.
+
+</details>
 
 </details>
 
@@ -270,7 +321,15 @@ mm/yr**. The three general desert boxes now clear their `<200` target (Atacama r
 special `<50` target), while the Midwest deficit is cut by roughly half without drying the Prairies
 (439) or creating a zonal precipitation increase. On the deterministic 64×128 benchmark, reference
 error improves **0.457→0.318**, arid land is **17.7%** (Earth ~19–20%), Sahara/Kalahari are
-**195/157**, and the Midwest is **979 mm/yr** (in target). Residual: the real-terrain Midwest result
+**195/157**, and the Midwest is **979 mm/yr** (in target).
+> **Caveat added 2026-08-02**: the "arid land is 17.7% (Earth ~19–20%)" figure here is a *cell-count*
+> percentage and is biased — see A2's banner. Area-weighted, arid land is **28.9%** against Earth's
+> **26.4%**, i.e. the model is slightly *over*-arid rather than slightly under. This **inverts the
+> sign** of that particular piece of evidence; it does not affect A5's precipitation numbers (mm/yr
+> box means and `global_rescale_factor` are unaffected by the Köppen counting bug), so A5's core
+> conclusion stands.
+
+Residual: the real-terrain Midwest result
 is still ~11% below the bottom of its target and the remaining 2.08× rescale is concentrated by
 design in regimes whose raw production should be low; this is a large structural closure, not a
 claim that all precipitation calibration is finished.
@@ -850,7 +909,21 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
    justify a cap — the docstring recording *why* a value was capped is exactly the list of
    hypotheses worth re-testing, and re-running a cached sweep is far cheaper than inventing a new
    mechanism. (Corollary: this is why those "why we capped it here" notes are worth writing.)
-8. **At savanna/tropical latitudes the rescale *target* is the lever, not raw production**
+8. **Validate the *metric* before spending sessions optimizing against it** (2026-08-02 — the
+   single highest-leverage finding of this whole audit's history). Köppen land-share percentages were
+   computed as plain cell counts on an equirectangular grid, with no cos(latitude) area weighting, in
+   *both* tracked measurement sites. That inflated polar land to 38.3% (Earth ~16.6%) and, since the
+   shares are a closed budget, deflated every other group — which is the entire origin of the
+   long-standing "tropics are 2–4x under-represented" belief that multiple sessions tried to fix with
+   precipitation physics. Correcting the weighting moved mean absolute error against Earth from
+   **8.7pp to 2.2pp with zero physics change**, and revealed that the tropical band (22.0% vs Earth's
+   19.0%) was never too small at all. It also showed a same-day calibration had stopped at the wrong
+   value because the biased metric mis-reported the optimum. **Practical rule**: when a metric has
+   driven several sessions of work without the gap closing, audit the metric's own construction —
+   especially any per-cell statistic on a lat/lon grid, where a missing `cos(lat)` is invisible,
+   plausible-looking, and systematically wrong in a fixed direction. Cheap to check, and it can
+   invalidate more accumulated conclusions than any physics fix.
+9. **At savanna/tropical latitudes the rescale *target* is the lever, not raw production**
    (2026-08-01, measured): a raw-production-side change there is absorbed almost entirely by a
    compensating change in the moisture-budget's synthetic fill — an attempted seasonal modulation of
    `_raw_conversion_gain` moved final precipitation by ~0.05% and reclassified zero cells, while a

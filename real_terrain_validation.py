@@ -153,21 +153,53 @@ def _zonal_metrics(
 
 
 def _koppen_land_percentages(state: PlanetState, land_mask: np.ndarray) -> dict[str, float]:
+    """Köppen group shares of land, weighted by true cell AREA (cos-latitude).
+
+    Area weighting added 2026-08-02 (ACCURACY_AUDIT.md A2). These were previously
+    plain cell counts, but the grid is equirectangular: a cell at 85 deg covers
+    ~cos(85 deg) ~= 8.7% of the area of an equatorial one, so counting cells
+    equally massively over-weights the poles and under-weights the tropics.
+    Measured on the tracked 64x128 benchmark, the distortion was severe -- polar
+    read 38.3% of land (Earth ~16.6%) purely as a counting artifact, and because
+    Köppen shares are a closed budget that inflation was subtracted from every
+    other group. Correcting it moves the mean absolute error against Earth's real
+    group shares from 8.7pp to 2.2pp without any physics change:
+
+        group      cell-count    area-weighted    Earth
+        A (trop)        12.7%            22.0%    19.0%
+        B (arid)        18.3%            28.9%    26.4%
+        C               9.0%            12.3%    13.4%
+        D              21.7%            21.1%    24.6%
+        E (polar)      38.3%            15.6%    16.6%
+
+    Several sessions of tropical-biome work were calibrated against the
+    unweighted numbers and were therefore chasing an inflated gap -- see A2.
+    """
     if state.koppen_type is None or not np.any(land_mask):
         return {}
     from climate_averages import KOPPEN_NAMES
 
-    names = [KOPPEN_NAMES.get(int(value), "") for value in state.koppen_type[land_mask]]
-    total = max(len(names), 1)
+    codes = np.asarray(state.koppen_type)[land_mask]
+    H, W = np.asarray(state.koppen_type).shape
+    lat_rad = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * np.pi
+    weights = np.repeat(np.cos(lat_rad)[:, None], W, axis=1)[land_mask]
+    total = float(weights.sum())
+    if total <= 0.0:
+        return {}
+
+    names = np.array([KOPPEN_NAMES.get(int(value), "") for value in codes])
+
+    def _share(predicate) -> float:
+        mask = np.array([predicate(name) for name in names], dtype=bool)
+        return 100.0 * float(weights[mask].sum()) / total
+
     return {
-        "arid": 100.0 * sum(name.startswith(("BW", "BS")) for name in names) / total,
-        "humid_temperate_continental": (
-            100.0
-            * sum(name[:2] in ("Cf", "Cs", "Cw", "Df", "Dw") for name in names)
-            / total
+        "arid": _share(lambda n: n.startswith(("BW", "BS"))),
+        "humid_temperate_continental": _share(
+            lambda n: n[:2] in ("Cf", "Cs", "Cw", "Df", "Dw")
         ),
-        "polar": 100.0 * sum(name.startswith(("ET", "EF")) for name in names) / total,
-        "tropical": 100.0 * sum(name.startswith(("Af", "Am", "Aw")) for name in names) / total,
+        "polar": _share(lambda n: n.startswith(("ET", "EF"))),
+        "tropical": _share(lambda n: n.startswith(("Af", "Am", "Aw"))),
     }
 
 

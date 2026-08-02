@@ -933,7 +933,7 @@ class PlanetParams:
     never moving at all, which is unambiguously wrong physics on any tilted
     planet regardless of how much of the area-fraction gap it closes alone."""
 
-    itcz_seasonal_target_response: float = 1.7
+    itcz_seasonal_target_response: float = 2.0
     """Strength [0-1ish] of the fix for `itcz_seasonal_response`'s own flagged
     "honest limitation" (see that field's docstring): closes the gap where the
     moisture-budget/zonal-rescale target in `atmosphere.generate_precipitation`
@@ -1028,12 +1028,35 @@ class PlanetParams:
     in Koppen biome classification against the project's designated reference map.
     Revisit if zonal precip magnitude ever becomes the priority over biome shape.
 
-    **Honest limitation, unchanged**: Aw+Am is still well short of Earth's
-    ~18-20% even at 1.7 -- this knob converts Af->Aw/Am within an
-    already-too-small tropical band; it cannot grow the band itself. The
-    remaining gap is the moisture-budget rescale's other structural limits (see
-    `docs/ACCURACY_AUDIT.md` A2/A5), not further tuning of this knob: pushing to
-    2.0 overshoots Af to 3.95% (below Earth) while Aw+Am only reaches 8.71%."""
+    **RE-CALIBRATED AGAIN 2026-08-02, 1.7 -> 2.0, after fixing a measurement
+    bug.** Everything above (and the "1.7" conclusion) was calibrated against
+    Köppen shares computed as *plain cell counts*, which on an equirectangular
+    grid over-weight the poles severely -- see
+    `real_terrain_validation._koppen_land_percentages`, now area-weighted. Under
+    the corrected metric the picture changes materially, because tropical cells
+    had been systematically under-counted:
+
+        k     Af      Am      Aw     MAE vs Earth   refErr
+        1.7   10.70%  4.23%   7.10%      2.61pp     0.3195
+        2.0    6.82%  6.22%   8.94%      1.37pp     0.3217
+        2.2    4.84%  6.13%  10.97%      1.42pp     0.3233
+        2.4    3.14%  6.43%  12.28%      2.52pp     0.3248
+        (Earth: Af ~6.0%, Am ~4.0%, Aw ~10.0% of land area)
+
+    2.0 minimises the error against Earth's real Af/Am/Aw split. Note the old
+    unweighted metric had reported k=2.0 as "overshooting Af to 3.95%, below
+    Earth's 6-7%" -- area-weighted, k=2.0 puts Af at 6.82%, essentially on
+    target. The previous 1.7 stopping point was an artifact of that bias.
+    Deserts and continental boxes stay flat across this range (Sahara 193->192,
+    US Midwest 980->982), and `reference_error_score` rises 0.3195->0.3217 --
+    the same zonal-magnitude-vs-biome-accuracy trade documented above, now with
+    a trustworthy biome metric on the other side of it.
+
+    **Honest limitation, unchanged**: this knob redistributes *within* the
+    tropical band (A total stays ~22% across the whole sweep); it cannot grow
+    the band. That is fine -- area-weighted, A total is 22.0% against Earth's
+    19.0%, i.e. the band was never actually too small. The old "Aw+Am is 2-4x
+    under-represented" framing was itself a product of the counting bug."""
 
     precip_raw_shape_weight: float = 0.0
     """Strength [0-1] of blending `precip_potential`'s own row-relative raw

@@ -193,13 +193,29 @@ def _land_coldest_month_c(state, land_mask, lat_n: float, lat_s: float) -> float
 
 
 def _koppen_breakdown(state, land_mask) -> dict[str, float]:
+    """Köppen land-fraction breakdown, weighted by true cell AREA (cos-latitude).
+
+    Area weighting added 2026-08-02 (ACCURACY_AUDIT.md A2) -- see
+    `real_terrain_validation._koppen_land_percentages` for the full measurement.
+    Plain cell counts on an equirectangular grid over-weight the poles severely
+    (polar read 38.3% of land vs Earth's ~16.6%), and since Köppen shares are a
+    closed budget that inflation was silently subtracted from the tropics.
+    """
     from climate_averages import KOPPEN_NAMES
 
     k = state.koppen_type
     if k is None:
         return {}
-    vals, counts = np.unique(k[land_mask], return_counts=True)
-    total = land_mask.sum()
+    H, W = k.shape
+    lat_rad = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * np.pi
+    weight_grid = np.repeat(np.cos(lat_rad)[:, None], W, axis=1)
+    codes = k[land_mask]
+    weights = weight_grid[land_mask]
+    total = float(weights.sum())
+    if total <= 0.0:
+        return {}
+    vals = np.unique(codes)
+    counts = np.array([weights[codes == v].sum() for v in vals], dtype=np.float64)
     arid = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "").startswith(("BW", "BS")))
     humid = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "")[:2] in ("Cf", "Cs", "Cw", "Df", "Dw"))
     polar = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "").startswith(("ET", "EF")))
