@@ -873,7 +873,7 @@ class PlanetParams:
     never moving at all, which is unambiguously wrong physics on any tilted
     planet regardless of how much of the area-fraction gap it closes alone."""
 
-    itcz_seasonal_target_response: float = 1.0
+    itcz_seasonal_target_response: float = 1.7
     """Strength [0-1ish] of the fix for `itcz_seasonal_response`'s own flagged
     "honest limitation" (see that field's docstring): closes the gap where the
     moisture-budget/zonal-rescale target in `atmosphere.generate_precipitation`
@@ -920,23 +920,60 @@ class PlanetParams:
     Monotonic and substantial in the right direction through the whole swept
     range (Af down, Aw+Am up, total A-climate land-fraction roughly conserved
     at k<=1.0 as intended -- cells are converting Af->Aw/Am within the tropics,
-    not leaving it), but **arid_pct starts climbing measurably past k=1.0**
+    not leaving it), but **arid_pct started climbing measurably past k=1.0**
     (12.3%->12.5%->13.7%->15.3% at k=0/1.0/1.5/2.0) while every named
-    desert/continental EMA box stays flat through k=1.0 and only Kalahari/
-    Atacama drift up (~4-7%) beyond it -- a real overshoot where an
+    desert/continental EMA box stayed flat through k=1.0 and Kalahari/Atacama
+    drifted up (~4-7%) beyond it -- read at the time as an overshoot where an
     excessively deep dry season pushes savanna-adjacent cells over Koppen's
-    aridity-index threshold into steppe (BSh) instead of stopping at Aw,
-    eroding the model's already-hard-won desert-vs-continental ranking work
-    for no further within-tropics benefit. **k=1.0 sits right at the knee**:
-    the largest value with no measurable arid/continental-EMA cost (all boxes
-    match the k=0 baseline to within run-to-run noise) while still nearly
-    quadrupling Aw (2.00%->4.97%) and cutting Af by ~29% (11.24%->7.98%).
+    aridity-index threshold into steppe (BSh) instead of stopping at Aw. On
+    that basis k=1.0 was chosen as "the knee".
 
-    **Honest limitation, same as `itcz_seasonal_response`**: still short of
-    Earth's Aw~18-20% target even at k=1.0 -- this closes the specific
-    deficit-filling mechanism that fix's own docstring flagged, but the
-    remaining gap is the moisture-budget rescale's other structural limits
-    (see `known-physics-gaps.md` item 3b), not further tuning of this knob."""
+    **RE-CALIBRATED 2026-08-01 to 1.7** (deterministic 64x128 benchmark,
+    `real_terrain_validation.RealTerrainValidationConfig()` defaults, fresh
+    spinup -- the tracked instrument, not the 10yr-EMA-lagged save above):
+
+        k     Af%     Aw+Am%   arid%   Sahara  Kalahari  Atacama  Midwest  refErr
+        1.0   11.05   2.25     17.67   195     157       146      979      0.3185
+        1.5    7.79   5.07     18.15   194     156       146      981      0.3213
+        1.6    7.01   5.73     18.23   193     156       146      981      0.3219
+        1.7    6.07   6.65     18.23   193     156       146      981      0.3226
+        2.0    3.95   8.71     18.29   192     155       146      981      0.3245
+
+    **The k>1.0 blocker above no longer applies, and re-testing it was the
+    point.** That 2026-07-31 reading rejected k>1.0 because arid_pct rose *while
+    desert boxes drifted wetter* -- i.e. the extra aridity was being manufactured
+    at the tropical margin rather than in real deserts. Post-A5 (see
+    `docs/ACCURACY_AUDIT.md` A5, which fixed raw production and made
+    `subsidence_suppression` regime-aware) that failure mode is simply absent:
+    across this whole sweep Sahara/Kalahari/Atacama are flat-to-slightly-*drier*
+    and every continental box is flat, while arid_pct moves 17.67%->18.23%
+    *toward* Earth's ~19-20% rather than past it. A5 also moved arid_pct's
+    starting point from ~12% up to ~17.7%, which is why the old sweep's
+    "climbing arid" signal read as overshoot then and reads as convergence now.
+
+    1.7 puts **Af at 6.07%, inside Earth's ~6-7%** (from 11.05%, a longstanding
+    ~1.7x over-representation) and nearly triples Aw+Am (2.25%->6.65%), with no
+    measurable desert/continental cost on the benchmark *or* on real terrain
+    (512x1024, 2yr MONTHLY seasonally-balanced: Sahara 131->126, Midwest
+    709->705, Central Europe 502->502, S Japan 1138->1138 -- all within noise).
+
+    **Real, accepted cost**: `reference_error_score` 0.3185->0.3226 (+1.3%),
+    driven entirely by the 10-20N zonal band's precip ratio (0.768->0.714). That
+    band is the savanna belt itself, and deepening its dry season genuinely lowers
+    its annual mean. Note the modulation stops being exactly mean-preserving above
+    k~1.0 because the `clip(0.05)` floor truncates the dry-season trough while the
+    wet-season boost stays moisture-budget-limited. This is a deliberate trade of
+    a zonal *magnitude* metric (which contains no biome information -- refErr is
+    only zonal temperature bias + precip ratio) for a large, on-target improvement
+    in Koppen biome classification against the project's designated reference map.
+    Revisit if zonal precip magnitude ever becomes the priority over biome shape.
+
+    **Honest limitation, unchanged**: Aw+Am is still well short of Earth's
+    ~18-20% even at 1.7 -- this knob converts Af->Aw/Am within an
+    already-too-small tropical band; it cannot grow the band itself. The
+    remaining gap is the moisture-budget rescale's other structural limits (see
+    `docs/ACCURACY_AUDIT.md` A2/A5), not further tuning of this knob: pushing to
+    2.0 overshoots Af to 3.95% (below Earth) while Aw+Am only reaches 8.71%."""
 
     precip_raw_shape_weight: float = 0.0
     """Strength [0-1] of blending `precip_potential`'s own row-relative raw

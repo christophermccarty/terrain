@@ -61,7 +61,63 @@ from the others. The `coastal_upwelling_fog_strength` diagnostic gate (D3) is th
 remaining lever specifically for Atacama's narrow-coastal-strip signature, not another divergence-based
 mechanism; real SST-coupled upwelling physics (D3's actual recommended next step) is the honest fix.
 
-### A2. 🔴 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — WORSENED by the A5 fix
+### A2. 🟡 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — Af now on-target, Aw/Am residual
+**STATUS UPDATE 2026-08-01 (later same day)**: the regression documented below was **fixed**, and Af
+is now *inside* Earth's range for the first time in the project's history. Fix shipped:
+`PlanetParams.itcz_seasonal_target_response` **1.0 → 1.7**.
+
+**Why this value was available now but not before** (the interesting part — this knob had already
+been swept to 2.0 on 2026-07-31 and deliberately capped at 1.0): that earlier sweep rejected k>1.0
+because `arid_pct` climbed *while the named desert boxes drifted wetter*, i.e. the extra aridity was
+being manufactured at the tropical margin instead of in real deserts. Post-A5 that failure mode is
+simply absent — across a fresh 1.0→2.0 sweep the desert boxes are flat-to-slightly-**drier**
+(Sahara 195→193, Kalahari 157→156, Atacama 146) and every continental box is flat, while `arid_pct`
+moves 17.67%→18.23%, i.e. *toward* Earth's ~19–20% rather than past it. A5 had also lifted
+`arid_pct`'s starting point from ~12% to ~17.7%, which is exactly why the same signal read as
+"overshoot" then and reads as "convergence" now. **Re-testing a previously-rejected parameter after
+a major upstream change was the whole win here** — the parameter did not change, the constraint did.
+
+**Measured (deterministic 64×128 benchmark, fresh spinup — the tracked instrument, not the
+EMA-lagged save)**:
+
+| k | Af% (→6–7) | Aw+Am% (→18–20) | arid% (→19–20) | Sahara | Midwest | refErr |
+|---|---|---|---|---|---|---|
+| 1.0 (was) | 11.05 | 2.25 | 17.67 | 195 | 979 | 0.3185 |
+| **1.7 (now)** | **6.07** | **6.65** | **18.23** | 193 | 981 | 0.3226 |
+| 2.0 | 3.95 | 8.71 | 18.29 | 192 | 981 | 0.3245 |
+
+Confirmed on real terrain (512×1024, 2yr MONTHLY, seasonally balanced): named boxes unchanged —
+Sahara 131→126, Midwest 709→705, Central Europe 502→502, S Japan 1138→1138, all within noise.
+**Real, accepted cost**: `reference_error_score` 0.3185→0.3226 (+1.3%), traceable entirely to the
+10–20°N zonal band's precip ratio (0.768→0.714) — that band *is* the savanna belt, and deepening its
+dry season genuinely lowers its annual mean. (The modulation also stops being exactly mean-preserving
+above k≈1.0: its `clip(0.05)` floor truncates the dry-season trough while the wet-season boost stays
+moisture-budget-limited.) Deliberate trade of a zonal *magnitude* metric that contains no biome
+information (refErr = zonal temperature bias + precip ratio only) for a large, on-target improvement
+in biome classification against the project's designated Köppen reference map.
+**Residual keeping this 🟡 rather than 🟢**: Aw+Am is 6.65% vs Earth's ~18–20%. This knob converts
+Af→Aw/Am *within* an already-too-small tropical band (total tropical land 13.30%→12.66% across the
+sweep vs Earth's ~24–27%); it cannot grow the band itself. Pushing to 2.0 overshoots Af to 3.95%
+(now *below* Earth) while Aw+Am only reaches 8.71% — so this specific lever is exhausted at 1.7.
+**Next lever for the residual**: the tropical band's total extent, not its internal Af/Aw split.
+
+**A negative result worth not repeating** (tried and reverted this session): the hypothesis that
+`_raw_conversion_gain` should migrate seasonally (it is built from `drybelt_regime_window`, a pure
+|latitude| shape with zero `day_of_year` dependence — the same gap class already fixed twice here)
+was implemented and swept 0.0→1.3. It changes final precipitation by **~0.05%** (savanna-band wettest
+month 4.325→4.327 mm/day) and moves no Köppen cell at all. Reason, measured: at savanna latitudes the
+moisture-budget rescale pins output to `target_row_mm_day`, so a raw-production-side change is
+absorbed almost entirely by a compensating change in synthetic fill. **Corollary worth remembering:
+at these latitudes the *target* is the lever, not raw production** — which is precisely why the
+target-side knob above worked. Reverted rather than shipped inert (unlike other 0.0-default params
+here, it provably does nothing for its stated purpose, so it would be misleading dead code).
+
+---
+
+<details>
+<summary>Original regression writeup (superseded by the fix above, kept for the diagnosis trail)</summary>
+
+### A2 (historical). 🔴 Tropical rainforest over-extent / savanna under-extent — WORSENED by the A5 fix
 **Symptom**: Sub-Saharan Africa and other tropical land render as near-unbroken Af (rainforest)
 with almost no savanna transition, vs. real Köppen's broad Aw/Am bands flanking a narrower Af core.
 **Re-measured 2026-08-01, and it's a regression, not the improvement A5's own writeup assumed**:
@@ -101,11 +157,12 @@ real bugs, but net-negative), and now A5's regime-gain fix (real gain for A1, ne
 (A5 addressed that) — it's that raising raw production *uniformly* across the whole non-dry-belt
 range doesn't create an intermediate savanna regime, it just makes rainforest-adjacent land wetter
 and steppe-adjacent land drier, both pulling *away* from the Aw classification band in the middle.
-**Recommended next lever, unattempted**: a genuine *third* regime (not just wet/dry) for the
-savanna transition zone specifically — e.g. gate part of `_raw_conversion_gain`'s boost by
-seasonality/distance-from-ITCZ-core so cells that are wet only part of the year (the actual physical
-definition of savanna) get a smaller boost than cells that are wet year-round, rather than every
-non-dry-belt cell receiving the same flat gain regardless of its own seasonal profile.
+**Recommended next lever** (proposed here, then **tested and disproved** the same session — see the
+negative result in the current A2 entry above): gating `_raw_conversion_gain` by seasonality was the
+obvious-looking fix, but raw-production-side changes are absorbed by the moisture-budget rescale at
+these latitudes. The target side (`itcz_seasonal_target_response`) is what actually worked.
+
+</details>
 
 ### A3. 🟡 Continental interior still short of target (US Midwest specifically)
 **Symptom**: US Midwest chronically the hardest of the six named boxes to bring up to Earth values.
@@ -694,11 +751,31 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
    mechanism cannot fix any of these; raw production had to rise and the rescale architecture had
    to become regime-aware. The successful follow-up did both and corrected
    `subsidence_suppression`'s regime accuracy; use that as the new baseline rather than reviving
-   the failed flat/redistribution-only attempts. **But it is not a free win**: the same wet/dry
+   the failed flat/redistribution-only attempts. **It was not a free win**: the same wet/dry
    contrast-sharpening that fixed A1 (deserts) directly *worsened* A2 (savanna transition) —
-   confirmed by measurement, not theoretical (Aw+Am land share dropped from 8.16% to 2.25%, see
-   A2). A1 and A2 are now in measured tension under this specific mechanism; a future fix for
-   either needs to check its effect on the other, not just its own target box.
+   confirmed by measurement, not theoretical (Aw+Am land share dropped from 8.16% to 2.25%). That
+   specific regression was subsequently fixed via `itcz_seasonal_target_response` 1.0→1.7 (see A2),
+   but the general lesson stands: a fix in section A should be measured against *all* of A1–A4, not
+   only its own target box.
+7. **Re-test previously-rejected parameters after any major upstream change — the constraint may
+   have moved, not the parameter** (2026-08-01, the session's highest-leverage-per-effort win).
+   `itcz_seasonal_target_response` had been swept to 2.0 on 2026-07-31 and deliberately capped at
+   1.0, with a documented reason: past 1.0, `arid_pct` climbed *while desert boxes drifted wetter*
+   (aridity manufactured at the tropical margin instead of in real deserts). After A5 landed, an
+   identical sweep showed that failure mode simply gone — deserts now stay flat-to-drier and
+   `arid_pct` moves *toward* Earth's target instead of past it, because A5 had raised `arid_pct`'s
+   starting point from ~12% to ~17.7%. The same measurement read as "overshoot" before and
+   "convergence" after. Nothing about the parameter changed; the regime it operated in did.
+   **Practical rule**: after a structural fix, re-run the sweeps that earlier sessions used to
+   justify a cap — the docstring recording *why* a value was capped is exactly the list of
+   hypotheses worth re-testing, and re-running a cached sweep is far cheaper than inventing a new
+   mechanism. (Corollary: this is why those "why we capped it here" notes are worth writing.)
+8. **At savanna/tropical latitudes the rescale *target* is the lever, not raw production**
+   (2026-08-01, measured): a raw-production-side change there is absorbed almost entirely by a
+   compensating change in the moisture-budget's synthetic fill — an attempted seasonal modulation of
+   `_raw_conversion_gain` moved final precipitation by ~0.05% and reclassified zero cells, while a
+   target-side change of comparable intent moved Af from 11.05% to 6.07%. Check which side of the
+   rescale a proposed mechanism sits on before building it.
 2. **Several "fixes" are real, tested, and shipped — but deliberately inert (default off/0.0)**
    because they measured net-negative, no-effect, or an unresolved trade-off for their intended
    purpose: `moisture_advection_scale`, `precip_raw_shape_weight`, `cloud_water_feedback`,
