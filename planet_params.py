@@ -275,22 +275,57 @@ class PlanetParams:
     At 0.3, coastal upwelling introduces realistic SST gradients at continental margins.
     Gated by has_liquid_water_ocean."""
 
-    ocean_gyre_strength: float = 0.0
+    ocean_gyre_strength: float = 1.0
     """Scaling factor for the 2D barotropic gyre current contribution to ocean
     heat transport (`ocean.compute_gyre_currents`) [0-1, >=0 in principle].
     0 = disabled (exact no-op: skips the whole block, matching `ekman_strength`'s
     own guard pattern). Purely additive alongside (never replacing) the existing
     1D zonal-mean transport (`calculate_ocean_heat_transport`) and Ekman
     deflection (`ekman_strength`) -- gives ocean currents real east-west (gyre)
-    structure that those two mechanisms can't produce on their own. No prior-
-    session calibration history -- this is the highest-risk, most-structural
-    item in the Jul 2026 backlog session (see six-item-backlog-session-2026-07
-    memory): ocean SST feeds every downstream climate metric, so re-verify
-    conservation/climate-drift/ECS guard-rail tests carefully before ever
-    raising this default, and check the resulting SST pattern for plausible
-    western-boundary-current structure rather than noise (the underlying
-    streamfunction solve is periodic-in-x/DFT-in-y, tolerating no true
-    meridional boundary condition -- same caveat as its atmosphere.py usage)."""
+    structure that those two mechanisms can't produce on their own.
+
+    **Calibrated 2026-08-02 (ACCURACY_AUDIT.md D5), default 0.0 -> 1.0.** It had
+    shipped inert with no calibration history, flagged as the highest-risk item
+    of the Jul 2026 backlog session, with two specific things to check first.
+    Both were checked and both came back clean:
+
+    - *"Check the SST pattern for plausible western-boundary-current structure
+      rather than noise."* It is coherent structure, not noise: the grid-scale
+      residual of the gyre-induced SST anomaly is 0.10 of its total standard
+      deviation (a value near/above 1.0 would indicate grid-scale noise). The
+      anomaly reproduces the correct gyre dipole in every region checked --
+      warming on western boundaries (Gulf Stream +0.38 K, Kuroshio +0.14 K) and
+      cooling on eastern boundaries (Canary -0.36 K, California -0.22 K,
+      Benguela -0.54 K, Humboldt -0.25 K).
+    - *"Re-verify guard-rail tests before raising this default."* Full suite
+      green; `reference_error_score` improves 0.3226 -> 0.3209 on the tracked
+      64x128 benchmark (and 0.3195 combined with the `land_west` sign fix below).
+
+    The improvement is physically located rather than a global-cooling artifact:
+    decomposing the score shows the precipitation half is flat (0.2811 ->
+    0.2817) and essentially all the gain is in the temperature half,
+    concentrated in the two ocean-dominated Southern-Hemisphere bands (0-10S
+    0.048 -> 0.036, 40-50S 0.557 -> 0.524) while the large Northern-Hemisphere
+    mid-latitude biases -- which are land/AMOC-driven (D2), not gyre-driven --
+    barely move. Returns saturate around 1.0 (values to 3.0 keep improving the
+    score only marginally, and this solve has no natural physical amplitude --
+    it is clipped to +-0.5 m/s -- so 1.0, the unscaled solve, is preferred over
+    chasing a metric that cannot distinguish "more correct" from "cools an
+    already-too-warm model").
+
+    **Known limitation, measured**: the eastern-boundary cooling above is real
+    ocean physics that D3 lists as entirely missing, but it does *not* propagate
+    to adjacent land precipitation -- Atacama precipitation is unchanged (146
+    mm/yr) at every gyre strength from 0.0 to 3.0. This directly answers the
+    doubt D3 itself raised ("it was never established that per-cell SST
+    anomalies propagate to land climate at all in this model's simplified
+    atmosphere"): they do not, at least not through this pathway. Enabling gyres
+    is therefore *not* a route to fixing Atacama (A1's remaining desert
+    residual).
+
+    Caveat unchanged: the underlying streamfunction solve is periodic-in-x/
+    DFT-in-y, tolerating no true meridional boundary condition -- same caveat as
+    its atmosphere.py usage."""
 
     ferrel_v_centre_deg: float = 44.0
     """Latitude centre [deg] of the mid-latitude lobe of the prescribed

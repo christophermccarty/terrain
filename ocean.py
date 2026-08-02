@@ -251,7 +251,32 @@ def calculate_ocean_heat_transport(
         + 0.35 * np.roll(wbc_core, 1, axis=1)   # 1 cell east of the boundary
         + 0.2 * np.roll(wbc_core, 2, axis=1)    # 2 cells east
     )
-    T_adjustment = T_adjustment * np.clip(western_enhancement, 1.0, 1.5)
+    # Sign bug fixed 2026-08-02 (ACCURACY_AUDIT.md D5): `western_enhancement` is a
+    # 1.0-1.5x *multiplier*, and was applied to `T_adjustment` unconditionally --
+    # but `T_adjustment` is a SIGNED quantity, and at real WBC cells it is
+    # predominantly negative (measured on the bundled 64x128 Earth DEM: 73.6% of
+    # the 159 WBC cells negative, mean -0.0138 K). Multiplying a negative value by
+    # 1.5 makes it *more* negative, so this heuristic was amplifying COOLING at
+    # exactly the Gulf-Stream/Kuroshio cells it was written to warm (net -0.0069 K
+    # at WBC cells, and removing the multiplier entirely measurably *improved*
+    # both `reference_error_score` and Gulf-Stream SST).
+    #
+    # Fix: amplify only the warming (positive) component, leaving cooling
+    # unscaled -- this preserves the intended "western boundary currents carry
+    # warm water poleward" physics where it applies, without inverting it where
+    # the local adjustment happens to be a cooling. Measured on the tracked
+    # 64x128 benchmark: reference_error_score 0.3226 -> 0.3206 (gyre off) and
+    # 0.3209 -> 0.3195 (gyre on), while Gulf-Stream SST anomaly strengthens from
+    # +0.377 K to +0.851 K -- i.e. strictly better than the old behaviour on both
+    # the aggregate score and the mechanism's own intended regional signal.
+    # Deleting the multiplier outright scores marginally better still on
+    # `reference_error_score` (0.3186) but discards a real, physically-motivated
+    # mechanism to do it, so the sign fix is preferred over removal.
+    T_adjustment = np.where(
+        T_adjustment > 0.0,
+        T_adjustment * np.clip(western_enhancement, 1.0, 1.5),
+        T_adjustment,
+    )
     
     # ============================================================================
     # OCEAN-ATMOSPHERE HEAT EXCHANGE

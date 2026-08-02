@@ -54,12 +54,16 @@ Atacama 123→102 mm/yr in isolation, real but small); the A5 regime-architectur
 2026-08-01 — closed Sahara/Kalahari, did not move Atacama, whose own aridity signature — a narrow
 coastal strip rather than a broad subsiding interior — was never well-served by any
 latitude/divergence-based mechanism tried so far, per B3's own note on the same tension).
-**Recommended next lever for the Atacama residual**: Atacama's own diagnostics (see A5's real-terrain
-wind-diagnostics table) show `div=1.70–1.79`, an outlier an order of magnitude above every other
-desert box — it's already about as suppressed as this mechanism can make it structurally distinct
-from the others. The `coastal_upwelling_fog_strength` diagnostic gate (D3) is the more promising
-remaining lever specifically for Atacama's narrow-coastal-strip signature, not another divergence-based
-mechanism; real SST-coupled upwelling physics (D3's actual recommended next step) is the honest fix.
+**Recommended next lever for the Atacama residual — sharpened 2026-08-02 by D5**: Atacama's own
+diagnostics (see A5's real-terrain wind-diagnostics table) show `div=1.70–1.79`, an outlier an order
+of magnitude above every other desert box — it's already about as suppressed as that mechanism can
+make it. This entry previously named "real SST-coupled upwelling physics" as the honest fix; **that
+is now known to be insufficient on its own.** D5's gyre calibration produced exactly that upwelling
+signal (Humboldt −0.25 K SST off the Atacama coast) and Atacama's precipitation did not move at all,
+at any gyre strength from 0.0 to 3.0. The blocker is not the absence of cold water — it's that
+**per-cell SST anomalies don't propagate into land precipitation in this model's atmosphere**. Any
+future Atacama attempt should target that coupling pathway first and verify it transmits *before*
+building more ocean physics, or it will reproduce D5's null result.
 
 ### A2. 🟡 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — Af now on-target, Aw/Am residual
 **STATUS UPDATE 2026-08-01 (later same day)**: the regression documented below was **fixed**, and Af
@@ -561,18 +565,26 @@ or bistability/collapse experiments are possible without that. `gradient_nh` (NH
 gradient) also still runs ~22K at 60×120 vs. a 40–65K target, partly an AMOC over-warming artifact
 at higher resolution (lower resolutions have a separate, unrelated synthetic-terrain artifact).
 
-### D3. 🟡 No real cold-current/coastal-upwelling physics (the Atacama mechanism)
-Confirmed: `ocean.calculate_ocean_heat_transport`'s own docstring mentions "eastern boundary
-currents (California, Canary) carry cold water south" as motivating physics, but that half was never
-implemented — only the symmetric western-boundary-current *warming* term exists.
-`get_major_ocean_currents`/`generate_ocean_currents` compute current *velocity* fields (gyres,
-Ekman transport) but these are **GUI-visualization-only**, never coupled back into temperature,
-salinity, or precipitation. What was shipped instead (`coastal_upwelling_fog_strength`) is an
-explicitly diagnostic proxy gate, not real upwelling physics — see A1. **A genuine fix would need
-new ocean-physics work** (actually cooling SST via simulated upwelling and confirming the existing
-land-sea coupling actually transmits that signal onto adjacent land climate) — this was considered
-and explicitly not attempted, since it was never established that per-cell SST anomalies propagate
-to land climate at all in this model's simplified atmosphere.
+### D3. 🟡 No real cold-current/coastal-upwelling physics — SST half now EXISTS (D5); the missing link is SST→land coupling
+**Substantially revised 2026-08-02 by D5's calibration pass.** The old framing — "eastern-boundary
+cooling was never implemented, only the symmetric western-boundary warming exists" — is **no longer
+accurate**. Enabling `ocean_gyre_strength` (now default 1.0, see D5) produces real, coherent
+eastern-boundary cooling as an emergent consequence of the wind-stress-curl gyre solve, in every
+region this mechanism is supposed to explain: **Benguela −0.54 K, Canary −0.36 K, Humboldt −0.25 K,
+California −0.22 K** (SST anomaly vs. gyres-off, on the tracked 64×128 benchmark), alongside the
+matching western-boundary warming. That is genuine cold-current physics, not a proxy gate.
+
+**But the gap this entry exists for is not closed — it has moved, and is now precisely located.**
+The upwelling-side SST signal does **not** reach land precipitation: Atacama is unchanged at
+146 mm/yr across the *entire* gyre-strength range 0.0→3.0. This settles the exact doubt this entry
+previously raised as untested ("it was never established that per-cell SST anomalies propagate to
+land climate at all in this model's simplified atmosphere") — **they do not**, at least not through
+this pathway.
+**So the real missing mechanism is SST→adjacent-land climate coupling, not the ocean cooling itself.**
+That is a materially different (and better-defined) target than "build upwelling physics", which is
+what this entry used to recommend and which would now be redundant work.
+`coastal_upwelling_fog_strength` remains a diagnostic proxy gate and remains the only thing actually
+affecting Atacama's precipitation — see A1.
 
 ### D4. 🟢 Ocean CO2 exchange uses instantaneous, not time-averaged, wind — fixed, verified 2026-08-01
 **Was**: `carbon_cycle.py`'s `ocean_co2_flux` computed piston velocity as `k ∝ wind_speed²`
@@ -590,16 +602,60 @@ value (falls back to instantaneous only when `wind_speed_avg is None`, e.g. very
 well inside the tightened ±25 ppm bound (down from the pre-fix +33 ppm that had forced the bound to
 be widened to 40 in the first place). No further action needed.
 
-### D5. 🟡 2D barotropic gyre solver exists but is uncoupled from climate by default
-`ocean.compute_gyre_currents` (a real streamfunction solve from wind-stress curl, reusing the FFT
-Poisson machinery already in `atmosphere.py`) exists and is gated behind
-`PlanetParams.ocean_gyre_strength=0.0`. This is more complete than ROADMAP's "2D barotropic gyres"
-entry suggests (it reads as an unstarted idea there; the solver itself has been built) — but at
-default 0.0 it contributes nothing to temperature/precipitation, so western-boundary-current
-warming and subpolar-gyre structure still only emerge from the older, separate `land_west`
-heuristic in `calculate_ocean_heat_transport`, not from this newer, more physical mechanism.
-**Recommended next step**: a calibration pass enabling `ocean_gyre_strength` and checking whether it
-can replace or improve on the `land_west` heuristic, rather than being purely a visualization layer.
+### D5. 🟢 2D barotropic gyre solver — calibrated and enabled 2026-08-02; found a real sign bug in the mechanism it was meant to replace
+**Was**: `ocean.compute_gyre_currents` (a real streamfunction solve from wind-stress curl, reusing
+the FFT Poisson machinery in `atmosphere.py`) existed but was gated behind
+`ocean_gyre_strength=0.0`, contributing nothing to climate — western-boundary-current warming came
+only from the older `land_west` heuristic in `calculate_ocean_heat_transport`.
+
+**Shipped**: `PlanetParams.ocean_gyre_strength` **0.0 → 1.0**, plus a **sign-bug fix in
+`land_west`** (see below). Both of the docstring's own stated pre-conditions were checked first and
+both came back clean:
+- *Structure, not noise*: the gyre-induced SST anomaly's grid-scale residual is **0.10** of its total
+  standard deviation (≥1.0 would mean grid-scale noise), and it reproduces the correct gyre dipole
+  everywhere checked — western boundaries warm (Gulf Stream +0.38 K, Kuroshio +0.14 K), eastern
+  boundaries cool (Benguela −0.54 K, Canary −0.36 K, Humboldt −0.25 K, California −0.22 K).
+- *Guard-rails*: full suite green; `reference_error_score` 0.3226 → 0.3209 (gyre alone), 0.3195 with
+  the `land_west` fix.
+
+**The improvement is physically located, not a global-cooling artifact** — decomposing the score
+shows the precipitation half is flat (0.2811 → 0.2817) and essentially all the gain is temperature,
+concentrated in the two ocean-dominated SH bands (0–10S 0.048 → 0.036, 40–50S 0.557 → 0.524) while
+the large NH mid-latitude biases (land/AMOC-driven, D2) barely move. Returns saturate near 1.0, and
+since the solve has no natural physical amplitude (clipped ±0.5 m/s), 1.0 — the unscaled solve — was
+preferred over chasing a metric that can't distinguish "more correct" from "cools an already-too-warm
+model" (values to 3.0 keep improving it marginally).
+
+**Real bug found in `land_west` while answering "can the gyre replace it?"**: `western_enhancement`
+is a 1.0–1.5× multiplier that was applied to `T_adjustment` unconditionally — but `T_adjustment` is a
+**signed** quantity, and at real WBC cells it is predominantly *negative* (measured on the bundled
+64×128 DEM: **73.6% of the 159 WBC cells negative**, mean −0.0138 K). Multiplying a negative by 1.5
+makes it more negative, so the heuristic was **amplifying cooling at exactly the Gulf-Stream/Kuroshio
+cells it was written to warm**. Two independent lines of evidence agreed: the sign census, and the
+fact that simply deleting the multiplier *improved* both `reference_error_score` and Gulf-Stream SST.
+Fixed by amplifying only the positive/warming component. Full matrix on the tracked benchmark:
+
+| `land_west` | gyre | refErr | Gulf Stream ΔT |
+|---|---|---|---|
+| orig (shipped) | 0.0 | 0.3226 | +0.000 |
+| orig | 1.0 | 0.3209 | +0.377 |
+| off | 1.0 | **0.3186** | +0.686 |
+| **fixed (shipped)** | **1.0** | 0.3195 | **+0.851** |
+
+Deleting the multiplier outright scores marginally best on refErr, but discards a real
+physically-motivated mechanism to do it; the sign fix is strictly better than the old behaviour on
+*both* the aggregate score and the mechanism's own intended regional signal, so it was preferred.
+**Real-terrain confirmation** (512×1024, 2yr MONTHLY, seasonally balanced): all named boxes flat
+except **US Midwest 705 → 747 mm/yr** — an unlooked-for gain on A3's chronically-short box.
+
+**Important negative result, and it answers a question D3 explicitly raised**: the eastern-boundary
+cooling above is exactly the physics D3 lists as entirely missing — but it does **not** propagate to
+adjacent land precipitation. Atacama precipitation is unchanged (146 mm/yr on the benchmark) at
+*every* gyre strength from 0.0 to 3.0. D3's own doubt ("it was never established that per-cell SST
+anomalies propagate to land climate at all in this model's simplified atmosphere") is now settled:
+**they do not, at least not through this pathway.** Enabling gyres is therefore not a route to fixing
+Atacama (A1's remaining desert residual) — that still needs a mechanism that couples SST to land
+precipitation, which is the actual missing link, not the upwelling itself.
 
 ---
 
