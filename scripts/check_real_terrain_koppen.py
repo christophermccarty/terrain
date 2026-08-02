@@ -204,11 +204,20 @@ def _koppen_breakdown(state, land_mask) -> dict[str, float]:
     humid = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "")[:2] in ("Cf", "Cs", "Cw", "Df", "Dw"))
     polar = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "").startswith(("ET", "EF")))
     tropical = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "").startswith(("Af", "Am", "Aw")))
+    # A2 (ACCURACY_AUDIT.md) individual Af/Am/Aw split -- added 2026-08-01 so this
+    # tracked script is the one place that measures it, instead of re-deriving a
+    # scratch script each session (per A2's own long-standing note).
+    af = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "").startswith("Af"))
+    am = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "").startswith("Am"))
+    aw = sum(c for v, c in zip(vals, counts) if KOPPEN_NAMES.get(int(v), "").startswith("Aw"))
     return {
         "arid_pct": 100.0 * arid / total,
         "humid_pct": 100.0 * humid / total,
         "polar_pct": 100.0 * polar / total,
         "tropical_pct": 100.0 * tropical / total,
+        "af_pct": 100.0 * af / total,
+        "am_pct": 100.0 * am / total,
+        "aw_pct": 100.0 * aw / total,
     }
 
 

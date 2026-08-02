@@ -61,52 +61,67 @@ from the others. The `coastal_upwelling_fog_strength` diagnostic gate (D3) is th
 remaining lever specifically for Atacama's narrow-coastal-strip signature, not another divergence-based
 mechanism; real SST-coupled upwelling physics (D3's actual recommended next step) is the honest fix.
 
-### A2. 🟡 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — needs re-verification
+### A2. 🔴 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — WORSENED by the A5 fix
 **Symptom**: Sub-Saharan Africa and other tropical land render as near-unbroken Af (rainforest)
 with almost no savanna transition, vs. real Köppen's broad Aw/Am bands flanking a narrower Af core.
-**Current numbers** (real-terrain, 2026-07-31, **stale — predates the 2026-08-01 A5 fix**): Af
-~8–15% of land (Earth ~6–7%, so still over-represented at the low end of the sweep), Aw+Am ~5–8%
-(Earth ~18–20%, still 2–4x under-represented even at the best-tuned setting). **Not yet
-re-measured** against the current code: A5's fix directly targeted this section's own diagnosed
-mechanism ("raw tropical-belt production itself needs to rise" — global_rescale_factor 5.46→2.06,
-with wet-regime raw production specifically recalibrated), so these numbers are very likely stale,
-but the Af/Am/Aw split still isn't in any tracked script (see "How to test" below) so no session has
-actually re-measured it yet. **This is the natural next item to check** — cheap (just needs the
-split added to the existing named-box script) and directly downstream of a fix that already landed.
-**Controlling variables**: `PlanetParams.itcz_seasonal_response` (0.7 — gives the ITCZ window real
-seasonal migration instead of being pinned at the equator year-round), `itcz_seasonal_target_response`
-(1.0 — makes the *rescale target* itself track the same seasonal dip instead of refilling it),
-`itcz_zonal_smooth_deg` (8.0 — damps Rossby-wave standing-pattern noise that was corrupting the
-belt's row-to-row shape), `precip_raw_shape_weight` (0.0, inert — an attempted per-cell
-within-tropics redistribution that measured net-negative).
-**How to test**: a scratch script splitting Af/Am/Aw individually (not committed anywhere —
-`scripts/check_real_terrain_koppen.py` only reports "tropical_pct" combined; worth adding the split
-to that tracked script rather than re-deriving it each session, per the itcz-seasonal-target-deficit
-session's own note).
-**What's been tried**: static-ITCZ fix (real, ~1pp gain), target-deficit fix (real, larger gain,
-Af 11%→8%, Aw 2%→5%), per-cell raw-shape redistribution (implemented correctly, found 2 real bugs
-along the way, but net-negative for the actual goal — pushes marginal cells into full BW/BS aridity
-via Köppen's own seasonality-scaled threshold rather than landing in Aw).
-**Root cause, now precisely characterized**: `global_rescale_factor` averages ~5.2x on real
-terrain — most of a row's final rain is synthetic fill, not raw physics. There isn't enough real
-moisture signal in the tropics for any *redistribution-only* mechanism to create a genuine
-Af→Aw gradient; **raw tropical-belt production itself needs to rise**, not be reshaped. Four+
-independent mechanisms (moisture transport, soil-bucket redesign, evapotranspiration gating,
-wind-convergence restructuring, raw-shape redistribution) have all been tried against this exact
-wall and all failed the same way — this is the single most load-bearing finding in the whole
-precipitation history and should stop future sessions from re-trying redistribution-only ideas.
-**Recommended next lever**: attack the raw production deficit directly — why is
-`global_rescale_factor` needing 5x at all? See A5.
+**Re-measured 2026-08-01, and it's a regression, not the improvement A5's own writeup assumed**:
+added the Af/Am/Aw split to `scripts/check_real_terrain_koppen.py`'s `_koppen_breakdown` (previously
+only reported combined `tropical_pct`, per this section's own long-standing complaint) and directly
+bisected the tracked deterministic 64×128 benchmark (`real_terrain_validation.py`'s
+`RealTerrainValidationConfig()` defaults — 1yr spinup + 1yr eval, matching
+`testing/fixtures/real_terrain_validation_baseline.json`) against commit `4bdc79a` (immediately
+pre-A5) vs current:
+
+| | pre-A5 | post-A5 | Earth |
+|---|---|---|---|
+| Af | 8.82% | 11.05% | ~6–7% |
+| Am | 1.48% | 0.22% | — |
+| Aw | 6.68% | 2.03% | — |
+| **Aw+Am combined** | **8.16%** | **2.25%** | **~18–20%** |
+
+Af moved *further* from target (worse), and Aw+Am — the specific under-represented category this
+item tracks — collapsed to barely a quarter of its pre-A5 share. **Mechanism**: A5's
+`_raw_conversion_gain` sharpens the wet/dry contrast by boosting all non-dry-belt raw production
+uniformly (up to 5.5×) while deliberately leaving dry-belt production untouched — this is exactly
+right for A1 (creates real desert-vs-non-desert contrast) but wrong for A2, which needs a *smoother*
+wet→dry gradient (savanna as a genuine transitional category) rather than a sharper wet/dry cliff.
+The same mechanism that fixed one gap widened the other — **these two items are now in direct,
+measured tension**, not independently solvable by the same lever.
+**Controlling variables**: `PlanetParams.itcz_seasonal_response` (0.7), `itcz_seasonal_target_response`
+(1.0), `itcz_zonal_smooth_deg` (8.0), `precip_raw_shape_weight` (0.0, inert), and now
+`atmosphere.generate_precipitation`'s `_raw_conversion_gain`/`drybelt_regime_window` (see A5) — the
+newly-identified direct cause of the regression.
+**How to test**: `scripts/check_real_terrain_koppen.py`'s `_koppen_breakdown` now reports
+`af_pct`/`am_pct`/`aw_pct` individually (added 2026-08-01); or the deterministic 64×128 benchmark via
+`real_terrain_validation.run_real_terrain_validation()`, reading `state.koppen_type` directly.
+**What's been tried**: static-ITCZ fix (real, ~1pp gain, pre-A5), target-deficit fix (real, larger
+gain pre-A5, Af 11%→8%, Aw 2%→5%), per-cell raw-shape redistribution (implemented correctly, found 2
+real bugs, but net-negative), and now A5's regime-gain fix (real gain for A1, net-negative here).
+**Root cause, now precisely characterized**: the wall isn't just "raw production is too scarce"
+(A5 addressed that) — it's that raising raw production *uniformly* across the whole non-dry-belt
+range doesn't create an intermediate savanna regime, it just makes rainforest-adjacent land wetter
+and steppe-adjacent land drier, both pulling *away* from the Aw classification band in the middle.
+**Recommended next lever, unattempted**: a genuine *third* regime (not just wet/dry) for the
+savanna transition zone specifically — e.g. gate part of `_raw_conversion_gain`'s boost by
+seasonality/distance-from-ITCZ-core so cells that are wet only part of the year (the actual physical
+definition of savanna) get a smaller boost than cells that are wet year-round, rather than every
+non-dry-belt cell receiving the same flat gain regardless of its own seasonal profile.
 
 ### A3. 🟡 Continental interior still short of target (US Midwest specifically)
 **Symptom**: US Midwest chronically the hardest of the six named boxes to bring up to Earth values.
 **Current numbers, independently re-verified 2026-08-01** (post-A5-fix, same run as A1): Canadian
-Prairies **437 mm/yr** (target 400–500 — back in range after the A5 fix, was slightly over before);
-Central Europe **502** (target 550–750 — now just *under* range, a new small side effect of the A5
-fix's wet-regime recalibration, was comfortably in range at 639 before); US Midwest **709** (target
-800–1000, ~11–30% short — better than the pre-fix 480–648, but the deficit A5's own writeup already
-flags as residual is real: not fully closed). Central Europe dipping under range is a genuine new,
-small regression from the A5 fix worth a follow-up look, not yet investigated.
+Prairies **437 mm/yr** (target 400–500 — back in range after the A5 fix); Central Europe **502**
+(target 550–750 — still under range); US Midwest **709** (target 800–1000, ~11–30% short — better
+than the pre-fix level, but not fully closed).
+**Correction (2026-08-01, same-session self-correction)**: this document previously claimed Central
+Europe was "a new small regression" from A5, citing 639 as its pre-fix value. That 639 figure was
+stale (from an unrelated, non-comparable earlier session's measurement), not a clean same-methodology
+baseline. A direct, same-save/same-code bisection against commit `4bdc79a` (immediately pre-A5) shows
+Central Europe was **463 mm/yr before A5**, i.e. A5 genuinely *improved* it (463→502, +8.4%) — still
+short of its 550 floor, but a real gain, not a regression. Always bisect against the immediately-prior
+commit on the identical save/config when checking whether a fix helped or hurt a specific box; a
+number carried over from a different session's measurement is not a valid baseline (see process
+note 6's sibling lesson about this exact mistake).
 **Controlling variables**: `ferrel_v_centre_deg` (44.0, down from 48.0), `ferrel_v_land_shift_deg`
 (-4.0, decouples land Ferrel-cell center from ocean's), `PlanetParams` land-temperature bonus terms
 in `simulate.py` (`_midlat_storm_bonus_1d`, `_atm_land_transport_1d`, `_handoff_bonus_1d`), the
@@ -145,15 +160,22 @@ baking it in pre-smoothing measured almost no effect).
 reaches a plurality (35% Cfa / 39% BSh / 19% Af, never a clean majority — pushing the exemption
 strength further starts overshooting into Af and bleeding into US Midwest). Köppen classification
 shares themselves haven't been re-measured post-A5-fix (10yr EMA lags too much to reflect it yet
-regardless — see A5's sampling note). **Magnitude update, independently re-verified 2026-08-01**
-(post-A5-fix, same run as A1/A3): SE US **772 mm/yr**, East China **578**, S Japan **1138**, vs. the
-1100–2200 target range — S Japan now clears the target range entirely (was ~838–898 before), SE US
-improved but still short (was ~500–585 before A4's original fix — wait, was 754–807 pre-A5-fix, see
-A5's own table), East China actually *dropped* (was ~744–786 pre-A5-fix) — a mixed, not uniformly
-positive, side effect of A5's wet-regime recalibration on the monsoon boxes specifically, not yet
-investigated. This corrects which side of the Köppen aridity threshold a cell lands on; the magnitude
-gap is no longer uniformly the same raw-production-deficit wall as A2/A5 (that's now largely closed)
-but East China's specific regression deserves its own look.
+regardless — see A5's sampling note).
+**Magnitude update, independently re-verified 2026-08-01** (post-A5-fix, same save/run as A1/A3;
+pre-A5 baseline confirmed via clean same-save bisection against commit `4bdc79a`, not a stale
+cross-session number — see A3's correction note for why that distinction matters): SE US
+**745→772 mm/yr** (modest real gain), S Japan **840→1138** (now clears the 1100–2200 target range
+entirely), East China **745→578** (a real, confirmed drop, not an artifact) — a mixed, not uniformly
+positive, side effect of A5's wet-regime recalibration on the monsoon boxes specifically.
+**East China investigated 2026-08-01**: not a simple saturation or single-formula cause like the
+orographic-test bug — `precip_target_achieved_fraction` for East China's latitude rows only drops
+marginally post-A5 (~0.94→~0.92), far too small on its own to explain a 22% final drop, while
+`zonal_rescale_factor` needed for those rows rises (~1.4–1.9 → ~1.6–2.2). This means the effect
+compounds through the moisture-budget's step-to-step feedback (soil moisture → land_evap → humidity)
+over the 2-year measurement window rather than being visible in any single step's snapshot — a
+genuinely different, harder-to-isolate cause than the two bugs already fixed in A5's own entry.
+**Not yet root-caused**; flagged for a future session rather than force-diagnosed here, since single-step
+debug-field snapshots (the diagnostic method that worked for the orographic/cloud bugs) don't expose it.
 **Real, accepted cost**: Kalahari's own BSh share drifted 91%→84% (the exemption's inland decay
 reach overlaps southern Africa's Indian Ocean/Mozambique-Channel coast).
 
@@ -672,7 +694,11 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
    mechanism cannot fix any of these; raw production had to rise and the rescale architecture had
    to become regime-aware. The successful follow-up did both and corrected
    `subsidence_suppression`'s regime accuracy; use that as the new baseline rather than reviving
-   the failed flat/redistribution-only attempts.
+   the failed flat/redistribution-only attempts. **But it is not a free win**: the same wet/dry
+   contrast-sharpening that fixed A1 (deserts) directly *worsened* A2 (savanna transition) —
+   confirmed by measurement, not theoretical (Aw+Am land share dropped from 8.16% to 2.25%, see
+   A2). A1 and A2 are now in measured tension under this specific mechanism; a future fix for
+   either needs to check its effect on the other, not just its own target box.
 2. **Several "fixes" are real, tested, and shipped — but deliberately inert (default off/0.0)**
    because they measured net-negative, no-effect, or an unresolved trade-off for their intended
    purpose: `moisture_advection_scale`, `precip_raw_shape_weight`, `cloud_water_feedback`,
@@ -686,7 +712,14 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
 3. **Testing-methodology lesson, repeated across multiple sessions**: a single-day or single-month
    snapshot has been mistaken for climatology at least twice, producing false "regression" reports
    later retracted. Always use a 12-month (or full seasonal cycle) average, and record `day_of_year`
-   with any long-run sample to rule out the calendar-aliasing artifact (C2).
+   with any long-run sample to rule out the calendar-aliasing artifact (C2). A third instance
+   (2026-08-01): when checking whether a fix helped or hurt a specific named box, compare against a
+   **same-save, same-code, freshly-bisected** pre-fix measurement, not a number carried over from an
+   earlier session's write-up — Central Europe was briefly, incorrectly flagged as "regressed by A5"
+   in this document because its cited pre-fix baseline (639) came from an unrelated, non-comparable
+   earlier measurement; a clean bisect against the immediately-prior commit on the identical save
+   showed A5 actually improved it (463→502). `git worktree add --detach <commit>` against the same
+   `saves/*.pkl` is cheap and removes this whole class of false positive/negative.
 4. **Real-terrain vs synthetic-fixture tension**: several precip fixes were tuned against a
    synthetic test fixture's spatial uniformity (e.g. the orographic test's meridional-only elevation
    ramp) and had to be deliberately gated (row-heterogeneity-based blending) so they wouldn't be
