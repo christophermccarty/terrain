@@ -1022,7 +1022,133 @@ class PlanetParams:
     `orog`'s weight/sharpness relative to the other five terms *and* lift the
     0.85 `remove_frac` cap *and* survive the row rescale -- three coupled
     changes, which is a calibration session of its own, not a one-line change.
-    This field stays as the ablation handle for that work."""
+    This field stays as the ablation handle for that work.
+
+    **Update 2026-08-02**: stage 2 above ("`orog` barely differentiates the pair
+    to begin with") was root-caused, and it was not a property of the formula --
+    it was the normalizer feeding this ceiling. See
+    `orographic_normalizer_land_only`, which makes this ceiling meaningful for
+    the first time."""
+
+    orographic_normalizer_land_only: bool = True
+    """Normalize the orographic-uplift term `orog` by the 90th percentile of its
+    **land** cells instead of the whole grid. `False` reproduces the historical
+    behavior exactly and is the current default.
+
+    **The bug this exists to fix (found 2026-08-02, ACCURACY_AUDIT.md A5).**
+    `atmosphere.generate_precipitation` normalizes with
+    `orog / (np.percentile(orog, 90.0) + 1e-6)`, but the line immediately above it
+    is `orog = land_f * orog`, which sets every ocean cell to exactly 0.0. On
+    Earth's DEM ~66% of cells are ocean, so that "90th percentile" is really the
+    ~70th percentile of the land distribution, and the normalizer comes out
+    **3.8x too small** (0.0101 vs 0.0382 on `saves/earth.pkl`). Every land value
+    is inflated by that factor, and `orographic_uplift_clip` then truncates
+    **20.0% of all land and 100% of the steepest 5%**.
+
+    The consequence is not a magnitude error, it is **total loss of the
+    directional signal**. Traced along the Cascades transect at 46.6N, the raw
+    upslope term behaves exactly as intended -- 0.41 climbing to the crest,
+    dropping to *precisely* 0.0000 on the lee side -- but after normalization and
+    clipping, `orog` reads a saturated **2.000 on both flanks**. The term that
+    exists solely to distinguish windward from leeward was reporting the same
+    number for both. Same picture on the S Andes transect.
+
+    This is why A5's earlier ablation found raising the ceiling to be a null
+    result and concluded `orog`'s own W/L ratio was "only 1.05": with a
+    3.8x-inflated input, raising a ceiling from 2.0 to 4.0 just moves where the
+    flattening happens. The ceiling was never the binding constraint; the
+    normalizer feeding it was.
+
+    Setting this `True` drops clip truncation from 20.0% of land to 5.6% and
+    restores real contrast in the term itself. Measured `orog` windward/leeward
+    ratios on `saves/earth.pkl`, land-only normalizer with the clip relaxed:
+
+        range           global/2.0   land/2.0   land/4.0   land/inf   Earth
+        Cascades             1.05       1.16       1.17       1.35     3-6x
+        Sierra Nevada        0.94       0.83       0.90       1.70     2-5x
+        S Andes              1.03       1.11       1.32       2.11    5-15x
+        Southern Alps        1.06       1.45       1.41       2.23    4-12x
+        Scandinavia          1.39       1.49       1.49       1.49     2-4x
+        Himalaya             0.80       1.00       1.25       1.49    5-20x
+
+    Note this is the *signal*, measured before any downstream absorption. See
+    `scripts/check_orographic_contrast.py`, which reports the ratio at each
+    pipeline stage, and A5 for what the end-to-end effect turned out to be."""
+
+    precip_rain_out_ceiling: float = 0.85
+    """Maximum fraction of a cell's moisture column that can rain out in one
+    step, in `atmosphere.generate_precipitation`. 0.85 is the value hardcoded
+    before 2026-08-02, so that default is an exact no-op.
+
+    This is stage 1 of A5's three absorption stages, and it is real: measured on
+    `saves/earth.pkl`, the **entire S Andes windward slope** (-75.1 through
+    -72.2) sits pinned at 0.85, so no upstream orographic gain can raise its
+    precipitation -- it is already stripping the maximum permitted fraction of
+    its column. Globally 4.7% of land is pinned, but the pinning is concentrated
+    precisely on the wettest windward flanks.
+
+    The original 0.85 has a real justification that any change has to respect:
+    at dt=6 an uncapped removal fraction clips to 1.0, stripping the column
+    completely, leaving `humidity_next` ~= 0 everywhere and erasing the spatial
+    humidity gradients the next substep needs. Raising this trades windward
+    dynamic range against that stability margin -- it is not free headroom."""
+
+    precip_orographic_weight: float = 0.20
+    """Weight of the orographic-uplift term `orog` in `precip_potential`'s
+    six-term sum. 0.20 is the historical hardcoded value and an exact no-op.
+
+    A5's stage 2. The other five terms are rescaled so the total weight stays at
+    its historical 1.10, making this a knob on orography's *relative* share
+    rather than on the magnitude of `precip_potential` -- magnitude alone is
+    absorbed by the moisture-budget rescale, so only the relative share can move
+    spatial contrast.
+
+    The stage is real: even with `orographic_normalizer_land_only` restoring the
+    signal, `orog`'s windward/leeward ratio at the Cascades (1.16) is diluted to
+    0.92 by the time it is summed with the humidity/convective/ascent terms,
+    which carry 0.90 of the weight between them and are not orographically
+    organized. Raising this alone is not sufficient, though -- see
+    `precip_orographic_shape_weight` for the stage that actually binds."""
+
+    precip_potential_ceiling: float = 3.0
+    """Ceiling on `precip_potential` in `atmosphere.generate_precipitation`,
+    applied inside its smoothing loop and again after the raw-conversion gain.
+    3.0 is the historical hardcoded value and an exact no-op.
+
+    **A5's fourth absorption stage, which the audit's original three-stage
+    analysis missed.** It is invisible to a magnitude check and only shows up in a
+    contrast one: with the orographic normalizer fixed, `precip_potential`'s
+    windward/leeward ratio saturates at **~2.9 whether the incoming `orog` ratio
+    is 3.0 or 11.7**, because the windward cell is pinned at this ceiling while
+    the leeward cell is not. Raising `precip_orographic_weight` against a bound
+    ceiling then *lowers* the ratio, since it can only lift the unpinned leeward
+    side -- which is why that knob measured backwards before this was found."""
+
+    precip_orographic_shape_weight: float = 1.0
+    """Blend raw production shape into the moisture-budget *target* where
+    orography is active, 0.0 = exact no-op (the default).
+
+    **A5's stage 3, and the one that actually binds.** The moisture-budget
+    rescale is a deficit-filling mechanism: it tops each cell up toward a target,
+    so wherever the fill supplies most of a row's rain -- which is nearly
+    everywhere, `global_rescale_factor` averages ~2.0 even after A5 -- it
+    actively *erases* whatever spatial contrast raw production created. Measured
+    on `saves/earth.pkl`: the S Andes pair reaches a `precip_potential`
+    windward/leeward ratio of 1.69 and comes out at **0.88 in final P**. Not
+    merely damped -- inverted, because the leeward flank under-produces against
+    its target and is therefore handed more synthetic fill than the windward one.
+
+    This is process note 9 ("check which side of the rescale a proposed mechanism
+    sits on") applied to orography: the target is the lever, so an orographic
+    mechanism that only touches raw production cannot work no matter how strong
+    it is. `precip_raw_shape_weight` already implements exactly the needed blend,
+    but is gated by `itcz_window` and therefore cannot reach a mid-latitude
+    mountain range at all. This parameter applies the same blend gated by the
+    orographic signal instead, so it acts only where orography is doing something
+    and leaves the hard-won desert/continental mid-latitude weighting alone.
+
+    Mean-preserving by construction (renormalized into `cell_weight` exactly like
+    `_desert_factor`), so row totals are unaffected."""
 
     itcz_seasonal_response: float = 0.4
     """Fraction [0-1] of the full solar-declination swing (`solar_declination`)

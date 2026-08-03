@@ -203,6 +203,43 @@ def _koppen_land_percentages(state: PlanetState, land_mask: np.ndarray) -> dict[
     }
 
 
+def _koppen_map_skill(state: PlanetState, land_mask: np.ndarray) -> dict[str, Any]:
+    """Per-cell Köppen agreement against the gridded reference map (audit H10).
+
+    This is the only validation signal in the platform that is not a spatial
+    aggregate. The named boxes, zonal bands, and global Köppen shares can all be
+    satisfied by a model whose regional *pattern* is wrong -- a share metric in
+    particular is a closed budget, so two compensating regional errors cancel
+    exactly. Group accuracy/kappa here cannot be fooled that way.
+
+    Returns an empty dict (rather than raising) when the reference PNG is absent
+    so that a checkout without it still validates on every other metric.
+    """
+    if state.koppen_type is None or not np.any(land_mask):
+        return {}
+    try:
+        from koppen_reference import score_koppen_map
+
+        report = score_koppen_map(state.koppen_type, land_mask=land_mask)
+    except (FileNotFoundError, ValueError):
+        return {}
+    if "group" not in report:
+        return {}
+    return {
+        "group_accuracy": report["group"]["accuracy"],
+        "group_kappa": report["group"]["kappa"],
+        "group_share_mae_pp": report["group"]["share_mae_pp"],
+        "class_accuracy": report["class"]["accuracy"],
+        "class_kappa": report["class"]["kappa"],
+        "scored_cells": report["scored_cells"],
+        "group_accuracy_by_zone": report["group_accuracy_by_zone"],
+        "region_group_accuracy": {
+            name: (None if value is None else value["group_accuracy"])
+            for name, value in report["per_region"].items()
+        },
+    }
+
+
 def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, Any]:
     if (
         state.temperature is None
@@ -348,6 +385,7 @@ def summarize_real_terrain_climate(
         ),
         "zonal": zonal,
         "koppen_land_percent": _koppen_land_percentages(state, land_mask),
+        "koppen_map_skill": _koppen_map_skill(state, land_mask),
         "precip_rescale": _precip_rescale_metrics(state, planet_params),
         "reference_error_score": reference_error_score,
     }
@@ -551,6 +589,30 @@ def compare_validation_reports(
                 failures.append(
                     f"{section}.{name}: {got:.6g} vs baseline {want:.6g} "
                     f"(allowed ±{allowed:.6g})"
+                )
+
+    # Gridded map skill (audit H10). Only the five headline scalars are gated:
+    # the per-zone and per-region entries in the same block are recorded for
+    # diagnosis but are far too noisy to assert on at 64x128, where a named box
+    # can hold a handful of land cells.
+    baseline_skill = baseline_metrics.get("koppen_map_skill") or {}
+    current_skill = current_metrics.get("koppen_map_skill") or {}
+    if baseline_skill and current_skill:
+        for name, absolute_tolerance in (
+            ("group_accuracy", 0.03),
+            ("group_kappa", 0.03),
+            ("group_share_mae_pp", 1.0),
+            ("class_accuracy", 0.03),
+            ("class_kappa", 0.03),
+        ):
+            if name not in baseline_skill or name not in current_skill:
+                continue
+            got = float(current_skill[name])
+            want = float(baseline_skill[name])
+            if abs(got - want) > absolute_tolerance:
+                failures.append(
+                    f"koppen_map_skill.{name}: {got:.6g} vs baseline {want:.6g} "
+                    f"(allowed ±{absolute_tolerance:g})"
                 )
 
     for name, want_values in baseline_metrics["zonal"].items():

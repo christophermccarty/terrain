@@ -457,6 +457,147 @@ must raise `orog`'s weight/sharpness against the other five terms **and** lift t
 cap **and** survive the row rescale — three coupled changes, a calibration session of its own.
 `orographic_uplift_clip` exists as the ablation handle for that work.
 
+#### A5-OROG. 🟡 That calibration session was run 2026-08-02 — a real bug was found upstream of all three stages, and two changes shipped
+
+**First, the instrument** (process note 11, applied): `regional_validation.OROGRAPHIC_PAIRS` — six
+windward/leeward box pairs (Cascades, Sierra Nevada, S Andes, Southern Alps, Scandinavia, Himalaya),
+each verified against the bundled DEM to straddle a resolved crest, with approximate real-world box
+ratios. Driven by `scripts/check_orographic_contrast.py`, which reports the ratio **at each pipeline
+stage** so absorption is distinguishable from absence of signal. These need ≥256×512; at 64×128 one
+cell spans a whole range.
+
+Baseline was **worse than the ~1.2× previously recorded** — mean final W/L across the six ranges
+**0.96**, i.e. no orographic contrast at all, several ranges inverted.
+
+**The root cause is a normalizer bug, and it sits upstream of all three documented stages.**
+`atmosphere.py` computes `orog / (np.percentile(orog, 90.0) + 1e-6)` on the line *after*
+`orog = land_f * orog` has zeroed every ocean cell. Earth's DEM is ~66% ocean, so that "90th
+percentile" is really land's ~70th and the divisor comes out **3.8× too small** (0.0101 vs 0.0382).
+Every land value is inflated by that factor and `orographic_uplift_clip` then truncates **20.0% of
+all land and 100% of the steepest 5%**.
+
+The consequence is not a magnitude error — it is **total loss of the directional signal**. Traced
+along the Cascades transect at 46.6°N, the raw upslope term is exactly right: 0.41 climbing to the
+crest, dropping to *precisely* 0.0000 in the lee. After normalization and clipping, `orog` reads a
+saturated **2.000 on both flanks**. Same on the S Andes transect. The term whose entire purpose is
+to distinguish windward from leeward was reporting an identical number for both.
+
+**This retroactively explains A5's own earlier "null result"** and corrects its stage 2. With a
+3.8×-inflated input, moving a ceiling from 2.0 to 4.0 only relocates the flattening — which is why
+that A/B moved W/L by under 2%. And "`orog`'s own W/L ratio is only 1.05" was never a property of
+the formula; it was measuring a saturated field. With the normalizer fixed, `orog` at the crest
+reaches **3.0–11.7×**, which is Earth-realistic.
+
+**There is also a fourth absorption stage the original analysis missed**: the hardcoded
+`clip(precip_potential, 0, 3.0)`. `precip_potential`'s W/L ratio saturates at **~2.9 whether the
+incoming `orog` ratio is 3.0 or 11.7**, because the windward cell pins there and the leeward one
+does not. This is why raising `precip_orographic_weight` measures *backwards* — against a bound
+ceiling it can only lift the unpinned leeward side. Now gated as `precip_potential_ceiling`.
+
+Full attenuation chain, crest ±2 cells, normalizer fixed (`saves/earth.pkl`):
+
+| | orog | → potential | → remove_frac | → final P |
+|---|---|---|---|---|
+| Cascades | 3.03 | 2.69 | 1.49 | 1.03 |
+| Sierra Nevada | 6.15 | 2.86 | 1.44 | 1.00 |
+| S Andes | 6.97 | 2.95 | 1.68 | 1.12 |
+| Southern Alps | 11.67 | 2.87 | 1.44 | 1.25 |
+
+**Only the target side moves final precipitation, exactly as process note 9 predicts.** Raising
+`precip_potential_ceiling` (3.0→12.0) and `precip_rain_out_ceiling` (0.85→0.97) change the final
+result by **nothing at all** — identical to two decimals on every range. The moisture-budget fill is
+a *deficit-filling* mechanism, so it actively erases whatever contrast raw production creates; the
+S Andes pair reaches a potential ratio of 1.69 and comes out **inverted at 0.88**, because the
+leeward flank under-produces against its target and is therefore handed more synthetic fill.
+
+**Shipped** (two defaults changed, three handles shipped inert):
+- `orographic_normalizer_land_only` **False → True** — the bug fix. Normalizes over land cells that
+  carry signal; on Earth 99.7% of land is nonzero so this is a 0.4% difference from a plain land
+  percentile, but it keeps the normalizer meaningful on relief-free terrain, where a plain land
+  percentile collapses toward zero and every coastal cell pins at the clip.
+- `precip_orographic_shape_weight` **0.0 → 1.0** — blends raw production shape into the moisture
+  budget's *target*, gated by the orographic signal. This is the existing `precip_raw_shape_weight`
+  mechanism, which was only ever gated by `itcz_window` and so could never reach a mid-latitude
+  mountain range.
+- Inert ablation handles: `precip_orographic_weight` (0.20), `precip_potential_ceiling` (3.0),
+  `precip_rain_out_ceiling` (0.85), `orographic_uplift_clip` (2.0, unchanged).
+
+**Result on the tracked 64×128 benchmark** — every named box moved toward its target:
+
+| | baseline | shipped | target |
+|---|---|---|---|
+| `reference_error_score` | 0.2974 | **0.2071** | — |
+| Atacama | 147 | **65** | <50 |
+| Sahara / Kalahari | 196 / 170 | 164 / 138 | <200 |
+| Canadian Prairies | 538 | 504 | 400–500 |
+| US Midwest | 985 | 899 | 800–1000 |
+| Central Europe | 826 | 791 | 550–750 |
+| SE US / East China / S Japan | 929 / 665 / 993 | 991 / 690 / 1116 | higher |
+| H10 group accuracy | 0.6883 | 0.6855 | — |
+| H10 class accuracy | 0.3877 | 0.3889 | — |
+
+**Atacama 147 → 65 mm/yr is the headline.** A1 has carried it as the sole unclosed desert residual
+for many sessions, and D5 established that the ocean-side fix (real upwelling) does not reach it.
+It responds here because the Atacama *is* an Andean rain-shadow desert — an orographic mechanism is
+the physically correct lever, and it was the one mechanism never actually working. Verify against
+A1's <50 target before declaring it closed; 65 is close, not there.
+
+**Real, accepted cost, and a warning about how it was nearly mis-tuned**: the rescale mean rises
+**2.008 → 2.651** (more synthetic fill — A5's own structural metric, moving the wrong way). This
+comes entirely from the normalizer fix (the shape blend costs 2.625→2.651, negligible), because the
+corrected `orog` is genuinely ~2.2× smaller than the inflated one — arguably the old figure was
+flattered by the bug. `precip_orographic_weight` **0.44** would restore magnitude exactly and drives
+rescale to **1.967, better than baseline**, with refErr improving further to 0.2044 — but it
+**degrades S Andes (1.29→0.96, inverted) and Southern Alps (2.13→1.32) below their baselines**, i.e.
+it buys aggregate scores by giving back the exact contrast this work exists to create. Process
+note 10's trap in a new costume. The knob stays at 0.20.
+
+**⚠️ The orographic contrast gap this section exists for is NOT closed. Be precise about which
+measure any future claim uses — the two disagree completely**, and quoting the narrow one against
+Earth's box-scale targets would overstate the result:
+
+| | crest ±2 cells | | box-scale (Earth-comparable) | | Earth |
+|---|---|---|---|---|---|
+| | baseline | shipped | baseline | shipped | |
+| Cascades | 1.03 | **1.93** | 1.09 | 0.99 | 3–6 |
+| Sierra Nevada | 1.00 | **1.22** | 0.96 | 0.89 | 2–5 |
+| S Andes | 1.14 | **1.29** | 0.84 | 0.89 | 5–15 |
+| Southern Alps | 1.74 | **2.13** | 0.82 | 0.91 | 4–12 |
+
+At the crest the fix works and is large (Cascades +87%). **At box scale — the only measure
+comparable to Earth's 3–6× — the mean is 0.96 before and 0.96 after, i.e. unchanged**, with two
+ranges up and two down. So the shipped change restores the orographic *signal* and delivers real
+gains elsewhere (below), but it does not move box-scale windward/leeward contrast at all.
+
+**Why, and it is now a well-posed problem rather than a vague one**: the model's orographic
+precipitation is a **1–2 cell spike at the crest**, whereas real orographic precipitation has a
+broad windward-flank footprint — air ascends well upwind of the crest and hydrometeors advect
+downwind before falling. A box mean over 4–6 cells therefore dilutes a signal that is correct
+exactly where it exists and absent everywhere else in the box. None of the four ceilings can fix
+that; they all act pointwise. **Next lever**: give the uplift signal an upwind footprint — an
+upstream-integrated parcel trajectory, or advection of the uplift/condensate signal along the wind
+— not another cap or weight. All four ceilings are gated for whoever attempts it, and
+`scripts/check_orographic_contrast.py` reports both measures so the next attempt can tell the
+difference immediately.
+
+**What the shipped change is actually worth, then**: not the orographic contrast gap, but the
+regional precipitation gains in the table above — most of all Atacama, plus a 30% `reference_error_score`
+improvement and every named box moving toward target. The orographic *mechanism* being repaired is
+what produced those; the *contrast metric* it was built to move is still open.
+
+**A large lead found here and deliberately NOT taken — flag for a future session.** The orographic
+gate is `clip(orog / orographic_uplift_clip, 0, 1)`. Under the *old* inflated normalizer that gate
+covers **33.8% of land**, i.e. it is not orographic at all but a broad terrain-weighted raw-shape
+target blend. Run that way (`precip_orographic_shape_weight=1.0` with the normalizer bug left in
+place) the tracked benchmark gives `reference_error_score` **0.1856** — far better than the 0.2071
+shipped here — with H10 group accuracy *up* (0.6896) and class accuracy *up* (0.3935). It was not
+shipped because it is a different mechanism wearing an orographic name, and it depends on a bug for
+its breadth. But it is effectively **the ungated raw-shape target blend, re-tested post-A5**, and
+the 2026-07-31 rejection of that mechanism (see the `precip_raw_shape_weight` entry: "nearly doubled
+`arid_pct`", "US Midwest 610→400") **does not reproduce** on current code. That is textbook process
+note 7 — the constraint moved, not the parameter. Worth a session of its own, tested honestly as a
+land-wide mechanism with its own gate rather than as a side effect of this one.
+
 <details><summary>Superseded recommendation (kept for the diagnosis trail)</summary>
 
 the `remove_frac`-saturation interaction itself is a
@@ -974,14 +1115,10 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
    plumbing already existing to support exactly this.
 9. **Milankovitch scenario runner** — obliquity/eccentricity are wired through insolation but no
    scripted orbital-parameter sweep exists to demonstrate spontaneous glaciation.
-10. **Gridded (ERA5/CRU) map-correlation validation** — current validation is 9 named boxes +
-    6 zonal reference bands + a handful of Köppen area fractions. No spatial correlation/RMSE
-    against an actual gridded reference product exists, meaning *regional* errors (a desert core,
-    a continental interior) that a zonal mean would average away can silently persist — precisely
-    the class of error most of section A describes. This is arguably the highest-leverage missing
-    piece of *infrastructure* (not physics) in the whole project: nearly every session above had to
-    re-derive its own named-box measurement from scratch because no single scored map-comparison
-    exists yet.
+10. ~~**Gridded map-correlation validation**~~ — **BUILT 2026-08-02, see H10-DONE below.**
+    The classification half is done and tracked; per-cell *temperature/precipitation* RMSE against
+    a licensed ERA5/CRU pack remains absent (`EARTH_ZONAL_REFERENCE`'s 6 zonal bands are still the
+    only T/P anchor).
 11. **Real SST-coupled ocean-current climate feedback** — ocean current *fields* are computed
     (climatological gyres + Ekman transport) but only for GUI visualization; they don't feed back
     into temperature, salinity, or precipitation (D3, D5 describe the two real physics mechanisms
@@ -990,6 +1127,59 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
 13. **GUI test coverage** — `main.py` (~116KB) has no automated test coverage at all; not a physics
     inaccuracy, but a real risk multiplier for undetected regressions in the biome/temperature/wind
     view layers that this whole audit relies on for visual comparison against the Köppen reference.
+
+---
+
+## H10-DONE. 🟢 Gridded Köppen map skill — built 2026-08-02
+
+The reference product was already in the repo: the user's designated
+`Koppen_classification_world_map_1991-2020_-3C_borderless.png` is a genuine **3600×1800 (0.1°)
+equirectangular Köppen-Geiger raster** in the standard 31-colour Beck legend, not just a picture.
+No network or licensed data was needed. Verified by direct spot check before building anything
+(Amazon→Af, Sahara→BWh, Chicago→Dfa, London→Cfb, Moscow→Dfb, Atacama→BWk, Greenland/Antarctica→EF,
+open ocean→white); the one legend colour not in the published key was identified as **As** from its
+geography (Sri Lanka, NE Brazil, Somalia, Vietnam, Hispaniola).
+
+**What exists now**
+- `koppen_reference.py` — palette decode (exact lookup; an unknown colour **raises** rather than
+  silently becoming ocean), area-correct regridding to any 2:1 grid (per-cell majority over the
+  source pixels whose centres fall inside it, so non-integer ratios like 1800/64 = 28.125 and
+  1800/512 = 3.5 are both exact), a documented 30→19 class folding that **preserves the group
+  letter** (so group-level scoring is folding-independent), and area-weighted scoring.
+- `scripts/check_koppen_map_skill.py` — headline scores, confusion matrix, per-class table,
+  per-region and per-zone accuracy, and a PNG error map tinted by what the model claimed.
+- `metrics.koppen_map_skill` in `real_terrain_validation.py`, **regression-gated** in
+  `compare_validation_reports` on five headline scalars (±0.03 / ±1.0pp).
+- `testing/test_koppen_map_skill.py` — 23 tests, self-tested against planted violations (removing
+  the cos(lat) weight, a regridding offset, and a silent unknown-colour fallback are each caught by
+  their intended test).
+
+**Baseline on the tracked 64×128 benchmark**: group accuracy **0.688**, group κ **0.606**,
+class accuracy **0.388**, class κ **0.331**, group share MAE **2.06pp**.
+
+**It immediately earned its keep — the aggregate metrics were hiding real errors:**
+- **Group share MAE is 2.06pp while 31% of land is in the wrong group.** Shares are a closed budget,
+  so compensating regional errors cancel exactly. Polar is the cleanest example: share 15.4% vs
+  reference 15.4% — apparently perfect — yet F1 0.798, i.e. ~20% of polar land is misplaced. This is
+  the exact blind spot H10 was opened for, now demonstrated rather than asserted.
+- **The model cannot emit Csa, Csb, Cwa, Cfc or Dwd at all** (0.00% model share against 1.94 / 1.16 /
+  3.59 / 0.31 / 0.17% in the reference). **Mediterranean climate does not exist in this model.**
+  That is ~7.2% of Earth's land the classifier structurally cannot produce, and no previous metric
+  could have revealed it — a share-based or box-based check simply never asks the question.
+- **Two boxes the project has spent sessions tuning for precipitation are failing on *group*.**
+  US Midwest 12.2% group accuracy (model Cfa vs reference Dfa) and Central Europe 0.0% (model Dfb vs
+  reference Cfb) — both temperature-driven misclassifications, i.e. C1's residual showing up
+  spatially. Worth reading alongside A3, which treats the Midwest as a precipitation problem.
+- Worst latitude bands are −60:−50 (0.0%), −50:−40 (36.6%) and 40:50 (45.1%).
+
+**Corrected Earth reference shares.** A2 compares against hand-entered constants; measured from the
+designated reference on the same area-weighted basis they are **A 19.9 / B 28.6 / C 14.9 / D 22.5 /
+E 14.1%** (vs A2's 19.0 / 26.4 / 13.4 / 24.6 / 16.6), stable to ≤1.2pp across resolution. Prefer
+`koppen_reference.earth_group_shares()` over the literals in A2.
+
+**Caveat**: this is a classification reference. It says nothing about how *wrong* a wrong cell is,
+and cannot replace a T/P RMSE. It is also insensitive to the model's own vocabulary gaps in the
+group score (a model that never emits Csa still scores C correctly if it emits Cfb there).
 
 ---
 
@@ -1098,3 +1288,28 @@ These are not "inaccurate" in the sense of producing a wrong number — no code 
    actually pinned the exact cause in minutes rather than hours. **New large-effect mechanisms should
    still ship gated even when the calibrated value is believed correct** — the gate itself is what
    makes an interaction bug like this one cheaply diagnosable via ablation instead of a bisect.
+12. **A percentile (or any distribution statistic) taken over a masked field is measuring the mask,
+   not the field** (2026-08-02, and it is the same bug class as note 8's missing `cos(lat)`).
+   `atmosphere.py` normalized the orographic term with `np.percentile(orog, 90.0)` one line after
+   `orog = land_f * orog` had set every ocean cell to exactly 0.0. Earth's DEM is ~66% ocean, so the
+   nominal 90th percentile was really land's ~70th and the divisor came out 3.8x too small; the clip
+   downstream then saturated and the term reported an identical value on both flanks of every
+   mountain range — a total loss of the directional information it existed to carry. It survived
+   for a long time because **every aggregate check it could have failed, it passed**: the global
+   mean was fine, the named boxes are not mountainous, and the term's magnitude was plausible. Only
+   a *contrast* measurement exposed it. **Practical rule**: whenever a statistic is computed over a
+   field that has been masked, zeroed, or clipped, state explicitly which population it is meant to
+   describe and restrict it to that population. And when a mechanism "does nothing", check that its
+   input still carries information before concluding the mechanism is weak — A5 spent a full
+   ablation concluding `orog`'s windward/leeward ratio was "only 1.05" when it was measuring a
+   saturated field, not a formula.
+13. **Build the instrument before the fix, and expect the instrument itself to be the finding**
+   (2026-08-02). H10's gridded map score was built as infrastructure to support orographic work, and
+   before a single physics change it had already shown that the model **cannot emit Csa, Csb, Cwa,
+   Cfc or Dwd at all** — Mediterranean climate does not exist in this simulator, ~7.2% of Earth's
+   land — and that two boxes tracked for *precipitation* (US Midwest, Central Europe) are actually
+   failing on temperature-driven *group* classification. Neither is visible to a share metric, a
+   zonal mean, or a named box; the share metric in particular reads 2.06pp MAE while 31% of land is
+   in the wrong group, because shares are a closed budget and compensating regional errors cancel
+   exactly. Note this is the *third* time in this document's history that an instrument change, not
+   a physics change, produced the largest single correction (see notes 8 and 11).

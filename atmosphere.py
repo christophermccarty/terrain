@@ -3329,13 +3329,35 @@ def generate_precipitation(
         slope = np.hypot(gx, gy)
         orog = np.clip(gx * u + gy * v, 0.0, None) + 0.25 * slope
         orog = land_f * orog
-        orog = orog / (np.percentile(orog, 90.0) + 1e-6)
-        # This ceiling — not the percentile normalization above — is what bounds
-        # windward/leeward contrast spatially, and it binds hard: on real terrain
-        # the old fixed 2.0 truncated 87.7% of the steepest 5% of land (mean
-        # pre-clip 11.3). Raising it alone is still a null result, because the
-        # restored signal is absorbed downstream; see
-        # `PlanetParams.orographic_uplift_clip` for the full three-stage ablation.
+        # Normalizer choice decides whether the clip below carries any spatial
+        # information at all. `np.percentile(orog, 90.0)` spans the WHOLE grid,
+        # but `orog` was just zeroed over ocean — on Earth that is ~66% of cells
+        # sitting at exactly 0.0, so the nominal "90th percentile" is really only
+        # land's ~70th. The normalizer comes out ~3.8x too small, every land value
+        # is inflated by that factor, and the ceiling below then truncates 20% of
+        # land and 100% of the steepest 5% — flattening windward and leeward
+        # flanks onto the same clipped value and destroying the very contrast the
+        # term exists to create. Measured on saves/earth.pkl: along the Cascades
+        # and S Andes transects `orog` reads a saturated 2.000 on both flanks.
+        # See ACCURACY_AUDIT.md A5. Land-only restores the intended meaning of
+        # "90th percentile of the orographic signal" and drops clip truncation to
+        # ~6% of land.
+        if bool(pp.orographic_normalizer_land_only):
+            # Restrict to land cells that carry signal, not merely to land. On
+            # Earth 99.7% of land is nonzero so this is a 0.4% difference from a
+            # plain land percentile, but it is what keeps the normalizer
+            # meaningful on degenerate terrain: for a continent with no relief,
+            # the only nonzero cells are the land/ocean step at the coast, a
+            # plain land percentile collapses toward zero, and every coastal cell
+            # then divides by ~1e-6 and pins at the clip. That failure mode is
+            # not hypothetical for non-Earth presets.
+            land_cells = orog[(land_f > 0.5) & (orog > 0.0)]
+            normalizer = (
+                float(np.percentile(land_cells, 90.0)) if land_cells.size else 0.0
+            )
+        else:
+            normalizer = float(np.percentile(orog, 90.0))
+        orog = orog / (normalizer + 1e-6)
         orog = np.clip(
             orog + 0.15 * _lap(orog.astype(np.float32)),
             0.0,
@@ -3430,13 +3452,29 @@ def generate_precipitation(
         if _sc is not None:
             stratiform.flags.writeable = False
             _sc["stratiform"] = stratiform
+    # A5 stage 4 (found 2026-08-02, not in the audit's original three): this
+    # ceiling binds on windward cells and is why raising `orog` past a point
+    # stops helping -- `precip_potential`'s windward/leeward ratio saturates at
+    # ~2.9 whether the incoming `orog` ratio is 3.0 or 11.7, because the windward
+    # cell is pinned here while the leeward one is not. 3.0 is the historical
+    # hardcoded value, so the default is an exact no-op.
+    _potential_ceiling = float(pp.precip_potential_ceiling)
+
+    # `precip_orographic_weight` is A5's stage 2: `orog`'s share of this sum
+    # against the five terms that are not orographically organized. The other
+    # five are rescaled to hold the total weight at its historical 1.10, so this
+    # knob moves orography's *relative* contribution rather than the overall
+    # magnitude of `precip_potential` (which the moisture budget would absorb
+    # anyway). 0.20 reproduces the historical weights exactly.
+    _orog_weight = float(pp.precip_orographic_weight)
+    _other_scale = (1.10 - _orog_weight) / 0.90
     precip_potential = uplift_coeff * (
-        0.18 * rh_release +
-        0.24 * conv_driver +
-        0.20 * orog +
-        0.20 * convective +
-        0.22 * ascent_driver +
-        0.06 * stratiform
+        0.18 * _other_scale * rh_release +
+        0.24 * _other_scale * conv_driver +
+        _orog_weight * orog +
+        0.20 * _other_scale * convective +
+        0.22 * _other_scale * ascent_driver +
+        0.06 * _other_scale * stratiform
     ) * subsidence_suppression * rain_shadow_suppression
     lat_shape = np.clip(0.78 + 0.20 * itcz_window[:, None] + 0.02 * storm_window[:, None], 0.60, 1.40)
     precip_potential = precip_potential * lat_shape
@@ -3449,14 +3487,14 @@ def generate_precipitation(
         for _ in range(3):
             lap_p = _laplacian_numba(precip_potential.astype(np.float32))
             np.add(precip_potential, 0.18 * lap_p, out=precip_potential)
-            np.clip(precip_potential, 0.0, 3.0, out=precip_potential)
+            np.clip(precip_potential, 0.0, _potential_ceiling, out=precip_potential)
     else:
         # Fallback: original NumPy implementation. Same in-place reasoning as above --
         # _laplacian reads and fully materializes its output before we mutate.
         for _ in range(3):
             lap_p = _laplacian(precip_potential)
             np.add(precip_potential, 0.18 * lap_p, out=precip_potential)
-            np.clip(precip_potential, 0.0, 3.0, out=precip_potential)
+            np.clip(precip_potential, 0.0, _potential_ceiling, out=precip_potential)
     post_shape = np.clip(0.92 + 0.20 * itcz_window[:, None] - 0.10 * storm_window[:, None], 0.82, 1.12)
     # Convert the dimensionless precipitation drivers into a realistic daily
     # rain-out timescale by regime.  The previous uniform conversion left raw
@@ -3484,7 +3522,7 @@ def generate_precipitation(
     # bisect had to stand in for the first time this mechanism misbehaved.
     _raw_conversion_gain = 1.0 + float(pp.precip_raw_conversion_gain) * _raw_conversion_affinity
     precip_potential = np.clip(
-        _raw_conversion_gain * precip_potential * post_shape, 0.0, 3.0
+        _raw_conversion_gain * precip_potential * post_shape, 0.0, _potential_ceiling
     )
 
     # Convert potential to precipitation (mm/day) with moisture conservation
@@ -3492,7 +3530,16 @@ def generate_precipitation(
     # stripping), leaving humidity_next≈0 everywhere and erasing spatial gradients.
     # Limiting to dt=2.0 and 0.85 ensures cells retain ~15% of moisture, so
     # the next substep starts with a spatially differentiated humidity field.
-    remove_frac = np.clip(rain_efficiency * precip_potential * min(dt, 2.0), 0.0, 0.85)
+    # The ceiling is `PlanetParams.precip_rain_out_ceiling` (0.85 default = the
+    # long-standing hardcoded value). It is the second of A5's absorption stages:
+    # a windward flank that "wants" to rain harder cannot, because it is already
+    # stripping the maximum permitted fraction of its column. Measured on
+    # saves/earth.pkl, the entire S Andes windward slope sits pinned at 0.85.
+    remove_frac = np.clip(
+        rain_efficiency * precip_potential * min(dt, 2.0),
+        0.0,
+        float(pp.precip_rain_out_ceiling),
+    )
     dq = np.clip(remove_frac * q, 0.0, q)
     column_mm_per_q = 2000.0  # ~20 mm PW for q=0.01
     P = dq * (column_mm_per_q / dt)
@@ -3679,7 +3726,41 @@ def generate_precipitation(
         _raw_shape = np.clip(
             precip_potential / (_land_pp_row_mean[:, None] + 1e-6), 0.2, 3.0
         ).astype(np.float32, copy=False)
+        # Shared by the orographic gate below and the ITCZ-gated blend beneath
+        # it. Built only when at least one of them is active, so the historical
+        # both-weights-zero configuration does no extra work.
+        _orog_shape_w = float(pp.precip_orographic_shape_weight)
         _raw_shape_w = float(pp.precip_raw_shape_weight)
+        if _orog_shape_w > 0.0 or _raw_shape_w > 0.0:
+            _raw_shape_applied = np.where(land_f > 0.5, _raw_shape, 1.0).astype(
+                np.float32, copy=False
+            )
+        # A5 stage 3, added 2026-08-02. The moisture-budget fill is a
+        # *deficit-filling* mechanism: it tops each cell up toward a target, so
+        # wherever it supplies most of the rain it actively erases whatever
+        # spatial contrast raw production created. That is why an orographic gain
+        # upstream does not survive to final precipitation -- measured on
+        # saves/earth.pkl, the S Andes pair reaches a `precip_potential` ratio of
+        # 1.69 and comes out at 0.88 in final P, i.e. inverted.
+        #
+        # The fix is to make the *target* orographically aware, which is process
+        # note 9's rule ("check which side of the rescale a mechanism sits on")
+        # applied to orography. The identical raw-shape blend already exists
+        # directly below for the tropics, but it is gated by `itcz_window` and so
+        # cannot reach a mid-latitude mountain range at all. This gate is the
+        # orographic signal itself, so the blend acts only where orography is
+        # doing something and leaves the validated desert/continental mid-latitude
+        # weighting untouched everywhere else.
+        if _orog_shape_w > 0.0:
+            _orog_gate = np.clip(
+                orog / max(float(pp.orographic_uplift_clip), 1e-6), 0.0, 1.0
+            )
+            _orog_blend = (
+                _orog_shape_w * _orog_gate * (land_f > 0.5)
+            ).astype(np.float32)
+            _desert_factor = _desert_factor * (
+                1.0 - _orog_blend + _orog_blend * _raw_shape_applied
+            )
         if _raw_shape_w > 0.0:
             # Gated by `itcz_window` (real-terrain measurement, 2026-07-31):
             # an ungated version -- applying this blend at every latitude --
@@ -3705,8 +3786,8 @@ def generate_precipitation(
             # Ocean cells keep a neutral factor of 1.0 in the blend -- their
             # share of the row's target is untouched, exactly like
             # `_desert_factor` alone -- so only land is reshaped, and only
-            # relative to other land in the same row.
-            _raw_shape_applied = np.where(land_f > 0.5, _raw_shape, 1.0).astype(np.float32, copy=False)
+            # relative to other land in the same row. (`_raw_shape_applied` is
+            # now built just above, shared with the orographic gate.)
             _desert_factor = _desert_factor * (1.0 - _raw_shape_w_row + _raw_shape_w_row * _raw_shape_applied)
         _row_norm = np.mean(_desert_factor, axis=1, dtype=np.float64).astype(np.float32)
         cell_weight = _desert_factor / (_row_norm[:, None] + 1e-6)
