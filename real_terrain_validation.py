@@ -15,6 +15,8 @@ from masks import get_masks
 from planet_params import EARTH, PlanetParams
 from regional_validation import (
     EARTH_PRECIP_REGIONS,
+    OROGRAPHIC_PAIRS,
+    orographic_contrast,
     precipitation_by_region_mm_year,
     region_mean,
     target_error_fraction,
@@ -203,6 +205,46 @@ def _koppen_land_percentages(state: PlanetState, land_mask: np.ndarray) -> dict[
     }
 
 
+def _orographic_contrast_metrics(
+    mean_precipitation_mm_day: np.ndarray, land_mask: np.ndarray
+) -> dict[str, Any]:
+    """Annual-mean windward:leeward ratio for each `OROGRAPHIC_PAIRS` range.
+
+    `scripts/check_orographic_contrast.py` reports the same ratios but from a
+    *single* precipitation call on one saved state, which pins every range to
+    whatever the wind happened to be doing at that instant -- on
+    `saves/earth.pkl` the Scandinavian flow is easterly, so that pair's
+    "windward" box is downwind and its ratio is uninterpretable. This computes
+    the ratio from the evaluation period's mean precipitation instead, which is
+    the measure comparable to Earth's published box climatology (audit process
+    note 3).
+
+    Returns `{}` below ~256x512, where a single cell spans a whole range and the
+    two flank boxes collapse onto it -- reporting a number there would be
+    process note 11 in reverse, an instrument that cannot resolve the phenomenon
+    quietly emitting a confident value.
+    """
+    ratios: dict[str, float] = {}
+    for pair in OROGRAPHIC_PAIRS:
+        contrast = orographic_contrast(
+            mean_precipitation_mm_day, pair, land_mask=land_mask
+        )
+        if contrast is None or not np.isfinite(contrast["ratio"]):
+            continue
+        ratios[pair.name] = float(contrast["ratio"])
+    if len(ratios) < len(OROGRAPHIC_PAIRS):
+        return {}
+    shortfalls = [
+        max(0.0, pair.ratio_min - ratios[pair.name]) / pair.ratio_min
+        for pair in OROGRAPHIC_PAIRS
+    ]
+    return {
+        "ratios": ratios,
+        "mean_ratio": float(np.mean(list(ratios.values()))),
+        "mean_shortfall_vs_earth_floor": float(np.mean(shortfalls)),
+    }
+
+
 def _koppen_map_skill(state: PlanetState, land_mask: np.ndarray) -> dict[str, Any]:
     """Per-cell Köppen agreement against the gridded reference map (audit H10).
 
@@ -384,6 +426,9 @@ def summarize_real_terrain_climate(
             else None
         ),
         "zonal": zonal,
+        "orographic_contrast": _orographic_contrast_metrics(
+            mean_precipitation_mm_day, land_mask
+        ),
         "koppen_land_percent": _koppen_land_percentages(state, land_mask),
         "koppen_map_skill": _koppen_map_skill(state, land_mask),
         "precip_rescale": _precip_rescale_metrics(state, planet_params),

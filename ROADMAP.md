@@ -41,6 +41,14 @@ can emerge on its own (jets, monsoons, real storm dynamics).
   **Best lead:** it grows with integration time (7.00 at 4yr → 7.97 at 23.8yr),
   so the mechanism has multi-year memory; test soil moisture first by holding it
   fixed over a long run and re-measuring.
+  > **Scope narrowed 2026-08-03 (ACCURACY_AUDIT.md A6).** "A direct cause of the
+  > model emitting no Mediterranean climate" is now only half true. **Csa was
+  > recovered from precipitation alone** (0.01% → 1.93% of land, against Earth's
+  > 1.94%) by giving the subtropical dry belt the seasonal migration it never
+  > had, with this temperature defect entirely unfixed. What still rests on this
+  > item is **Csb** (0.42% vs 1.16% — needs a warmest month under 22 °C) and
+  > **Cfc** (0.00% vs 0.31%). Still worth doing, and the lead above is still the
+  > lead; the prize is ~1.05% of land, not the whole Mediterranean.
 
 - ~~**1.5-layer atmosphere.**~~ **Done 2026-07-04.** `atmosphere.evolve_wind_aloft()`
   gives the atmosphere a real, independent prognostic upper-level wind layer

@@ -1208,6 +1208,85 @@ class PlanetParams:
     `scripts/check_orographic_contrast.py`, which reports the ratio at each
     pipeline stage, and A5 for what the end-to-end effect turned out to be."""
 
+    orographic_upwind_footprint_km: float = 0.0
+    """E-folding length of the **upstream** footprint given to the orographic
+    uplift term, in kilometres. 0.0 = exact no-op (the pointwise term that
+    existed before 2026-08-03).
+
+    **The defect this addresses is shape, and it is the only one A5-OROG left
+    open.** That session repaired the orographic *signal* (the
+    `orographic_normalizer_land_only` bug) and measured every pointwise ceiling
+    in the pipeline -- `orographic_uplift_clip`, `precip_potential_ceiling`,
+    `precip_rain_out_ceiling`, `precip_orographic_weight`. At the crest the fix
+    was large (Cascades windward/leeward 1.03 -> 1.93), but at **box scale --
+    the only measure comparable to Earth's published 3-6x ratios -- the mean
+    across six ranges was 0.96 before and 0.96 after, i.e. unchanged.** The
+    reason is geometric rather than a missing gain: `clip(gx*u + gy*v, 0, None)`
+    on a real DEM is a 1-2 cell spike sitting on the crest, so a box mean over
+    4-6 cells dilutes a signal that is correct exactly where it exists and
+    absent everywhere else in the box. No ceiling can fix that -- they all act
+    pointwise. A5-OROG named this parameter's mechanism as the next lever.
+
+    The physics: air begins ascending well upstream of a barrier (upstream
+    blocking and deceleration), so uplift is not confined to the cells where the
+    resolved slope is steepest. A cell therefore samples the uplift at points
+    *downwind* of itself, which places a crest's signal onto the windward flank
+    ahead of it. See `atmosphere._smear_along_wind`, and
+    `orographic_spillover_km` for the opposite-direction companion.
+
+    **Specified in kilometres, not cells, deliberately.** The equivalent
+    cell-count formulation would mean a different physical distance at every
+    resolution -- exactly the bug A5 had to fix in the monsoon inland mask,
+    whose fixed 20-cell reach meant 7 deg at 1024 columns and 56 deg in the
+    128-column fixture.
+
+    **Shipped at 0.0 (inert) because the measured gain is real but small, and it
+    is paid for elsewhere.** The mechanism works: it is the first thing tried
+    that moves box-scale windward/leeward contrast at all, and the attenuation
+    chain shows why -- on `saves/earth.pkl` at 400 km the S Andes `orog` ratio
+    goes 1.11 -> 3.14 and now survives *intact* through `precip_potential`
+    (3.15) and `remove_frac` (3.09), so the four pointwise ceilings really are no
+    longer binding. Measured on the 256x512 fresh-spinup benchmark against the
+    annual-mean contrast metric (`metrics.orographic_contrast`):
+
+        footprint_km   mean W/L   grpAcc   clsAcc   refErr   Atacama
+        0 (default)      1.567    0.7024   0.4343   0.1290     57
+        100              1.628    0.7031   0.4350   0.1309     58
+        200              1.649    0.7029   0.4356   0.1357     62
+        400              1.646    0.7026   0.4345   0.1399     66
+
+    That is +5% of contrast against Earth's 3-6x, for `reference_error_score`
+    +0.007 and Atacama drifting back up toward the <50 target it had just come
+    under. Saturates by ~200 km. The H10 accuracies move by less than a tenth of
+    a percent either way, i.e. within the noise that process note 14 says a
+    single grid cannot resolve.
+
+    **What remains binding is the moisture budget's deficit fill, not the uplift
+    signal.** The same S Andes pair whose `remove_frac` ratio reaches 3.09 comes
+    out at 1.37 in final precipitation: `precip_orographic_shape_weight` blends
+    raw shape into the target but its gate saturates at
+    `orog >= orographic_uplift_clip`, so a broader footprint does not widen it
+    proportionally. Raising that weight to 2.2 alongside a 200 km footprint is a
+    genuinely large regional win -- mean W/L 1.567 -> **1.799**, Atacama
+    **57 -> 39.5 mm/yr, under its <50 target for the first time**, Sahara
+    164 -> 148, `reference_error_score` 0.129 -> 0.123 -- but it reproduces
+    A5-LEAD's verdict on that knob exactly (group accuracy 0.7024 -> 0.6983,
+    class 0.4343 -> 0.4291 at 256x512, matching A5-LEAD's own 0.6985 for
+    weight 2.2), so the trade is the shape weight's, not this parameter's.
+    Whoever revisits that trade should reach for this footprint too; it is the
+    piece that makes the raw signal worth propagating."""
+
+    orographic_spillover_km: float = 0.0
+    """E-folding length of the **downstream** spillover of the orographic uplift
+    term, in kilometres. 0.0 = exact no-op.
+
+    The companion to `orographic_upwind_footprint_km`, in the other direction:
+    condensate formed in ascent is carried some distance downstream before it
+    reaches the ground, so a cell also samples the uplift at points *upwind* of
+    itself. Physically real, but it works against windward/leeward contrast by
+    construction (it moves signal toward the lee), which is why it is separately
+    gated rather than folded into one symmetric smoothing length."""
+
     precip_rain_out_ceiling: float = 0.85
     """Maximum fraction of a cell's moisture column that can rain out in one
     step, in `atmosphere.generate_precipitation`. 0.85 is the value hardcoded
@@ -1453,6 +1532,166 @@ class PlanetParams:
     compositions byte-identical. Worth remembering as an instance of the general
     rule -- a 64x128 named box holds only a handful of land cells, so a single
     reclassified cell reads as a double-digit percentage swing."""
+
+    drybelt_seasonal_response: float = 0.25
+    """Fraction [0-1] of the full solar-declination swing that the **subtropical
+    dry belt's** poleward edge tracks seasonally, in
+    `atmosphere.generate_precipitation`'s `drybelt_window` /
+    `drybelt_regime_window`. 0.0 is an exact no-op (the static belt every default
+    before 2026-08-03 used).
+
+    **This is the third instance of the same bug class, and the one that carries
+    Mediterranean climate.** `itcz_window` was found in 2026-07-30 to be a pure
+    function of `|latitude|` with zero `day_of_year` dependence, and
+    `_zonal_precip_target_profile` the same on 2026-07-31 (see
+    `itcz_seasonal_response` / `itcz_seasonal_target_response`, whose docstrings
+    both explicitly record that `storm_window`/`drybelt_window` were left
+    untouched as "features this session did not investigate"). They are the same
+    defect: on a tilted planet the subtropical high migrates with the sun, and a
+    belt pinned to a fixed `|latitude|` cannot produce a summer-dry climate.
+
+    **Why it is the specific blocker for Csa/Csb** (H10-DONE, ACCURACY_AUDIT.md,
+    and the `missing-koppen-classes-rootcause` diagnosis it prompted): the model
+    emitted *zero* Mediterranean cells. `climate_averages.classify_koppen`
+    reaches Cs only when `P_summer_driest < P_winter_wettest / 3`, and land
+    precipitation in this model peaks in local *summer* essentially everywhere,
+    because land precip tracks land surface temperature through evaporation and
+    nothing opposes it. Real Mediterranean climate is precisely the opposite
+    forcing winning: the subtropical high sits over 35-42 deg in summer and
+    suppresses convection outright, then retreats equatorward in winter and lets
+    the storm track in. With a static belt that seasonal alternation does not
+    exist anywhere in the code, so the ratio is not merely too weak -- it is
+    inverted, and no classifier threshold change can recover the class.
+
+    **Hemisphere-antisymmetric, unlike the ITCZ knob.** `itcz_window` is built on
+    signed latitude around a single centre, so one shift moves the whole belt.
+    This belt is symmetric about the equator (`abs_lat_deg`), and its two halves
+    migrate in *opposite* directions at any given time: in NH summer the NH belt
+    moves poleward while the SH belt moves equatorward. Implemented as
+    `abs_lat_deg - k * declination_deg * sign(lat_deg)`, which reproduces that
+    with one term and feeds the Gaussian and the wide 16-34 deg regime window
+    identically.
+
+    Physically, Earth's subtropical ridge migrates ~5-10 deg against the 23.44
+    deg declination swing, i.e. a ratio of ~0.25-0.4 -- the same range
+    `itcz_seasonal_response` was independently calibrated into. 0.25 is a 5.9 deg
+    migration, at the conservative end of that.
+
+    **Calibration (2026-08-03), with `drybelt_seasonal_equatorward_fraction=0.0`
+    throughout.** Swept on the 128x256 fresh-spinup benchmark; `Csa` is the
+    area-weighted land share of the class the model previously could not emit
+    (Earth 1.94%):
+
+        response  grpAcc  clsAcc  kappa   shareMAE   Csa    Sahara  Midwest
+        0.00      0.7031  0.4194  0.6236    2.18    0.01     129      912
+        0.15      0.7062  0.4227  0.6275    2.15    0.68     131      855
+        0.20      0.7068  0.4224  0.6283    2.13    1.11     131      827
+        0.25      0.7082  0.4223  0.6303    2.05    1.58     131      811
+        0.30      0.7078  0.4200  0.6298    1.99    1.87     132      788
+
+    0.25 is both the group-accuracy/kappa optimum and the largest value that
+    leaves **US Midwest inside its 800-1000 target** at that resolution; 0.30
+    buys another 0.3pp of Csa and pushes it out.
+
+    **Confirmed at three resolutions** (audit process note 14 -- a bounded-metric
+    gain read only at 64x128 has reversed sign at higher resolution before):
+
+        grid      grpAcc            clsAcc            kappa             Csa
+        64x128    0.6855 -> 0.6864  0.3884 -> 0.3943  0.6021 -> 0.6033  0.11 -> 0.97
+        128x256   0.7031 -> 0.7082  0.4194 -> 0.4223  0.6236 -> 0.6303  0.01 -> 1.58
+        256x512   0.7024 -> 0.7049  0.4343 -> 0.4335  0.6223 -> 0.6259  0.00 -> 1.93
+
+    Group accuracy and kappa improve at all three; class accuracy improves at two
+    and is flat at the third. Deserts are untouched everywhere (Sahara 164->165 /
+    129->131 / 164->166; Atacama 65->64 / 61->60 / 57->56).
+
+    **Real, accepted cost: the continental-interior boxes, and it grows with
+    resolution.** US Midwest 900->841 (64x128), 912->811 (128x256), 878->786
+    (256x512) and Central Europe 791->785 / 568->554 / 581->548 -- the last two
+    dip just under their 550 floor. The monsoon boxes also give back (S Japan
+    1115->979 at 64x128, 2073->1875 at 256x512). Both are the same mechanism
+    seen from the other side: a *zonally uniform* belt that advances poleward in
+    summer necessarily suppresses summer rain over the 35-45 deg eastern margins
+    too, where real monsoon inflow keeps it. That is the identical tension
+    `monsoon_east_margin_exemption` exists for (audit A4), and the honest next
+    lever for it. `reference_error_score` registers the cost as +0.0025 at
+    64x128 and +0.0006 at 256x512.
+
+    **A measured regional artifact worth knowing about before re-deriving it.**
+    Of six real Mediterranean regions the mechanism fixes five (Greece, coastal
+    California, central Chile, Cape Town, SW Australia all develop a proper
+    winter-wet cycle -- e.g. California goes from a flat 22-36 mm/month all year
+    to 70 in January and 4.8 in July). **Iberia inverts instead**, developing a
+    285 mm/month June peak. Root-caused, not left as a puzzle: it is
+    `monsoon_east_margin_exemption`, which sees the Mediterranean Sea to Iberia's
+    east and exempts it from the dry belt. Setting that knob to 0.0 restores
+    Iberia's proper cycle (Jan 85, Jun 38, Nov 103) and confirms the cause. The
+    spike is that large because the moisture budget's redistribution is
+    mean-preserving within a row: once the seasonal belt suppresses the rest of
+    37-41N, an unsuppressed strip inherits nearly the whole row's synthetic fill.
+    The exemption itself is calibrated at 3.0 for SE US/East China/S Japan and
+    was deliberately not disturbed here."""
+
+    drybelt_seasonal_equatorward_fraction: float = 0.0
+    """How much of the dry belt's poleward-edge seasonal migration its
+    *equatorward* edge follows, in `atmosphere.generate_precipitation`. 1.0 is a
+    rigid translation (the whole belt slides); **0.0, the shipped default**, pins
+    the equatorward edge so the belt widens into the summer hemisphere instead.
+    Inert whenever `drybelt_seasonal_response` is 0.0.
+
+    **Why the rigid translation is wrong, measured rather than assumed.** At
+    `drybelt_seasonal_response=0.3` with this at 1.0, the belt leaves 15-22N for
+    half the year and takes `subsidence_suppression` with it: the Sahara box goes
+    **129 -> 223 mm/yr**, straight through its <200 target, and US Midwest 912 ->
+    782 out of its own range. The audit's A1 names the desert boxes as the
+    binding constraint on any tropical/monsoon tuning, and a rigid belt spends
+    all of that budget at once.
+
+    The physics says the same thing: the Hadley cell's descending branch is
+    bounded on its equatorward side by the ITCZ, which migrates only ~5-8 deg,
+    while its poleward edge advances much further into the summer hemisphere. The
+    belt therefore *widens* seasonally rather than sliding, which is exactly what
+    keeps the Sahara dry year-round on the real Earth while still giving 35-42 deg
+    a summer under the ridge and a winter under the storm track.
+
+    Pinning the edge costs nothing that the rigid version bought: at response 0.3
+    the two score group accuracy 0.7078 (pinned) vs 0.7048 (rigid) and class
+    accuracy 0.4200 vs 0.4125, i.e. the pinned form is better on both, while
+    Sahara stays at 132 instead of 223 mm/yr.
+
+    Implemented as a single latitude-dependent shift so the Gaussian and the
+    wide regime window inherit it together. A shift that varies with latitude can
+    fold the coordinate onto itself and give the belt a spurious second peak, so
+    the transition widens with the shift magnitude to keep the warp's slope below
+    1 for any response in [0, 1]; at the shipped 0.25 that widening is inactive.
+    See `testing/test_seasonal_belts.py::test_belt_never_develops_a_second_peak`,
+    which checks past every shipped value because these knobs exist to be
+    swept."""
+
+    storm_track_seasonal_response: float = 0.0
+    """As `drybelt_seasonal_response`, but for `storm_window` (the mid-latitude
+    storm-track latitude weight, centred at `STORM_TRACK_CENTER_DEG`). 0.0 is an
+    exact no-op.
+
+    Separately gated rather than folded into one knob because the two belts feed
+    different terms and carry independent calibration history: `drybelt_window`
+    gates `subsidence_suppression`, `land_evap` and the desert redistribution
+    (i.e. it is load-bearing for A1's desert targets), while `storm_window` only
+    adds mid-latitude weight to the humidity/convergence/ascent drivers. Keeping
+    them separable is what makes an ablation attribute a change to one or the
+    other.
+
+    Both migrate together on Earth (the storm track rides the poleward edge of
+    the Ferrel cell), so a physically coherent configuration moves this roughly
+    in step with `drybelt_seasonal_response`.
+
+    **Ships at 0.0 on measurement, not by omission.** At 0.3 on the 128x256
+    benchmark it leaves every Koppen skill metric and every desert unmoved (group
+    accuracy 0.7031 -> 0.7030, Sahara 129.40 -> 129.38, arid share 26.86 ->
+    26.88, Csa unchanged at 0.01%). Its one visible effect is Central Europe
+    568 -> 608 mm/yr, still inside its 550-750 target -- real, but unrelated to
+    the Mediterranean gap this pair of knobs was built for, so it is left for a
+    session with a reason to move it. The dry belt carries the entire effect."""
 
     itcz_seasonal_target_response: float = 2.0
     """Strength [0-1ish] of the fix for `itcz_seasonal_response`'s own flagged

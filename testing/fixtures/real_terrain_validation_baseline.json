@@ -11,32 +11,32 @@
     "wind_block_size": 4
   },
   "metrics": {
-    "continental_minus_desert_precip_mm_year": 609.2840323960787,
+    "continental_minus_desert_precip_mm_year": 588.8606349002318,
     "global": {
-      "cloud_fraction": 0.16028945299429226,
+      "cloud_fraction": 0.15981553860015596,
       "land_soil_floor_fraction": 0.0,
-      "land_soil_moisture": 0.5144178203809058,
+      "land_soil_moisture": 0.5146980241605981,
       "nh_midlat_soil_floor_fraction": 0.0,
-      "ocean_temperature_k": 292.73799113577314,
-      "polar_precip_mm_day": 0.42618030668162943,
-      "precip_mm_day": 2.979791435417682,
-      "temperature_k": 291.3046781824934
+      "ocean_temperature_k": 292.73841670809236,
+      "polar_precip_mm_day": 0.42607690307027346,
+      "precip_mm_day": 2.9831753522557163,
+      "temperature_k": 291.30275752211014
     },
     "koppen_land_percent": {
-      "arid": 27.463871451860275,
-      "humid_temperate_continental": 34.06770007296966,
-      "polar": 15.611178475868273,
+      "arid": 27.334408763383923,
+      "humid_temperate_continental": 34.21486635279077,
+      "polar": 15.593474884523513,
       "tropical": 22.857249999301786
     },
     "koppen_map_skill": {
-      "class_accuracy": 0.38837079215879666,
-      "class_kappa": 0.33201996870366857,
-      "group_accuracy": 0.6854885494393342,
+      "class_accuracy": 0.39426109876404924,
+      "class_kappa": 0.33909150698638657,
+      "group_accuracy": 0.6864115176636771,
       "group_accuracy_by_zone": {
         "-10:0": 0.8118494687588043,
         "-20:-10": 0.5195678363747418,
         "-30:-20": 0.7301369922902359,
-        "-40:-30": 0.7200271093115101,
+        "-40:-30": 0.6910337709920125,
         "-50:-40": 0.36602314236997585,
         "-60:-50": 0.0,
         "-70:-60": 0.5164882483345371,
@@ -45,15 +45,15 @@
         "0:10": 0.8267129915607804,
         "10:20": 0.6176190166342016,
         "20:30": 0.6623303899674385,
-        "30:40": 0.6570585812657129,
-        "40:50": 0.457821912421042,
+        "30:40": 0.6711491904617125,
+        "40:50": 0.46111793390914263,
         "50:60": 0.8011684783587393,
-        "60:70": 0.618797190662161,
+        "60:70": 0.6207328141324469,
         "70:80": 0.8634603382364143,
         "80:90": 1.0
       },
-      "group_kappa": 0.6020527013679206,
-      "group_share_mae_pp": 2.0160833334723627,
+      "group_kappa": 0.6032779886689293,
+      "group_share_mae_pp": 1.9686499474776715,
       "region_group_accuracy": {
         "Atacama": 0.6740565071727328,
         "Canadian Prairies": 1.0,
@@ -67,85 +67,86 @@
       },
       "scored_cells": 3523
     },
+    "orographic_contrast": {},
     "precip_rescale": {
       "capacity_limited_fraction": 0.828125,
-      "max": 17.633251190185547,
-      "mean": 2.663228544173762,
-      "mean_target_achieved_fraction": 0.8065138957463205,
-      "mean_unmet_mm_day": 0.34727880243735854,
+      "max": 17.698177337646484,
+      "mean": 2.6650717384181917,
+      "mean_target_achieved_fraction": 0.806358628673479,
+      "mean_unmet_mm_day": 0.34759361889155116,
       "saturated_fraction": 0.0,
       "strategy": "moisture_budget"
     },
-    "reference_error_score": 0.20757355752226062,
+    "reference_error_score": 0.21009537327089922,
     "regional_precip_mm_year": {
-      "Atacama": 65.21808581545362,
-      "Canadian Prairies": 503.76599804188163,
-      "Central Europe": 791.077751320703,
-      "East China": 689.5895506915481,
-      "Kalahari": 137.71581213715783,
-      "S Japan": 1114.6140867823783,
-      "SE US": 990.4941798828697,
-      "Sahara": 163.5774122085169,
-      "US Midwest": 899.5196579867797
+      "Atacama": 63.68163984315273,
+      "Canadian Prairies": 506.9093111086144,
+      "Central Europe": 785.0499799586092,
+      "East China": 687.3007590944743,
+      "Kalahari": 137.66002885843474,
+      "S Japan": 979.4427719149979,
+      "SE US": 948.6865910484718,
+      "Sahara": 165.42345772797307,
+      "US Midwest": 841.3877400630327
     },
     "regional_soil_moisture": {
-      "Atacama": 0.5580853554937576,
-      "Canadian Prairies": 0.5178032889962197,
-      "Central Europe": 0.5227010955413183,
-      "East China": 0.49557364938987636,
-      "Kalahari": 0.5624372694227432,
-      "S Japan": 0.48347902546326327,
-      "SE US": 0.4444028247768681,
-      "Sahara": 0.5630272948631534,
-      "US Midwest": 0.5065011096497378
+      "Atacama": 0.557464748620987,
+      "Canadian Prairies": 0.5157803272207578,
+      "Central Europe": 0.5194336719810964,
+      "East China": 0.4947870754533345,
+      "Kalahari": 0.5622134361830023,
+      "S Japan": 0.4893362397948901,
+      "SE US": 0.446731686902543,
+      "Sahara": 0.5630391232945301,
+      "US Midwest": 0.5287789376452566
     },
     "regional_target_error_fraction": {
-      "Atacama": 0.3043617163090724,
-      "Canadian Prairies": 0.007531996083763261,
-      "Central Europe": 0.05477033509427065,
-      "East China": 0.3391169162824733,
+      "Atacama": 0.2736327968630546,
+      "Canadian Prairies": 0.013818622217228835,
+      "Central Europe": 0.04673330661147899,
+      "East China": 0.3403884671697365,
       "Kalahari": 0.0,
-      "S Japan": 0.2206299605534644,
-      "SE US": 0.07300388007808685,
+      "S Japan": 0.28207146731136457,
+      "SE US": 0.1008756059676855,
       "Sahara": 0.0,
       "US Midwest": 0.0
     },
     "zonal": {
       "0-10N": {
-        "precip_mm_year": 1876.08820968001,
-        "precip_ratio": 0.938044104840005,
-        "temperature_bias_c": -0.6230202406644025,
-        "temperature_c": 25.876979759335597
+        "precip_mm_year": 1876.1833185575933,
+        "precip_ratio": 0.9380916592787967,
+        "temperature_bias_c": -0.6228365192810088,
+        "temperature_c": 25.87716348071899
       },
       "0-10S": {
-        "precip_mm_year": 1889.5674012057893,
-        "precip_ratio": 1.2597116008038596,
-        "temperature_bias_c": 0.30913075904061316,
-        "temperature_c": 25.809130759040613
+        "precip_mm_year": 1889.5334680154922,
+        "precip_ratio": 1.2596889786769947,
+        "temperature_bias_c": 0.309485163291356,
+        "temperature_c": 25.809485163291356
       },
       "10-20N": {
-        "precip_mm_year": 1433.5541627495293,
-        "precip_ratio": 0.796418979305294,
-        "temperature_bias_c": -0.6235245572195254,
-        "temperature_c": 24.876475442780475
+        "precip_mm_year": 1433.6384691856822,
+        "precip_ratio": 0.7964658162142679,
+        "temperature_bias_c": -0.6236444486511346,
+        "temperature_c": 24.876355551348865
       },
       "40-50N": {
-        "precip_mm_year": 975.7147924834927,
-        "precip_ratio": 1.6261913208058212,
-        "temperature_bias_c": 6.248211921254892,
-        "temperature_c": 15.248211921254892
+        "precip_mm_year": 973.2578445771304,
+        "precip_ratio": 1.6220964076285507,
+        "temperature_bias_c": 6.234222283959468,
+        "temperature_c": 15.234222283959468
       },
       "40-50S": {
-        "precip_mm_year": 1021.9758014389744,
-        "precip_ratio": 1.277469751798718,
-        "temperature_bias_c": 5.151421890656252,
-        "temperature_c": 17.151421890656252
+        "precip_mm_year": 1022.039467125809,
+        "precip_ratio": 1.2775493339072612,
+        "temperature_bias_c": 5.151699658234975,
+        "temperature_c": 17.151699658234975
       },
       "50-60N": {
-        "precip_mm_year": 671.8021746962665,
-        "precip_ratio": 1.3436043493925331,
-        "temperature_bias_c": 5.151501247618,
-        "temperature_c": 9.151501247618
+        "precip_mm_year": 671.4964582165297,
+        "precip_ratio": 1.3429929164330594,
+        "temperature_bias_c": 5.143865376048723,
+        "temperature_c": 9.143865376048723
       }
     }
   },
@@ -179,6 +180,8 @@
     "deep_ocean_depth_m": 3700.0,
     "deep_ocean_exchange_rate": 9.13e-05,
     "deep_ocean_heat_capacity_ratio": 0.013513513513513514,
+    "drybelt_seasonal_equatorward_fraction": 0.0,
+    "drybelt_seasonal_response": 0.25,
     "eccentricity": 0.0167,
     "eddy_heat_flux_coeff": 0.006,
     "ekman_strength": 0.3,
@@ -235,7 +238,9 @@
     "ocean_transport_coeff": 0.3,
     "orbital_period_days": 365.2422,
     "orographic_normalizer_land_only": true,
+    "orographic_spillover_km": 0.0,
     "orographic_uplift_clip": 2.0,
+    "orographic_upwind_footprint_km": 0.0,
     "perihelion_day": 3.0,
     "pgf_continentality_amp": 0.0,
     "polar_cooling_scale": 0.3,
@@ -263,6 +268,7 @@
     "spherical_metric_clouds": true,
     "spherical_metric_precip": true,
     "storm_pressure_amp_pa": 110.0,
+    "storm_track_seasonal_response": 0.0,
     "subsidence_divergence_regime_gate": 1.0,
     "surface_gravity": 9.81,
     "surface_pressure_pa": 101325.0,
@@ -283,6 +289,6 @@
     "final_total_days": 730.4843999999996,
     "sampled_days": 365.24219999999997,
     "spinup_cycles": 12,
-    "wall_seconds": 16.295948200160637
+    "wall_seconds": 15.32005920005031
   }
 }

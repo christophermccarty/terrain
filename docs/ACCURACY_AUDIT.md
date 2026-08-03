@@ -566,7 +566,15 @@ Earth's box-scale targets would overstate the result:
 
 At the crest the fix works and is large (Cascades +87%). **At box scale — the only measure
 comparable to Earth's 3–6× — the mean is 0.96 before and 0.96 after, i.e. unchanged**, with two
-ranges up and two down. So the shipped change restores the orographic *signal* and delivers real
+ranges up and two down.
+> **Correction 2026-08-03 (A5-FOOTPRINT, process note 16)**: the box-scale figures in this table are
+> single-precipitation-call values on one saved state, so each range is pinned to that instant's
+> wind — Scandinavia's is easterly there, making its "windward" box the downwind one. On the
+> annual-mean metric now tracked as `metrics.orographic_contrast`, the same baseline is **1.57** at
+> 256×512. The *conclusion* is unaffected (the shipped change still does not move box scale), but do
+> not quote 0.96 as the model's contrast.
+
+So the shipped change restores the orographic *signal* and delivers real
 gains elsewhere (below), but it does not move box-scale windward/leeward contrast at all.
 
 **Why, and it is now a well-posed problem rather than a vague one**: the model's orographic
@@ -584,6 +592,67 @@ difference immediately.
 regional precipitation gains in the table above — most of all Atacama, plus a 30% `reference_error_score`
 improvement and every named box moving toward target. The orographic *mechanism* being repaired is
 what produced those; the *contrast metric* it was built to move is still open.
+
+#### A5-FOOTPRINT. 🟡 The upwind footprint was built 2026-08-03 — the mechanism works, the ceilings really are exhausted, and the residual blocker is now unambiguously the moisture budget
+
+A5-OROG's named next lever ("give the uplift signal an upwind footprint … not another cap or
+weight") was implemented as `PlanetParams.orographic_upwind_footprint_km` plus its opposite-direction
+companion `orographic_spillover_km`, both **shipped at 0.0 (inert)**. `atmosphere._smear_along_wind`
+samples the raw uplift product along the local wind direction with an exponential weight, in
+kilometres rather than cells — the resolution-invariance trap A5 already had to fix once in the
+monsoon inland mask.
+
+**First, a correction to this section's own headline number.** A5-OROG records box-scale
+windward/leeward as "0.96 before and 0.96 after". That figure comes from
+`scripts/check_orographic_contrast.py`, which runs **one** precipitation call on one saved state, so
+every range is pinned to whatever the wind was doing at that instant — on `saves/earth.pkl` the flow
+over Scandinavia is *easterly* (u = −0.84 m/s), which makes that pair's "windward" box the downwind
+one and its ratio meaningless. Measured instead from the evaluation period's **mean** precipitation
+at 256×512, the baseline is **1.57**, not 0.96. New tracked metric
+`metrics.orographic_contrast` in `real_terrain_validation.py` reports it (and returns `{}` below
+256×512 rather than emitting a confident number from unresolved boxes). Process note 3's fourth
+instance, and now note 16 — the single-step probe is for stage-by-stage ablation, not for a level.
+
+**The mechanism does what it was designed to do, and the four ceilings are confirmed exhausted.**
+On `saves/earth.pkl` with a 400 km footprint the S Andes `orog` ratio goes **1.11 → 3.14**, and for
+the first time it survives the whole raw pipeline intact — `precip_potential` 3.15, `remove_frac`
+3.09. Nothing pointwise is clipping it any more.
+
+**Result, 256×512 fresh spinup, annual mean:**
+
+| footprint | mean W/L | H10 group | H10 class | refErr | Atacama |
+|---|---|---|---|---|---|
+| 0 km (shipped) | 1.567 | 0.7024 | 0.4343 | 0.1290 | 57 |
+| 100 km | 1.628 | 0.7031 | 0.4350 | 0.1309 | 58 |
+| 200 km | **1.649** | 0.7029 | 0.4356 | 0.1357 | 62 |
+| 400 km | 1.646 | 0.7026 | 0.4345 | 0.1399 | 66 |
+
++5% of contrast against Earth's 3–6×, saturating by ~200 km, for `reference_error_score` +0.007 and
+Atacama drifting back up toward the <50 target it had only just come under. The H10 accuracies move
+by under 0.1pp either way — inside the noise process note 14 warns a single grid cannot resolve.
+Hence inert.
+
+**The blocker is now precisely located, and it is not the uplift term.** The same S Andes pair whose
+`remove_frac` ratio reaches 3.09 comes out at **1.37** in final precipitation. That is the
+moisture-budget deficit fill, i.e. A5's stage 3 — and `precip_orographic_shape_weight`, the knob for
+it, is gated by `clip(orog / orographic_uplift_clip, 0, 1)`, which *saturates*, so a broader
+footprint does not widen the gate proportionally to the signal it created.
+
+**A large, honest regional win exists here and is not takeable for the documented reason.** Footprint
+200 km together with `precip_orographic_shape_weight=2.2` gives, at 256×512: mean W/L
+**1.567 → 1.799**, **Atacama 57 → 39.5 mm/yr — under its <50 target for the first time in the
+project's history** — Sahara 164 → 148, US Midwest still in range at 841, `reference_error_score`
+0.129 → 0.123. But H10 group accuracy falls 0.7024 → **0.6983** and class 0.4343 → 0.4291, which
+**reproduces A5-LEAD's own 256×512 measurement of that knob to three digits** (it recorded 0.6985 /
+0.4289 for weight 2.2). So the trade belongs to the shape weight, not to the footprint; A5-LEAD's
+rejection stands, re-confirmed independently. Anyone who revisits it should carry the footprint
+along — it is what makes the raw signal worth propagating in the first place.
+
+**Still open, and now well-posed**: box-scale W/L is 1.57 (was believed 0.96) against Earth's 3–6×.
+Raw production can now deliver ~3× at the crest and hold it to `remove_frac`; the entire remaining
+loss is the deficit fill erasing it. The next lever is the *gate* on the target-side blend — make it
+track the orographic signal's breadth rather than saturating at a fixed clip — not another uplift
+mechanism.
 
 <details>
 <summary>The "large lead deliberately not taken" as originally written 2026-08-02 (kept for the trail — its premise was refuted the same week, see A5-LEAD below)</summary>
@@ -783,6 +852,105 @@ own `subsidence_divergence_regime_gate` experiment shows the row-level-vs-cell-l
 matters less than which *underlying signal* (`subsidence_suppression`) the redistribution reads —
 the real leverage point is fixing that signal's own regime-accuracy (see B1), not building another
 layer of caps/weights on top of it.
+
+### A6. 🟡 Mediterranean climate did not exist — fixed 2026-08-03; Csa recovered, Csb/Cfc still blocked by temperature
+
+**Symptom (was)**: H10-DONE's single most striking finding — the model emitted **0.00%** Csa and
+Csb. `climate_averages.classify_koppen` reaches Cs only when
+`P_summer_driest < P_winter_wettest / 3`, and land precipitation peaked in local *summer*
+essentially everywhere, so the Mediterranean signal was not weak, it was **inverted**. No classifier
+threshold could recover the class.
+
+**Root cause, and it is the third instance of one bug class.** `drybelt_window` and
+`drybelt_regime_window` were `exp(-((|lat| - 28)/8)²)`-shaped — pure functions of `|latitude|` with
+**zero `day_of_year` dependence**. `itcz_window` was found to have exactly this defect on
+2026-07-30, and `_zonal_precip_target_profile` on 2026-07-31; both of those fixes' docstrings state
+in as many words that `storm_window`/`drybelt_window` were "features this session did not
+investigate". Mediterranean climate *is* the seasonal migration of the subtropical high — over
+35–42° in summer suppressing convection, retreating equatorward in winter to let the storm track in
+— so a belt pinned to a fixed latitude cannot produce it anywhere on the planet.
+
+**Fix shipped**: `PlanetParams.drybelt_seasonal_response` **0.0 → 0.25** with
+`drybelt_seasonal_equatorward_fraction` **0.0**. `storm_track_seasonal_response` also exists and
+**ships inert at 0.0 — measured, not assumed**: at 0.3 it leaves every Köppen skill metric and every
+desert unmoved (group accuracy 0.7031 → 0.7030, Sahara 129.40 → 129.38, arid share 26.86 → 26.88,
+Csa unchanged at 0.01%). Its one visible effect is Central Europe 568 → 608 mm/yr — still inside its
+550–750 target and arguably better centred, but nothing to do with the Mediterranean gap, so it is
+left for a session that has a reason to move it. **The dry belt carries the entire Csa effect.**
+
+**Two implementation points that are the difference between working and not:**
+1. **Hemisphere-antisymmetric, unlike the ITCZ knob.** `itcz_window` is built on signed latitude
+   around one centre, so a single shift moves the whole belt. This belt is symmetric about the
+   equator and its two halves migrate in *opposite* directions at once (NH poleward while SH is
+   equatorward). Implemented as `|lat| − k·declination·sign(lat)`.
+2. **It widens, it does not translate.** The obvious rigid translation is measurably wrong: at
+   response 0.3 it carries `subsidence_suppression` off 15–22°N for half the year and the **Sahara
+   goes 129 → 223 mm/yr, straight through its <200 target**, with US Midwest 912 → 782. Earth's
+   Hadley descending branch is bounded equatorward by the ITCZ while its poleward edge advances far
+   further, so pinning the equatorward edge is both the physics and the fix — Sahara stays at 132,
+   *and* group accuracy is better than the rigid version's (0.7078 vs 0.7048).
+
+**Result.** Area-weighted land share of Csa (Earth 1.94%), 128×256:
+
+| `drybelt_seasonal_response` | H10 group | H10 class | kappa | share MAE | Csa | Sahara | US Midwest |
+|---|---|---|---|---|---|---|---|
+| 0.00 (was) | 0.7031 | 0.4194 | 0.6236 | 2.18 | **0.01** | 129 | 912 |
+| 0.15 | 0.7062 | 0.4227 | 0.6275 | 2.15 | 0.68 | 131 | 855 |
+| 0.20 | 0.7068 | 0.4224 | 0.6283 | 2.13 | 1.11 | 131 | 827 |
+| **0.25 (shipped)** | **0.7082** | 0.4223 | **0.6303** | 2.05 | **1.58** | 131 | 811 |
+| 0.30 | 0.7078 | 0.4200 | 0.6298 | 1.99 | 1.87 | 132 | 788 |
+
+0.25 is both the group-accuracy/kappa optimum and the largest value leaving US Midwest inside its
+800–1000 target at that resolution. It is also the physically conservative end of Earth's ~5–10°
+ridge migration (5.9° against the 23.44° declination swing).
+
+**Confirmed at three resolutions** (process note 14): group accuracy 0.6855→0.6864 / 0.7031→0.7082 /
+0.7024→0.7049 and kappa up at all three; class accuracy up at 64×128 (0.3884→0.3943) and 128×256
+(0.4194→0.4223), marginally down at 256×512 (0.4343→0.4335); Csa 0.11→0.97 / 0.01→1.58 / 0.00→1.93.
+Deserts untouched everywhere (Sahara 164→165 / 129→131 / 164→166; Atacama 65→64 / 61→60 / 57→56).
+
+**Real, accepted cost, and it grows with resolution**: the continental-interior and monsoon boxes.
+US Midwest 900→841 / 912→811 / 878→**786**, Central Europe 791→785 / 568→554 / 581→**548** (the last
+two just under their 550 floor), S Japan 1115→979 at 64×128 and 2073→1875 at 256×512. All one
+mechanism seen from the other side: a **zonally uniform** belt advancing poleward in summer also
+suppresses summer rain over the 35–45° *eastern* margins, where real monsoon inflow keeps it. That
+is precisely the tension `monsoon_east_margin_exemption` exists for (A4), and the honest next lever.
+`reference_error_score` prices the whole cost at +0.0025 (64×128) and +0.0006 (256×512).
+
+**A regional artifact, root-caused rather than left as a puzzle.** Five of six real Mediterranean
+regions now develop a proper winter-wet cycle — California goes from a flat 22–36 mm/month all year
+to **70 in January and 4.8 in July**; Greece to 117/11.7; Morocco to 31/8.6. **Iberia inverts
+instead**, growing a 285 mm/month June peak. Cause: `monsoon_east_margin_exemption` sees the
+Mediterranean Sea to Iberia's east and exempts it from the dry belt; setting that knob to 0.0
+restores Iberia's proper cycle (Jan 85, Jun 38, Nov 103) and confirms it. The spike is that *large*
+because the moisture budget's redistribution is mean-preserving within a row — once the seasonal
+belt suppresses the rest of 37–41°N, one unsuppressed strip inherits nearly the whole row's
+synthetic fill. The exemption is calibrated at 3.0 for SE US/East China/S Japan and was deliberately
+not disturbed.
+
+**Residual keeping this 🟡**: **Csb reaches only 0.42% against Earth's 1.16%, and Cfc is still
+0.00%.** Both are now blocked by *temperature*, not precipitation — Csb requires the warmest month
+below 22 °C and Cfc fewer than four months above 10 °C, and C1b's summer land-temperature ceiling
+(`_land_cap_1d` binding on 55.7% of month/row pairs, concentrating warmest-month values in 26–29 °C)
+is what denies both. This **usefully splits a gap the audit previously treated as one**: the
+`missing-koppen-classes-rootcause` diagnosis named two causes and judged the temperature one "the
+more fundamental", concluding that "fixing precip seasonality alone cannot recover Csa/Csb". Half of
+that is now disproved — Csa came back from precipitation alone, essentially exactly on Earth's share.
+Csb and Cfc are what actually rest on C1b.
+
+**An amplifier deliberately not built.** The rescale *target* (`_zonal_precip_target_profile`) is
+still a static |lat| table modulated only by `itcz_window`, so the deficit fill partially refills the
+summer drought this mechanism creates — the exact situation `itcz_seasonal_target_response` was added
+for on 2026-07-31, and the same knob shape is available for the dry belt. It was not built because
+the precipitation side alone already lands Csa on Earth's share to 0.01pp; a target-side amplifier
+would overshoot. It is the lever to reach for if a future session wants a deeper Mediterranean
+drought (e.g. after C1b unblocks Csb), and process note 9 says it will be far stronger than anything
+further on the raw-production side.
+
+**Instrument**: `scripts/check_mediterranean_seasonality.py` reports both Köppen seasonality ratios
+(`P_summer_driest/P_winter_wettest` for Cs, `P_winter_driest/P_summer_wettest` for Cw) over six
+Mediterranean and four monsoon boxes, plus the fraction of land passing each gate — the quantity the
+classifier actually reads, which no annual-mean or share metric can see.
 
 ---
 
@@ -1297,6 +1465,14 @@ class accuracy **0.388**, class κ **0.331**, group share MAE **2.06pp**.
   3.59 / 0.31 / 0.17% in the reference). **Mediterranean climate does not exist in this model.**
   That is ~7.2% of Earth's land the classifier structurally cannot produce, and no previous metric
   could have revealed it — a share-based or box-based check simply never asks the question.
+  > **Updated 2026-08-03 — this list is now down to two, and the "~7.2%" figure was never right.**
+  > Dwd and Cwa were never missing: both read 0.00% only on the 1yr/64×128 fixture, and measure
+  > **0.63%** and **2.61%** of land on a real 512×1024 state. **Csa is fixed** (0.01% → 1.93%
+  > area-weighted at 256×512, against Earth's 1.94%) by giving the subtropical dry belt the seasonal
+  > migration it never had — see A6. What remains genuinely absent is **Csb (0.42% vs 1.16%) and
+  > Cfc (0.00% vs 0.31%)**, ~1.05% of land, and both are blocked by C1b's summer land-temperature
+  > ceiling rather than by precipitation. Re-verify any per-class share on a state at 128×256 or
+  > better before calling a class missing.
 - **Two boxes the project has spent sessions tuning for precipitation are failing on *group*.**
   US Midwest 12.2% group accuracy (model Cfa vs reference Dfa) and Central Europe 0.0% (model Dfb vs
   reference Cfb) — both temperature-driven misclassifications, i.e. C1's residual showing up
@@ -1448,6 +1624,29 @@ group score (a model that never emits Csa still scores C correctly if it emits C
    64×128 benchmark is for cheap A/B *direction-finding* and regression-gating, not for deciding
    whether a few-tenths-of-a-percent accuracy change is real. Anything that would be written into
    this document as a recommendation needs a 128×256 confirmation — it costs about 35 s per case.
+15. **When one latitude window is caught with no `day_of_year` dependence, audit *all* of them the
+   same day** (2026-08-03, A6). This defect has now been found three times in the same file:
+   `itcz_window` (2026-07-30), `_zonal_precip_target_profile` (2026-07-31), and
+   `drybelt_window`/`drybelt_regime_window` (2026-08-03). Both earlier fixes' docstrings state
+   explicitly that the remaining windows were "features this session did not investigate" — the
+   third one sat there, in the same function, for three days, and it turned out to be the one
+   carrying an entire missing Köppen class. A pure-`|latitude|` window is *plausible-looking and
+   systematically wrong in a fixed direction*, exactly note 8's signature, and the whole family is
+   auditable in about five minutes: grep the window constructions and check which ones take
+   `day_of_year`. `storm_window` was the fourth and is the only one that measured inert. **Practical
+   rule**: a bug class is cheaper to sweep than to rediscover; when a fix note says "I did not look
+   at the neighbours", that sentence is the next task, not a disclaimer.
+16. **A single-snapshot probe measures the wind, not the climate — even when the field it reads is
+   terrain-derived** (2026-08-03, A5-FOOTPRINT; the fourth instance of note 3). A5-OROG's headline
+   "box-scale windward/leeward is 0.96 before and 0.96 after" came from one precipitation call on
+   `saves/earth.pkl`. On that state the flow over Scandinavia is easterly, so that pair's "windward"
+   box is the *downwind* one and its ratio is uninterpretable. Measured from the evaluation period's
+   mean precipitation instead, the same baseline is **1.57**. The trap is specific and worth naming:
+   a stage-by-stage ablation *must* be single-step (that is what makes the stages comparable), which
+   makes it tempting to read a level off the same run — but only the ratio between stages is
+   meaningful there, never the level. `metrics.orographic_contrast` now reports the annual-mean
+   version and returns `{}` below 256×512 rather than emitting a confident number from boxes that do
+   not resolve.
 13. **Build the instrument before the fix, and expect the instrument itself to be the finding**
    (2026-08-02). H10's gridded map score was built as infrastructure to support orographic work, and
    before a single physics change it had already shown that the model **cannot emit Csa, Csb, Cwa,

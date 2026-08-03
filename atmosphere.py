@@ -1385,6 +1385,94 @@ def _advect_scalar_semi_lagrangian(
     return field_new.astype(np.float32)
 
 
+def _smear_along_wind(
+    field: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    dx_meters: np.ndarray,
+    dy_meters: float,
+    upwind_km: float,
+    downwind_km: float,
+    *,
+    max_samples: int = 24,
+) -> np.ndarray:
+    """Give a pointwise terrain signal a directional footprint along the wind.
+
+    Written for the orographic-uplift term, whose defect is *shape*, not
+    magnitude: on a real DEM the upslope product is a 1-2 cell spike sitting on
+    the crest, whereas real orographic precipitation covers a broad windward
+    flank. Air begins ascending well upstream of a barrier (upstream blocking
+    and deceleration), and the condensate it produces is carried some distance
+    downstream before it reaches the ground. A box mean over 4-6 cells -- the
+    only measure comparable to Earth's published windward/leeward ratios --
+    therefore dilutes a model signal that is correct exactly where it exists and
+    absent everywhere else in the box. See ACCURACY_AUDIT.md A5-OROG, which
+    names this as the next lever after establishing that all four pointwise
+    ceilings in the pipeline are exhausted.
+
+    ``upwind_km`` is the e-folding length of the **upstream** footprint: a cell
+    samples points *downwind* of itself, which is what places a crest's uplift
+    onto the flank ahead of it. ``downwind_km`` is the spillover in the other
+    direction (a cell samples points *upwind* of itself), representing
+    hydrometeor drift past the crest. Both are physical distances, not cell
+    counts, so the mechanism is resolution-invariant -- the fixed 20-cell
+    monsoon mask that meant 7 deg at 1024 columns and 56 deg at 128 is the
+    failure mode being avoided here.
+
+    The result is a weighted average whose weights sum to 1 (the cell itself
+    carries weight 1, each sample ``exp(-distance / e-folding length)``), so a
+    spatially uniform field is returned unchanged and total signal is broadly
+    conserved while its distribution broadens.
+    """
+    if upwind_km <= 0.0 and downwind_km <= 0.0:
+        return field
+
+    map_coordinates = _scipy_map_coordinates
+    if map_coordinates is None:
+        from scipy.ndimage import map_coordinates  # last-resort fallback
+
+    H, W = field.shape
+    if _MGRID_CACHE["key"] != (H, W):
+        _MGRID_CACHE.update({"key": (H, W), "yx": np.mgrid[0:H, 0:W]})
+    y_grid, x_grid = _MGRID_CACHE["yx"]
+
+    # Wind *direction* only -- the footprint length is a prescribed physical
+    # scale, so a stronger wind must not also stretch it (that would make the
+    # mechanism a second, uncalibrated function of wind speed on top of the
+    # upslope product `gx*u + gy*v`, which already carries the speed dependence).
+    speed = np.sqrt(u * u + v * v)
+    u_hat = u / (speed + 1e-6)
+    v_hat = v / (speed + 1e-6)
+
+    # Sampling cadence: fine enough not to step over intervening cells, capped
+    # so a long footprint on a fine grid stays affordable. `dy_meters` is the
+    # meridional spacing and is the resolution-invariant cell scale here (`dx`
+    # collapses toward the poles, where these ranges do not sit).
+    cell_km = float(dy_meters) / 1000.0
+    accumulated = field.astype(np.float64, copy=True)
+    total_weight = 1.0  # the cell's own contribution
+
+    for length_km, sign in ((float(upwind_km), 1.0), (float(downwind_km), -1.0)):
+        if length_km <= 0.0:
+            continue
+        reach_km = 3.0 * length_km  # ~95% of an exponential's mass
+        n_steps = int(np.clip(np.ceil(reach_km / max(cell_km, 1e-6)), 1, max_samples))
+        step_km = reach_km / n_steps
+        for step in range(1, n_steps + 1):
+            distance_m = 1000.0 * step_km * step
+            x_sample = x_grid + sign * u_hat * distance_m / (dx_meters + 1e-3)
+            y_sample = y_grid - sign * v_hat * distance_m / dy_meters
+            x_sample = np.mod(x_sample, W)
+            y_sample = np.clip(y_sample, 0, H - 1)
+            weight = float(np.exp(-step_km * step / length_km))
+            accumulated += weight * map_coordinates(
+                field, [y_sample, x_sample], order=1, mode="wrap"
+            )
+            total_weight += weight
+
+    return (accumulated / total_weight).astype(field.dtype, copy=False)
+
+
 @jit(nopython=True, parallel=True, cache=True)
 def _advect_scalar_cfl_step_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray,
                                   u_cfl: np.ndarray, v_cfl: np.ndarray) -> np.ndarray:
@@ -2826,22 +2914,87 @@ def generate_precipitation(
     # static-equator behavior. See its PlanetParams docstring for the root-cause measurement.
     _itcz_center_deg = float(pp.itcz_seasonal_response) * math.degrees(pp.solar_declination(day_of_year))
     itcz_window = np.exp(-(((lat_deg - _itcz_center_deg) / ITCZ_HALF_WIDTH_DEG) ** 2)).astype(np.float32, copy=False)
-    storm_window = np.exp(-((abs_lat_deg - STORM_TRACK_CENTER_DEG) / 15.0) ** 2).astype(np.float32, copy=False)
-    drybelt_window = np.exp(-((abs_lat_deg - DRYBELT_CENTER_DEG) / 8.0) ** 2).astype(np.float32, copy=False)
-    # The Gaussian identifies the dry-belt centre but falls to only 7% by
-    # 15 degrees, leaving the southern Sahara/Sahel edge effectively outside
-    # the regime.  Use a smooth 16-34 degree core (with 10-16 and 34-38 degree
-    # shoulders) for regime decisions; keep `drybelt_window` itself for the
-    # older calibrated latitude-shape terms below.
-    _belt_rise = np.clip((abs_lat_deg - 10.0) / 6.0, 0.0, 1.0)
-    _belt_rise = _belt_rise * _belt_rise * (3.0 - 2.0 * _belt_rise)
-    _belt_fall = np.clip((38.0 - abs_lat_deg) / 4.0, 0.0, 1.0)
-    _belt_fall = _belt_fall * _belt_fall * (3.0 - 2.0 * _belt_fall)
-    drybelt_regime_window = np.maximum(
-        drybelt_window, (_belt_rise * _belt_fall).astype(np.float32)
-    )
 
     _sc = _static_cache
+    if _sc is not None and "drybelt_window" in _sc:
+        # Held fixed for every substep of one outer call, exactly like
+        # temperature and wind (see `simulate._generate_precipitation_substepped`).
+        # These windows are day-independent unless a seasonal response is enabled,
+        # so caching them is a no-op at the defaults; with one enabled it is what
+        # keeps `subsidence_suppression` -- which is cached below and reads
+        # `drybelt_regime_window` -- consistent with the uncached terms that read
+        # the same window further down.
+        storm_window = _sc["storm_window"]
+        drybelt_window = _sc["drybelt_window"]
+        drybelt_regime_window = _sc["drybelt_regime_window"]
+    else:
+        # Seasonal migration of the subtropical high and the storm track. Unlike
+        # the ITCZ, whose centre is a single signed latitude, these two belts are
+        # symmetric about the equator, so their migration is hemisphere-
+        # ANTIsymmetric: in NH summer the NH belt moves poleward while the SH
+        # belt (in its winter) moves equatorward. Shifting `abs_lat_deg` by
+        # `+/-shift` per hemisphere expresses that in one line and applies it to
+        # the Gaussian and the wide regime window built from it alike.
+        # See PlanetParams.drybelt_seasonal_response for why this matters
+        # (Mediterranean climate is exactly this migration).
+        _declination_deg = math.degrees(pp.solar_declination(day_of_year))
+        _hemisphere = np.sign(lat_deg).astype(np.float32)
+        _drybelt_shift = (
+            float(pp.drybelt_seasonal_response) * _declination_deg * _hemisphere
+        )
+        # The Hadley cell's descending branch does not translate rigidly: its
+        # poleward edge advances strongly into the summer hemisphere while its
+        # equatorward edge is held near the ITCZ, so the belt *widens* in summer
+        # rather than sliding off the subtropical deserts. A rigid translation
+        # measurably uncovers them -- at response 0.3 the Sahara goes 129 -> 223
+        # mm/yr, straight through its <200 target, because the whole belt (and
+        # with it `subsidence_suppression`) leaves 15-22N for half the year.
+        #
+        # Expressed as one coordinate warp so the Gaussian and the wide regime
+        # window below both inherit it: the shift is scaled by a weight that is
+        # 0 equatorward of the belt centre and 1 poleward of it.
+        _equatorward_fraction = float(pp.drybelt_seasonal_equatorward_fraction)
+        # A latitude-dependent shift can fold the coordinate onto itself if it
+        # changes faster than latitude does, which would give the belt a
+        # spurious second peak. The warp's slope is
+        # `|shift| * (1 - f) * max(d/dlat of smoothstep) = |shift|*(1-f)*1.5/W`,
+        # so widening the transition with the shift keeps it below 1 for any
+        # response in [0, 1]. At the shipped 0.25 the shift is ~5.9 deg and this
+        # leaves the 16 deg transition untouched; the widening only engages
+        # past ~0.45, where a fixed 16 deg would have started folding.
+        _warp_width_deg = max(16.0, 1.6 * float(np.max(np.abs(_drybelt_shift))))
+        _poleward_weight = np.clip(
+            (abs_lat_deg - DRYBELT_CENTER_DEG) / _warp_width_deg + 0.5, 0.0, 1.0
+        )
+        _poleward_weight = (
+            _poleward_weight * _poleward_weight * (3.0 - 2.0 * _poleward_weight)
+        ).astype(np.float32)
+        _drybelt_lat_deg = abs_lat_deg - _drybelt_shift * (
+            _equatorward_fraction
+            + (1.0 - _equatorward_fraction) * _poleward_weight
+        )
+        _storm_lat_deg = abs_lat_deg - (
+            float(pp.storm_track_seasonal_response) * _declination_deg * _hemisphere
+        )
+        storm_window = np.exp(-((_storm_lat_deg - STORM_TRACK_CENTER_DEG) / 15.0) ** 2).astype(np.float32, copy=False)
+        drybelt_window = np.exp(-((_drybelt_lat_deg - DRYBELT_CENTER_DEG) / 8.0) ** 2).astype(np.float32, copy=False)
+        # The Gaussian identifies the dry-belt centre but falls to only 7% by
+        # 15 degrees, leaving the southern Sahara/Sahel edge effectively outside
+        # the regime.  Use a smooth 16-34 degree core (with 10-16 and 34-38 degree
+        # shoulders) for regime decisions; keep `drybelt_window` itself for the
+        # older calibrated latitude-shape terms below.
+        _belt_rise = np.clip((_drybelt_lat_deg - 10.0) / 6.0, 0.0, 1.0)
+        _belt_rise = _belt_rise * _belt_rise * (3.0 - 2.0 * _belt_rise)
+        _belt_fall = np.clip((38.0 - _drybelt_lat_deg) / 4.0, 0.0, 1.0)
+        _belt_fall = _belt_fall * _belt_fall * (3.0 - 2.0 * _belt_fall)
+        drybelt_regime_window = np.maximum(
+            drybelt_window, (_belt_rise * _belt_fall).astype(np.float32)
+        )
+        if _sc is not None:
+            _sc["storm_window"] = storm_window
+            _sc["drybelt_window"] = drybelt_window
+            _sc["drybelt_regime_window"] = drybelt_regime_window
+
     if _sc is not None and "land_mask" in _sc:
         land_mask, sea_mask = _sc["land_mask"], _sc["sea_mask"]
         land_f, sea_f = _sc["land_f"], _sc["sea_f"]
@@ -3099,6 +3252,14 @@ def generate_precipitation(
             _sc["subsidence_suppression"] = subsidence_suppression
     if debug_fields is not None:
         debug_fields["subsidence_suppression"] = subsidence_suppression
+        # The latitude windows themselves, so a seasonal-migration change is
+        # inspectable directly rather than only through what it does to
+        # `subsidence_suppression` (which also carries the divergence field and
+        # is smoothed, so a window defect is not cleanly readable there).
+        debug_fields["drybelt_window"] = drybelt_window
+        debug_fields["drybelt_regime_window"] = drybelt_regime_window
+        debug_fields["storm_window"] = storm_window
+        debug_fields["itcz_window"] = itcz_window
 
     if humidity is None:
         base_q = np.where(sea_mask, 0.013, 0.009).astype(np.float32, copy=False)
@@ -3329,6 +3490,27 @@ def generate_precipitation(
         slope = np.hypot(gx, gy)
         orog = np.clip(gx * u + gy * v, 0.0, None) + 0.25 * slope
         orog = land_f * orog
+        # Upwind footprint (A5-OROG's named next lever): the four pointwise
+        # ceilings downstream are all exhausted, and the residual defect is that
+        # this product is a 1-2 cell spike on the crest while real orographic
+        # precipitation covers a broad windward flank. Smear it along the wind
+        # *before* normalizing, so the percentile below describes the broadened
+        # field and the clip truncates it consistently. Re-masked to land
+        # afterwards: the smear samples across the coast, and an ocean cell has
+        # no orographic uplift to receive.
+        if (
+            float(pp.orographic_upwind_footprint_km) > 0.0
+            or float(pp.orographic_spillover_km) > 0.0
+        ):
+            orog = land_f * _smear_along_wind(
+                orog,
+                u,
+                v,
+                dx_grid,
+                dy_grid,
+                float(pp.orographic_upwind_footprint_km),
+                float(pp.orographic_spillover_km),
+            )
         # Normalizer choice decides whether the clip below carries any spatial
         # information at all. `np.percentile(orog, 90.0)` spans the WHOLE grid,
         # but `orog` was just zeroed over ocean — on Earth that is ~66% of cells

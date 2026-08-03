@@ -192,6 +192,147 @@ class TestInertHandles:
         )
 
 
+class TestUpwindFootprint:
+    """A5-OROG's named next lever: the uplift term's *shape*, not its magnitude.
+
+    All four pointwise ceilings in the pipeline were measured and exhausted, and
+    the residual defect is geometric -- `clip(gx*u + gy*v, 0, None)` on a real
+    DEM is a 1-2 cell spike on the crest, while real orographic precipitation
+    covers a broad windward flank. A box mean therefore dilutes a signal that is
+    correct exactly where it exists and absent everywhere else in the box.
+    """
+
+    @staticmethod
+    def _with(**overrides):
+        return dataclasses.replace(EARTH, **overrides)
+
+    def test_defaults_are_no_ops(self):
+        assert EARTH.orographic_upwind_footprint_km == 0.0
+        assert EARTH.orographic_spillover_km == 0.0
+
+    def test_zero_footprint_is_bit_identical(self):
+        elevation = _ridge()
+        base = _precip_fields(elevation, EARTH)["orog"]
+        explicit = _precip_fields(
+            elevation, self._with(orographic_upwind_footprint_km=0.0)
+        )["orog"]
+        assert np.array_equal(base, explicit)
+
+    def test_footprint_broadens_the_windward_flank(self):
+        """The mechanism's whole purpose: signal further upwind of the crest."""
+        crest = 64
+        elevation = _ridge(crest=crest)
+        far_upwind = slice(crest - 12, crest - 7)  # outside the resolved slope
+
+        def upwind_share(footprint_km: float) -> float:
+            orog = _precip_fields(
+                elevation, self._with(orographic_upwind_footprint_km=footprint_km)
+            )["orog"]
+            return float(orog[:, far_upwind].mean() / orog[:, crest - 2:crest + 1].mean())
+
+        assert upwind_share(400.0) > upwind_share(0.0)
+
+    def test_footprint_does_not_leak_into_the_lee(self):
+        """Upwind and downwind are separate knobs precisely so this holds.
+
+        A symmetric smoothing would raise the leeward flank as much as the
+        windward one and destroy the contrast it is meant to build.
+        """
+        crest = 64
+        elevation = _ridge(crest=crest)
+        lee = slice(crest + 7, crest + 12)
+
+        def lee_share(footprint_km: float) -> float:
+            orog = _precip_fields(
+                elevation, self._with(orographic_upwind_footprint_km=footprint_km)
+            )["orog"]
+            return float(orog[:, lee].mean() / orog[:, crest - 2:crest + 1].mean())
+
+        assert lee_share(400.0) <= lee_share(0.0) + 1e-4
+
+    def test_spillover_moves_signal_the_other_way(self):
+        crest = 64
+        elevation = _ridge(crest=crest)
+        lee = slice(crest + 7, crest + 12)
+
+        def lee_share(spillover_km: float) -> float:
+            orog = _precip_fields(
+                elevation, self._with(orographic_spillover_km=spillover_km)
+            )["orog"]
+            return float(orog[:, lee].mean() / orog[:, crest - 2:crest + 1].mean())
+
+        assert lee_share(400.0) > lee_share(0.0)
+
+    def test_reversing_the_wind_reverses_the_footprint(self):
+        crest = 64
+        elevation = _ridge(crest=crest)
+        params = self._with(orographic_upwind_footprint_km=400.0)
+        west = _precip_fields(elevation, params, u=6.0)["orog"]
+        east = _precip_fields(elevation, params, u=-6.0)["orog"]
+        west_side = slice(crest - 12, crest - 7)
+        east_side = slice(crest + 7, crest + 12)
+        assert west[:, west_side].mean() > west[:, east_side].mean()
+        assert east[:, east_side].mean() > east[:, west_side].mean()
+
+    def test_uniform_field_is_preserved(self):
+        """The smear is a weighted average, so flat terrain must not drift.
+
+        Guards against the footprint acting as a hidden global gain: `orog` is
+        percentile-normalized downstream, so a magnitude change there would be
+        silently absorbed and only show up as a mis-calibrated clip fraction.
+        """
+        from atmosphere import _smear_along_wind
+
+        shape = (32, 64)
+        field = np.full(shape, 0.7, dtype=np.float32)
+        smeared = _smear_along_wind(
+            field,
+            np.full(shape, 5.0, dtype=np.float32),
+            np.full(shape, 2.0, dtype=np.float32),
+            np.full(shape, 3.0e5, dtype=np.float64),
+            3.0e5,
+            300.0,
+            120.0,
+        )
+        assert np.allclose(smeared, field, atol=1e-5)
+
+    def test_footprint_is_a_physical_distance_not_a_cell_count(self):
+        """Resolution invariance, the failure mode A5 had to fix once already.
+
+        The monsoon inland mask shipped with a fixed 20-cell reach, which meant
+        7 degrees at 1024 columns and 56 degrees in the 128-column fixture. A
+        footprint expressed in kilometres must cover the same fraction of a
+        ridge at any resolution, so the same physical smear measures the same
+        upwind share on a ridge scaled with the grid.
+        """
+        params = self._with(orographic_upwind_footprint_km=600.0)
+
+        def scaled_ridge(height: int, width: int, crest: int) -> np.ndarray:
+            """`_ridge` with a crest of fixed *angular* width, not cell width."""
+            elevation = np.zeros((height, width), dtype=np.float32)
+            elevation[:, width // 4:3 * width // 4] = 0.02
+            scale = width / 128.0
+            for offset in range(-int(6 * scale), int(6 * scale) + 1):
+                elevation[:, crest + offset] = 0.02 + 0.5 * np.exp(
+                    -((offset / (2.5 * scale)) ** 2)
+                )
+            return elevation
+
+        def upwind_share(height: int) -> float:
+            width = 2 * height
+            crest = width // 2
+            orog = _precip_fields(scaled_ridge(height, width, crest), params)["orog"]
+            scale = width // 128
+            far = slice(crest - 12 * scale, crest - 7 * scale)
+            peak = slice(crest - 2 * scale, crest + 1 * scale)
+            return float(orog[:, far].mean() / orog[:, peak].mean())
+
+        coarse, fine = upwind_share(64), upwind_share(128)
+        assert abs(coarse - fine) < 0.35 * max(coarse, fine), (
+            f"footprint is resolution-dependent: {coarse:.3f} vs {fine:.3f}"
+        )
+
+
 class TestPairDefinitions:
     def test_pairs_are_well_formed(self):
         for pair in OROGRAPHIC_PAIRS:

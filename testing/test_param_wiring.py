@@ -114,6 +114,11 @@ PLANET_PARAM_CASES = [
     ("soil_deep_evap_weight", 5.0),
     ("abyssal_overturning_coeff", 0.05),  # default 0.0 (exact no-op)
     ("coastal_upwelling_fog_strength", 0.9),  # default 0.5
+    ("drybelt_seasonal_response", 0.0),  # default 0.25; 0.0 is the static belt
+    ("drybelt_seasonal_equatorward_fraction", 1.0),  # default 0.0 (pinned edge)
+    ("storm_track_seasonal_response", 0.3),  # default 0.0 (exact no-op)
+    ("orographic_upwind_footprint_km", 300.0),  # default 0.0 (exact no-op)
+    ("orographic_spillover_km", 300.0),  # default 0.0 (exact no-op)
 ]
 
 
