@@ -797,6 +797,43 @@ Novosibirsk, Kiev) via `monthly_temp`, compared against the coldest DAILY-mode r
 the 10yr Köppen EMA (which lags and can hide an already-fixed bug behind stale classification — this
 exact confusion happened once already, see `static-itcz-seasonal-fix`'s "false alarm" note).
 
+### C1b. 🔴 Summer land-temperature ceiling — `_land_cap_1d` is not a safety net, it is the mechanism
+**Measured 2026-08-02.** C1 above treats the mid-latitude land cycle as a *winter* problem. Its
+summer half is separately broken, and by a hard clamp rather than by any physics term.
+`simulate._evolve_temperature`'s `_land_cap_1d` is applied as `np.minimum`, which maps every
+overshooting month onto the *same* ceiling value. Traced at 41.4°N (zonal, soil 0.55):
+
+| stage | Jan | Feb | Mar | Apr | May | Jun | Jul | Aug | Sep |
+|---|---|---|---|---|---|---|---|---|---|
+| radiative only | -33.0 | -12.6 | 9.2 | 26.3 | 36.9 | 40.9 | 38.1 | 28.7 | 13.0 |
+| + transport bonus | -6.7 | 13.6 | 35.4 | 52.5 | 63.2 | 67.1 | 64.3 | 54.9 | 39.2 |
+| + evap cooling | -6.7 | 13.6 | 35.4 | 45.3 | 45.3 | 43.7 | 44.5 | 45.2 | 38.5 |
+| **+ land cap** | -6.7 | 13.6 | **27.9** | **27.9** | **27.9** | **27.9** | **27.9** | **27.9** | **27.9** |
+
+The three transport trapezoids are sized for winter but added year-round (+26 K here), pushing the
+summer target to a physically impossible 67°C; the evapotranspiration cooling from
+`evapotranspiration-cooling-fix` removes part of it but leaves ~44°C, still far above the ceiling.
+So the clamp still does all the work: it **binds on 55.7% of (month, row) pairs at 25–50°**, and its
+25.7–27.9°C range there is exactly the 26–29°C window holding 42–45% of mid-latitude land's warmest
+month. The in-code comment calling it *"a rarely-binding safety net … not the primary mechanism"*
+is measurably wrong and has misled at least two sessions — it has been corrected in place.
+
+**Knobs shipped (all exact no-ops at their defaults, verified bit-identical)**:
+`land_transport_seasonality`, `evap_cooling_strength`, `land_cap_softness_k` (soft-min via
+`simulate._soft_min_cap`), `evap_cooling_season_width`. Enabled together they cut the ceiling
+fraction 42.0% → 16.8% and amplitude MAPE 0.456 → 0.335, and move C/D group shares toward the
+reference — **but H10 bounded skill degrades** (group accuracy 0.6577 → 0.6375, kappa 0.5664 →
+0.5424) and no missing Köppen class is recovered, so the defaults deliberately stay off. See
+process note 10: this is the share-improves/accuracy-doesn't pattern.
+
+**Separate and still open — the cycle *shape*.** Land at 25–50° spends 7.00 months above its own
+annual mean (sinusoid 6.00; ocean 6.31–6.72), rising to 7.97 on the 23.8yr state. This is
+**independent of the ceiling**: it stayed at 6.99–7.00 in the very run where the ceiling fraction
+fell to 16.8%. Refuted causes: winter trough depth (a winter-only boost moved it 7.00→6.99),
+the evap-cooling seasonal gate (7.00→7.00), snow/ice albedo (never-freezing land 7.93 vs freezing
+7.98), and resolution quantization (7.00 at heights 96/192 alike). Best lead: it grows with
+integration time, so the mechanism has multi-year memory — test soil moisture first.
+
 ### C2. 🟢 Calendar aliasing — ANNUAL/MONTHLY seasonal-phase drift — fixed, verified 2026-08-01
 **Was**: the old `optimizer/headless.py`'s `_SUBSTEPS[ANNUAL]` advanced exactly 364.0 days per
 nominal year vs. `orbital_period_days=365.2422` — a 1.2422-day/year phase slip that completed a

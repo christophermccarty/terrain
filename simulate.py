@@ -212,6 +212,24 @@ def _evolve_wind_substepped(
     return u, v, u2, v2
 
 
+def _soft_min_cap(x: np.ndarray, cap: np.ndarray, width: float) -> np.ndarray:
+    """Smooth, strictly-monotonic replacement for ``np.minimum(x, cap)``.
+
+    ``width <= 0`` returns the exact hard minimum (bit-identical), so this is a
+    drop-in no-op at the default. For ``width > 0`` returns
+    ``cap - width * log(1 + exp((cap - x) / width))``, evaluated via
+    ``np.logaddexp`` so the large-overshoot branch cannot overflow. The result
+    tracks ``x`` well below ``cap``, asymptotes to ``cap`` well above it, and is
+    strictly increasing in ``x`` everywhere in between -- which is the property
+    the hard clamp destroys, and the reason the clamp flattened seven
+    consecutive months onto one value. See `land_cap_softness_k`.
+    """
+    if width <= 0.0:
+        return np.minimum(x, cap)
+    z = (cap - x) / width
+    return (cap - width * np.logaddexp(0.0, z)).astype(np.float32, copy=False)
+
+
 def _evolve_temperature_substepped(
     T_prev, T_base, elevation, Hc, Wc, block_size, H, W,
     day_of_year, days: float, *,
@@ -898,8 +916,33 @@ def simulate_step(
     _handoff_fall = np.clip((66.0 - _abs_lat_deg_land) / 16.0, 0.0, 1.0)
     _handoff_bonus_1d = 20.0 * _handoff_rise * _handoff_fall
 
+    # Local seasonal signal: +1 at the local summer solstice, -1 at the local
+    # winter solstice, 0 at the equinoxes. Computed here (rather than at its
+    # original site further down, just above the evapotranspiration cooling)
+    # because the transport seasonality below needs it too -- it depends only
+    # on `pp`, `new_day` and `lat`, so hoisting it is side-effect free.
+    _delta_season = pp.solar_declination(new_day)
+    _summer_signal_1d = np.sign(lat) * (_delta_season / max(pp.obliquity_rad, 1e-6))
+    _summer_factor_1d = np.clip(_summer_signal_1d, 0.0, 1.0).astype(np.float32)  # 0 in winter, 1 at local summer peak
+
+    # Seasonal modulation of the three land heat-transport trapezoids above.
+    # All three are sized for a winter deficit but applied year-round; real eddy
+    # heat flux scales with the meridional temperature gradient, which is far
+    # larger in winter. Adding the full winter-sized bonus in summer pushes the
+    # summer target tens of K above anything physical, which forces _land_cap_1d
+    # below to hard-clamp seven consecutive months to an identical value -- that
+    # clamp is the square wave. Cutting the summer half lets the target fall back
+    # under the cap so the underlying sinusoid survives.
+    # `land_transport_seasonality = 0.0` reproduces the previous behaviour
+    # exactly. See the field's docstring in planet_params.py for the stage-by-
+    # stage measurement.
+    _land_transport_season_1d = (
+        1.0 - float(pp.land_transport_seasonality) * _summer_signal_1d
+    ).astype(np.float32)
+
     T_base_land = T_base_land + (
-        _atm_land_transport_1d + _midlat_storm_bonus_1d + _handoff_bonus_1d
+        (_atm_land_transport_1d + _midlat_storm_bonus_1d + _handoff_bonus_1d)
+        * _land_transport_season_1d
     )[:, None].astype(np.float32, copy=False)
 
     # Evapotranspiration/convective cooling (2026-07, root-cause fix for the summer
@@ -921,8 +964,12 @@ def simulate_step(
     # land gets strong cooling), and (c) the local hemisphere's own seasonal cycle via
     # solar declination (near-zero in winter, peaking at the local summer solstice) so
     # the transition is smooth in time rather than an instant on/off clamp.
-    # _land_cap_1d is kept below as a safety-net backstop for any remaining extreme
-    # case, not the primary mechanism.
+    # NOTE (measured 2026-08-02): the intent below was that _land_cap_1d becomes a
+    # safety-net backstop rather than the primary mechanism. That did not happen.
+    # This term lowers the 41N summer target from ~67C to ~44C -- still far above
+    # the 27.9C ceiling -- so the cap continues to do all the work, binding on
+    # 55.7% of (month, row) pairs at 25-50 deg. Do not rely on the old claim that
+    # the cap rarely binds; see ACCURACY_AUDIT.md C1b.
     if state.soil_moisture is not None:
         _soil_2d = _coarsen_many({"soil": state.soil_moisture}, Hc, Wc, block_size)["soil"]
     else:
@@ -932,22 +979,37 @@ def simulate_step(
         _, _land_mask_early = get_masks(_elev_c_early)
     else:
         _land_mask_early = np.zeros((Hc, Wc), dtype=bool)
-    _delta_season = pp.solar_declination(new_day)
-    _summer_signal_1d = np.sign(lat) * (_delta_season / max(pp.obliquity_rad, 1e-6))
-    _summer_factor_1d = np.clip(_summer_signal_1d, 0.0, 1.0).astype(np.float32)  # 0 in winter, 1 at local summer peak
+    # `_summer_factor_1d` is computed further up (hoisted so the winter transport
+    # boost can share the same seasonal signal) -- the two are exactly out of phase.
     _EVAP_COOL_THRESHOLD_K = 290.0
     _EVAP_COOL_COEFF_MAX = 0.85
+    # Saturating seasonal gate: a contraction toward the threshold is only
+    # shape-preserving if its *strength* is constant through the warm season.
+    # Letting the strength track `_summer_factor_1d` all the way to the solstice
+    # (evap_cooling_season_width = 1.0) makes the cooling peak where the cycle
+    # peaks, squaring off the top -- see the field's docstring in planet_params.py.
+    _evap_season_1d = np.clip(
+        _summer_factor_1d / max(float(pp.evap_cooling_season_width), 1e-6), 0.0, 1.0
+    ).astype(np.float32)
     _evap_excess_2d = np.maximum(T_base_land - _EVAP_COOL_THRESHOLD_K, 0.0)
     _evap_cooling_2d = (
-        _summer_factor_1d[:, None] * _EVAP_COOL_COEFF_MAX * np.clip(_soil_2d, 0.0, 1.0) * _evap_excess_2d
+        _evap_season_1d[:, None]
+        * (_EVAP_COOL_COEFF_MAX * float(pp.evap_cooling_strength))
+        * np.clip(_soil_2d, 0.0, 1.0) * _evap_excess_2d
     ) * _land_mask_early.astype(np.float32)
     T_base_land = (T_base_land - _evap_cooling_2d).astype(np.float32, copy=False)
 
     # Re-apply summer cap: atmospheric transport can only raise winter/polar-night
     # temperatures; it must not push summer land above observed peak means.
-    # Now a rarely-binding safety net (see evapotranspiration cooling above), not the
-    # primary mechanism.
-    T_base_land = np.minimum(T_base_land, _land_cap_1d[:, None].astype(np.float32, copy=False))
+    # NOT the "rarely-binding safety net" this comment used to claim: measured, it
+    # binds on 55.7% of (month, row) pairs at 25-50 deg and clamps seven
+    # consecutive months at 41N to one identical value. `land_cap_softness_k > 0`
+    # swaps the hard minimum for a strictly-monotonic soft-min so the clamp stops
+    # writing a flat top into the annual cycle.
+    T_base_land = _soft_min_cap(
+        T_base_land, _land_cap_1d[:, None].astype(np.float32, copy=False),
+        float(pp.land_cap_softness_k),
+    )
 
     # Calculate temperature for lagged day (ocean response with 1.5 month delay)
     lag_days = pp.ocean_lag_days * (float(pp.orbital_period_days) / 365.2422)  # scale thermal lag with year length
@@ -1086,26 +1148,40 @@ def simulate_step(
             polar_cooling_scale=polar_cooling_scale,
             planet_params=pp,
         )
-        land_base = (
-            np.repeat(T_land_lat[:, None], Wc, axis=1).astype(np.float32, copy=False)
-            + co2_temp_offset
-            + (_atm_land_transport_1d + _midlat_storm_bonus_1d)[:, None]
-        )
         summer_signal = np.sign(lat) * (
             pp.solar_declination(day) / max(pp.obliquity_rad, 1e-6)
         )
-        summer_factor = np.clip(summer_signal, 0.0, 1.0).astype(np.float32)
+        summer_factor = np.clip(
+            np.clip(summer_signal, 0.0, 1.0)
+            / max(float(pp.evap_cooling_season_width), 1e-6),
+            0.0, 1.0,
+        ).astype(np.float32)
+        # Same seasonal transport modulation as the outer path, resampled at this
+        # inner date. (NOTE: this path has always summed only two of the outer
+        # path's three transport trapezoids -- `_handoff_bonus_1d` is absent
+        # here. That is a pre-existing inconsistency, inert at the default
+        # `temperature_substep_days=0.0`; left as found rather than changed
+        # blind, since this path cannot be validated while it is disabled.)
+        land_base = (
+            np.repeat(T_land_lat[:, None], Wc, axis=1).astype(np.float32, copy=False)
+            + co2_temp_offset
+            + (
+                (_atm_land_transport_1d + _midlat_storm_bonus_1d)
+                * (1.0 - float(pp.land_transport_seasonality) * summer_signal)
+            )[:, None]
+        )
         evap_excess = np.maximum(land_base - _EVAP_COOL_THRESHOLD_K, 0.0)
         evap_cooling = (
             summer_factor[:, None]
-            * _EVAP_COOL_COEFF_MAX
+            * (_EVAP_COOL_COEFF_MAX * float(pp.evap_cooling_strength))
             * np.clip(_soil_2d, 0.0, 1.0)
             * evap_excess
             * _land_mask_early.astype(np.float32)
         )
-        land_base = np.minimum(
+        land_base = _soft_min_cap(
             land_base - evap_cooling,
             _land_cap_1d[:, None],
+            float(pp.land_cap_softness_k),
         ).astype(np.float32, copy=False)
 
         ocean_day = (

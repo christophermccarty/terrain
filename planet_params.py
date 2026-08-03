@@ -217,6 +217,139 @@ class PlanetParams:
     Lower values allow more polar warming; higher values sharpen the
     equator-to-pole gradient."""
 
+    land_transport_seasonality: float = 0.0
+    """Seasonal modulation of atmospheric heat transport into land
+    [dimensionless, 0-1]. `0.0` is an exact no-op reproducing the previous
+    season-independent behaviour; `1.0` means the bonus doubles at the local
+    winter solstice and falls to zero at the local summer solstice.
+
+    `simulate._evolve_temperature` warms land with three latitude-only
+    trapezoids (`_atm_land_transport_1d`, `_midlat_storm_bonus_1d`,
+    `_handoff_bonus_1d`) that stand in for eddy/storm-track/Ferrel heat
+    transport. Every one of them is motivated in its own comment by a *winter*
+    deficit ("Antarctic winter equilibrium", "winter cyclones", "coldest-month
+    means of -37 to -39 C") -- yet all three are applied at full strength year
+    round, with no `day_of_year` dependence at all. That is not what the real
+    mechanism does: eddy heat flux scales with the meridional temperature
+    gradient, which is roughly 2-3x larger in winter than in summer, so real
+    transport into midlatitude land is strongly winter-weighted.
+
+    Applying a constant is what forces `_land_cap_1d` to bind as hard as it
+    does, and that clamp -- not the cap's own existence -- is what squares off
+    the land seasonal cycle. Traced stage by stage at 41.4 N (zonal, soil 0.55):
+
+        radiative only      -33.0 -12.6   9.2  26.3  36.9  40.9 ... (a sinusoid)
+        + transport bonus    -6.7  13.6  35.4  52.5  63.2  67.1 ... (+26 K flat)
+        + evap cooling       -6.7  13.6  35.4  45.3  45.3  43.7 ...
+        + land cap           -6.7  13.6  27.9  27.9  27.9  27.9 ... (7 months
+                                                                     identical)
+
+    The bonus is sized for winter but added in summer too, lifting the summer
+    target to a physically impossible 67 C; the evapotranspiration cooling below
+    removes part of it (to ~44 C) but nowhere near enough, so `_land_cap_1d`
+    hard-clamps seven consecutive months to exactly its own ceiling value. The
+    cap binds on **55.7% of (month, row) pairs at 25-50 deg** -- its docstring
+    calling it a "rarely-binding safety net" is measurably wrong -- and its
+    25.7-27.9 C range at those latitudes is exactly the 26-29 C window that
+    42-45% of midlatitude land's warmest month falls into.
+
+    Consequence: land at 25-50 deg spends 7.0-8.0 months above its own annual
+    mean (a sinusoid gives 6.0; ocean at the same latitudes gives 6.3). That
+    shape makes Koppen's Cfc unreachable (needs <4 months >10 C) and pushes
+    maritime midlatitude cells out of the C group into D -- a direct cause of
+    the model emitting zero Csa/Csb/Cfc.
+
+    This scales the three trapezoids by `1 - land_transport_seasonality *
+    summer_signal`, where `summer_signal` runs +1 at the local summer solstice
+    to -1 at the local winter solstice (the same solar-declination signal the
+    evapotranspiration cooling uses). Cutting the *summer* bonus is the operative
+    half: it lowers the summer target back under the cap so the clamp stops
+    binding and the underlying sinusoid shows through. Raising the winter half
+    is a bonus that also narrows the amplitude excess -- but note that a
+    winter-only variant of this term was measured first and moved squareness
+    only 7.00 -> 6.99, so the winter trough is *not* where the square wave comes
+    from. Do not re-derive this the other way round.
+
+    See ACCURACY_AUDIT.md C1 (mid-latitude winter cold bias) and the
+    missing-Koppen-classes root cause."""
+
+    land_cap_softness_k: float = 0.0
+    """Softening width [K] for `simulate._evolve_temperature`'s summer land
+    temperature ceiling `_land_cap_1d`. `0.0` is an exact no-op reproducing the
+    previous hard `np.minimum` clamp.
+
+    The hard clamp is what physically writes the plateau into the land seasonal
+    cycle: because `np.minimum` maps every overshooting month onto the *same*
+    ceiling value, seven consecutive months at 41 N come out bit-identical (see
+    `land_transport_seasonality`). This replaces it with a smooth soft-min,
+
+        y = c - w * log(1 + exp((c - x) / w))
+
+    which is `y ~ x` well below the ceiling, asymptotes to `c` well above it, and
+    is *strictly monotonic* in `x` throughout -- so months that differ before the
+    clamp still differ after it, and the annual cycle keeps its ordering and
+    curvature instead of being flat-topped. `w` sets how far below the ceiling
+    the softening starts to matter.
+
+    Note this alone cannot rescue a large overshoot: the soft-min still converges
+    to the ceiling, so a month sitting 16 K above it lands within 0.02 K of the
+    hard-clamped value. It only preserves shape once the overshoot has been
+    brought down to the same order as `w` -- which is what
+    `land_transport_seasonality` and `evap_cooling_strength` are for. The three
+    are meant to be set together."""
+
+    evap_cooling_strength: float = 1.0
+    """Multiplier on `simulate._evolve_temperature`'s evapotranspiration cooling
+    coefficient (`_EVAP_COOL_COEFF_MAX`, 0.85) [dimensionless]. `1.0` is an exact
+    no-op.
+
+    Raising this deepens the contraction of summer land temperature toward the
+    290 K reference, lowering the summer target so the `_land_cap_1d` ceiling
+    stops binding. The mechanism stays soil-moisture-aware, so deserts (low
+    `soil_moisture`) are affected far less than moist continental interiors --
+    which is both the physically correct behaviour and the reason this cannot on
+    its own flatten the desert side of the problem.
+
+    Retains the property that the cooling only removes energy above 290 K, so it
+    can never drive land below that reference."""
+
+    evap_cooling_season_width: float = 1.0
+    """Width of the seasonal ramp gating evapotranspiration cooling
+    [dimensionless, (0, 1]]. `1.0` is an exact no-op reproducing the previous
+    behaviour.
+
+    `simulate._evolve_temperature`'s evapotranspiration cooling is
+    `summer_factor * 0.85 * soil * max(T - 290, 0)`, where `summer_factor` runs
+    0 -> 1 from equinox to local summer solstice. Rearranged, that is a
+    contraction of land temperature toward 290 K:
+
+        T <- 290 + (1 - 0.85 * soil * summer_factor) * (T - 290)
+
+    The contraction *strength* therefore rises and falls with the season while
+    the quantity being contracted, `(T - 290)`, already peaks in summer. Cooling
+    thus carries two powers of the seasonal cycle and bites hardest exactly at
+    the peak -- a differential peak-flattening operator. A contraction with a
+    *constant* factor is linear and so shape-preserving (it rescales amplitude
+    above the threshold but leaves a sinusoid a sinusoid); only a
+    seasonally-varying factor squares off the top of the cycle. Measured: this
+    is what puts 42-45% of midlatitude land's warmest month into a single
+    26-29 C window and holds land at ~7.0-8.0 months above its own annual mean
+    against ocean's 6.3 (a sinusoid gives 6.0). Raising winter temperatures does
+    *not* fix it -- a full sweep of `land_winter_transport_boost` moved squareness
+    only 7.00 -> 6.99 -- because the defect is in the summer half.
+
+    This divides `summer_factor` by the field before clipping back to [0, 1], so
+    the gate saturates once the season is `evap_cooling_season_width` of the way
+    to the solstice and is flat from there on. Cooling then acts as a
+    near-constant contraction across the warm season -- still exactly zero in
+    winter (the `max(T - 290, 0)` term and the ramp both vanish), still
+    soil-moisture-aware, so deserts stay hot and the mechanism from
+    `evapotranspiration-cooling-fix` is preserved -- while no longer flattening
+    the peak it was only ever meant to lower. Smaller values saturate earlier
+    and are more shape-preserving; the cost is a cooler shoulder season, so this
+    trades against the summer land-warmer-than-ocean sign `_land_cap_1d`
+    protects and should not be pushed to 0."""
+
     ocean_transport_coeff: float = 0.3
     """Poleward ocean heat flux scale [dimensionless].
     Multiplier on the parameterised meridional ocean heat transport.

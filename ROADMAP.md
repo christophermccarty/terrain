@@ -26,6 +26,22 @@
 The single-layer atmosphere is now well-tuned but fundamentally limits what
 can emerge on its own (jets, monsoons, real storm dynamics).
 
+- **Land seasonal-cycle SHAPE — open, cause unknown (added 2026-08-02).** Land at
+  25–50° spends **7.00 months above its own annual mean** (a sinusoid gives 6.00;
+  ocean at the same latitudes gives 6.31–6.72), rising to 7.97 on the 23.8yr
+  state — a broad warm plateau with a narrow deep winter trough. This blocks
+  Köppen `Cfc` outright (needs <4 months >10 °C) and, with the winter cliff,
+  pushes maritime mid-latitudes out of the C group entirely, so it is a direct
+  cause of the model emitting no Mediterranean climate. The *ceiling* half of the
+  problem is solved and documented (ACCURACY_AUDIT.md **C1b** — `_land_cap_1d`'s
+  hard clamp), but the shape is **independent of it**: squareness stayed
+  6.99–7.00 in the very run where the ceiling fraction fell 42.0% → 16.8%.
+  Refuted: winter trough depth, the evap-cooling seasonal gate, snow/ice albedo,
+  resolution quantization (see C1b for the numbers — don't re-derive these).
+  **Best lead:** it grows with integration time (7.00 at 4yr → 7.97 at 23.8yr),
+  so the mechanism has multi-year memory; test soil moisture first by holding it
+  fixed over a long run and re-measuring.
+
 - ~~**1.5-layer atmosphere.**~~ **Done 2026-07-04.** `atmosphere.evolve_wind_aloft()`
   gives the atmosphere a real, independent prognostic upper-level wind layer
   (own advection/Coriolis/PGF momentum budget, weak Rayleigh friction, no
