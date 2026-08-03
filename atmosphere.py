@@ -3731,10 +3731,33 @@ def generate_precipitation(
         # both-weights-zero configuration does no extra work.
         _orog_shape_w = float(pp.precip_orographic_shape_weight)
         _raw_shape_w = float(pp.precip_raw_shape_weight)
-        if _orog_shape_w > 0.0 or _raw_shape_w > 0.0:
+        _land_shape_w = float(pp.precip_land_shape_weight)
+        if _orog_shape_w > 0.0 or _raw_shape_w > 0.0 or _land_shape_w > 0.0:
             _raw_shape_applied = np.where(land_f > 0.5, _raw_shape, 1.0).astype(
                 np.float32, copy=False
             )
+        def _apply_shape_blend(factor, blend):
+            # Shared by all three gatings below, which differ only in `blend`.
+            #
+            # `blend` is clipped to [0, 1] because the expression is a linear
+            # interpolation from `factor` toward `factor * _raw_shape_applied`
+            # and is only meaningful inside that range. Above 1.0 it extrapolates
+            # past the endpoint, and since `_raw_shape` is floored at 0.2 -- which
+            # it actually reaches, on 13.9% of land on the tracked benchmark --
+            # that drives `_desert_factor` negative (blend 1.7 x shape 0.2 gives
+            # -0.36): measured at 20.0% of land for a weight of 1.5. A negative
+            # `_desert_factor` becomes a negative `cell_weight`, i.e. a negative
+            # share of the row's precipitation target.
+            #
+            # This fails *silently* without the clip -- downstream clips keep
+            # final precipitation non-negative, so the only symptom is a
+            # corrupted spatial weighting. No shipped default reaches the
+            # extrapolating range, but these weights exist to be swept as
+            # ablation handles (A5-LEAD swept one to 5.0), so the guard earns its
+            # keep. See testing/test_land_shape_blend.py.
+            blend = np.clip(blend, 0.0, 1.0).astype(np.float32)
+            return factor * (1.0 - blend + blend * _raw_shape_applied)
+
         # A5 stage 3, added 2026-08-02. The moisture-budget fill is a
         # *deficit-filling* mechanism: it tops each cell up toward a target, so
         # wherever it supplies most of the rain it actively erases whatever
@@ -3755,11 +3778,26 @@ def generate_precipitation(
             _orog_gate = np.clip(
                 orog / max(float(pp.orographic_uplift_clip), 1e-6), 0.0, 1.0
             )
-            _orog_blend = (
-                _orog_shape_w * _orog_gate * (land_f > 0.5)
-            ).astype(np.float32)
-            _desert_factor = _desert_factor * (
-                1.0 - _orog_blend + _orog_blend * _raw_shape_applied
+            _desert_factor = _apply_shape_blend(
+                _desert_factor, _orog_shape_w * _orog_gate * (land_f > 0.5)
+            )
+        if _land_shape_w > 0.0:
+            # Land-wide, ungated by latitude or terrain. Ships inert at 0.0 and is
+            # expected to stay that way: this is the mechanism audit A5-OROG's
+            # deferred lead claimed to be "effectively" measuring, and testing it
+            # honestly (2026-08-02, audit A5-LEAD) refuted the lead. Enabled, it
+            # degrades every bounded H10 metric monotonically and at 1.0
+            # reproduces the 2026-07-31 rejection of the ungated
+            # `precip_raw_shape_weight` almost exactly -- arid share 27.5->33.2%,
+            # US Midwest 900->399 mm/yr.
+            #
+            # The lead's actual gain came from the buggy normalizer making the
+            # *orographic* gate terrain-weighted-but-broad, not from breadth as
+            # such; a uniform land-wide blend does not reproduce it. Kept as a
+            # tested mechanism (process note 2) so the next session to reach for
+            # this finds the audit's sweep table instead of rebuilding it.
+            _desert_factor = _apply_shape_blend(
+                _desert_factor, _land_shape_w * (land_f > 0.5)
             )
         if _raw_shape_w > 0.0:
             # Gated by `itcz_window` (real-terrain measurement, 2026-07-31):
@@ -3788,7 +3826,7 @@ def generate_precipitation(
             # `_desert_factor` alone -- so only land is reshaped, and only
             # relative to other land in the same row. (`_raw_shape_applied` is
             # now built just above, shared with the orographic gate.)
-            _desert_factor = _desert_factor * (1.0 - _raw_shape_w_row + _raw_shape_w_row * _raw_shape_applied)
+            _desert_factor = _apply_shape_blend(_desert_factor, _raw_shape_w_row)
         _row_norm = np.mean(_desert_factor, axis=1, dtype=np.float64).astype(np.float32)
         cell_weight = _desert_factor / (_row_norm[:, None] + 1e-6)
         if pp.moisture_budget_precip_rescale:

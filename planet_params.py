@@ -1259,7 +1259,7 @@ class PlanetParams:
 
     precip_orographic_shape_weight: float = 1.0
     """Blend raw production shape into the moisture-budget *target* where
-    orography is active, 0.0 = exact no-op (the default).
+    orography is active, 0.0 = exact no-op.
 
     **A5's stage 3, and the one that actually binds.** The moisture-budget
     rescale is a deficit-filling mechanism: it tops each cell up toward a target,
@@ -1282,6 +1282,40 @@ class PlanetParams:
 
     Mean-preserving by construction (renormalized into `cell_weight` exactly like
     `_desert_factor`), so row totals are unaffected."""
+
+    precip_land_shape_weight: float = 0.0
+    """Blend raw production shape into the moisture-budget *target* over **all**
+    land, at every latitude, ungated. 0.0 = exact no-op (the default).
+
+    The third and broadest gating of the one shared `_raw_shape` blend, alongside
+    `precip_raw_shape_weight` (gated by `itcz_window`) and
+    `precip_orographic_shape_weight` (gated by the orographic signal). All three
+    compose multiplicatively and each is an exact no-op at 0.0.
+
+    **Why this exists as its own knob, and why it is expected to stay at 0.0**
+    (2026-08-02, audit A5-LEAD). A5-OROG deferred a "large lead": with the
+    orographic normalizer bug left in place its gate covers 87.8% of land at an
+    area-weighted mean of 0.36 -- not an orographic mechanism at all -- and run
+    that way the tracked 64x128 benchmark beat the shipped configuration on
+    `reference_error_score` *and* both H10 accuracies. That lead identified
+    itself as "effectively the ungated raw-shape target blend", and asked for a
+    session testing it honestly as a land-wide mechanism with its own gate. This
+    parameter is that mechanism. **The test refuted the lead.**
+
+    Swept, it degrades every bounded metric monotonically (group accuracy 0.6855
+    -> 0.6723 -> 0.6577 at 0.0/0.45/1.0, class accuracy and share MAE likewise)
+    while `reference_error_score` improves to a minimum at 0.45 -- process note
+    10 exactly. At 1.0 it reproduces the **2026-07-31 rejection** of the ungated
+    `precip_raw_shape_weight` almost exactly: `arid_pct` 27.5 -> 33.2% and US
+    Midwest 900 -> 399 mm/yr, the two effects that session gated that mechanism
+    to the ITCZ to avoid. So that rejection stands, contrary to the lead's claim
+    that it "does not reproduce" -- it does not reproduce for the *buggy
+    orographic* gate, which is terrain-weighted, but it does for a uniform
+    land-wide blend. The two are not the same mechanism.
+
+    Kept rather than reverted (process note 2) so the next session to reach for
+    "blend raw production shape into the target over all land" finds a tested
+    mechanism and the audit's sweep table instead of rebuilding it."""
 
     itcz_seasonal_response: float = 0.4
     """Fraction [0-1] of the full solar-declination swing (`solar_declination`)

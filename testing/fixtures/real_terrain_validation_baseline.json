@@ -239,6 +239,7 @@
     "perihelion_day": 3.0,
     "pgf_continentality_amp": 0.0,
     "polar_cooling_scale": 0.3,
+    "precip_land_shape_weight": 0.0,
     "precip_orographic_shape_weight": 1.0,
     "precip_orographic_weight": 0.2,
     "precip_potential_ceiling": 3.0,
@@ -282,6 +283,6 @@
     "final_total_days": 730.4843999999996,
     "sampled_days": 365.24219999999997,
     "spinup_cycles": 12,
-    "wall_seconds": 15.781052100006491
+    "wall_seconds": 16.295948200160637
   }
 }

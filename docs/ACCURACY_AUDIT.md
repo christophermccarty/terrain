@@ -585,6 +585,9 @@ regional precipitation gains in the table above — most of all Atacama, plus a 
 improvement and every named box moving toward target. The orographic *mechanism* being repaired is
 what produced those; the *contrast metric* it was built to move is still open.
 
+<details>
+<summary>The "large lead deliberately not taken" as originally written 2026-08-02 (kept for the trail — its premise was refuted the same week, see A5-LEAD below)</summary>
+
 **A large lead found here and deliberately NOT taken — flag for a future session.** The orographic
 gate is `clip(orog / orographic_uplift_clip, 0, 1)`. Under the *old* inflated normalizer that gate
 covers **33.8% of land**, i.e. it is not orographic at all but a broad terrain-weighted raw-shape
@@ -597,6 +600,97 @@ the 2026-07-31 rejection of that mechanism (see the `precip_raw_shape_weight` en
 `arid_pct`", "US Midwest 610→400") **does not reproduce** on current code. That is textbook process
 note 7 — the constraint moved, not the parameter. Worth a session of its own, tested honestly as a
 land-wide mechanism with its own gate rather than as a side effect of this one.
+
+</details>
+
+#### A5-LEAD. 🟢 That session was run 2026-08-02 — the lead does not survive a resolution check, and is now closed
+
+The lead above was taken up as its own session, exactly as it asked. **Both of its claims are
+64×128 artifacts.** Nothing here changes a shipped default; the finding is that the deferred
+opportunity was not real, plus one latent bug guard.
+
+**Reproduced first** (process note 3): baseline `reference_error_score` **0.2076** / group accuracy
+**0.6855** / class accuracy **0.3884**, and the buggy-normalizer lead **0.1856 / 0.6896 / 0.3935** —
+matching the write-up above to every printed digit. The lead is real *as measured*.
+
+**1. The honest land-wide mechanism is net-negative, i.e. the 2026-07-31 rejection does reproduce
+after all.** `PlanetParams.precip_land_shape_weight` (new, shipped **inert at 0.0**) applies the same
+`_raw_shape` blend to all land at every latitude, ungated — the mechanism the lead was said to be
+"effectively" measuring. Swept on the tracked benchmark it degrades **every bounded metric
+monotonically** while `reference_error_score` improves to a minimum at 0.45 and then worsens:
+
+| `precip_land_shape_weight` | refErr | group acc | class acc | share MAE | arid% | Sahara | US Midwest |
+|---|---|---|---|---|---|---|---|
+| 0.0 (default) | 0.2076 | **0.6855** | **0.3884** | **2.02** | 27.5 | 164 | 900 |
+| 0.15 | 0.1839 | 0.6845 | 0.3896 | 2.16 | 28.0 | 129 | 828 |
+| 0.45 | **0.1775** | 0.6723 | 0.3775 | 2.70 | 29.6 | 75 | 680 |
+| 1.00 | 0.2028 | 0.6577 | 0.3623 | 3.82 | 33.2 | 22 | 399 |
+
+At 1.0 this is **the 2026-07-31 result almost exactly** — `arid_pct` climbing hard and US Midwest
+collapsing to ~400 mm/yr, the two specific effects that session gated the mechanism to the ITCZ to
+avoid. So the lead's "does not reproduce" claim was wrong: it did not reproduce *for the buggy
+orographic gate*, which is terrain-weighted, but it reproduces cleanly for the uniform land-wide
+mechanism the lead identified it with. **The two are not the same mechanism**, and the win was never
+about breadth.
+
+**2. The win is terrain-weighting, and it is reachable without the bug — but it does not survive
+resolution.** Measured gate coverage: the shipped normalizer gives an area-weighted gate mean of
+**0.216**, the buggy one **0.362** (87.8% of land above 0.05). So the lead is the *same* gate, wider
+and stronger — and simply raising `precip_orographic_shape_weight` above its shipped 1.0 reproduces
+most of it honestly, at no cost in orographic contrast (mean box-scale W/L **0.96 → 0.98 → 1.02 →
+1.08** across 1.0/1.7/2.2/3.0 on `saves/earth.pkl`, i.e. slightly *better*).
+
+The rest of the gap is the lead's other half: the buggy normalizer also inflates `orog` into
+`precip_potential` itself, not just into the gate. Adding `precip_orographic_weight=0.44` on top of
+the raised shape weight closes it almost exactly (refErr **0.1856**, group **0.6885**, class
+**0.3930**, rescale **2.050** vs the lead's 0.1856 / 0.6896 / 0.3935 / 2.027) — but A5-OROG's warning
+about that value **reproduces precisely**: it degrades S Andes 0.89→0.72 and Southern Alps 0.91→0.77,
+mean W/L 0.96→0.92. Rejected on those grounds, independently of everything below.
+
+That looked shippable. It is not — **the sign of every bounded metric flips with resolution**:
+
+| | 64×128 (tracked) | | | 128×256 | | | 256×512 | | |
+|---|---|---|---|---|---|---|---|---|---|
+| | refErr | grpAcc | clsAcc | refErr | grpAcc | clsAcc | refErr | grpAcc | clsAcc |
+| baseline (ow=1.0) | 0.2076 | 0.6855 | 0.3884 | 0.1483 | **0.7031** | **0.4194** | 0.1290 | **0.7024** | **0.4343** |
+| ow=1.7 | 0.1889 | **0.6878** | 0.3920 | 0.1309 | 0.6993 | 0.4163 | — | — | — |
+| ow=2.2 | 0.1871 | 0.6867 | **0.3929** | 0.1284 | 0.6955 | 0.4136 | 0.1225 | 0.6985 | 0.4289 |
+| lead (buggy norm) | 0.1856 | **0.6896** | **0.3935** | 0.1260 | 0.6994 | 0.4124 | 0.1250 | 0.7019 | 0.4299 |
+| land-wide 0.45 | 0.1775 | 0.6723 | 0.3775 | — | — | — | 0.1311 | 0.6906 | 0.4228 |
+
+At 64×128 raising the weight reads as **+0.23pp** group accuracy; at 128×256 it is **−0.38pp** and at
+256×512 **−0.39pp**, and class accuracy and share MAE move the same way. **The buggy lead itself is
+also worse than baseline at both higher resolutions** (group 0.6994 / 0.7019 vs 0.7031 / 0.7024) — so
+the specific result that motivated the deferral, "H10 group accuracy *up*, class accuracy *up*", is
+an artifact of the tracked fixture's own coarseness and does not hold anywhere else.
+
+`reference_error_score` improves in *every* one of these configurations at *every* resolution. It is
+the only metric that does. Process note 10 for the third independent time, now with a resolution
+dimension — and see new process note 14.
+
+**Shipped**: `precip_land_shape_weight` (0.0, inert — kept per process note 2 so the next session
+finds a tested mechanism and this table instead of rebuilding it), and a **`clip(blend, 0, 1)` guard**
+in `atmosphere.py`'s now-shared `_apply_shape_blend` helper. The three shape blends are linear
+interpolations toward `_raw_shape`, which floors at 0.2; a weight above ~1.25 extrapolated past the
+endpoint and could drive `_desert_factor` **negative**, silently inverting that cell's share of its
+row target. No shipped default reaches it, but this session swept `precip_orographic_shape_weight` to
+5.0 and these weights exist to be swept. Verified bit-identical at defaults.
+
+**Full suite: 472 passed, 1 failed, and the failure was benign but was still root-caused rather than
+assumed** (process note 6). `test_compact_real_terrain_run_matches_tracked_baseline` reported "planet
+parameters differ from baseline" — that check compares the serialized `PlanetParams` and
+short-circuits *before* any metric comparison, so adding a field fails it by construction regardless
+of behaviour. Confirmed benign by diffing a fresh report against the tracked baseline directly: the
+only difference is the added `precip_land_shape_weight: 0.0` and the **metrics block is byte-identical**.
+Baseline regenerated; the regenerated file's diff is two lines (the new field and `wall_seconds`),
+which is itself an independent confirmation that this session changed no behaviour.
+
+**Not invalidated: the shipped `precip_orographic_shape_weight=1.0` itself.** Turning it fully off at
+128×256 does score marginally better on the bounded metrics (group 0.7050 vs 0.7031, class 0.4241 vs
+0.4194) — but at a cost of `reference_error_score` 0.2434 vs 0.1483 and **Atacama 146 vs 61 mm/yr**,
+i.e. A1's last desert residual reopening completely. A5-OROG recorded that same small H10 group dip
+(0.6883→0.6855) and accepted it deliberately for exactly these regional gains; that trade still
+measures the same way at 4× the resolution, so the default stands.
 
 <details><summary>Superseded recommendation (kept for the diagnosis trail)</summary>
 
@@ -1284,7 +1378,8 @@ group score (a model that never emits Csa still scores C correctly if it emits C
    rescale a proposed mechanism sits on before building it.
 2. **Several "fixes" are real, tested, and shipped — but deliberately inert (default off/0.0)**
    because they measured net-negative, no-effect, or an unresolved trade-off for their intended
-   purpose: `moisture_advection_scale`, `precip_raw_shape_weight`, `cloud_water_feedback`,
+   purpose: `moisture_advection_scale`, `precip_raw_shape_weight`, `precip_land_shape_weight`
+   (degrades every bounded H10 metric monotonically — A5-LEAD), `cloud_water_feedback`,
    `abyssal_overturning_coeff`, `pgf_continentality_amp`, `enable_surface_hydrology`,
    `enable_land_ice_dynamics`, `moisture_budget_tropical_cap_boost` (no measurable effect at any
    strength). The old whole-signal version of `subsidence_divergence_regime_gate` belonged in this
@@ -1340,6 +1435,19 @@ group score (a model that never emits Csa still scores C correctly if it emits C
    input still carries information before concluding the mechanism is weak — A5 spent a full
    ablation concluding `orog`'s windward/leeward ratio was "only 1.05" when it was measuring a
    saturated field, not a formula.
+14. **Confirm a bounded-metric gain at a second resolution before deferring a session to it**
+   (2026-08-02, A5-LEAD). The tracked 64×128 fixture reported the deferred orographic-breadth lead as
+   improving H10 group accuracy +0.4pp and class accuracy +0.5pp. At 128×256 and again at 256×512
+   both **reverse sign** — the lead is worse than baseline at every resolution above the fixture's.
+   This is not process note 11 (an instrument too coarse to *see* a phenomenon, reporting a null); it
+   is worse, because a coarse grid produced a confident, reproducible, wrong-signed **improvement**
+   that survived exact re-measurement and drove a documented recommendation. `reference_error_score`,
+   meanwhile, improved at every resolution and in every configuration tested, including ones where
+   ~31% of land classification got worse — so agreement between refErr and a 64×128 accuracy reading
+   is not corroboration, it is two views of the same under-resolved field. **Practical rule**: the
+   64×128 benchmark is for cheap A/B *direction-finding* and regression-gating, not for deciding
+   whether a few-tenths-of-a-percent accuracy change is real. Anything that would be written into
+   this document as a recommendation needs a 128×256 confirmation — it costs about 35 s per case.
 13. **Build the instrument before the fix, and expect the instrument itself to be the finding**
    (2026-08-02). H10's gridded map score was built as infrastructure to support orographic work, and
    before a single physics change it had already shown that the model **cannot emit Csa, Csb, Cwa,
