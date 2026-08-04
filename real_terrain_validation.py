@@ -154,6 +154,174 @@ def _zonal_metrics(
     return metrics
 
 
+# Continental-land seasonal-cycle anchors, by latitude band. Warmest/coldest
+# month and annual mean in C, from published climatology for mid-continental
+# stations in each band (the same standing as EARTH_ZONAL_REFERENCE's numbers:
+# summary anchors, not a gridded product). "Squareness" is months a cell spends
+# above its own annual mean; a sinusoid gives exactly 6.00 and real land runs
+# only slightly above that.
+#
+# **These level anchors do not match the population the metric measures, and
+# must not be optimised against** (found 2026-08-04, audit process note 8's
+# fourth instance). The anchors describe *mid-continental stations*;
+# `_land_seasonal_cycle_metrics` below computes an area-weighted mean over
+# **all** land in the band. Those diverge badly in exactly the bands C1b works
+# on: by the bundled Köppen reference's own accounting, 25-35N land is 54% arid
+# subtropics (BWh alone is 42%) plus 8% Tibetan plateau, and 35-45N is 34% cold
+# desert -- neither is "mid-continental", and both have far milder winters than
+# the -2/-4 C anchors below imply. Optimising `cycle_error_score` therefore
+# drives the subtropics cold, which is the most likely explanation for C1b's
+# recurring finding that knobs improving this score degrade H10 accuracy.
+#
+# Measured, on the same 128x256 run: this metric reports the 25-35N coldest
+# month as +12.85 K too warm, while `koppen_temperature_thresholds` -- which
+# needs no anchors, only the reference's own definitional bounds -- finds
+# **100%** of that band's reference-C land on the correct side of both the -3 C
+# and +18 C boundaries. The apparent 13 K bias is the anchor, not the model.
+#
+# `squareness_months` and `plateau_months` are unaffected: both are
+# dimensionless properties of a cell's own cycle compared against a sinusoid,
+# so they are valid for any population. `cycle_error_score` is built from those
+# alone for that reason; the level biases are still reported, as diagnosis, but
+# are not scored. Use `koppen_temperature_thresholds` for level questions.
+EARTH_LAND_CYCLE_REFERENCE: dict[str, dict[str, float]] = {
+    "25-35N": {"lat_s": 25.0, "lat_n": 35.0, "warmest_c": 26.0, "coldest_c": -2.0,
+               "mean_c": 12.0, "amplitude_k": 28.0},
+    "35-45N": {"lat_s": 35.0, "lat_n": 45.0, "warmest_c": 24.0, "coldest_c": -4.0,
+               "mean_c": 10.0, "amplitude_k": 28.0},
+    "45-55N": {"lat_s": 45.0, "lat_n": 55.0, "warmest_c": 21.0, "coldest_c": -8.0,
+               "mean_c": 7.0, "amplitude_k": 29.0},
+    "25-35S": {"lat_s": -35.0, "lat_n": -25.0, "warmest_c": 24.0, "coldest_c": 8.0,
+               "mean_c": 16.0, "amplitude_k": 16.0},
+}
+EARTH_LAND_SQUARENESS = 6.2
+
+
+def _land_seasonal_cycle_metrics(
+    state: PlanetState, land_mask: np.ndarray
+) -> dict[str, Any]:
+    """Shape and level of the land annual temperature cycle (audit C1b).
+
+    Built 2026-08-03 because **nothing in the platform measured this**. C1b has
+    been worked across several sessions on numbers produced by throwaway offline
+    probes, so no result was regression-gated and each session re-derived the
+    same figures. The three quantities that matter are all here:
+
+    - ``squareness_months``: months a cell spends above its own annual mean. A
+      sinusoid gives 6.00; this model's land runs 7.0-7.9 (ocean 6.3-6.7), a
+      broad warm plateau joined to a narrow deep winter trough.
+    - ``warmest_c`` / ``coldest_c`` / ``mean_c``: the *level*, which turns out to
+      be the binding error rather than the shape. Measured offline, the forcing
+      entering ``_land_cap_1d`` has an annual mean ~21 K above Earth's at 41 deg,
+      and the clamp is the only thing hiding it -- so a metric that watched shape
+      alone would score a mean-bias fix as a regression.
+    - ``plateau_months``: months within 1 K of the cell's own warmest month. A
+      sinusoid gives ~1.4; a hard clamp writes a flat top and drives this toward
+      7. This is the clamp's fingerprint *in the output*.
+
+    Restricted to land, area-weighted, and to bands where a meaningful number of
+    land cells exist -- an ocean cell's cycle is damped by ``ocean_lag_days`` and
+    is not the phenomenon under test.
+
+    **A rejected first version, recorded so it is not rebuilt** (process note 11):
+    the obvious metric is the fraction of (cell, month) pairs sitting on
+    ``_land_cap_1d``. It reads **0.00 in three of four bands** and is useless,
+    because the clamp is applied to the ``T_base_land`` *forcing* while
+    ``monthly_temp`` is the output of a subsequent relaxation toward it -- the
+    output approaches the ceiling from below and essentially never touches it.
+    C1b's "binds on 55.7% of (month, row) pairs" is a forcing-stage number and
+    cannot be reproduced from any saved state. ``plateau_months`` measures the
+    same defect where it is actually observable.
+    """
+    monthly = state.monthly_temp
+    if monthly is None or np.asarray(monthly).ndim != 3:
+        return {}
+    monthly_c = np.asarray(monthly, dtype=np.float64) - 273.15
+    if monthly_c.shape[0] != 12 or not np.any(land_mask):
+        return {}
+    H = land_mask.shape[0]
+    lat = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * 180.0
+    # The shipped ceiling, recomputed here rather than imported: this metric must
+    # keep reporting a meaningful cap-bound fraction if the clamp is reshaped or
+    # retired, and importing the live array would make it silently follow.
+    weights = np.cos(np.radians(lat))
+
+    annual_mean = monthly_c.mean(axis=0)
+    above = (monthly_c > annual_mean[None, :, :]).sum(axis=0).astype(np.float64)
+    warmest = monthly_c.max(axis=0)
+    coldest = monthly_c.min(axis=0)
+    plateau = (monthly_c >= warmest[None, :, :] - 1.0).sum(axis=0).astype(np.float64)
+    # What a *pure sinusoid of this cell's own amplitude* would score on the same
+    # 1 K / 12-sample plateau test. A fixed constant cannot serve here: the test
+    # is in absolute kelvin, so a low-amplitude cycle spends more months within
+    # 1 K of its peak for reasons that have nothing to do with a clamp (at
+    # amplitude 28 K a sinusoid scores ~1.4 months, at 16 K it scores ~1.9).
+    # Comparing each cell against its own amplitude's sinusoid removes that
+    # dependence, so `plateau_excess_months` isolates the flat top itself and
+    # stays valid across the differing amplitudes of different bands.
+    # Closed form rather than a sampled model sinusoid: a sampled one has to
+    # assume where the peak falls relative to a month centre, and that choice
+    # alone moves the count by a whole month. The continuous fraction of a cycle
+    # spending within 1 K of its peak is (12/pi) * arccos(1 - 1/A) months, for
+    # half-amplitude A. Residual disagreement with the model's own 12-sample
+    # count is the sampling quantisation itself, ~0.5 months, which is well
+    # inside the 3-5 month signal a real clamp produces.
+    half_amplitude = np.maximum((warmest - coldest) / 2.0, 1e-9)
+    sinusoid_plateau = (12.0 / np.pi) * np.arccos(
+        np.clip(1.0 - 1.0 / half_amplitude, -1.0, 1.0)
+    )
+
+    bands: dict[str, Any] = {}
+    errors: list[float] = []
+    for name, reference in EARTH_LAND_CYCLE_REFERENCE.items():
+        rows = (lat >= reference["lat_s"]) & (lat < reference["lat_n"])
+        cells = np.asarray(land_mask, dtype=bool) & rows[:, None]
+        if int(np.count_nonzero(cells)) < 4:
+            continue
+        cell_weights = np.broadcast_to(weights[:, None], land_mask.shape)[cells]
+        total = float(cell_weights.sum())
+
+        def mean_of(field: np.ndarray) -> float:
+            return float((field[cells] * cell_weights).sum() / total)
+
+        warmest_c = mean_of(warmest)
+        coldest_c = mean_of(coldest)
+        mean_c = mean_of(annual_mean)
+        bands[name] = {
+            "squareness_months": mean_of(above),
+            "warmest_c": warmest_c,
+            "coldest_c": coldest_c,
+            "mean_c": mean_c,
+            "amplitude_k": warmest_c - coldest_c,
+            "warmest_bias_c": warmest_c - reference["warmest_c"],
+            "coldest_bias_c": coldest_c - reference["coldest_c"],
+            "mean_bias_c": mean_c - reference["mean_c"],
+            "plateau_months": mean_of(plateau),
+            "plateau_excess_months": mean_of(plateau - sinusoid_plateau),
+        }
+        # Shape only. The `warmest_bias_c`/`coldest_bias_c` terms this score used
+        # to include were scored against station anchors for a population this
+        # metric does not measure -- see EARTH_LAND_CYCLE_REFERENCE's note. They
+        # remain in `bands` for diagnosis; the anchor-free level authority is
+        # `koppen_temperature_thresholds`.
+        errors.extend(
+            [
+                abs(bands[name]["squareness_months"] - EARTH_LAND_SQUARENESS) * 5.0,
+                abs(bands[name]["plateau_excess_months"]) * 5.0,
+            ]
+        )
+    if not bands:
+        return {}
+    return {
+        "bands": bands,
+        # One scalar so this can be regression-gated and swept. Both terms are in
+        # months and are scaled by 5 so that a month of shape error registers on
+        # the same footing as 5 K would have -- keeping the score's magnitude
+        # comparable to the pre-2026-08-04 version it replaces.
+        "cycle_error_score": float(np.mean(errors)),
+    }
+
+
 def _koppen_land_percentages(state: PlanetState, land_mask: np.ndarray) -> dict[str, float]:
     """Köppen group shares of land, weighted by true cell AREA (cos-latitude).
 
@@ -280,6 +448,39 @@ def _koppen_map_skill(state: PlanetState, land_mask: np.ndarray) -> dict[str, An
             for name, value in report["per_region"].items()
         },
     }
+
+
+def _koppen_temperature_thresholds(
+    state: PlanetState, land_mask: np.ndarray
+) -> dict[str, Any]:
+    """Land coldest/warmest month vs Köppen's own threshold bounds (audit C1b).
+
+    The anchor-free companion to ``_land_seasonal_cycle_metrics``.  That metric
+    scores an area-weighted band mean against mid-continental *station* anchors,
+    which is a population mismatch -- see ``EARTH_LAND_CYCLE_REFERENCE``'s own
+    revised note.  This one asks a question the reference can answer exactly:
+    the reference calls this cell Dfb, so its coldest month is below -3 C; where
+    does the model put it?
+
+    Headline scalars are ``coldest_month.accuracy`` and ``warmest_month.accuracy``
+    (area-weighted fraction of scorable reference land the model places inside
+    the reference-implied interval), each paired with a signed
+    ``too_warm_fraction``/``too_cold_fraction`` so a change's *direction* is
+    visible rather than just its size.
+    """
+    if state.monthly_temp is None or not np.any(land_mask):
+        return {}
+    monthly = np.asarray(state.monthly_temp)
+    if monthly.ndim != 3 or monthly.shape[0] != 12:
+        return {}
+    try:
+        from koppen_reference import score_temperature_thresholds
+
+        return score_temperature_thresholds(
+            monthly, land_mask=land_mask, model_codes=state.koppen_type
+        )
+    except (FileNotFoundError, ValueError):
+        return {}
 
 
 def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, Any]:
@@ -429,8 +630,12 @@ def summarize_real_terrain_climate(
         "orographic_contrast": _orographic_contrast_metrics(
             mean_precipitation_mm_day, land_mask
         ),
+        "land_seasonal_cycle": _land_seasonal_cycle_metrics(state, land_mask),
         "koppen_land_percent": _koppen_land_percentages(state, land_mask),
         "koppen_map_skill": _koppen_map_skill(state, land_mask),
+        "koppen_temperature_thresholds": _koppen_temperature_thresholds(
+            state, land_mask
+        ),
         "precip_rescale": _precip_rescale_metrics(state, planet_params),
         "reference_error_score": reference_error_score,
     }
@@ -658,6 +863,26 @@ def compare_validation_reports(
                 failures.append(
                     f"koppen_map_skill.{name}: {got:.6g} vs baseline {want:.6g} "
                     f"(allowed ±{absolute_tolerance:g})"
+                )
+
+    # Anchor-free land temperature skill (audit C1b). Gated on the two headline
+    # accuracies only; the directional too_warm/too_cold splits and the per-zone
+    # breakdown are diagnostic, and a change that moves land across a Köppen
+    # threshold necessarily moves both halves of a split at once.
+    baseline_thresholds = baseline_metrics.get("koppen_temperature_thresholds") or {}
+    current_thresholds = current_metrics.get("koppen_temperature_thresholds") or {}
+    if baseline_thresholds and current_thresholds:
+        for name in ("coldest_month", "warmest_month"):
+            want_entry = baseline_thresholds.get(name) or {}
+            got_entry = current_thresholds.get(name) or {}
+            if "accuracy" not in want_entry or "accuracy" not in got_entry:
+                continue
+            got = float(got_entry["accuracy"])
+            want = float(want_entry["accuracy"])
+            if abs(got - want) > 0.03:
+                failures.append(
+                    f"koppen_temperature_thresholds.{name}.accuracy: {got:.6g} "
+                    f"vs baseline {want:.6g} (allowed ±0.03)"
                 )
 
     for name, want_values in baseline_metrics["zonal"].items():

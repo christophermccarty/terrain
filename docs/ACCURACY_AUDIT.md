@@ -1096,6 +1096,193 @@ the evap-cooling seasonal gate (7.00→7.00), snow/ice albedo (never-freezing la
 7.98), and resolution quantization (7.00 at heights 96/192 alike). Best lead: it grows with
 integration time, so the mechanism has multi-year memory — test soil moisture first.
 
+#### C1b-2026-08-03. 🔴 Root cause corrected, instrument built, square wave demonstrably removable — but the fix is net-negative on per-cell accuracy and ships inert
+
+**The diagnosis above is aimed at the wrong quantity, and that is why five knobs have now failed
+against it.** Measured offline, stage by stage:
+
+| stage | squareness 30°N | 41.4°N | 50°N |
+|---|---|---|---|
+| radiative equilibrium only | 6.61 | 6.51 | 6.44 |
+| + the three transport trapezoids | 6.61 | 6.51 | 6.44 |
+| + evapotranspiration cooling | **7.20** | **7.17** | **6.87** |
+| + `_land_cap_1d` | **7.73** | **7.89** | **7.43** |
+
+Three things follow that the entry above gets wrong:
+
+1. **The radiative base is fine** — 6.44–6.61, inside the ocean's own 6.31–6.72 band. Nothing
+   upstream is producing a square wave, so "the mechanism has multi-year memory, test soil moisture"
+   was chasing a secondary drift, not the cause.
+2. **There are two clamps, not one.** The evapotranspiration cooling contributes as much squareness
+   as `_land_cap_1d` does (+0.66 vs +0.72 at 41.4°N). It is
+   `summer_factor · 0.85 · soil · max(T − 290, 0)` — proportional to the *excess*, summer only,
+   i.e. a soft clamp toward 290 K. C1b lists "the evap-cooling seasonal gate" as refuted, but that
+   sweep moved `evap_cooling_season_width`, which changes *when* the term engages, not that it
+   contracts the top. The mechanism was inside the term the whole time.
+3. **The binding error is the annual mean, not the shape.** At 41.4°N the forcing reaching the cap
+   has an annual mean of **32.1 °C against Earth's ~10 °C**. `_land_cap_1d` is therefore not a
+   ceiling on a sound cycle, it is a **mean-bias corrector wearing a ceiling's clothes** — it deletes
+   the summer half of a +21 K year-round error and leaves the winter half, which is how the model
+   ends up with a plausible warmest month and a plausible coldest month joined by seven identical
+   ones. The source is unambiguous: the radiative base's *mean* is right (6.1 °C at 41.4°N) and its
+   *amplitude* is 81 K against Earth's ~28 K, while the three trapezoids add **+26 K every month**.
+
+**This explains every previous failure at once.** A first-order relaxation preserves the annual mean
+exactly, and `land_transport_seasonality` also preserves it (its `summer_signal` averages to zero
+over an orbit). So all four shipped knobs are *amplitude-side levers aimed at a level error* — they
+could only trade one error for another, which is precisely the share-improves/accuracy-doesn't
+pattern C1b recorded without being able to explain. Swept directly: at a land time constant of
+**120 days** the summer target is still 48 °C and the clamp still binds on 59% of the cycle.
+
+**Instrument built** (process note 13): `metrics.land_seasonal_cycle` in `real_terrain_validation`,
+reporting per latitude band the squareness, plateau width, warmest/coldest/mean and their biases
+against `EARTH_LAND_CYCLE_REFERENCE`, plus one `cycle_error_score`. **Nothing in the platform
+measured any of this before** — C1b has been worked across several sessions entirely on throwaway
+offline probes, which is why no result was regression-gated and each session re-derived the same
+figures. A first version reporting the fraction of cells *sitting on* `_land_cap_1d` was built and
+rejected: it reads 0.00 in three of four bands, because the clamp applies to the `T_base_land`
+forcing while `monthly_temp` is the output of a later relaxation toward it — **C1b's "binds on 55.7%
+of (month, row) pairs" is a forcing-stage number and cannot be reproduced from any saved state.**
+
+**Three mechanisms shipped, all inert**: `land_transport_deficit_k` (gates the trapezoids by
+`clip((273.15 − T_pre)/D, 0, 1)` — self-limiting, per cell, no prescribed seasonal schedule, which
+is what eddy heat flux actually does), `land_transport_deficit_gain` (the affordance the gate
+creates: once summer transport is identically zero the winter magnitude can be raised on its own
+merits), and `land_thermal_inertia_days`.
+
+**They work on the cycle.** On the tracked land bands the square wave is essentially removed —
+squareness **7.00 → 6.00–6.46**, the first time this number has moved at all — amplitude improves
+(35–45°N 22.1 → 24.3 K against Earth's 28), and 45–55°N's mean bias goes −0.2 → +0.5 K.
+
+**And they are net-negative on per-cell classification, confirmed on a converged run so it is not a
+spinup transient** (128×256, 14 yr, Köppen's own 10 yr EMA fully spun up):
+
+| | refErr | H10 group | H10 class | kappa | share MAE | cycle err | Csa | Csb |
+|---|---|---|---|---|---|---|---|---|
+| baseline | 0.1592 | **0.6868** | **0.4005** | **0.6019** | 3.66 | 3.72 | 1.80 | 0.20 |
+| D=25, gain 1.5 | 0.1647 | 0.6821 | 0.3999 | 0.5966 | 2.64 | **2.72** | **2.08** | **0.37** |
+| D=40, gain 2.0 | 0.1724 | 0.6751 | 0.3982 | 0.5879 | **2.14** | **2.63** | **2.08** | 0.32 |
+
+Group accuracy and kappa fall by ~0.5–1.2pp in every configuration tried, at 3 yr and at 14 yr
+alike, while share MAE, cycle error, Csa and Csb all improve. Per process note 10 and this entry's
+own precedent, that is not a default change.
+
+**The genuinely new finding, and the next session's target: the model's Köppen accuracy currently
+depends on a compensating error.** Making the land cycle physically *more* correct moves cells
+across Köppen boundaries in a net-negative direction, which means a second error is being cancelled
+by the first. The cycle metric localizes it: after the fix, 45–55°N is close to Earth on every
+measure (mean bias +0.5 K, squareness 6.22) while **25–45°N winters remain 8–10 K too warm with
+amplitudes of 18–24 K against Earth's 28**. That residual is `_midlat_storm_bonus_1d`'s 22°→42° ramp
+— but narrowing it was tested (ramp start 22° → 35°) and makes group accuracy *worse* (0.6946 →
+0.6757), so it is not a simple over-provisioning either. **Fix the 25–45°N winter warm bias first,
+then re-run this table**; the shape mechanisms are wired and waiting.
+> **⚠️ Superseded 2026-08-04 — see C1b-2026-08-04 below before acting on this paragraph.** The
+> "25–45°N winters remain 8–10 K too warm" figure comes from `land_seasonal_cycle`, whose level
+> anchors describe mid-continental stations while the metric averages over all land in the band.
+> Anchor-free, 100% of 25-35N reference-temperate land is correctly placed and the real residual is
+> confined to ~22% of 35-45N — with the *opposite* sign at 45-55N. The "compensating error"
+> hypothesis in the paragraph above is most likely the bad scoreboard, not physics.
+
+**A latent bug found along the way, worth its own attention**: `_evolve_temperature`'s
+`land_blend = 0.2` is a fraction per *call*, not per day, so the land's only thermal inertia — and
+with it the entire amplitude of the land annual cycle — is set by whatever step length the caller
+uses. A 12-day span retains 0.800 of the prior temperature in one step against 0.069 in twelve.
+`land_thermal_inertia_days` converts it to `1 − exp(−dt/τ)`, which is split-invariant exactly.
+**It does not fix `simulate_step` end to end** (measured: the 12-way-split land discrepancy goes
+4.34 K → 5.44 K, because other terms scale linearly in `days` and dominate) — so it is a correctness
+fix for one term, not a remedy for MONTHLY-vs-DAILY differences.
+
+#### C1b-2026-08-04. 🟡 The "25–45°N winter warm bias" was mostly the metric. Anchor-free instrument built; the residual is real, much smaller, and has *both* signs
+
+C1b-2026-08-03 closed by naming this as "the next session's target": *"Fix the 25–45°N winter warm
+bias first, then re-run this table."* That session was run. **The target as stated does not survive
+its own instrument**, and this is process note 8's fourth instance — the fourth time an
+instrument change, not a physics change, produced the session's largest correction.
+
+**`EARTH_LAND_CYCLE_REFERENCE`'s level anchors describe a different population than the metric
+averages over.** The anchors are, in that constant's own words, "mid-continental stations";
+`_land_seasonal_cycle_metrics` computes an **area-weighted mean over all land in the band**. Those
+diverge hardest in exactly the bands C1b works on. Measured from the bundled Köppen reference's own
+composition:
+
+| band | reference land composition | anchor `coldest_c` |
+|---|---|---|
+| 25-35N | **54% B** (BWh alone 42%), 34% C, 8% E (Tibet), 2.5% D | −2.0 °C |
+| 35-45N | 34% B (BWk/BSk), 40% C, 22% D | −4.0 °C |
+| 45-55N | 65% D, 18% C, 15% B | −8.0 °C |
+
+25-35N land is majority hot desert plus a Tibetan fringe. It is not "mid-continental" and its true
+area-weighted coldest month is nowhere near −2 °C, so the metric's reported **+12.85 K warm bias
+there is the anchor, not the model** — confirmed directly: on the same 128×256 run, **100%** of that
+band's reference-C land sits correctly inside both the −3 °C and +18 °C bounds its class requires.
+Optimising `cycle_error_score` drives the subtropics cold, which is the most likely explanation for
+C1b's own recurring, previously-unexplained finding that every knob improving that score degraded
+H10 accuracy. **It was never a compensating physics error; it was a scoreboard pointing the wrong
+way.**
+
+**Instrument shipped: `metrics.koppen_temperature_thresholds`** (`koppen_reference.
+score_temperature_thresholds`), regression-gated on its two headline accuracies. It needs no anchors
+at all — every reference-classified cell carries an exact definitional constraint (a Dfb cell *is* a
+cell whose coldest month is below −3 °C; the bundled map is the −3 °C variant), so the model is
+scored against the reference's own thresholds on exactly the cells being measured. It gives up
+magnitude in exchange: it reports how much land is on the wrong side of a boundary and in which
+direction, not how many kelvin out. B is excluded from the coldest-month score (arid-defined, no
+temperature constraint) and `Cwa` from the warmest-month score (Cwa/Cwb/Cwc fold together and
+disagree about the 22 °C bound — scoring it would score the folding). 13 tests, of which the six
+load-bearing ones were each confirmed to **fail** on a planted violation: missing cos(lat), scoring
+arid cells, scoring the folded Cwa, the 0 °C variant boundary, dropping the Dwd −38 °C refinement,
+and swapping the warm/cold direction split. (The other seven are input-validation and
+bound-assignment cases that a planted violation would break by construction.)
+
+**`cycle_error_score` is now shape-only.** Its two level terms were the anchor-dependent ones; the
+band biases are still reported for diagnosis. `plateau_months` also gained a self-calibrating
+companion, `plateau_excess_months`: the plateau test is in absolute kelvin, so a low-amplitude cycle
+scores more plateau months for reasons that have nothing to do with a clamp (a sinusoid scores ~1.4
+months at 28 K amplitude but ~1.9 at 16 K). Each cell is now compared against its *own* amplitude's
+sinusoid, which removes that dependence. Squareness needed no such fix — a sinusoid gives exactly
+6.00 at every amplitude.
+
+**The re-scoped defect, 128×256 baseline.** Global coldest-month accuracy is **0.865** (7.2% of land
+too warm, 6.4% too cold) and warmest-month **0.714**. The band means were hiding two things:
+
+- **The worst zone is 40-50N (0.629), and its error has both signs at once** — 22% too warm *and*
+  15% too cold. A single-signed "winters are too warm" diagnosis cannot describe it, and no
+  latitude-only term can fix it.
+- Split by reference group, the two halves are opposed: **35-45N reference-D land is 94.8% too
+  warm** (model coldest month +1.17 °C against the < −3 °C its class requires) while **45-55N
+  reference-C land is 99.5% too cold** (−8.66 °C against ≥ −3 °C). The second of those is C1's
+  known residual; the first is what C1b was chasing, and it is confined to ~22% of one band rather
+  than spanning 25-45°N.
+- Also newly visible and **not previously recorded**: reference-E land is **53.9% too warm** on its
+  warmest month, and 30-40N is 27% too warm. The polar summer figure is large enough to deserve its
+  own look.
+
+**A mechanism was built for it, and it is a clean negative result** —
+`PlanetParams.land_transport_maritime_decay` (+ `land_transport_maritime_km`, e-folding 1200 km),
+**shipped inert at 0.0**, verified bit-identical at that default across all 355 numeric metrics. All
+three transport trapezoids are pure functions of |latitude|, so every land cell in a row receives an
+identical winter bonus and the model has *no maritime moderation gradient at all*; this adds one,
+mean-preserving across each row's land so the calibrated zonal level is untouched. The proximity
+field is right (Britain 0.72, Paris 0.63, US Midwest 0.27, Novosibirsk 0.17) and the effect is
+correctly signed where continentality is the discriminator — at 45-55N it warms reference-C land
+across the sweep. But every bounded metric degrades monotonically (group accuracy 0.7082→0.7040,
+40-50N zone 0.6286→0.6098 at decay 1.5).
+
+**Why, and this is the finding worth carrying forward: at 35-45N, reference-D land is not more
+continental than reference-C land.** Measured on the model's own coarse temperature grid, maritime
+proximity is **0.312 vs 0.310** and elevation **0.062 vs 0.049** — indistinguishable on both
+candidate discriminators, so the mechanism *warms* the very cells it was built to cool. The
+genuinely continental cells at that latitude are the arid ones (maritime 0.125), which Köppen scores
+on precipitation and which this cannot reach.
+
+**Next lever, now a well-posed question rather than a target number**: whatever separates 35-45N's
+C from its D is neither distance from the ocean nor height. Find that discriminator before building
+another mechanism — the two obvious ones are now measured and excluded. Note also that the model's
+land temperature forcing is computed on a **coarse** grid (32×64 at the tracked 128×256 config,
+`block_size=4`), where a continent spans ~10 cells; that is a real ceiling on how much geographic
+temperature contrast the model can express at all, and it is worth establishing whether it binds
+here before attributing the residual to physics.
+
 ### C2. 🟢 Calendar aliasing — ANNUAL/MONTHLY seasonal-phase drift — fixed, verified 2026-08-01
 **Was**: the old `optimizer/headless.py`'s `_SUBSTEPS[ANNUAL]` advanced exactly 364.0 days per
 nominal year vs. `orbital_period_days=365.2422` — a 1.2422-day/year phase slip that completed a
@@ -1647,6 +1834,22 @@ group score (a model that never emits Csa still scores C correctly if it emits C
    meaningful there, never the level. `metrics.orographic_contrast` now reports the annual-mean
    version and returns `{}` below 256×512 rather than emitting a confident number from boxes that do
    not resolve.
+17. **A reference constant describes a *population*, and the metric must aggregate over that same
+   population** (2026-08-04, C1b-2026-08-04). This is note 8's bug class with a different disguise:
+   note 8 was a missing `cos(lat)` inside the aggregation, this is a mismatch between what the
+   aggregation covers and what the reference number means. `EARTH_LAND_CYCLE_REFERENCE` says in its
+   own comment that its values come from "mid-continental stations"; the metric next to it computes
+   an area-weighted mean over **all** land in the band, and 25-35N land is 54% arid subtropics. The
+   result was a reported **+12.85 K** winter warm bias in a band where an anchor-free check finds
+   **100%** of the reference-temperate land correctly placed — and an entire session-spanning
+   hypothesis ("the model's Köppen accuracy depends on a compensating error") built on top of it,
+   because every knob that improved the bad score did degrade the good one. **Practical rules**: (a)
+   when you write a reference constant, write down the population it describes, not just the number
+   and the source; (b) when a metric and a bounded skill score consistently disagree about the sign
+   of an improvement, suspect the metric's reference before inventing physics to explain the
+   conflict; (c) prefer references that are *definitional* over ones that are typical — Köppen's own
+   class thresholds gave an exact per-cell constraint here, needing no anchors at all, and could
+   have been used from the start.
 13. **Build the instrument before the fix, and expect the instrument itself to be the finding**
    (2026-08-02). H10's gridded map score was built as infrastructure to support orographic work, and
    before a single physics change it had already shown that the model **cannot emit Csa, Csb, Cwa,

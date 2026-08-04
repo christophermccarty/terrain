@@ -41,6 +41,29 @@ can emerge on its own (jets, monsoons, real storm dynamics).
   **Best lead:** it grows with integration time (7.00 at 4yr → 7.97 at 23.8yr),
   so the mechanism has multi-year memory; test soil moisture first by holding it
   fixed over a long run and re-measuring.
+  > **Superseded 2026-08-03 — cause found, and the soil-moisture lead was the
+  > wrong trail** (ACCURACY_AUDIT.md **C1b-2026-08-03**). Traced stage by stage,
+  > the radiative base is already fine (6.44–6.61, inside the ocean's own band);
+  > the squareness is manufactured by **two** clamps, `_land_cap_1d` *and* the
+  > excess-proportional evapotranspiration cooling, in roughly equal measure.
+  > More importantly the binding error is the annual **mean** — the forcing runs
+  > +21 K at 41°N — which is why the four knobs shipped here, all amplitude-side,
+  > could never move it. Three new gated mechanisms take squareness **7.00 →
+  > 6.00**, but cost ~0.5pp of H10 group accuracy at both 3 yr and a converged
+  > 14 yr, so they ship inert. Next target is the **25–45°N winter warm bias**
+  > (8–10 K), which is what remains after the shape is fixed.
+  > **Corrected 2026-08-04 (ACCURACY_AUDIT.md C1b-2026-08-04): that "next
+  > target" was mostly the scoreboard.** The 8–10 K figure came from
+  > `land_seasonal_cycle`, whose level anchors describe mid-continental stations
+  > while the metric area-averages *all* land in the band (25-35N land is 54%
+  > arid subtropics). Scored against Köppen's own definitional thresholds
+  > instead — the new, anchor-free `koppen_temperature_thresholds` — **100%** of
+  > 25-35N reference-temperate land is correctly placed. The real residual is
+  > ~22% of 35-45N being too warm *and* 99.5% of 45-55N maritime land being too
+  > cold: two signs inside one zone, which no latitude-only term can fix. A
+  > continentality mechanism was built for it and is a measured negative result
+  > (`land_transport_maritime_decay`, inert) — at 35-45N the reference-D land is
+  > neither more continental nor higher than the reference-C land.
   > **Scope narrowed 2026-08-03 (ACCURACY_AUDIT.md A6).** "A direct cause of the
   > model emitting no Mediterranean climate" is now only half true. **Csa was
   > recovered from precipitation alone** (0.01% → 1.93% of land, against Earth's

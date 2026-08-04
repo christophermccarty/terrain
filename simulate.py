@@ -90,6 +90,12 @@ _RELAX_CACHE = {"key": None, "u": None, "v": None}
 # this threshold (for example 8.0 reproduces the former coarse cadence).
 _PRECIP_SUBSTEP_DAYS = 1.0
 
+# Reference temperature for `PlanetParams.land_transport_deficit_k`'s gate. The
+# freezing point rather than a fitted constant: poleward eddy heat flux into a
+# continent is a winter phenomenon, and 273.15 K is the physically meaningful
+# boundary rather than one more tunable. The gate's *width* is the parameter.
+_LAND_TRANSPORT_DEFICIT_REF_K = 273.15
+
 
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
                                         humidity, soil_moisture, soil_moisture_deep,
@@ -228,6 +234,64 @@ def _soft_min_cap(x: np.ndarray, cap: np.ndarray, width: float) -> np.ndarray:
         return np.minimum(x, cap)
     z = (cap - x) / width
     return (cap - width * np.logaddexp(0.0, z)).astype(np.float32, copy=False)
+
+
+_MARITIME_CACHE: dict = {"key": None, "field": None}
+
+
+def _maritime_proximity(
+    land_mask: np.ndarray, e_folding_km: float, planet_radius_km: float
+) -> np.ndarray:
+    """``exp(-distance_to_nearest_ocean / e_folding_km)`` over land, 0 on ocean.
+
+    Computed by iterated max-decay dilation outward from the sea mask rather
+    than a true distance transform, so this stays pure numpy -- the project has
+    no scipy dependency in its simulation path and this is not a good reason to
+    add one. The two differ only where the shortest path to open water is
+    strongly diagonal, which is well inside this mechanism's own calibration
+    uncertainty.
+
+    Resolution-invariance is handled the way `atmosphere.py`'s monsoon inland
+    mask handles it (and for the same reason -- a fixed cell reach silently
+    became a different physical distance on every grid): the per-step decay is
+    derived from each axis's own physical spacing in km, and the longitudinal
+    spacing carries its cos(latitude) convergence, so the field is a function of
+    real distance rather than of cell count.
+    """
+    H, W = land_mask.shape
+    key = (H, W, float(e_folding_km), float(planet_radius_km),
+           int(np.count_nonzero(land_mask)), hash(land_mask.tobytes()))
+    if _MARITIME_CACHE["key"] == key:
+        return _MARITIME_CACHE["field"]
+
+    lat_spacing_km = np.pi * planet_radius_km / H
+    lat = (0.5 - (np.arange(H, dtype=np.float64) + 0.5) / H) * np.pi
+    lon_spacing_km = np.maximum(
+        2.0 * np.pi * planet_radius_km * np.cos(lat) / W, 1e-3
+    )
+    decay_lat = np.float32(np.exp(-lat_spacing_km / max(e_folding_km, 1e-6)))
+    decay_lon = np.exp(
+        -lon_spacing_km / max(e_folding_km, 1e-6)
+    ).astype(np.float32)[:, None]
+
+    field = (~np.asarray(land_mask, dtype=bool)).astype(np.float32)
+    # Three e-foldings along the *finest* axis is where the field has decayed to
+    # ~5%; beyond that the iteration cannot change any value materially.
+    finest = min(lat_spacing_km, float(lon_spacing_km.max()))
+    steps = int(np.clip(np.ceil(3.0 * e_folding_km / max(finest, 1e-6)), 1, 512))
+    for _ in range(steps):
+        updated = np.maximum(field, np.roll(field, 1, axis=0) * decay_lat)
+        updated = np.maximum(updated, np.roll(updated, -1, axis=0) * decay_lat)
+        updated = np.maximum(updated, np.roll(updated, 1, axis=1) * decay_lon)
+        updated = np.maximum(updated, np.roll(updated, -1, axis=1) * decay_lon)
+        if np.array_equal(updated, field):
+            break
+        field = updated
+    field = (field * np.asarray(land_mask, dtype=np.float32)).astype(np.float32)
+    field.flags.writeable = False
+    _MARITIME_CACHE["key"] = key
+    _MARITIME_CACHE["field"] = field
+    return field
 
 
 def _evolve_temperature_substepped(
@@ -921,6 +985,16 @@ def simulate_step(
     # original site further down, just above the evapotranspiration cooling)
     # because the transport seasonality below needs it too -- it depends only
     # on `pp`, `new_day` and `lat`, so hoisting it is side-effect free.
+    # Coarse land mask, hoisted here (from the evapotranspiration block below)
+    # so the continentality weighting on the transport bonus can use it too.
+    # Depends only on `state.elevation` and the coarse grid, so the move is
+    # side-effect free and the cached coarsening is shared, not repeated.
+    if state.elevation is not None:
+        _elev_c_early = _coarsen_elevation_cached(state.elevation, Hc, Wc, block_size)
+        _, _land_mask_early = get_masks(_elev_c_early)
+    else:
+        _land_mask_early = np.zeros((Hc, Wc), dtype=bool)
+
     _delta_season = pp.solar_declination(new_day)
     _summer_signal_1d = np.sign(lat) * (_delta_season / max(pp.obliquity_rad, 1e-6))
     _summer_factor_1d = np.clip(_summer_signal_1d, 0.0, 1.0).astype(np.float32)  # 0 in winter, 1 at local summer peak
@@ -940,10 +1014,89 @@ def simulate_step(
         1.0 - float(pp.land_transport_seasonality) * _summer_signal_1d
     ).astype(np.float32)
 
-    T_base_land = T_base_land + (
+    _transport_total_1d = (
         (_atm_land_transport_1d + _midlat_storm_bonus_1d + _handoff_bonus_1d)
         * _land_transport_season_1d
     )[:, None].astype(np.float32, copy=False)
+    # Continentality (2026-08-04, audit C1b). All three trapezoids above are pure
+    # functions of |latitude|, so every land cell in a row receives the identical
+    # winter heat-transport bonus -- the model has no maritime moderation
+    # gradient at all. Measured against the Koppen reference's own threshold
+    # bounds (`koppen_temperature_thresholds`), that shows up as an error with
+    # *both* signs inside one latitude zone: at 40-50N the model puts 22% of
+    # reference land too warm and 15% too cold, and the split is by
+    # continentality -- 94.8% of 35-45N reference-D (continental) land has a
+    # coldest month above the -3 C its class requires, while 99.5% of 45-55N
+    # reference-C (maritime) land is below it. No latitude-only term can fix a
+    # defect whose sign flips within a row.
+    #
+    # Deliberately **mean-preserving across each row's land**: the zonal-mean
+    # level here was calibrated by C1's handoff work and the three trapezoids'
+    # own tuning, and this mechanism exists to add contrast, not to relitigate
+    # that level. `land_transport_maritime_decay = 0.0` is an exact no-op.
+    #
+    # **Shipped inert -- a measured negative result, not an unswept knob.** It
+    # helps at 45-55N and hurts at 35-45N, where reference-D land turns out to
+    # be neither more continental nor higher than reference-C land (0.312 vs
+    # 0.310 maritime proximity, 0.062 vs 0.049 elevation). Full sweep table and
+    # the reasoning are in the field's docstring in planet_params.py; do not
+    # re-enable it without a discriminator that actually separates those two.
+    _maritime_decay = float(pp.land_transport_maritime_decay)
+    if _maritime_decay > 0.0 and np.any(_land_mask_early):
+        _maritime = _maritime_proximity(
+            _land_mask_early,
+            float(pp.land_transport_maritime_km),
+            float(pp.radius_m) / 1000.0,
+        )
+        _land_f_early = _land_mask_early.astype(np.float32)
+        _land_per_row = _land_f_early.sum(axis=1, keepdims=True)
+        _maritime_row_mean = np.divide(
+            (_maritime * _land_f_early).sum(axis=1, keepdims=True),
+            np.maximum(_land_per_row, 1.0),
+        )
+        # Rows with no land contribute nothing; their factor is left at 1.0.
+        _maritime_factor = np.where(
+            _land_per_row > 0.0,
+            1.0 + _maritime_decay * (_maritime - _maritime_row_mean),
+            1.0,
+        )
+        _transport_total_1d = (
+            _transport_total_1d * np.clip(_maritime_factor, 0.0, 2.0)
+        ).astype(np.float32, copy=False)
+    # Deficit gating (2026-08-03, audit C1b). The three trapezoids above are
+    # sized for a winter deficit but added every month, which is the *mean*
+    # error `_land_cap_1d` below then hides: measured offline at 41.4 deg, they
+    # push the annual-mean target to 32 C against Earth's ~10 C, and no
+    # amplitude-side knob can touch that (a relaxation preserves the mean
+    # exactly, and `land_transport_seasonality` also does, since its seasonal
+    # signal averages to zero over a year). That is why C1b's four shipped
+    # knobs all traded shape for level and lost H10 accuracy.
+    #
+    # Real eddy heat flux scales with the meridional temperature gradient *and
+    # damps it*, so the physically-shaped form is self-limiting: full strength
+    # into a cold winter continent, nothing into a warm summer one, with no
+    # prescribed seasonal schedule at all. Gating on the cell's own pre-bonus
+    # temperature gives exactly that, and per-cell rather than per-row, so cold
+    # continental interiors draw more than mild maritime cells at the same
+    # latitude -- which is also the right sign for the continentality gradient.
+    # `land_transport_deficit_k = 0.0` disables it and reproduces the flat
+    # trapezoids bit-for-bit.
+    _deficit_k = float(pp.land_transport_deficit_k)
+    if _deficit_k > 0.0:
+        # `land_transport_deficit_gain` is the affordance the gate creates and
+        # is meaningless without it: once summer transport is identically zero,
+        # the winter magnitude can be raised without re-opening the summer
+        # overshoot that forced the clamp in the first place. The three
+        # trapezoids were each capped by exactly that constraint, so their
+        # calibrated peaks are lower bounds, not tuned optima.
+        _transport_total_1d = (
+            _transport_total_1d
+            * float(pp.land_transport_deficit_gain)
+            * np.clip(
+                (_LAND_TRANSPORT_DEFICIT_REF_K - T_base_land) / _deficit_k, 0.0, 1.0
+            ).astype(np.float32, copy=False)
+        )
+    T_base_land = T_base_land + _transport_total_1d
 
     # Evapotranspiration/convective cooling (2026-07, root-cause fix for the summer
     # overheating _land_cap_1d above only ever patched post-hoc): real land loses
@@ -974,11 +1127,9 @@ def simulate_step(
         _soil_2d = _coarsen_many({"soil": state.soil_moisture}, Hc, Wc, block_size)["soil"]
     else:
         _soil_2d = np.full((Hc, Wc), 0.55, dtype=np.float32)
-    if state.elevation is not None:
-        _elev_c_early = _coarsen_elevation_cached(state.elevation, Hc, Wc, block_size)
-        _, _land_mask_early = get_masks(_elev_c_early)
-    else:
-        _land_mask_early = np.zeros((Hc, Wc), dtype=bool)
+    # `_land_mask_early` is computed further up (hoisted so the continentality
+    # weighting on the transport bonus can share it) -- it depends only on
+    # `state.elevation` and the coarse grid, so hoisting is side-effect free.
     # `_summer_factor_1d` is computed further up (hoisted so the winter transport
     # boost can share the same seasonal signal) -- the two are exactly out of phase.
     _EVAP_COOL_THRESHOLD_K = 290.0
@@ -2819,7 +2970,26 @@ def _evolve_temperature(
     # --- Land surface blend toward seasonal baseline ---
     if T_base_land is not None:
         T_base_land = T_base_land - lapse_rate * alt_km
-        land_blend = np.where(land_mask, 0.2, 0.0)
+        # This is the land's *only* thermal inertia, and 0.2 is a fraction per
+        # CALL rather than per day -- so its effective time constant is set by
+        # whatever step length the caller happens to use. Over a 12-day span
+        # this keeps 0.800 of the prior temperature integrated as one step and
+        # 0.069 integrated as twelve, from identical physics. Same defect class
+        # as the monsoon mask's fixed cell count: a physical scale expressed in
+        # units of the discretisation.
+        #
+        # `land_thermal_inertia_days > 0` converts it to `1 - exp(-dt/tau)`,
+        # which makes *this term* split-invariant exactly. It does NOT make
+        # `simulate_step` step-length invariant end to end -- measured, the
+        # 12-way-split land discrepancy goes 4.34 K -> 5.44 K, because the
+        # residual is dominated by other terms that scale linearly in `days`.
+        # 0.0 keeps the historical constant and is an exact no-op.
+        _tau_land = float(_pp.land_thermal_inertia_days)
+        if _tau_land > 0.0:
+            _land_rate = float(1.0 - np.exp(-float(days) / _tau_land))
+        else:
+            _land_rate = 0.2
+        land_blend = np.where(land_mask, _land_rate, 0.0)
         T_sst = ((1.0 - land_blend) * T_sst + land_blend * T_base_land).astype(np.float32, copy=False)
 
     # --- Equal-and-opposite air–surface sensible heat exchange (OCEAN ONLY) ---
@@ -3066,5 +3236,7 @@ def clear_simulation_caches() -> None:
     _OCEAN_ADJ_CACHE.update({"adj": None, "last_update_day": -9999.0})
     _CARBON_SLOW_CACHE.clear()
     _CARBON_SLOW_CACHE.update({"key": None, "last_update_day": -9999.0, "biome": None})
+    _MARITIME_CACHE.clear()
+    _MARITIME_CACHE.update({"key": None, "field": None})
     clear_all_caches()
     clear_temperature_cache()

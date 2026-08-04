@@ -217,6 +217,163 @@ class PlanetParams:
     Lower values allow more polar warming; higher values sharpen the
     equator-to-pole gradient."""
 
+    land_transport_maritime_decay: float = 0.0
+    """Continentality contrast on the land heat-transport bonus. 0.0 is an exact
+    no-op; positive values move part of each row's bonus from its continental
+    interior to its maritime margins, **preserving the row's land mean**.
+
+    **The defect this addresses** (2026-08-04, audit C1b). All three transport
+    trapezoids (`_atm_land_transport_1d`, `_midlat_storm_bonus_1d`,
+    `_handoff_bonus_1d`) are pure functions of |latitude|, so every land cell in
+    a row gets the identical winter bonus and the model has no maritime
+    moderation gradient at all. C1b previously read this as a single-signed
+    "25-45N winters are 8-10 K too warm", measured against
+    `EARTH_LAND_CYCLE_REFERENCE`'s mid-continental station anchors. Those anchors
+    do not describe the population that metric averages over (see its own note),
+    and the anchor-free `koppen_temperature_thresholds` shows the real defect has
+    **both signs inside one latitude zone**: at 40-50N, 22% of reference land is
+    too warm and 15% too cold, split by continentality --
+
+    - 35-45N reference-**D** (continental) land: **94.8%** has a coldest month
+      above the -3 C its Koppen class requires;
+    - 45-55N reference-**C** (maritime) land: **99.5%** is below it.
+
+    No latitude-only term can fix an error whose sign flips within a row, which
+    is why five previous knobs aimed at the band mean all traded one error for
+    another.
+
+    Mean-preserving by construction: the zonal-mean winter level was calibrated
+    by C1's `_handoff_bonus_1d` work and the trapezoids' own tuning, and this
+    knob exists to add contrast, not to reopen that. See
+    `land_transport_maritime_km` for the length scale.
+
+    **Ships inert at 0.0 because it is a measured negative result** -- kept, per
+    the audit's process note 2, so the next session finds a tested mechanism and
+    this table instead of rebuilding it. Swept at 128x256:
+
+    | decay | H10 group | H10 class | kappa | Tcold acc | 40-50N zone |
+    |-------|-----------|-----------|-------|-----------|-------------|
+    | 0.0   | 0.7082    | 0.4223    | 0.6303| 0.8646    | 0.6286      |
+    | 0.3   | 0.7075    | 0.4214    | 0.6295| 0.8643    | 0.6249      |
+    | 0.6   | 0.7067    | 0.4207    | 0.6283| 0.8635    | 0.6186      |
+    | 1.0   | 0.7057    | 0.4204    | 0.6271| 0.8638    | 0.6147      |
+    | 1.5   | 0.7040    | 0.4193    | 0.6250| 0.8633    | 0.6098      |
+
+    Every bounded metric degrades monotonically. **The mechanism works; the
+    premise does not hold at 35-45N**, and that is the useful finding. The
+    maritime field itself is correct (Britain 0.72, Paris 0.63, US Midwest 0.27,
+    Novosibirsk 0.17, central Siberia 0.15) and the direction of effect is right
+    -- at 45-55N it warms reference-C land (Tcold -8.66 -> -8.42 across the
+    sweep) and cools reference-D, exactly as intended. But measured on the
+    coarse temperature grid, **35-45N reference-D land is not more continental
+    than reference-C land at all**: maritime proximity 0.312 vs 0.310, and
+    elevation 0.062 vs 0.049 -- indistinguishable on both candidate
+    discriminators. So at that latitude the mechanism *warms* the very cells
+    (94.8% already too warm) it was built to cool, and the genuinely continental
+    cells there are the arid ones, which Köppen scores on precipitation and
+    which this cannot reach.
+
+    Whatever separates 35-45N's C from its D is therefore neither distance from
+    the ocean nor height, and that is the open question C1b now hands on."""
+
+    land_transport_maritime_km: float = 1200.0
+    """e-folding distance [km] for `land_transport_maritime_decay`'s maritime
+    proximity field. Inert while that knob is 0.0.
+
+    1200 km is roughly the depth to which winter maritime air masses moderate
+    real continents -- the Cfb/Dfb transition across Europe sits near it, and it
+    is the scale at which January isotherms turn from zonal to meridional over
+    Eurasia and North America. Distances are physical, not in grid cells, so the
+    field is resolution-invariant (the trap `atmosphere.py`'s monsoon inland mask
+    had to be fixed for once already)."""
+
+    land_transport_deficit_k: float = 0.0
+    """Width [K] of the temperature-deficit gate on land heat transport in
+    `simulate._evolve_temperature`. 0.0 disables the gate and reproduces the flat
+    trapezoids bit-for-bit; a positive value scales them by
+    `clip((273.15 - T_pre) / land_transport_deficit_k, 0, 1)`.
+
+    **Why this exists rather than another seasonal knob** (2026-08-03, audit
+    C1b). `land_transport_seasonality` below was built on the correct diagnosis
+    -- the three trapezoids are sized for winter and applied year-round -- but on
+    the wrong quantity. Measured offline at 41.4 deg, the forcing reaching
+    `_land_cap_1d` has an **annual mean of 32 C against Earth's ~10 C**, and:
+
+    - a first-order relaxation preserves the annual mean *exactly*, so no amount
+      of land thermal inertia can touch it (swept: at tau = 120 days the summer
+      target is still 48 C and the clamp still binds on 59% of the cycle);
+    - `land_transport_seasonality` also preserves it, because its `summer_signal`
+      averages to zero over an orbit -- it redistributes winter/summer without
+      lowering the mean.
+
+    So both existing knobs are amplitude-side levers aimed at a **level** error,
+    which is why sweeping them improved shape and share metrics while H10 bounded
+    accuracy fell: they were trading one error for another. A deficit gate is the
+    first lever here that changes the mean.
+
+    It is also the physically-shaped one. Eddy heat flux scales with the
+    meridional temperature gradient *and damps it*, so the mechanism is
+    self-limiting -- full strength into a cold winter continent, nothing into a
+    warm summer one -- with no prescribed seasonal schedule at all. Gating on the
+    cell's own pre-bonus temperature reproduces that, and does it **per cell**
+    rather than per latitude row, so a cold continental interior draws more
+    transport than a mild maritime cell at the same latitude. That is the right
+    sign for continentality, which the latitude-only trapezoids cannot express.
+
+    The reference is the freezing point (`simulate._LAND_TRANSPORT_DEFICIT_REF_K`)
+    rather than a fitted constant, so this parameter controls only the gate's
+    width. Measured mean bonus, flat vs gated at D = 20 K: 30 deg 10.8 -> 1.2 K,
+    41.4 deg 26.2 -> 8.8 K, 50 deg 23.4 -> 10.2 K, 60 deg 18.9 -> 10.0 K -- the
+    winter peak is preserved everywhere the trapezoids were calibrated on it
+    (C1's -37 C coldest-month fix), while the summer contribution goes to zero."""
+
+    land_transport_deficit_gain: float = 1.0
+    """Multiplier on the deficit-gated land heat transport. Inert unless
+    `land_transport_deficit_k > 0`; 1.0 keeps the trapezoids' calibrated
+    magnitudes.
+
+    This is the affordance the gate exists to create, and it is meaningless
+    without it. Each of the three trapezoids was capped by the same constraint --
+    raising it pushed the *summer* target past anything physical and forced
+    `_land_cap_1d` to clamp harder -- so their peaks are lower bounds set by a
+    side effect, not tuned optima. Once the gate makes summer transport
+    identically zero, the winter magnitude can be raised on its own merits.
+
+    That matters because two independent instruments agree the model's 45-55 deg
+    winter is still too cold: the land-cycle metric reads its coldest month 4 K
+    below Earth's, and H10's group shares read C 4.0pp under and D 3.3pp over --
+    the two largest group errors, near equal-and-opposite, which is what a
+    coldest-month bias across the C/D boundary looks like."""
+
+    land_thermal_inertia_days: float = 0.0
+    """Land surface relaxation time constant [days] toward the seasonal baseline
+    `T_base_land`, in `simulate._evolve_temperature`. 0.0 keeps the historical
+    fixed blend and is an exact no-op.
+
+    **The historical blend is a fraction per CALL, not per day**: `land_blend =
+    0.2` regardless of how long the step is. This is the land's only thermal
+    inertia, so the effective time constant -- and with it the entire amplitude
+    of the land annual cycle -- is set by whatever step length the caller
+    happens to use. Over a 12-day span it keeps **0.800** of the prior
+    temperature integrated as one step against **0.069** integrated as twelve,
+    from identical physics. Same defect class as the monsoon inland mask's fixed
+    20-cell reach: a physical scale expressed in units of the discretisation.
+
+    A positive value uses `1 - exp(-dt/tau)`, so *this term* becomes split
+    invariant exactly: at tau = 27 days a 12-day span retains 0.6412 of the prior
+    temperature whether it is integrated in one step or twelve, against 0.800 vs
+    0.069 for the fixed blend.
+
+    **It does not make `simulate_step` step-length invariant end to end, and that
+    was measured rather than assumed.** On the same 12-day split the mean land
+    temperature discrepancy is 4.34 K with the fixed blend and **5.44 K** at
+    tau = 27 -- it goes *up*, because the residual is dominated by other terms
+    that scale linearly in `days` (advection, diffusion, the evaporation budget)
+    and changing this rate changes how much of that shows through. So this is a
+    correctness fix for one term, not a remedy for the MONTHLY-vs-DAILY
+    differences the wind and precip substep gates address. See
+    `testing/test_land_seasonal_cycle.py`, which pins both halves."""
+
     land_transport_seasonality: float = 0.0
     """Seasonal modulation of atmospheric heat transport into land
     [dimensionless, 0-1]. `0.0` is an exact no-op reproducing the previous

@@ -114,6 +114,16 @@ PLANET_PARAM_CASES = [
     ("soil_deep_evap_weight", 5.0),
     ("abyssal_overturning_coeff", 0.05),  # default 0.0 (exact no-op)
     ("coastal_upwelling_fog_strength", 0.9),  # default 0.5
+    ("land_transport_deficit_k", 25.0),  # default 0.0 (exact no-op)
+    ("land_thermal_inertia_days", 60.0),  # default 0.0 (exact no-op)
+    ("land_transport_maritime_decay", 1.0),  # default 0.0 (exact no-op)
+    # land_transport_maritime_km is deliberately absent: it only sets the
+    # e-folding length of the field the knob above weights by, so it is inert
+    # until that knob is non-zero and a lone perturbation is correctly a no-op.
+    # land_transport_deficit_gain is deliberately absent: it multiplies the
+    # *gated* transport, so it is inert until land_transport_deficit_k > 0 and a
+    # lone perturbation is correctly a no-op. Covered instead by
+    # test_land_seasonal_cycle.py::test_gain_is_inert_while_the_gate_is_off.
     ("drybelt_seasonal_response", 0.0),  # default 0.25; 0.0 is the static belt
     ("drybelt_seasonal_equatorward_fraction", 1.0),  # default 0.0 (pinned edge)
     ("storm_track_seasonal_response", 0.3),  # default 0.0 (exact no-op)

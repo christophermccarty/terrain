@@ -27,6 +27,7 @@ regional pattern error, which is the specific blind spot H10 names.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -554,6 +555,194 @@ def score_koppen_map(
             "reference_dominant": short_class_name(dominant_reference),
         }
     result["per_region"] = per_region
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Anchor-free temperature scoring
+# ---------------------------------------------------------------------------
+
+# Köppen's own temperature thresholds, as (low, high) half-open bounds in C.
+# These are *definitional*, not climatology: a cell the reference labels Dfb has
+# a coldest month below -3 C by construction, whatever its actual value.  That is
+# what makes the scoring below anchor-free -- it needs no station values and no
+# assumption about which population a latitude band contains.
+#
+# The bundled map is the **-3 C variant** (see its filename), so the C/D boundary
+# is -3 C rather than 0 C.
+_TCOLD_BOUNDS_BY_GROUP: dict[int, tuple[float, float]] = {
+    GROUP_A: (18.0, math.inf),
+    GROUP_C: (-3.0, 18.0),
+    GROUP_D: (-math.inf, -3.0),
+    # B is defined by aridity and carries no temperature constraint; E is defined
+    # by its *warmest* month.  Both are excluded from the coldest-month score.
+}
+# `d` (any group) additionally requires a coldest month below -38 C.
+_TCOLD_BOUNDS_BY_CLASS: dict[int, tuple[float, float]] = {
+    KOPPEN_DWD: (-math.inf, -38.0),
+}
+# Warmest-month bounds.  Third letter `a` requires >= 22 C; `b` and `c` both
+# require < 22 C (they differ only in how many months clear 10 C, which this
+# scoring deliberately does not test).  E is bounded by definition.
+_TWARM_BOUNDS_BY_CLASS: dict[int, tuple[float, float]] = {
+    KOPPEN_EF: (-math.inf, 0.0),
+    KOPPEN_ET: (0.0, 10.0),
+    KOPPEN_CFA: (22.0, math.inf),
+    KOPPEN_CSA: (22.0, math.inf),
+    KOPPEN_DFA: (22.0, math.inf),
+    KOPPEN_CFB: (-math.inf, 22.0),
+    KOPPEN_CFC: (-math.inf, 22.0),
+    KOPPEN_CSB: (-math.inf, 22.0),
+    KOPPEN_DFB: (-math.inf, 22.0),
+    KOPPEN_DFC: (-math.inf, 22.0),
+    # KOPPEN_CWA is deliberately absent: the reference's Cwa/Cwb/Cwc all fold
+    # into it, and those disagree about the 22 C bound (`a` is above it, `b`/`c`
+    # below).  Scoring it would be scoring the folding, not the model.
+}
+
+
+def _threshold_scores(
+    values: np.ndarray,
+    weights: np.ndarray,
+    low: np.ndarray,
+    high: np.ndarray,
+) -> dict[str, float]:
+    """Area-weighted agreement of ``values`` with half-open ``[low, high)`` bounds."""
+    total = float(weights.sum())
+    if total <= 0.0:
+        return {}
+    inside = (values >= low) & (values < high)
+    return {
+        "accuracy": float(weights[inside].sum() / total),
+        "too_warm_fraction": float(weights[values >= high].sum() / total),
+        "too_cold_fraction": float(weights[values < low].sum() / total),
+        "model_mean_c": float(np.average(values, weights=weights)),
+        "scored_cells": int(values.size),
+    }
+
+
+def score_temperature_thresholds(
+    monthly_temp_k: np.ndarray,
+    *,
+    land_mask: np.ndarray | None = None,
+    model_codes: np.ndarray | None = None,
+    reference: ReferenceGrid | None = None,
+    reference_path: str | Path = DEFAULT_REFERENCE_PATH,
+    min_reference_land_fraction: float = 0.0,
+) -> dict[str, Any]:
+    """Score land coldest/warmest month against Köppen's own threshold bounds.
+
+    **Why this exists** (audit C1b, 2026-08-04).  The platform's other land
+    temperature instrument, ``real_terrain_validation._land_seasonal_cycle_metrics``,
+    compares an *area-weighted mean over all land in a latitude band* against
+    hand-entered anchors described in its own docstring as "mid-continental
+    stations".  Those are two different populations, and the mismatch is large
+    and one-signed: 25-35N land is 54% arid subtropics and 8% Tibetan plateau by
+    the bundled reference's own accounting, so a mid-continental coldest-month
+    anchor of -2 C understates that band's true area-weighted value by something
+    like 10 K.  Optimising against it drives the model's subtropics cold.
+
+    This function needs no anchors at all.  Every cell the reference classifies
+    carries an exact, definitional constraint on its coldest and/or warmest
+    month -- a Dfb cell *is* a cell whose coldest month is below -3 C -- so the
+    model can be scored against the reference's own thresholds, on exactly the
+    cells being measured, with no assumption about what a band "typically"
+    contains.  What it gives up is magnitude: it reports how much land is on the
+    wrong side of a boundary and in which direction, not how many kelvin out.
+
+    Cells are scored only where the reference constrains the quantity:
+    coldest-month over groups A/C/D (B is arid-defined, E is warmest-defined),
+    warmest-month over E and over the C/D classes whose thermal sub-letter
+    survives the reference-to-model folding.
+
+    Returns ``{}`` if no cell is scorable.
+    """
+    monthly = np.asarray(monthly_temp_k, dtype=np.float64)
+    if monthly.ndim != 3 or monthly.shape[0] != 12:
+        raise ValueError(
+            f"monthly_temp_k must be (12, H, W), got shape {monthly.shape}"
+        )
+    height, width = monthly.shape[1], monthly.shape[2]
+    if reference is None:
+        reference = load_reference_grid(height, width, path=reference_path)
+    if reference.shape != (height, width):
+        raise ValueError(
+            f"reference grid {reference.shape} does not match model grid "
+            f"{(height, width)}"
+        )
+
+    celsius = monthly - 273.15
+    tcold = celsius.min(axis=0)
+    twarm = celsius.max(axis=0)
+
+    weights = _area_weights(height, width)
+    reference_land = (
+        reference.land_fraction >= float(min_reference_land_fraction)
+    ) & (reference.codes != KOPPEN_OCEAN)
+    if land_mask is not None:
+        reference_land = reference_land & np.asarray(land_mask, dtype=bool)
+    if model_codes is not None:
+        reference_land = reference_land & (
+            np.asarray(model_codes) != KOPPEN_OCEAN
+        )
+    if not np.any(reference_land):
+        return {}
+
+    reference_codes = reference.codes.astype(np.int64)
+    groups = koppen_group(reference_codes)
+
+    # Per-cell bound arrays, NaN where the reference constrains nothing.
+    def _bounds(by_group, by_class) -> tuple[np.ndarray, np.ndarray]:
+        low = np.full((height, width), np.nan)
+        high = np.full((height, width), np.nan)
+        for group, (lo, hi) in by_group.items():
+            sel = groups == group
+            low[sel], high[sel] = lo, hi
+        for code, (lo, hi) in by_class.items():
+            sel = reference_codes == code
+            low[sel], high[sel] = lo, hi
+        return low, high
+
+    tcold_low, tcold_high = _bounds(_TCOLD_BOUNDS_BY_GROUP, _TCOLD_BOUNDS_BY_CLASS)
+    twarm_low, twarm_high = _bounds({}, _TWARM_BOUNDS_BY_CLASS)
+
+    result: dict[str, Any] = {"grid": {"height": height, "width": width}}
+    lat = (0.5 - (np.arange(height, dtype=np.float64) + 0.5) / height) * 180.0
+
+    for name, values, low, high in (
+        ("coldest_month", tcold, tcold_low, tcold_high),
+        ("warmest_month", twarm, twarm_low, twarm_high),
+    ):
+        scored = reference_land & ~np.isnan(low)
+        if not np.any(scored):
+            continue
+        entry = dict(
+            _threshold_scores(values[scored], weights[scored], low[scored], high[scored])
+        )
+        by_group: dict[str, Any] = {}
+        for label, group in (("A", GROUP_A), ("C", GROUP_C), ("D", GROUP_D),
+                             ("E", GROUP_E)):
+            sel = scored & (groups == group)
+            if not np.any(sel):
+                continue
+            by_group[label] = _threshold_scores(
+                values[sel], weights[sel], low[sel], high[sel]
+            )
+        entry["by_reference_group"] = by_group
+        by_zone: dict[str, Any] = {}
+        for edge in range(-90, 90, 10):
+            rows = (lat >= edge) & (lat < edge + 10)
+            sel = scored & rows[:, None]
+            if not np.any(sel):
+                continue
+            by_zone[f"{edge}:{edge + 10}"] = _threshold_scores(
+                values[sel], weights[sel], low[sel], high[sel]
+            )
+        entry["by_zone"] = by_zone
+        result[name] = entry
+
+    if "coldest_month" not in result and "warmest_month" not in result:
+        return {}
     return result
 
 
