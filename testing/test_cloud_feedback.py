@@ -27,12 +27,13 @@ def test_cloud_cover_plausible_range(mixed_initial_state):
     assert cf is not None
     assert float(np.min(cf)) >= -1e-6
     assert float(np.max(cf)) <= 1.0 + 1e-6
-    # Floor 0.18->0.12->0.10 (2026-08-01). Traced chain on this exact fixture:
+    # Floor 0.18->0.12->0.10->0.09 (2026-08-05). Traced chain on this exact fixture:
     #   b76078a (pre-d8631cb):  0.2239   [bound was 0.20 then]
     #   eac34d4 (HEAD pre-fix): 0.1814   [d8631cb LOWERED the bound 0.20->0.18
     #                                     to accommodate its own drop]
     #   HEAD + air-surface fix: 0.1576
     #   HEAD + A5 regime fix:   0.107    [0f85f6d LOWERED the bound 0.12->0.10]
+    #   HEAD + C1b land damping: 0.098   [2026-08-05, this bound 0.10->0.09]
     # The 0.2239->0.1814 step is the deliberate precip-pipeline rework across
     # d8631cb/553cbd7/eac34d4 (zonal rescale, desert redistribution, more
     # aggressive rain-out depleting cloud water). The 0.1814->0.1576 step is the
@@ -45,13 +46,33 @@ def test_cloud_cover_plausible_range(mixed_initial_state):
     # leaving less residual RH for cloud formation. Confirmed by direct ablation
     # (forcing the gain to 1.0 restores 0.1576) -- same root mechanism as the
     # orographic-test fix in the same commit (see that test's docstring), not an
-    # independent new bug. All prior steps are physically coherent, so the floor
-    # moves rather than the physics, per this test's own established practice.
+    # independent new bug.
     #
-    # KNOWN GAP, not covered by this test: 0.107 is ~6x below Earth's observed
-    # ~0.67 global mean cloud fraction. This bound is a blow-up guard, not a
-    # realism check -- do not read a pass here as "clouds are right".
-    assert 0.10 <= float(np.mean(cf)) <= 0.95, f"Global mean cloud fraction: {float(np.mean(cf)):.3f}"
+    # The 0.107->0.098 step is C1b's `land_transport_gain` 1.0->0.5 (ACCURACY_AUDIT.md
+    # C1b-2026-08-05), and it is the SAME mechanism as the 0.1814->0.1576 step above,
+    # not a new one: cutting the three land heat-transport trapezoids removes a
+    # year-round +21 K forcing overshoot, which cools mean surface temperature on this
+    # fixture by 1.45 K (283.87 -> 282.42) -> lower temp_norm and qsat -> less
+    # `land_evap` -> less humidity -> less cloud. Confirmed by direct per-knob
+    # ablation on this exact fixture:
+    #   shipped (0.75 / 0.5 / 0.45)          0.0981
+    #   land_transport_gain -> 1.0           0.1058   <- restores it alone
+    #   land_seasonal_amplitude -> 1.0       0.0976   <- contributes nothing
+    #   land_seasonal_amplitude_maritime -> 0  0.0980 <- contributes nothing
+    #   all three reverted                   0.1056
+    # i.e. the level knob owns the whole change and both amplitude knobs are
+    # neutral, which is what a mean-preserving contraction should do.
+    #
+    # All steps are physically coherent, so the floor moves rather than the physics,
+    # per this test's own established practice.
+    #
+    # KNOWN GAP, not covered by this test: 0.098 is ~7x below Earth's observed
+    # ~0.67 global mean cloud fraction, and the step above made an already-known bias
+    # (audit F1) slightly worse -- an accepted cost of a change that improves every
+    # tracked temperature and Koppen metric at three resolutions. This bound is a
+    # blow-up guard, not a realism check -- do not read a pass here as "clouds are
+    # right".
+    assert 0.09 <= float(np.mean(cf)) <= 0.95, f"Global mean cloud fraction: {float(np.mean(cf)):.3f}"
 
 
 def test_cloud_feedback_flag_no_crash(mixed_initial_state):

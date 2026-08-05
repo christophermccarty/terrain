@@ -1473,6 +1473,65 @@ def _smear_along_wind(
     return (accumulated / total_weight).astype(field.dtype, copy=False)
 
 
+# Scale [K] at which the SST -> land coupling's response saturates.  Both halves
+# of that mechanism use `tanh(anomaly / this)`, so their strength knobs mean
+# "largest fractional change" rather than "change per kelvin, unbounded".  Fixed
+# rather than a PlanetParams field: it describes how far an ocean temperature
+# anomaly can plausibly shift the boundary layer above it, which is not a
+# per-planet tuning freedom -- the strength knobs already span that.
+_SST_COUPLING_REFERENCE_K = 2.0
+
+
+def _upwind_sst_anomaly(
+    temperature: np.ndarray,
+    sea_f: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    dx_meters: np.ndarray,
+    dy_meters: float,
+    reach_km: float,
+) -> np.ndarray:
+    """Ocean-fraction-weighted SST anomaly of the water *upwind* of each cell [K].
+
+    Audit D3/D5.  D5 built real eastern-boundary upwelling (Benguela -0.54 K,
+    Humboldt -0.25 K vs gyres-off) and then measured that it changes adjacent
+    land precipitation by nothing at all, at any gyre strength -- settling that
+    per-cell SST anomalies do not reach land climate in this model's atmosphere.
+    This is the missing link, built as its own field so the coupling can be
+    tested independently of whatever produces the anomaly.
+
+    The anomaly is taken against each row's **own ocean mean**, so it isolates
+    basin/current structure from the meridional temperature gradient: a
+    cold-current cell is cold *for its latitude*, which is the physically
+    meaningful quantity and the only one a land cell at the same latitude can
+    respond to differentially.
+
+    ``reach_km`` is an e-folding fetch, not a cell count -- the
+    resolution-invariance trap this file has already had to fix twice (the
+    monsoon inland mask's 20 cells, `_maritime_proximity`'s pass cap).
+    ``_smear_along_wind``'s second length samples *upwind* of each cell, which
+    is the direction air actually arrives from; its weights sum to 1 including
+    the cell's own (zero over land) contribution, so the returned field is the
+    mean upwind-ocean anomaly scaled by how oceanic that fetch is. It therefore
+    decays to zero inland on its own, with no separate coastal mask -- unlike
+    `coastal_upwelling_fog_strength`'s hand-built two-cell decay, which is the
+    diagnostic proxy this replaces.
+    """
+    # float64 for the row reduction: this is a small difference between large
+    # absolute temperatures, so accumulating a full row in float32 costs real
+    # precision in exactly the quantity being extracted. Same reason
+    # `_land_pp_sum` below reduces in float64.
+    per_row = sea_f.sum(axis=1, keepdims=True, dtype=np.float64)
+    row_mean = np.divide(
+        (temperature * sea_f).sum(axis=1, keepdims=True, dtype=np.float64),
+        np.maximum(per_row, 1.0),
+    )
+    anomaly = ((temperature - row_mean) * sea_f).astype(np.float32, copy=False)
+    return _smear_along_wind(
+        anomaly, u, v, dx_meters, dy_meters, 0.0, float(reach_km)
+    )
+
+
 @jit(nopython=True, parallel=True, cache=True)
 def _advect_scalar_cfl_step_numba(q: np.ndarray, u: np.ndarray, v: np.ndarray,
                                   u_cfl: np.ndarray, v_cfl: np.ndarray) -> np.ndarray:
@@ -3076,6 +3135,35 @@ def generate_precipitation(
 
     wind_speed = np.sqrt(u * u + v * v) + 1e-6
     temp_norm = np.clip((temperature - 255.0) / 45.0, 0.0, 1.0)
+    # Hoisted from the moisture-advection block below (cached on (H, W, pp), so
+    # this is free): the SST coupling gate inside the subsidence block needs the
+    # same metric grids, and that block runs first.
+    _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
+
+    # Upwind SST anomaly (audit D3), built once and consumed twice: by the
+    # suppression gate in the subsidence block below, and by the target-share
+    # blend in the moisture budget. Those sit on opposite sides of the row
+    # rescale, which is the distinction process note 9 exists for -- see
+    # `sst_land_target_weight`.
+    _sst_strength = float(getattr(pp, "sst_land_coupling_strength", 0.0))
+    _sst_target_w = float(getattr(pp, "sst_land_target_weight", 0.0))
+    _sst_anom_field = None
+    if (_sst_strength != 0.0 or _sst_target_w != 0.0) and np.any(sea_mask) and np.any(land_mask):
+        if _sc is not None and "sst_anom" in _sc:
+            _sst_anom_field = _sc["sst_anom"]
+        else:
+            _sst_anom_field = _upwind_sst_anomaly(
+                temperature,
+                sea_f,
+                u,
+                v,
+                dx_grid,
+                dy_grid,
+                float(pp.sst_land_coupling_km),
+            )
+            if _sc is not None:
+                _sst_anom_field.flags.writeable = False
+                _sc["sst_anom"] = _sst_anom_field
 
     if _sc is not None and "qsat" in _sc:
         qsat = _sc["qsat"]
@@ -3222,6 +3310,62 @@ def generate_precipitation(
             1.0,
         ).astype(np.float32, copy=False)
         subsidence_suppression = (subsidence_suppression * _fog_gate).astype(np.float32, copy=False)
+        # SST -> adjacent-land climate coupling (2026-08-05, audit D3).
+        #
+        # The gate above is a *geometry* proxy: west-facing coast x subtropical
+        # latitude, with no ocean temperature in it at all. D5 then built the
+        # real physics it stands in for -- a wind-stress-curl gyre solve that
+        # produces genuine eastern-boundary cooling (Benguela -0.54 K, Canary
+        # -0.36 K, Humboldt -0.25 K) -- and measured that Atacama precipitation
+        # does not move by a single mm/yr across gyre strengths 0.0 to 3.0.
+        # D3's conclusion was that the missing piece is not the ocean cooling
+        # but the coupling, and that any future attempt should build *this*
+        # first and verify it transmits, or it will reproduce that null result.
+        #
+        # This is that coupling. Cold water upwind stabilises the boundary layer
+        # it feeds (a marine inversion caps convection, which is why Atacama and
+        # the Namib are hyper-arid *on a coast*); warm water upwind destabilises
+        # it and loads it with moisture (Gulf Stream, Kuroshio). Both signs come
+        # from one term, applied to `subsidence_suppression` -- deliberately the
+        # same array the fog gate uses, because that is the one pathway in this
+        # model already *demonstrated* to reach land precipitation (the fog gate
+        # moved Atacama 123 -> 102 mm/yr). Per-cell ocean evaporation already
+        # responds to SST through `qsat`, and the moisture budget's row rescale
+        # erases it again; process note 9.
+        #
+        # Deliberately composed with the fog gate rather than replacing it: that
+        # knob is calibrated and carries A1's Atacama result, so retiring it is a
+        # separate decision from establishing whether this transmits.
+        #
+        # **This half is measured to be inert on Earth, and both reasons are
+        # worth knowing before reaching for it again.** (1) In the deserts it
+        # was aimed at, `subsidence_suppression` is already 0.02-0.04, i.e. on
+        # its own floor after A5's regime architecture -- a multiplicative
+        # drying gate has no headroom left there at all, which also means the
+        # fog gate's documented "Atacama 123 -> 102 mm/yr" would not reproduce
+        # today. (2) Where there *is* headroom the moisture budget's row rescale
+        # absorbs the change: process note 9. The target-side companion
+        # (`sst_land_target_weight`) is the half that survives.
+        if _sst_strength != 0.0 and _sst_anom_field is not None:
+            # Land only. An ocean cell's own suppression is not what this term
+            # is about, and letting it feed back on the water that produced the
+            # anomaly would be a self-reinforcing loop with no physical
+            # counterpart.
+            _sst_gate = np.clip(
+                1.0
+                + _sst_strength
+                * np.tanh(_sst_anom_field / _SST_COUPLING_REFERENCE_K)
+                * land_f,
+                0.25,
+                2.0,
+            ).astype(np.float32, copy=False)
+            subsidence_suppression = np.clip(
+                subsidence_suppression * _sst_gate, 0.02, 1.0
+            ).astype(np.float32, copy=False)
+            if debug_fields is not None:
+                debug_fields["sst_land_gate"] = _sst_gate
+        if debug_fields is not None and _sst_anom_field is not None:
+            debug_fields["upwind_sst_anomaly"] = _sst_anom_field
         # East-coast/monsoon-margin exemption (2026-07-30, se-us-east-asia-
         # drybelt fix; see `monsoon_margin_factor` above for the mechanism).
         # Applied post-hoc, AFTER `itcz_zonal_smooth_deg`'s wide (32-deg
@@ -3350,7 +3494,8 @@ def generate_precipitation(
     # continental-interior/desert gap above -- that remains a separate, open
     # question (the RH-trigger-favors-local-moisture mechanism described in
     # the paragraph above still applies).
-    _lat_2d_grid, dx_grid, dy_grid, _f_grid, _eq_window_grid, _lon_1d_grid = _wind_static_grids(H, W, pp)
+    # (`dx_grid`/`dy_grid` are computed once, further up, where the SST coupling
+    # gate also needs them; `_wind_static_grids` is cached on (H, W, pp) anyway.)
     if _sc is not None and "u_scale" in _sc:
         u_scale, v_scale = _sc["u_scale"], _sc["v_scale"]
     else:
@@ -4009,6 +4154,69 @@ def generate_precipitation(
             # relative to other land in the same row. (`_raw_shape_applied` is
             # now built just above, shared with the orographic gate.)
             _desert_factor = _apply_shape_blend(_desert_factor, _raw_shape_w_row)
+        # SST -> land precipitation, target side (audit D3, 2026-08-05).
+        #
+        # The suppression gate up in the subsidence block is the intuitive place
+        # for this and is measurably inert: it sits *upstream* of the rescale, so
+        # the deficit fill tops the cell back up toward a target that never heard
+        # about the SST anomaly. Process note 9's rule, third instance -- the
+        # target is the lever, not raw production.
+        #
+        # Here the anomaly moves the cell's *share of its row's target*: land
+        # downwind of water that is warm for its latitude claims more of the row,
+        # land downwind of cold water claims less. Renormalized by `_row_norm`
+        # immediately below like every other term here, so it is exactly
+        # row-mean-preserving -- it redistributes within a latitude circle and
+        # cannot change a zonal total the model is already calibrated against.
+        #
+        # Land-only and multiplicative on `_desert_factor` rather than routed
+        # through `_apply_shape_blend`: those three blends all interpolate toward
+        # `_raw_shape`, a *production* signal, whereas this is an independent
+        # physical driver with its own sign. Floored well above zero so a cold
+        # anomaly can suppress a cell's share but never zero or invert it.
+        #
+        # **Saturating, not linear in kelvin, and that is load-bearing.** A
+        # linear response bounded only by a clip lets a single outlier cell take
+        # the whole bound: the model's Kuroshio anomaly reaches +1.9 K where the
+        # land-cell median is 0.35 K, so at weight 0.9 the S Japan box claimed
+        # 2.7x its row's target share and came out at 2809 mm/yr against a
+        # 1100-2200 target at 256x512 -- a real regression traceable entirely to
+        # the tail. `tanh` keeps the response very nearly linear over the
+        # +-1 K where most coastal land sits while bounding the tail, so the
+        # weight means "largest fractional change in target share" rather than
+        # "change per kelvin, unbounded until the clip". The 2.0 K reference is
+        # a fixed constant rather than a knob: it is a property of how far an
+        # SST anomaly can plausibly shift a boundary layer, not something to
+        # tune per planet, and the strength knob already spans that freedom.
+        #
+        # **Cold side only, and that is a physics decision rather than a
+        # tuning one.** The suppressing half is a mechanism this model has
+        # nothing else for: cold water caps the boundary layer above it with a
+        # marine inversion, which is why Atacama and the Namib are hyper-arid
+        # *on a coastline*. The warming half is already represented twice --
+        # ocean evaporation responds to SST through `qsat`, and
+        # `monsoon_east_margin_exemption` was calibrated at 3.0 specifically for
+        # SE US / East China / S Japan, i.e. the exact warm-boundary-current
+        # margins a symmetric form would boost again. Measured, that
+        # double-count is not subtle: the symmetric version drives S Japan to
+        # 2633 mm/yr against its 1100-2200 target at 256x512, while the
+        # cold-only form leaves every warm margin untouched and keeps the
+        # desert gains. `np.minimum(..., 0)` rather than a second knob, because
+        # a warm-side strength that must stay at zero is not a freedom.
+        if _sst_target_w != 0.0 and _sst_anom_field is not None:
+            _sst_target_factor = np.clip(
+                1.0
+                + _sst_target_w
+                * np.minimum(
+                    np.tanh(_sst_anom_field / _SST_COUPLING_REFERENCE_K), 0.0
+                )
+                * land_f,
+                0.2,
+                3.0,
+            ).astype(np.float32, copy=False)
+            _desert_factor = _desert_factor * _sst_target_factor
+            if debug_fields is not None:
+                debug_fields["sst_target_factor"] = _sst_target_factor
         _row_norm = np.mean(_desert_factor, axis=1, dtype=np.float64).astype(np.float32)
         cell_weight = _desert_factor / (_row_norm[:, None] + 1e-6)
         if pp.moisture_budget_precip_rescale:

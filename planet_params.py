@@ -217,10 +217,12 @@ class PlanetParams:
     Lower values allow more polar warming; higher values sharpen the
     equator-to-pole gradient."""
 
-    land_transport_maritime_decay: float = 0.0
-    """Continentality contrast on the land heat-transport bonus. 0.0 is an exact
-    no-op; positive values move part of each row's bonus from its continental
-    interior to its maritime margins, **preserving the row's land mean**.
+    land_transport_maritime_decay: float = 1.0
+    """Continentality contrast on the land heat-transport bonus, in units of
+    *fraction of the winter bonus per standard deviation of continentality*.
+    0.0 is an exact no-op; positive values move part of each row's bonus from its
+    continental interior to its maritime margins, **preserving the row's land
+    mean**.
 
     **The defect this addresses** (2026-08-04, audit C1b). All three transport
     trapezoids (`_atm_land_transport_1d`, `_midlat_storm_bonus_1d`,
@@ -244,37 +246,89 @@ class PlanetParams:
 
     Mean-preserving by construction: the zonal-mean winter level was calibrated
     by C1's `_handoff_bonus_1d` work and the trapezoids' own tuning, and this
-    knob exists to add contrast, not to reopen that. See
-    `land_transport_maritime_km` for the length scale.
+    knob exists to add contrast, not to reopen that. The anomaly is divided by
+    its own land-area-weighted spread, so this number keeps its meaning when the
+    shape knobs (`land_transport_maritime_km`, `land_transport_upwind_ratio`)
+    change the field. Applied with a winter weight -- see `simulate.py` -- since
+    maritime moderation is a winter effect and applying it year-round warms
+    maritime *summers*, which is the wrong sign.
 
-    **Ships inert at 0.0 because it is a measured negative result** -- kept, per
-    the audit's process note 2, so the next session finds a tested mechanism and
-    this table instead of rebuilding it. Swept at 128x256:
+    **History: this shipped inert at 0.0 on 2026-08-04 as a measured negative
+    result, and that result was wrong.** It was rejected because "35-45N
+    reference-D land is not more continental than reference-C land -- maritime
+    proximity 0.312 vs 0.310". Those two numbers are reproducible, and they are
+    a population artifact: they were measured by re-deriving the Köppen
+    reference *at the 32x64 coarse grid*, which leaves 35 C cells and 15 D cells
+    for the entire band, while the metric they were aimed at
+    (`koppen_temperature_thresholds`) scores the fine grid. On the population
+    actually scored, the two separate by **0.84 sd**. Two fixes then made that
+    separation reachable by the physics -- computing the proximity field at
+    native resolution (`simulate._maritime_proximity_coarse`) and making it
+    anisotropic (`land_transport_upwind_ratio`) -- and the sign of the result
+    flipped. Swept at 128x256, winter-gated, `upwind_ratio=32`:
 
-    | decay | H10 group | H10 class | kappa | Tcold acc | 40-50N zone |
-    |-------|-----------|-----------|-------|-----------|-------------|
-    | 0.0   | 0.7082    | 0.4223    | 0.6303| 0.8646    | 0.6286      |
-    | 0.3   | 0.7075    | 0.4214    | 0.6295| 0.8643    | 0.6249      |
-    | 0.6   | 0.7067    | 0.4207    | 0.6283| 0.8635    | 0.6186      |
-    | 1.0   | 0.7057    | 0.4204    | 0.6271| 0.8638    | 0.6147      |
-    | 1.5   | 0.7040    | 0.4193    | 0.6250| 0.8633    | 0.6098      |
+    | decay | H10 group | H10 class | kappa | Tcold  | Twarm  | 40-50N |
+    |-------|-----------|-----------|-------|--------|--------|--------|
+    | 0.0   | 0.7082    | 0.4223    | 0.6303| 0.8646 | 0.7138 | 0.6286 |
+    | 0.7   | 0.7179    | 0.4242    | 0.6427| 0.8843 | 0.7147 | 0.7581 |
+    | **1.0** | **0.7176** | **0.4252** | **0.6424** | **0.8875** | **0.7142** | **0.7825** |
+    | 1.4   | 0.7170    | 0.4245    | 0.6417| 0.8902 | 0.7141 | 0.8041 |
 
-    Every bounded metric degrades monotonically. **The mechanism works; the
-    premise does not hold at 35-45N**, and that is the useful finding. The
-    maritime field itself is correct (Britain 0.72, Paris 0.63, US Midwest 0.27,
-    Novosibirsk 0.17, central Siberia 0.15) and the direction of effect is right
-    -- at 45-55N it warms reference-C land (Tcold -8.66 -> -8.42 across the
-    sweep) and cools reference-D, exactly as intended. But measured on the
-    coarse temperature grid, **35-45N reference-D land is not more continental
-    than reference-C land at all**: maritime proximity 0.312 vs 0.310, and
-    elevation 0.062 vs 0.049 -- indistinguishable on both candidate
-    discriminators. So at that latitude the mechanism *warms* the very cells
-    (94.8% already too warm) it was built to cool, and the genuinely continental
-    cells there are the arid ones, which Köppen scores on precipitation and
-    which this cannot reach.
+    1.0 sits at the group-accuracy/kappa knee; past it the coldest-month score
+    keeps creeping up while group accuracy turns over, and the strength stops
+    being physically interpretable (a cell 1 sd from its row's mean
+    continentality already gets its whole winter bonus doubled or removed).
 
-    Whatever separates 35-45N's C from its D is therefore neither distance from
-    the ocean nor height, and that is the open question C1b now hands on."""
+    **Confirmed at three resolutions** (process note 14), baseline -> shipped:
+
+    | grid    | H10 group       | Tcold           | 40-50N zone     | Twarm  |
+    |---------|-----------------|-----------------|-----------------|--------|
+    | 64x128  | 0.6864 -> 0.6968| 0.8750 -> 0.8977| 0.5715 -> 0.7498| +0.0000|
+    | 128x256 | 0.7082 -> 0.7176| 0.8646 -> 0.8875| 0.6286 -> 0.7825| +0.0004|
+    | 256x512 | 0.7049 -> 0.7114| 0.8646 -> 0.8837| 0.6437 -> 0.7794| +0.0017|
+
+    The gain is contrast, not level: reference-C and reference-D coldest-month
+    accuracy improve *simultaneously* (128x256: C 0.7352 -> 0.7719, D 0.8693 ->
+    0.9087), which a shift in the band mean cannot do.
+
+    **Real, accepted cost**: `reference_error_score` 0.1508 -> 0.1526 at
+    128x256 (+0.0058 at 64x128), traceable entirely to the 40-50N and 50-60N
+    zonal-mean temperature bias rising 0.10 K and 0.18 K. The mechanism is
+    mean-preserving in the *forcing*, but land temperature is a nonlinear
+    function of it (evapotranspiration cooling and `_land_cap_1d` both compress
+    the warm side), so redistributing the forcing does not preserve the mean
+    temperature exactly. Both bands were already warm-biased, so this adds to an
+    existing error rather than creating a new one -- and per process note 10,
+    `reference_error_score` carries no biome information at all.
+
+    Band x reference-group coldest-month agreement, 128x256, baseline ->
+    shipped (this cross-tab is the view the defect was localized with; the
+    metric reports `by_zone` and `by_reference_group` separately):
+
+    | band   | grp | accuracy        | model coldest month |
+    |--------|-----|-----------------|---------------------|
+    | 25-35N | A   | 0.125 -> 0.502  | 17.11 -> 18.01 C    |
+    | 25-35N | D   | 0.092 -> 0.229  |  4.21 ->  1.55 C    |
+    | 35-45N | C   | 0.998 -> 0.990  |  4.37 ->  5.79 C    |
+    | 35-45N | D   | 0.050 -> 0.433  |  1.17 -> -1.50 C    |
+    | 45-55N | C   | 0.005 -> 0.292  | -8.65 -> -4.56 C    |
+    | 45-55N | D   | 0.983 -> 0.967  |-10.44 ->-12.37 C    |
+    | 55-65N | C   | 0.011 -> 0.011  |-14.03 -> -9.93 C    |
+
+    The two headline defects both improve sharply: 35-45N reference-D goes from
+    95.0% to 56.7% too warm, and 45-55N reference-C from 99.5% to 70.8% too
+    cold. That second row is also **C1's long-standing mid-latitude winter cold
+    residual**, which no latitude-only term had moved.
+
+    **Still open, and neither defect is closed.** 57% of 35-45N reference-D land
+    is still too warm and 71% of 45-55N reference-C still too cold. 55-65N
+    reference-C is the one place the mechanism does not reach at all: it warms
+    those cells 4 K (-14.03 -> -9.93) and their accuracy does not move, because
+    they need -3 C. Coastal Norway and southern Alaska are ~1 cell wide at this
+    resolution, so the row's land is overwhelmingly Siberian and Canadian and a
+    row-mean-preserving redistribution has almost nothing to give them. The
+    contrast is now present and correctly signed; it is not yet large enough,
+    and at 55-65N the limit is geometric rather than a matter of strength."""
 
     land_transport_maritime_km: float = 1200.0
     """e-folding distance [km] for `land_transport_maritime_decay`'s maritime
@@ -286,6 +340,54 @@ class PlanetParams:
     Eurasia and North America. Distances are physical, not in grid cells, so the
     field is resolution-invariant (the trap `atmosphere.py`'s monsoon inland mask
     had to be fixed for once already)."""
+
+    land_transport_upwind_ratio: float = 32.0
+    """Anisotropy of the maritime-proximity field: how much further ocean to a
+    cell's **west** reaches than ocean in any other direction. 1.0 is isotropic.
+    Inert while `land_transport_maritime_decay` is 0.0.
+
+    Midlatitude flow is westerly in both hemispheres, so the ocean that moderates
+    a winter continent is the one upwind of it. An isotropic distance-to-water
+    field cannot express that: New York (Dfa, coldest month -3 C) has open water
+    100 km east and 4000 km of continent west, while Lisbon (Csb, +11 C) at the
+    same latitude has the ocean upwind -- yet both sit ~100 km from the sea.
+
+    Measured on the population `koppen_temperature_thresholds` actually scores
+    (128x256 reference-classified land), as the separation between 35-45N
+    reference-C and reference-D land in pooled standard deviations:
+
+    | field                                    | 35-45N | 45-55N |
+    |------------------------------------------|--------|--------|
+    | isotropic, coarse any-land mask (was)    | 0.37   | 0.74   |
+    | isotropic, native resolution             | 0.83   | 0.99   |
+    | **upwind x32, native resolution (shipped)** | **1.02** | **1.21** |
+    | upwind x32, uncoarsened 128x256 (ceiling)| 1.00   | 1.21   |
+
+    The shipped coarse field matches the uncoarsened one, so once the mask and
+    the anisotropy are right the coarse forcing grid costs nothing here.
+
+    **This is the knob that decides whether the mechanism helps at all.** Held
+    at 1.0 (isotropic) with everything else shipped, H10 group accuracy is
+    *below* baseline at every strength (0.7053-0.7065 against 0.7082) --
+    reproducing the 2026-08-04 negative result. It only turns positive once the
+    field is anisotropic, and improves monotonically to a plateau at ~24-32:
+
+    | upwind | 1.0    | 4.0    | 8.0    | 16.0   | 24.0   | **32.0** | 48.0   |
+    |--------|--------|--------|--------|--------|--------|--------|--------|
+    | group  | 0.7053 | 0.7095 | 0.7135 | 0.7157 | 0.7167 | **0.7166** | 0.7171 |
+
+    (measured ungated at decay 1.0; the winter-gated defaults peak the same
+    way.) At 32 the upwind e-folding is ~38400 km on Earth, comparable to the
+    circumference -- that is the finding, not a fitting artifact: **westward
+    ocean influence should not decay on any scale smaller than a continent.**
+    An exponential with the 1200 km isotropic length saturates 2000 km inland
+    and then reports Warsaw, Moscow and Novosibirsk as equally continental,
+    when Earth's January isotherms keep falling across all of it. Values past
+    ~32 are on the plateau; the exact number is not critical.
+
+    See `simulate._maritime_proximity` for the implementation and
+    `_maritime_proximity_coarse` for why the mask matters as much as the
+    anisotropy does."""
 
     land_transport_deficit_k: float = 0.0
     """Width [K] of the temperature-deficit gate on land heat transport in
@@ -344,6 +446,84 @@ class PlanetParams:
     below Earth's, and H10's group shares read C 4.0pp under and D 3.3pp over --
     the two largest group errors, near equal-and-opposite, which is what a
     coldest-month bias across the C/D boundary looks like."""
+
+    land_seasonal_amplitude: float = 0.75
+    """Fraction of the radiative seasonal swing the land surface actually feels
+    [dimensionless]. `1.0` is an exact no-op reproducing the historical
+    behaviour; smaller values contract the land forcing's seasonal anomaly
+    toward its own annual mean.
+
+    **This is the term the land branch never had.** `temperature_kelvin_for_lat`
+    returns instantaneous local radiative equilibrium -- no surface heat
+    capacity, no dynamical damping. Its annual half-range at 41.4 deg is ~81 K
+    against Earth land's ~28 K. The ocean branch of `_evolve_temperature` has
+    damped its own swing since the model's early days (`ocean_seasonal_frac`,
+    the identical mean-preserving form); land ran with an implicit thermal
+    inertia of exactly zero.
+
+    Everything else in the land stack is a one-sided patch on that one error:
+    the three transport trapezoids lift a -33 C radiative winter, and
+    `_land_cap_1d` cuts a +41 C radiative summer. They do not cancel, because
+    the trapezoids are added in all twelve months while the cap only subtracts
+    in summer -- which is how the forcing ends up with an annual mean 21 K too
+    warm and a flat top across seven months (audit C1b's square wave).
+
+    Applied as `mean + k * (instantaneous - mean)`, so it is **exactly
+    mean-preserving**: it cannot move the annual-mean level that the trapezoids,
+    the cap and C1's handoff work were all calibrated against, only the swing
+    about it. That is the property four earlier C1b knobs lacked -- they were
+    amplitude-side levers aimed at a level error and could only trade one for
+    the other. This one is the reverse, and is meant to be set together with
+    `land_transport_gain`, which takes the level error out once the swing no
+    longer needs patching.
+
+    Calibrated jointly with that knob on the tracked benchmark; see
+    `docs/ACCURACY_AUDIT.md` C1b for the 2-D sweep."""
+
+    land_seasonal_amplitude_maritime: float = 0.45
+    """Continentality contrast on `land_seasonal_amplitude`, in units of
+    fraction of the row's damping per standard deviation of continentality.
+    `0.0` is an exact no-op; positive values damp maritime land's seasonal
+    cycle further and let continental land keep more of its swing.
+
+    `land_seasonal_amplitude` sets the zonal *level* of the damping; this sets
+    its contrast within a row, and the contrast is where the physical content
+    is. A maritime climate **is** a damped seasonal cycle -- that is the
+    definition of one, not a downstream consequence -- so the continentality
+    field `land_transport_maritime_decay` already builds (upwind-weighted
+    maritime proximity) is the correct modulator, shared rather than rebuilt.
+
+    **This is the term that mechanism's winter gate exists to work around.**
+    `land_transport_maritime_decay` scales an additive *bonus*, so applied
+    year-round it warms maritime summers -- the wrong sign -- and had to be
+    restricted to the winter half. It therefore cannot reach the model's
+    maritime-*summer* error at all, which is large: at 128x256, 81.5% of
+    -50:-40 and 48.7% of -40:-30 reference-C land (Chile, New Zealand,
+    Tasmania) has a warmest month above the 22 C its class requires. An
+    amplitude damping has the right sign in both seasons from one term -- warmer
+    maritime winters, cooler maritime summers, annual mean untouched -- so it
+    needs no seasonal gate.
+
+    Shares `_maritime_transport_factor`'s row-mean preservation, global spread
+    normalization and [-1, 1] bound, so amplitude stays in [0, 2x] and this knob
+    keeps its meaning when the field's shape knobs move."""
+
+    land_transport_gain: float = 0.5
+    """Uniform multiplier on the three land heat-transport trapezoids in
+    `simulate._evolve_temperature` [dimensionless]. `1.0` is an exact no-op.
+
+    Scales `_atm_land_transport_1d`, `_midlat_storm_bonus_1d` and
+    `_handoff_bonus_1d` together, so the latitude *shape* C1's handoff work
+    calibrated is preserved exactly and only the magnitude moves. Unlike
+    `land_transport_deficit_gain` this is unconditional -- that one is inert
+    without its gate.
+
+    Meaningless on its own, and deliberately so: all three trapezoids were sized
+    against an **undamped** radiative winter (27 K at 41 deg to lift a -33 C
+    January, 22 K at 65 deg to keep Antarctic winter off the 200 K floor).
+    `land_seasonal_amplitude` shrinks that deficit by construction, at which
+    point the calibrated peaks are an overshoot applied in all twelve months --
+    the annual-mean half of C1b's defect. Lowering this is what removes it."""
 
     land_thermal_inertia_days: float = 0.0
     """Land surface relaxation time constant [days] toward the seasonal baseline
@@ -971,6 +1151,78 @@ class PlanetParams:
 
     river_routing_fraction: float = 0.55
     """Fraction of available water sent downhill during each routing pass."""
+
+    sst_land_coupling_strength: float = 0.0
+    """Strength of the SST -> adjacent-land precipitation coupling, per kelvin
+    of upwind ocean temperature anomaly. `0.0` is an exact no-op.
+
+    Multiplies `subsidence_suppression` by `1 + strength * upwind_sst_anomaly`
+    over land, so water that is cold *for its latitude* dries the land it blows
+    onto and warm water wets it. See `atmosphere._upwind_sst_anomaly` for the
+    field and `generate_precipitation` for where it is applied.
+
+    **Audit D3's named blocker.** D5 built real eastern-boundary upwelling (a
+    wind-stress-curl gyre solve producing Benguela -0.54 K, Canary -0.36 K,
+    Humboldt -0.25 K against gyres-off) and measured Atacama precipitation
+    unchanged across gyre strengths 0.0 to 3.0. The conclusion recorded there is
+    that the missing mechanism is not the ocean cooling but the coupling, and
+    that the coupling must be built and shown to transmit *before* any further
+    ocean physics -- otherwise the null result just repeats. This is that term.
+
+    Applied to `subsidence_suppression` specifically because that is the one
+    pathway already demonstrated to reach land precipitation in this model
+    (`coastal_upwelling_fog_strength`, the geometric proxy this supersedes,
+    moved Atacama 123 -> 102 mm/yr through it). Ocean evaporation already
+    responds to SST through `qsat`, and the moisture budget's row rescale
+    removes it again -- process note 9."""
+
+    sst_land_target_weight: float = 0.0
+    """Target-side half of the SST -> land precipitation coupling, per kelvin of
+    upwind ocean temperature anomaly. `0.0` is an exact no-op.
+
+    Scales each land cell's share of its row's precipitation target by
+    `1 + weight * min(tanh(anomaly / 2 K), 0)`, renormalized per row, so it is
+    exactly row-mean-preserving: it redistributes rainfall within a latitude
+    circle away from land fed by anomalously cold water, and cannot move a zonal
+    total the model is calibrated against.
+
+    **Cold side only, and saturating.** Two things the sweep forced:
+
+    - The warm half is a *double count*. Ocean evaporation already responds to
+      SST through `qsat`, and `monsoon_east_margin_exemption` is calibrated at
+      3.0 for exactly the warm western-boundary-current margins (SE US, East
+      China, S Japan) a symmetric form would boost again -- measured, that drove
+      S Japan to 2809 mm/yr against a 1100-2200 target at 256x512. The
+      suppressing half has no counterpart anywhere in the model: a marine
+      inversion capping convection is why Atacama and the Namib are hyper-arid
+      *on a coastline*.
+    - `tanh` rather than linear-in-kelvin. The model's Kuroshio anomaly reaches
+      +1.9 K where the land median is 0.35 K, so a linear response bounded only
+      by a clip let one outlier take the whole bound. The 2 K reference is a
+      fixed constant, not a knob -- it describes how far an SST anomaly can shift
+      a boundary layer, which is not a per-planet tuning freedom.
+
+    Note one indirect effect that is *not* a warm-side boost: a warm patch lifts
+    its row's ocean mean, pushing other ocean cells negative and so raising the
+    fed land's share slightly after renormalization (+0.1% measured). That is
+    the row-relative reference, not this term's sign.
+
+    **This is the half that survives.** Its companion
+    `sst_land_coupling_strength` gates `subsidence_suppression`, which sits
+    upstream of the moisture budget's rescale -- the deficit fill simply tops
+    the cell back up toward a target that never heard about the anomaly, and the
+    measured effect on every benchmark metric is under 0.1pp at any strength.
+    Process note 9's rule (check which side of the rescale a mechanism sits on)
+    applied to ocean coupling, exactly as A5-OROG had to apply it to orography.
+    """
+
+    sst_land_coupling_km: float = 600.0
+    """E-folding upwind fetch [km] for `sst_land_coupling_strength`'s SST
+    anomaly field. A physical distance rather than a cell count, so the
+    mechanism is resolution-invariant -- the trap the monsoon inland mask (fixed
+    20 cells: 7 deg at 1024 columns, 56 deg at 128) and `_maritime_proximity`
+    (fixed 512-pass cap) each hit once. Inert while
+    `sst_land_coupling_strength` is 0.0."""
 
     coastal_upwelling_fog_strength: float = 0.5
     """Strength [0-1] of coastal-fog/cold-current desert suppression (see
@@ -2825,4 +3077,22 @@ MARS = PlanetParams(
     # wind_upper_hadley_edge_deg left at the Earth default (24.0): no Mars-specific
     # jet-latitude diagnostic has been run, and the Hadley-cell-edge reasoning behind
     # the value isn't obviously Earth-specific.
+    #
+    # Land seasonal damping: reasoned from first principles, NOT measured -- no
+    # Mars seasonal-cycle diagnostic exists. Earth's 0.75 represents surface heat
+    # capacity plus the atmospheric heat transport that responds to a temperature
+    # anomaly and damps it. Mars has ~0.6% of Earth's atmospheric mass and no
+    # ocean, so both terms are small and its surface tracks radiative equilibrium
+    # far more closely -- which is the whole reason Mars has such large seasonal
+    # and diurnal swings. Inheriting Earth's damping would suppress exactly the
+    # behaviour that distinguishes the planet, so this is one of the few places
+    # where carrying the Earth calibration over is affirmatively wrong rather
+    # than merely unvalidated (contrast the note above).
+    land_seasonal_amplitude=1.0,
+    # land_transport_gain is left inherited at 0.5: it scales atmospheric heat
+    # transport into land, and a thin atmosphere transports less, so if anything
+    # Earth's reduced value is closer for Mars than the old 1.0 was.
+    # land_seasonal_amplitude_maritime needs no override -- with ocean_fraction=0
+    # the maritime-proximity field has no spread and `_maritime_transport_factor`
+    # returns exactly 1.0 by its own guard.
 )

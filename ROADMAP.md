@@ -64,6 +64,41 @@ can emerge on its own (jets, monsoons, real storm dynamics).
   > continentality mechanism was built for it and is a measured negative result
   > (`land_transport_maritime_decay`, inert) — at 35-45N the reference-D land is
   > neither more continental nor higher than the reference-C land.
+  > **Superseded 2026-08-04, later the same day (ACCURACY_AUDIT.md
+  > C1b-2026-08-04b): that negative result was itself a population artifact,
+  > and the mechanism now ships enabled.** "D land is not more continental"
+  > (0.312 vs 0.310) was measured by re-deriving the Köppen reference at the
+  > model's 32×64 *forcing* grid — 35 C cells and 15 D cells for the whole band
+  > — while the metric scores the 128×256 grid. On the scored population the two
+  > separate by **0.84 sd**. Two fixes made it reachable: computing the maritime
+  > field at native resolution (the coarse block mask inflates land 34% → 48% of
+  > area and erases coastal contrast) and making it **anisotropic** — westerly
+  > flow means the ocean that moderates a winter continent is the one *upwind*,
+  > and held isotropic the mechanism is still net-negative. Shipped
+  > `land_transport_maritime_decay` 0.0 → 1.0 and `land_transport_upwind_ratio`
+  > 1.0 → 32.0, with a winter weight. Confirmed at 64×128 / 128×256 / 256×512:
+  > H10 group +0.7 to +1.0pp, coldest-month threshold accuracy +1.9 to +2.3pp,
+  > the worst zone (40-50N) **+14 to +18pp**, warmest month flat. Both headline
+  > defects roughly halve, and reference-C and reference-D improve *together*,
+  > which is what distinguishes contrast from a level shift.
+  > **Followed up 2026-08-05 (ACCURACY_AUDIT.md C1b-2026-08-05), and the entry
+  > above turns out to have been half the mechanism.** The winter gate that
+  > mechanism needs is a symptom: it scales an additive *bonus*, so year-round it
+  > warms maritime summers — wrong sign — and therefore cannot reach the
+  > maritime-*summer* error at all (81.5% of −50:−40 reference-C land has a
+  > warmest month above the 22 °C its class requires). The root cause is one
+  > layer up: `temperature_kelvin_for_lat` returns instantaneous radiative
+  > equilibrium, with an annual half-range of ~81 K at 41° against Earth land's
+  > ~28 K, and **the land branch never had a thermal-inertia term at all** while
+  > the ocean branch has damped its own swing since the model's early days.
+  > Shipped `land_seasonal_amplitude` 1.0 → 0.75 (the missing damping, exactly
+  > mean-preserving), `land_transport_gain` 1.0 → 0.5 (the trapezoids were sized
+  > against an *undamped* winter) and `land_seasonal_amplitude_maritime`
+  > 0.0 → 0.45 (the same continentality field, applied to the amplitude, which
+  > has the right sign in both seasons and needs no gate). **Strictly dominant at
+  > 64×128 / 128×256 / 256×512 — every tracked metric improves, nothing traded.**
+  > Warmest-month threshold accuracy +4.2 / +4.5 / +3.0pp, the largest single
+  > move any C1b session has produced.
   > **Scope narrowed 2026-08-03 (ACCURACY_AUDIT.md A6).** "A direct cause of the
   > model emitting no Mediterranean climate" is now only half true. **Csa was
   > recovered from precipitation alone** (0.01% → 1.93% of land, against Earth's

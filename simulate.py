@@ -240,11 +240,24 @@ _MARITIME_CACHE: dict = {"key": None, "field": None}
 
 
 def _maritime_proximity(
-    land_mask: np.ndarray, e_folding_km: float, planet_radius_km: float
+    land_mask: np.ndarray,
+    e_folding_km: float,
+    planet_radius_km: float,
+    upwind_ratio: float = 1.0,
 ) -> np.ndarray:
     """``exp(-distance_to_nearest_ocean / e_folding_km)`` over land, 0 on ocean.
 
-    Computed by iterated max-decay dilation outward from the sea mask rather
+    ``upwind_ratio`` > 1 makes the field **anisotropic**: ocean lying to a cell's
+    west reaches it with an e-folding length ``upwind_ratio`` times longer than
+    ocean in any other direction.  At midlatitudes the flow is westerly in both
+    hemispheres, so the ocean that actually moderates a winter continent is the
+    one upwind of it, not the nearest one in any direction -- New York (Dfa) has
+    open water 100 km to its east and 4000 km of continent to its west, while
+    Lisbon (Csb) at the same latitude has the ocean upwind.  An isotropic field
+    calls those two cells similar; this one does not.  ``1.0`` restores the
+    isotropic field exactly.  See ``land_transport_upwind_ratio``.
+
+    Computed by max-decay dilation outward from the sea mask rather
     than a true distance transform, so this stays pure numpy -- the project has
     no scipy dependency in its simulation path and this is not a good reason to
     add one. The two differ only where the shortest path to open water is
@@ -259,7 +272,8 @@ def _maritime_proximity(
     real distance rather than of cell count.
     """
     H, W = land_mask.shape
-    key = (H, W, float(e_folding_km), float(planet_radius_km),
+    upwind_ratio = max(float(upwind_ratio), 1e-6)
+    key = (H, W, float(e_folding_km), float(planet_radius_km), upwind_ratio,
            int(np.count_nonzero(land_mask)), hash(land_mask.tobytes()))
     if _MARITIME_CACHE["key"] == key:
         return _MARITIME_CACHE["field"]
@@ -269,16 +283,44 @@ def _maritime_proximity(
     lon_spacing_km = np.maximum(
         2.0 * np.pi * planet_radius_km * np.cos(lat) / W, 1e-3
     )
-    decay_lat = np.float32(np.exp(-lat_spacing_km / max(e_folding_km, 1e-6)))
-    decay_lon = np.exp(
-        -lon_spacing_km / max(e_folding_km, 1e-6)
+    base_km = max(e_folding_km, 1e-6)
+    upwind_km = base_km * upwind_ratio
+    decay_lat = np.float32(np.exp(-lat_spacing_km / base_km))
+    decay_lon = np.exp(-lon_spacing_km / base_km).astype(np.float32)[:, None]
+    # `np.roll(field, +1, axis=1)` gives each cell the value of its *western*
+    # neighbour, so that is the term carrying upwind (westerly) ocean influence.
+    decay_lon_upwind = np.exp(
+        -lon_spacing_km / upwind_km
     ).astype(np.float32)[:, None]
 
-    field = (~np.asarray(land_mask, dtype=bool)).astype(np.float32)
+    sea = (~np.asarray(land_mask, dtype=bool)).astype(np.float32)
+
+    # The field is the better of two separately-computed reaches, because they are
+    # different physical claims and have very different numerics:
+    #
+    #  1. **Isotropic**, `e_folding_km` in every direction -- "is there water near
+    #     this cell". Short-ranged, so the iterated max-decay dilation below
+    #     converges in a few dozen passes. It genuinely needs the 2-D iteration:
+    #     the shortest path to open water can turn corners around a coastline.
+    #  2. **Upwind**, `e_folding_km * upwind_ratio` due west -- "how far is this
+    #     cell from the ocean the westerlies are bringing air from". That is a
+    #     path *along a latitude circle* by definition, so it needs no corner
+    #     turns and is exactly computable as a 1-D max-plus prefix scan.
+    #
+    # Keeping them separate is what makes the continental-scale reach affordable.
+    # Run as one coupled 2-D dilation it does not converge in any usable number of
+    # passes -- 580 single-shift passes at 512x1024, silently truncated by the
+    # loop's own cap, i.e. a field that changed with resolution for a purely
+    # numerical reason.  It is also the more faithful reading of the mechanism:
+    # a long *upwind* reach should not be able to propagate meridionally by
+    # turning corners, which is exactly what the coupled version let it do.
     # Three e-foldings along the *finest* axis is where the field has decayed to
-    # ~5%; beyond that the iteration cannot change any value materially.
+    # ~5%; beyond that the iteration cannot change any value materially.  This
+    # budget is set from `base_km` alone -- the upwind reach is handled below and
+    # no longer inflates it, which is what the 512 cap used to silently truncate.
     finest = min(lat_spacing_km, float(lon_spacing_km.max()))
-    steps = int(np.clip(np.ceil(3.0 * e_folding_km / max(finest, 1e-6)), 1, 512))
+    steps = int(np.clip(np.ceil(3.0 * base_km / max(finest, 1e-6)), 1, 512))
+    field = sea
     for _ in range(steps):
         updated = np.maximum(field, np.roll(field, 1, axis=0) * decay_lat)
         updated = np.maximum(updated, np.roll(updated, -1, axis=0) * decay_lat)
@@ -287,11 +329,185 @@ def _maritime_proximity(
         if np.array_equal(updated, field):
             break
         field = updated
+
+    if upwind_ratio > 1.0:
+        # Exact 1-D scan by doubling: shift west by 1, then 2, then 4 ...,
+        # squaring the decay each time, so `max_k sea[i-k] * decay**k` is reached
+        # in O(log W) passes.  `np.roll(f, +1, axis=1)` gives each cell its
+        # *western* neighbour's value, which is the upwind direction.
+        upwind = sea
+        shift, step_decay = 1, decay_lon_upwind
+        while shift < W:
+            upwind = np.maximum(
+                upwind, np.roll(upwind, shift, axis=1) * step_decay
+            )
+            step_decay = step_decay * step_decay
+            shift *= 2
+        field = np.maximum(field, upwind)
     field = (field * np.asarray(land_mask, dtype=np.float32)).astype(np.float32)
     field.flags.writeable = False
     _MARITIME_CACHE["key"] = key
     _MARITIME_CACHE["field"] = field
     return field
+
+
+_MARITIME_COARSE_CACHE: dict = {"key": None, "field": None}
+
+
+def _maritime_proximity_coarse(
+    elevation: np.ndarray,
+    Hc: int,
+    Wc: int,
+    block_size: int,
+    e_folding_km: float,
+    planet_radius_km: float,
+    upwind_ratio: float = 1.0,
+) -> np.ndarray:
+    """``_maritime_proximity`` evaluated on the *fine* grid, then block-averaged.
+
+    The land heat-transport bonus lives on the coarse temperature grid, but the
+    coarse **land mask** is not a coarsened coastline -- ``_coarsen`` block-means
+    the elevation and ``get_masks`` then calls any block containing a sliver of
+    land "land".  On the bundled Earth DEM that inflates land from 34.1% of area
+    to 48.3% at ``block_size=4`` (Earth is 29%), pushing every coastline outward
+    by up to a full coarse cell and flooding enclosed seas.  A maritime-proximity
+    field built on that mask has most of its coastal contrast erased before any
+    physics sees it: measured against the Köppen reference's own 35-45N C/D land,
+    the coarse-mask field separates the two populations by 0.37 sd against 0.84
+    for the same field computed at 128x256.
+
+    Computing at native resolution and averaging down keeps the coastlines and
+    only gives up the resolution, which recovers all of it -- 0.37 -> 0.83 sd
+    isotropic, and 1.02 with ``upwind_ratio=32``, against an uncoarsened ceiling
+    of 1.00.  Averaging rather than subsampling is what
+    makes it a coarse-cell *mean* proximity, so a cell straddling a coast lands
+    between its coastal and interior values instead of taking either one.
+
+    The average is taken over each block's **land** cells only.  A plain block
+    mean would divide a coastal sliver's high proximity by the whole block and
+    report the most maritime cells on the grid as the most continental ones --
+    the exact inversion this field exists to avoid.
+    """
+    elevation = np.asarray(elevation)
+    H, W = elevation.shape
+    if H != Hc * block_size or W != Wc * block_size:
+        # Non-integer coarsening: fall back to the coarse mask rather than
+        # guessing a reshape.  `_coarsen` is the only supported path here.
+        _, land_c = get_masks(_coarsen_elevation_cached(elevation, Hc, Wc, block_size),
+                             use_cache=False)
+        return _maritime_proximity(
+            land_c, e_folding_km, planet_radius_km, upwind_ratio
+        )
+
+    # Cheap O(1) content fingerprint rather than a full sum: this runs every
+    # step, and `masks.py` already measured a full `.sum()` at ~160 us per call
+    # on the 512x1024 grid.  Same strided-subset scheme as `masks._elev_fingerprint`
+    # and `sim_grid._coarsen_elevation_cached`, plus id() to catch in-place edits
+    # of a persistent array.
+    flat = elevation.ravel()
+    stride = max(1, flat.size // 512)
+    key = (id(elevation), H, W, Hc, Wc, int(block_size), float(e_folding_km),
+           float(planet_radius_km), float(upwind_ratio),
+           float(flat[0]), float(flat[-1]), float(flat[::stride].sum()))
+    if _MARITIME_COARSE_CACHE["key"] == key:
+        return _MARITIME_COARSE_CACHE["field"]
+
+    _, land_fine = get_masks(elevation)
+    fine = _maritime_proximity(
+        land_fine, e_folding_km, planet_radius_km, upwind_ratio
+    )
+    blocks = (Hc, block_size, Wc, block_size)
+    total = fine.reshape(blocks).sum(axis=(1, 3), dtype=np.float64)
+    land_count = land_fine.reshape(blocks).sum(axis=(1, 3), dtype=np.float64)
+    field = np.divide(total, land_count, out=np.zeros_like(total),
+                      where=land_count > 0)
+    field = np.ascontiguousarray(field, dtype=np.float32)
+    field.flags.writeable = False
+    _MARITIME_COARSE_CACHE["key"] = key
+    _MARITIME_COARSE_CACHE["field"] = field
+    return field
+
+
+def _maritime_transport_factor(
+    maritime: np.ndarray,
+    land_mask: np.ndarray,
+    lat: np.ndarray,
+    decay: float,
+    winter_weight_1d: np.ndarray,
+) -> np.ndarray:
+    """Row-mean-preserving continentality multiplier for the land transport bonus.
+
+    Returns a factor to multiply the summed heat-transport trapezoids by.  It is
+    ``1 + decay * winter * anomaly / spread`` where ``anomaly`` is each land
+    cell's maritime proximity relative to **its own row's land mean**, so the
+    calibrated zonal-mean winter level is untouched and only the contrast within
+    a row changes.  Ocean cells and land-free rows get exactly 1.0.
+
+    Two details that a planted-violation check showed are load-bearing:
+
+    - ``spread`` is the land-area-weighted standard deviation of the anomaly,
+      taken **globally**.  Dividing by it puts ``decay`` in units of "fraction of
+      the bonus per standard deviation of continentality", so it keeps its
+      meaning when ``land_transport_maritime_km`` or
+      ``land_transport_upwind_ratio`` change the field's spread -- without it the
+      strength and shape knobs are badly degenerate (a longer upwind reach
+      flattens the field, and the same physical effect then needs decay 12 where
+      a short reach needed 2).  Global rather than per-row because a row whose
+      land is uniformly maritime genuinely has no contrast, and per-row
+      normalization would manufacture one out of rounding.
+    - ``winter_weight_1d`` gates it to the winter half.  Maritime moderation is a
+      winter phenomenon; applied year-round the same contrast warms maritime
+      *summers*, which is the wrong sign -- the real effect of maritime exposure
+      on a summer maximum is to lower it.  Measured, the ungated form costs
+      0.26pp of warmest-month threshold accuracy at 128x256 and 0.45pp at
+      256x512, diffusely across reference groups C/D/E, while the gate removes
+      that cost and leaves every coldest-month gain intact.
+    """
+    land_f = np.asarray(land_mask, dtype=np.float32)
+    per_row = land_f.sum(axis=1, keepdims=True)
+    row_mean = np.divide(
+        (maritime * land_f).sum(axis=1, keepdims=True),
+        np.maximum(per_row, 1.0),
+    )
+    anomaly = (maritime - row_mean) * land_f
+    # Area weighting so the spread is a property of the planet's geography and
+    # not of the grid's polar cell crowding.
+    weight = land_f * np.cos(lat)[:, None].astype(np.float32)
+    weight_sum = float(weight.sum())
+    spread = (
+        float(np.sqrt((weight * anomaly * anomaly).sum() / weight_sum))
+        if weight_sum > 0.0
+        else 0.0
+    )
+    # A planet with no continentality contrast at all (an aquaplanet, or one
+    # land cell per row) gets no mechanism rather than a division blow-up.
+    if spread <= 1e-6:
+        return np.ones_like(anomaly, dtype=np.float32)
+    deviation = (
+        float(decay)
+        * np.asarray(winter_weight_1d, dtype=np.float32)[:, None]
+        * anomaly
+        / spread
+    )
+    # A cell can lose its whole bonus but not reverse it into a penalty, so the
+    # deviation is bounded to [-1, 1].  A bare clip would silently break the
+    # mean preservation above -- at the shipped strength the anomaly reaches
+    # ~3 standard deviations, so clipping alone leaves rows up to 22% of a bonus
+    # heavier than they started, which is a zonal-level change wearing a
+    # contrast mechanism's clothes.  Re-centring after each clip restores it;
+    # six passes converges to 5e-5 of a bonus on Earth's geography (one pass
+    # leaves 0.05, three leave 0.003) and the final clip guarantees the bound
+    # even if a pathological planet has not converged.  At the shipped strength
+    # 16.4% of land cells sit at the bound, so this is a genuinely saturating
+    # redistribution, not a small correction.
+    land_bool = land_f > 0.0
+    row_land = np.maximum(per_row, 1.0)
+    for _ in range(6):
+        deviation = np.clip(deviation, -1.0, 1.0) * land_f
+        offset = deviation.sum(axis=1, keepdims=True) / row_land
+        deviation = (deviation - offset) * land_f
+    deviation = np.clip(deviation, -1.0, 1.0)
+    return np.where(land_bool, 1.0 + deviation, 1.0).astype(np.float32, copy=False)
 
 
 def _evolve_temperature_substepped(
@@ -892,7 +1108,52 @@ def simulate_step(
         polar_cooling_scale=polar_cooling_scale,
         planet_params=pp,
     )
+    # Annual-mean radiative baseline, hoisted here from the ocean block below
+    # (which still consumes it) so the land seasonal damping can share it. It
+    # depends only on `lat`, `polar_cooling_scale` and `pp`, so the move is
+    # side-effect free and saves nothing/costs nothing when damping is off.
+    T_lat_annual_mean = temperature_kelvin_for_lat(
+        lat,
+        day_of_year=pp.vernal_equinox_day,
+        polar_cooling_scale=polar_cooling_scale,
+        planet_params=pp,
+    )
+    # Land seasonal amplitude damping (2026-08-04, audit C1b).
+    #
+    # `temperature_kelvin_for_lat` returns *instantaneous local radiative
+    # equilibrium*, which has no surface heat capacity and no dynamical damping
+    # in it at all. Measured at 41.4 deg, its annual half-range is ~81 K against
+    # Earth land's ~28 K -- the single largest error anywhere in this stack.
+    # Everything downstream is a patch for one half of it: the three transport
+    # trapezoids exist to lift a -33 C radiative winter, and `_land_cap_1d`
+    # exists to cut a +41 C radiative summer. Because the trapezoids are added
+    # every month while the cap only removes in summer, the pair does not cancel
+    # -- it leaves the forcing's annual mean 21 K too warm and writes a flat top
+    # across seven months (the square wave C1b tracks).
+    #
+    # The ocean branch below has damped its own seasonal swing since the model's
+    # early days (`ocean_seasonal_frac`, same mean-preserving form). Land simply
+    # never got the equivalent, so it ran with an implicit thermal inertia of
+    # zero. This is that term: a contraction of the seasonal anomaly toward the
+    # cell's own annual mean, which is **exactly mean-preserving** -- it cannot
+    # move the annual-mean calibration the trapezoids and `_land_cap_1d` were
+    # tuned against, only the swing about it.
+    #
+    # Land's damping is legitimately much weaker than ocean's (soil's thermal
+    # inertia is weeks, not years) but it is not 1.0: the anomaly is also damped
+    # by the atmospheric heat transport that responds to it, which is why an
+    # energy-balance land surface swings far less than its own radiative
+    # equilibrium. `land_seasonal_amplitude = 1.0` is an exact no-op and
+    # reproduces the historical behaviour bit-for-bit.
+    #
+    # Applied below, once the maritime field exists, because the strength is
+    # per-cell rather than global -- see `land_seasonal_amplitude_maritime`.
+    _land_seasonal_amp = float(pp.land_seasonal_amplitude)
     T_base_land = np.repeat(T_lat_land[:, None], Wc, axis=1).astype(np.float32, copy=False) + co2_temp_offset
+    _T_annual_mean_2d = (
+        np.repeat(T_lat_annual_mean[:, None], Wc, axis=1).astype(np.float32, copy=False)
+        + co2_temp_offset
+    )
     # Land summer temperature cap: temperature_kelvin_for_lat gives radiative equilibrium,
     # but real land surfaces never reach those peaks because latent heat (ET), soil heat
     # capacity, and turbulent exchange all limit summer temperatures.
@@ -1014,9 +1275,18 @@ def simulate_step(
         1.0 - float(pp.land_transport_seasonality) * _summer_signal_1d
     ).astype(np.float32)
 
+    # `land_transport_gain` is the companion knob to `land_seasonal_amplitude`
+    # above and is meaningless without it. All three trapezoids were sized
+    # against an *undamped* radiative winter -- 27 K at 41 deg to lift a -33 C
+    # January, 22 K at 65 deg to keep Antarctic winter off the 200 K floor. Damp
+    # the swing and that deficit shrinks by construction, so the calibrated peaks
+    # become an overshoot applied year-round, i.e. the +21 K annual-mean error
+    # `_land_cap_1d` currently hides. This scales all three together, preserving
+    # the latitude shape C1's handoff work calibrated; 1.0 is an exact no-op.
     _transport_total_1d = (
         (_atm_land_transport_1d + _midlat_storm_bonus_1d + _handoff_bonus_1d)
         * _land_transport_season_1d
+        * float(pp.land_transport_gain)
     )[:, None].astype(np.float32, copy=False)
     # Continentality (2026-08-04, audit C1b). All three trapezoids above are pure
     # functions of |latitude|, so every land cell in a row receives the identical
@@ -1035,33 +1305,106 @@ def simulate_step(
     # own tuning, and this mechanism exists to add contrast, not to relitigate
     # that level. `land_transport_maritime_decay = 0.0` is an exact no-op.
     #
-    # **Shipped inert -- a measured negative result, not an unswept knob.** It
-    # helps at 45-55N and hurts at 35-45N, where reference-D land turns out to
-    # be neither more continental nor higher than reference-C land (0.312 vs
-    # 0.310 maritime proximity, 0.062 vs 0.049 elevation). Full sweep table and
-    # the reasoning are in the field's docstring in planet_params.py; do not
-    # re-enable it without a discriminator that actually separates those two.
+    # The anomaly is divided by its own land-area-weighted standard deviation,
+    # so `decay` is in units of "fraction of the bonus per standard deviation of
+    # continentality" and does not silently rescale when the *shape* knobs
+    # (`land_transport_maritime_km`, `land_transport_upwind_ratio`) change the
+    # field's spread. Without it the two are badly degenerate: a longer upwind
+    # reach flattens the field toward 1 everywhere, and the same physical effect
+    # then needs decay 12 where a short reach needed 2. Global rather than
+    # per-row: a row whose land is uniformly maritime genuinely has no
+    # continentality contrast, and per-row normalization would manufacture one.
+    #
+    # 2026-08-04 (this session): re-enabled after the two fixes below. The
+    # earlier negative result -- "reference-D land at 35-45N is neither more
+    # continental nor higher than reference-C land, 0.312 vs 0.310" -- was a
+    # population artifact, not a fact about Earth. It was measured by
+    # re-deriving the Köppen reference *at the 32x64 coarse grid* (35 C cells
+    # and 15 D cells for the whole band), while the metric it was aimed at
+    # scores the fine grid. On the population actually scored, the two separate
+    # by 0.84 sd. See `_maritime_proximity_coarse` and
+    # `land_transport_upwind_ratio` for the two fixes that recovered it.
     _maritime_decay = float(pp.land_transport_maritime_decay)
-    if _maritime_decay > 0.0 and np.any(_land_mask_early):
-        _maritime = _maritime_proximity(
-            _land_mask_early,
+    _amp_maritime = float(pp.land_seasonal_amplitude_maritime)
+    _maritime = None
+    if (
+        (_maritime_decay > 0.0 or _amp_maritime != 0.0)
+        and np.any(_land_mask_early)
+        and state.elevation is not None
+    ):
+        _maritime = _maritime_proximity_coarse(
+            state.elevation,
+            Hc,
+            Wc,
+            block_size,
             float(pp.land_transport_maritime_km),
             float(pp.radius_m) / 1000.0,
+            float(pp.land_transport_upwind_ratio),
         )
-        _land_f_early = _land_mask_early.astype(np.float32)
-        _land_per_row = _land_f_early.sum(axis=1, keepdims=True)
-        _maritime_row_mean = np.divide(
-            (_maritime * _land_f_early).sum(axis=1, keepdims=True),
-            np.maximum(_land_per_row, 1.0),
-        )
-        # Rows with no land contribute nothing; their factor is left at 1.0.
-        _maritime_factor = np.where(
-            _land_per_row > 0.0,
-            1.0 + _maritime_decay * (_maritime - _maritime_row_mean),
-            1.0,
+    if _maritime_decay > 0.0 and _maritime is not None:
+        # Winter weighting: `_summer_signal_1d` is +1 at the local summer
+        # solstice and -1 at the local winter solstice, so this is 1 through
+        # winter and 0 through the whole summer half, smoothly and per
+        # hemisphere.  See `_maritime_transport_factor` for why.
+        _maritime_factor = _maritime_transport_factor(
+            _maritime,
+            _land_mask_early,
+            lat,
+            _maritime_decay,
+            np.clip(-_summer_signal_1d, 0.0, 1.0).astype(np.float32),
         )
         _transport_total_1d = (
-            _transport_total_1d * np.clip(_maritime_factor, 0.0, 2.0)
+            _transport_total_1d * _maritime_factor
+        ).astype(np.float32, copy=False)
+
+    # Per-cell land seasonal amplitude (2026-08-05, audit C1b).
+    #
+    # `land_seasonal_amplitude` above sets the zonal level of the damping; this
+    # sets its contrast within a row, and the contrast is the part that carries
+    # real physical content. A maritime climate *is* a damped seasonal cycle --
+    # that is the definition, not a consequence -- so the same continentality
+    # field the winter transport bonus already uses is the correct modulator.
+    #
+    # This is also the mechanism `_maritime_transport_factor`'s winter gate
+    # exists to work around. That factor is an additive *bonus*, so applying it
+    # year-round warms maritime summers, which is the wrong sign; it had to be
+    # restricted to winter and therefore cannot touch the model's
+    # maritime-summer error at all (measured at 128x256: 81.5% of -50:-40 and
+    # 48.7% of -40:-30 reference-C land -- Chile, New Zealand, Tasmania -- has a
+    # warmest month above the 22 C its class requires). An *amplitude* damping
+    # has the correct sign in both seasons by construction: it warms maritime
+    # winters and cools maritime summers, from one term, with the cell's annual
+    # mean untouched. That is why it needs no seasonal gate.
+    #
+    # Sign: high maritime proximity must *lower* the amplitude, so the shared
+    # factor is called with a negated decay. Everything else about it is wanted
+    # as-is -- the row-mean preservation (so `land_seasonal_amplitude` keeps
+    # meaning the row's mean damping), the global spread normalization (so this
+    # knob does not silently rescale when `land_transport_maritime_km` or
+    # `land_transport_upwind_ratio` change the field), and the [-1, 1] bound
+    # (amplitude stays in [0, 2x] -- a fully maritime cell can lose its whole
+    # seasonal cycle but never invert it).
+    if _amp_maritime != 0.0 and _maritime is not None:
+        _amp_field = _land_seasonal_amp * _maritime_transport_factor(
+            _maritime,
+            _land_mask_early,
+            lat,
+            -_amp_maritime,
+            np.ones_like(lat, dtype=np.float32),
+        )
+    elif _land_seasonal_amp != 1.0:
+        _amp_field = np.full((Hc, Wc), _land_seasonal_amp, dtype=np.float32)
+    else:
+        _amp_field = None
+    if _amp_field is not None:
+        # Land only: ocean cells of `T_base_land` are never consumed (the land
+        # blend in `_evolve_temperature` is zero there), but leaving them
+        # untouched keeps the array meaningful for anything that inspects it.
+        _amp_field = np.where(_land_mask_early, _amp_field, 1.0).astype(
+            np.float32, copy=False
+        )
+        T_base_land = (
+            _T_annual_mean_2d + _amp_field * (T_base_land - _T_annual_mean_2d)
         ).astype(np.float32, copy=False)
     # Deficit gating (2026-08-03, audit C1b). The three trapezoids above are
     # sized for a winter deficit but added every month, which is the *mean*
@@ -1185,12 +1528,8 @@ def simulate_step(
     #    Stream, Kuroshio, and thermohaline circulation. This offset is standard in
     #    energy balance climate models (Budyko 1969, Sellers 1969).
 
-    T_lat_annual_mean = temperature_kelvin_for_lat(
-        lat,
-        day_of_year=pp.vernal_equinox_day,
-        polar_cooling_scale=polar_cooling_scale,
-        planet_params=pp,
-    )
+    # (`T_lat_annual_mean` is computed once, up with the land branch, which also
+    # consumes it for `land_seasonal_amplitude`.)
 
     # Meridional heat transport warming: concentrated at high latitudes
     # 0K below 40°, ramping to 40K at 70°+ (matches observed SST - radiative eq deficit)
@@ -1313,12 +1652,21 @@ def simulate_step(
         # here. That is a pre-existing inconsistency, inert at the default
         # `temperature_substep_days=0.0`; left as found rather than changed
         # blind, since this path cannot be validated while it is disabled.)
-        land_base = (
+        land_base_radiative = (
             np.repeat(T_land_lat[:, None], Wc, axis=1).astype(np.float32, copy=False)
             + co2_temp_offset
+        )
+        if _amp_field is not None:
+            land_base_radiative = (
+                _T_annual_mean_2d
+                + _amp_field * (land_base_radiative - _T_annual_mean_2d)
+            ).astype(np.float32, copy=False)
+        land_base = (
+            land_base_radiative
             + (
                 (_atm_land_transport_1d + _midlat_storm_bonus_1d)
                 * (1.0 - float(pp.land_transport_seasonality) * summer_signal)
+                * float(pp.land_transport_gain)
             )[:, None]
         )
         evap_excess = np.maximum(land_base - _EVAP_COOL_THRESHOLD_K, 0.0)

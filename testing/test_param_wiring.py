@@ -116,10 +116,13 @@ PLANET_PARAM_CASES = [
     ("coastal_upwelling_fog_strength", 0.9),  # default 0.5
     ("land_transport_deficit_k", 25.0),  # default 0.0 (exact no-op)
     ("land_thermal_inertia_days", 60.0),  # default 0.0 (exact no-op)
-    ("land_transport_maritime_decay", 1.0),  # default 0.0 (exact no-op)
-    # land_transport_maritime_km is deliberately absent: it only sets the
-    # e-folding length of the field the knob above weights by, so it is inert
-    # until that knob is non-zero and a lone perturbation is correctly a no-op.
+    ("land_transport_maritime_decay", 0.0),  # default 1.0; 0.0 is the exact no-op
+    # land_transport_maritime_km and land_transport_upwind_ratio both shape the
+    # maritime-proximity field the knob above weights by, so both are live at the
+    # shipped default -- but only as a *shape* change, which a 15-day fresh-start
+    # run at 24x48 does not reliably resolve. Covered instead by
+    # test_maritime_transport.py, which exercises the field and the factor
+    # directly (including that upwind_ratio is inert when the decay knob is 0.0).
     # land_transport_deficit_gain is deliberately absent: it multiplies the
     # *gated* transport, so it is inert until land_transport_deficit_k > 0 and a
     # lone perturbation is correctly a no-op. Covered instead by
@@ -129,6 +132,18 @@ PLANET_PARAM_CASES = [
     ("storm_track_seasonal_response", 0.3),  # default 0.0 (exact no-op)
     ("orographic_upwind_footprint_km", 300.0),  # default 0.0 (exact no-op)
     ("orographic_spillover_km", 300.0),  # default 0.0 (exact no-op)
+    ("land_seasonal_amplitude", 1.0),  # default 0.75; 1.0 is the exact no-op
+    ("land_seasonal_amplitude_maritime", 0.0),  # default 0.45; 0.0 is the no-op
+    ("land_transport_gain", 1.0),  # default 0.5; 1.0 is the exact no-op
+    ("sst_land_target_weight", 1.5),  # default 0.0 (exact no-op)
+    # sst_land_coupling_strength is deliberately absent, and the reason is the
+    # finding rather than an omission: it gates `subsidence_suppression`, which
+    # in every desert it was aimed at already sits on its 0.02 floor, and
+    # elsewhere the moisture budget's row rescale absorbs it. It is measurably
+    # inert on Earth at any strength -- see audit D3 and its own docstring --
+    # so a wiring test that demanded a state change would fail for a documented
+    # physical reason, not a plumbing one. sst_land_coupling_km shapes the
+    # shared anomaly field and is inert while both strengths are 0.0.
 ]
 
 
