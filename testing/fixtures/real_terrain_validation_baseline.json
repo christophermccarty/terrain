@@ -537,8 +537,11 @@
     "enable_surface_hydrology": false,
     "epsilon_equator": 0.68,
     "epsilon_pole": 0.7,
+    "evap_cooling_amplitude": 0.0,
+    "evap_cooling_coeff": 0.85,
     "evap_cooling_season_width": 1.0,
     "evap_cooling_strength": 1.0,
+    "evap_cooling_threshold_k": 290.0,
     "ferrel_v_centre_deg": 44.0,
     "ferrel_v_land_shift_deg": -4.0,
     "gas_constant_dry": 287.0,
@@ -648,6 +651,6 @@
     "final_total_days": 730.4843999999996,
     "sampled_days": 365.24219999999997,
     "spinup_cycles": 12,
-    "wall_seconds": 13.502997000003234
+    "wall_seconds": 15.082332100020722
   }
 }

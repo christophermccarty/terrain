@@ -428,6 +428,41 @@ def _maritime_proximity_coarse(
     return field
 
 
+def _evap_cooling_fraction(
+    season: np.ndarray,
+    soil: np.ndarray,
+    coeff: float,
+    strength: float,
+) -> np.ndarray:
+    """Fraction of a land cell's above-threshold excess removed by evapotranspiration.
+
+    Shared by both of `simulate_step`'s forcing paths (the outer seasonal target
+    and `_temperature_bases_for_day`'s inner resample) so the invariant below is
+    maintained in exactly one place.
+
+    **The `[0, 1]` clip is a correctness guard, not a tuning choice.**  The
+    product ``season * coeff * strength * soil`` exceeds 1 once
+    ``coeff * strength > 1 / soil`` -- about ``evap_cooling_strength`` 1.18 at
+    the shipped 0.85 coefficient and a mid-range soil moisture -- past which the
+    term removes *more* than the whole excess and the map from pre- to
+    post-cooling temperature turns around, so a hotter cell comes out colder than
+    a cooler one.  A contraction toward a reference must be monotone in its input
+    and must not overshoot the reference; unclipped it is neither.  Inert at the
+    shipped defaults, whose product peaks at 0.85.
+
+    Audit process note 19: the bound and the invariant next to it have to be
+    checked together, and the check has to call this function rather than
+    re-derive the arithmetic.
+    """
+    return np.clip(
+        np.asarray(season, dtype=np.float32)
+        * (float(coeff) * float(strength))
+        * np.clip(np.asarray(soil, dtype=np.float32), 0.0, 1.0),
+        0.0,
+        1.0,
+    )
+
+
 def _maritime_transport_factor(
     maritime: np.ndarray,
     land_mask: np.ndarray,
@@ -1288,6 +1323,14 @@ def simulate_step(
         * _land_transport_season_1d
         * float(pp.land_transport_gain)
     )[:, None].astype(np.float32, copy=False)
+    # Hoisted from the evapotranspiration cooling further down so the
+    # evapotranspirative amplitude damping below can share it. Depends only on
+    # `state.soil_moisture` and the coarse grid, so moving it is side-effect free.
+    if state.soil_moisture is not None:
+        _soil_2d = _coarsen_many({"soil": state.soil_moisture}, Hc, Wc, block_size)["soil"]
+    else:
+        _soil_2d = np.full((Hc, Wc), 0.55, dtype=np.float32)
+
     # Continentality (2026-08-04, audit C1b). All three trapezoids above are pure
     # functions of |latitude|, so every land cell in a row receives the identical
     # winter heat-transport bonus -- the model has no maritime moderation
@@ -1396,6 +1439,49 @@ def simulate_step(
         _amp_field = np.full((Hc, Wc), _land_seasonal_amp, dtype=np.float32)
     else:
         _amp_field = None
+
+    # Evapotranspirative damping of the land seasonal amplitude (2026-08-05,
+    # audit C1b-EVAP). The *other* evapotranspiration term in this function --
+    # the contraction toward `evap_cooling_threshold_k` below -- is a level
+    # operation wearing a shape mechanism's clothes, and that is measurably why
+    # strengthening it costs accuracy: it subtracts from a cell's annual mean,
+    # which in the wet tropics (hot, high soil moisture, almost no seasonal
+    # cycle to flatten) pushes rainforest land under Koppen's 18 C A-boundary.
+    # Measured at 128x256, `evap_cooling_strength` 1.0 -> 2.0 loses 2.05pp of
+    # group accuracy in 0:10 and 1.08pp in -20:-10 while *gaining* 2.92pp on the
+    # US Midwest -- the mechanism is right about the mid-latitudes and wrong
+    # about the tropics, from one term.
+    #
+    # Damping the seasonal *amplitude* by the same soil-moisture field is the
+    # shape-only form of the identical physics: latent heat flux buffers a moist
+    # surface's swing, and a dry one's is unbuffered. Being exactly
+    # mean-preserving in time it cannot move any cell's annual mean, so it is
+    # inert by construction exactly where the threshold form does damage --
+    # a cell with no seasonal cycle has no amplitude to damp. Process note 20:
+    # the level was the wrong quantity to modulate; the amplitude is the right
+    # one.
+    #
+    # Shares `land_seasonal_amplitude_maritime`'s row-mean preservation and
+    # global spread normalization (so `land_seasonal_amplitude` keeps meaning
+    # the row's mean damping and this knob is in units of "fraction of amplitude
+    # per standard deviation of soil moisture"), and its [-1, 1] bound. Soil
+    # moisture is a *different* discriminator from continentality, not a proxy
+    # for it: the Sahel is dry without being continental and the Pacific
+    # Northwest is wet without being maritime-dominated in summer.
+    _amp_soil = float(pp.evap_cooling_amplitude)
+    if _amp_soil != 0.0 and np.any(_land_mask_early):
+        _amp_soil_field = _maritime_transport_factor(
+            _soil_2d,
+            _land_mask_early,
+            lat,
+            -_amp_soil,
+            np.ones_like(lat, dtype=np.float32),
+        )
+        _amp_field = (
+            _amp_soil_field
+            if _amp_field is None
+            else (_amp_field * _amp_soil_field).astype(np.float32, copy=False)
+        )
     if _amp_field is not None:
         # Land only: ocean cells of `T_base_land` are never consumed (the land
         # blend in `_evolve_temperature` is zero there), but leaving them
@@ -1466,17 +1552,20 @@ def simulate_step(
     # the 27.9C ceiling -- so the cap continues to do all the work, binding on
     # 55.7% of (month, row) pairs at 25-50 deg. Do not rely on the old claim that
     # the cap rarely binds; see ACCURACY_AUDIT.md C1b.
-    if state.soil_moisture is not None:
-        _soil_2d = _coarsen_many({"soil": state.soil_moisture}, Hc, Wc, block_size)["soil"]
-    else:
-        _soil_2d = np.full((Hc, Wc), 0.55, dtype=np.float32)
+    # `_soil_2d` is computed further up (hoisted so the evapotranspirative
+    # amplitude damping can share it) -- it depends only on
+    # `state.soil_moisture` and the coarse grid, so hoisting is side-effect free.
     # `_land_mask_early` is computed further up (hoisted so the continentality
     # weighting on the transport bonus can share it) -- it depends only on
     # `state.elevation` and the coarse grid, so hoisting is side-effect free.
     # `_summer_factor_1d` is computed further up (hoisted so the winter transport
     # boost can share the same seasonal signal) -- the two are exactly out of phase.
-    _EVAP_COOL_THRESHOLD_K = 290.0
-    _EVAP_COOL_COEFF_MAX = 0.85
+    # Both constants are `PlanetParams` fields as of 2026-08-05 (audit
+    # C1b-EVAP). The threshold in particular is not a neutral tuning constant:
+    # it is the term's *reach*, and at 290 K it excludes every zone whose
+    # warmest month is actually wrong -- see its docstring.
+    _EVAP_COOL_THRESHOLD_K = float(pp.evap_cooling_threshold_k)
+    _EVAP_COOL_COEFF_MAX = float(pp.evap_cooling_coeff)
     # Saturating seasonal gate: a contraction toward the threshold is only
     # shape-preserving if its *strength* is constant through the warm season.
     # Letting the strength track `_summer_factor_1d` all the way to the solstice
@@ -1486,10 +1575,14 @@ def simulate_step(
         _summer_factor_1d / max(float(pp.evap_cooling_season_width), 1e-6), 0.0, 1.0
     ).astype(np.float32)
     _evap_excess_2d = np.maximum(T_base_land - _EVAP_COOL_THRESHOLD_K, 0.0)
+    _evap_frac_2d = _evap_cooling_fraction(
+        _evap_season_1d[:, None],
+        _soil_2d,
+        _EVAP_COOL_COEFF_MAX,
+        float(pp.evap_cooling_strength),
+    )
     _evap_cooling_2d = (
-        _evap_season_1d[:, None]
-        * (_EVAP_COOL_COEFF_MAX * float(pp.evap_cooling_strength))
-        * np.clip(_soil_2d, 0.0, 1.0) * _evap_excess_2d
+        _evap_frac_2d * _evap_excess_2d
     ) * _land_mask_early.astype(np.float32)
     T_base_land = (T_base_land - _evap_cooling_2d).astype(np.float32, copy=False)
 
@@ -1671,9 +1764,12 @@ def simulate_step(
         )
         evap_excess = np.maximum(land_base - _EVAP_COOL_THRESHOLD_K, 0.0)
         evap_cooling = (
-            summer_factor[:, None]
-            * (_EVAP_COOL_COEFF_MAX * float(pp.evap_cooling_strength))
-            * np.clip(_soil_2d, 0.0, 1.0)
+            _evap_cooling_fraction(
+                summer_factor[:, None],
+                _soil_2d,
+                _EVAP_COOL_COEFF_MAX,
+                float(pp.evap_cooling_strength),
+            )
             * evap_excess
             * _land_mask_early.astype(np.float32)
         )

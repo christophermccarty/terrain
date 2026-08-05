@@ -136,6 +136,19 @@ PLANET_PARAM_CASES = [
     ("land_seasonal_amplitude_maritime", 0.0),  # default 0.45; 0.0 is the no-op
     ("land_transport_gain", 1.0),  # default 0.5; 1.0 is the exact no-op
     ("sst_land_target_weight", 1.5),  # default 0.0 (exact no-op)
+    ("evap_cooling_threshold_k", 275.0),  # default 290.0; lower = wider reach
+    ("evap_cooling_amplitude", 0.6),  # default 0.0 (exact no-op)
+    # evap_cooling_coeff is deliberately absent, and like sst_land_coupling_strength
+    # above the omission *is* a finding rather than a gap. Perturbing it 0.85 ->
+    # 0.30 leaves this fixture byte-identical even though 185 of its 346 land
+    # cells are above the 290 K threshold, because `_land_cap_1d` sits
+    # immediately downstream: those cells' forcing exceeds the cap both with and
+    # without the weaker cooling, so `min(T - cooling, cap)` is unchanged.
+    # Measured on the real-DEM benchmark, the cap absorbs 99.4% of this term
+    # (audit C1b-EVAP) -- so a wiring test demanding a state change here would
+    # fail for a documented physical reason, not a plumbing one. The knob is
+    # covered directly by test_evap_cooling.py, which exercises the shared
+    # fraction helper and pins that coeff and strength enter as a product.
     # sst_land_coupling_strength is deliberately absent, and the reason is the
     # finding rather than an omission: it gates `subsidence_suppression`, which
     # in every desert it was aimed at already sits on its 0.02 floor, and

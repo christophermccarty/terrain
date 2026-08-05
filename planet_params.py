@@ -633,7 +633,18 @@ class PlanetParams:
     hard-clamped value. It only preserves shape once the overshoot has been
     brought down to the same order as `w` -- which is what
     `land_transport_seasonality` and `evap_cooling_strength` are for. The three
-    are meant to be set together."""
+    are meant to be set together.
+
+    **That precondition is now met for the first time** (measured 2026-08-05,
+    audit C1b-EVAP). The 2026-08-05 amplitude work collapsed the forcing's peak
+    overshoot against this ceiling from **+11.54 K to -0.19 K** at 35-45N (and
+    +5.21 -> +1.08 at 25-35N), so the regime this knob has always required now
+    exists. Swept there it improves `cycle_error_score`, both Koppen threshold
+    accuracies, and produces the project's first nonzero Cfc -- but costs H10
+    group accuracy above w ~= 2, because the soft-min sits strictly *below* the
+    hard clamp (`y(c) = c - w*log 2`) and so carries a systematic cool bias of
+    order `w`. Anyone taking this up should compensate that level shift rather
+    than sweep the width alone."""
 
     evap_cooling_strength: float = 1.0
     """Multiplier on `simulate._evolve_temperature`'s evapotranspiration cooling
@@ -641,14 +652,30 @@ class PlanetParams:
     no-op.
 
     Raising this deepens the contraction of summer land temperature toward the
-    290 K reference, lowering the summer target so the `_land_cap_1d` ceiling
-    stops binding. The mechanism stays soil-moisture-aware, so deserts (low
-    `soil_moisture`) are affected far less than moist continental interiors --
-    which is both the physically correct behaviour and the reason this cannot on
-    its own flatten the desert side of the problem.
+    `evap_cooling_threshold_k` reference, lowering the summer target so the
+    `_land_cap_1d` ceiling stops binding. The mechanism stays soil-moisture-aware,
+    so deserts (low `soil_moisture`) are affected far less than moist continental
+    interiors -- which is both the physically correct behaviour and the reason
+    this cannot on its own flatten the desert side of the problem.
 
-    Retains the property that the cooling only removes energy above 290 K, so it
-    can never drive land below that reference."""
+    **This knob does nothing until it is large, and the reason is absorption**
+    (measured 2026-08-05, audit C1b-EVAP). `_land_cap_1d` is applied on the very
+    next line, and `min(T - cooling, cap)` is independent of `cooling` while the
+    result is still above the cap -- so **99.4% of this term never reaches the
+    output**, and values between 0.0 and ~1.4 are indistinguishable end to end.
+    Only once the contraction pulls the forcing *below* the cap does the knob
+    become live, which is why its response is a threshold rather than a ramp.
+    Do not read a null result here as the mechanism being weak.
+
+    **Above ~1.18 it used to invert.** The removed fraction
+    `season * evap_cooling_coeff * strength * soil` is now clipped to [0, 1] in
+    `simulate._evap_cooling_fraction`; before that guard, exceeding 1 removed more
+    than the whole excess and a hotter cell came out colder than a cooler one.
+    Sweeps of this knob recorded before 2026-08-05 that went past ~1.18 were
+    measuring that inversion, not a stronger contraction.
+
+    Retains the property that the cooling only removes energy above the
+    threshold, so it can never drive land below that reference."""
 
     evap_cooling_season_width: float = 1.0
     """Width of the seasonal ramp gating evapotranspiration cooling
@@ -686,6 +713,80 @@ class PlanetParams:
     and are more shape-preserving; the cost is a cooler shoulder season, so this
     trades against the summer land-warmer-than-ocean sign `_land_cap_1d`
     protects and should not be pushed to 0."""
+
+    evap_cooling_amplitude: float = 0.0
+    """Evapotranspirative damping of the land seasonal amplitude, in units of
+    fraction of amplitude per standard deviation of soil moisture
+    [dimensionless]. `0.0` is an exact no-op.
+
+    The shape-only sibling of `evap_cooling_strength`, and built because that
+    knob is a *level* mechanism (audit C1b-EVAP). Contracting land toward a
+    fixed `evap_cooling_threshold_k` subtracts from a cell's annual mean, which
+    is what the mid-latitudes want and what the wet tropics emphatically do not:
+    strengthening it costs 2.05pp of Koppen group accuracy in 0:10 and 1.08pp in
+    -20:-10 (cooling rainforest land under the 18 C A-boundary) while gaining
+    2.92pp on the US Midwest.
+
+    Damping the *amplitude* by the same soil-moisture field is the same physics
+    with the level removed: latent heat flux buffers a moist surface's seasonal
+    swing and leaves a dry one's unbuffered. It is exactly mean-preserving in
+    time, so it cannot move any cell's annual mean, and a cell with no seasonal
+    cycle has no amplitude to damp -- making it inert by construction precisely
+    where the threshold form does its damage.
+
+    Applied through the same row-mean-preserving, globally spread-normalized,
+    `[-1, 1]`-bounded factor as `land_seasonal_amplitude_maritime`, so
+    `land_seasonal_amplitude` keeps meaning the row's mean damping and this knob
+    only adds within-row contrast. Soil moisture is a genuinely different
+    discriminator from continentality rather than a proxy for it -- the Sahel is
+    dry without being continental."""
+
+    evap_cooling_threshold_k: float = 290.0
+    """Reference temperature the evapotranspiration cooling contracts land
+    toward, in `simulate._evolve_temperature`'s forcing [K]. `290.0` reproduces
+    the historical hardcoded constant exactly.
+
+    **This is the term's reach, and it was the reason the mechanism could not
+    touch the model's largest remaining temperature defect** (measured
+    2026-08-05, audit C1b-EVAP). The cooling is `... * max(T - threshold, 0)`,
+    so at 290 K (16.85 C) it is identically zero on any land whose forcing stays
+    below that -- which is all of the sub-polar and Southern-Hemisphere
+    mid-latitude land where the warmest-month error is concentrated. Scored
+    against the Koppen reference's own bounds at 128x256, warmest month is the
+    model's weak metric (0.760 against coldest month's 0.900) and the error is
+    two-thirds one-signed: 17.3% of scorable land too warm against 6.7% too
+    cold, rising to **39.1% too warm over reference-E land** and 0.76-0.99 of
+    the -70:-30 zones. None of that land ever reaches 290 K, so no setting of
+    `evap_cooling_strength` could reach it either.
+
+    Real evapotranspiration has no activation temperature; it proceeds wherever
+    energy and soil moisture are both available, which is exactly the regime
+    those zones are in. The threshold is a tuning constant from the term's
+    original subtropical purpose, not a physical bound, and lowering it extends
+    the mechanism to the land that needs it while leaving the moisture gate
+    (which is the part that keeps deserts hot) intact.
+
+    Also a hardcoded Earth constant on a non-Earth code path (audit C3): 290 K
+    means nothing on Mars, where it sits ~80 K above any surface temperature the
+    model produces and silently disables the term."""
+
+    evap_cooling_coeff: float = 0.85
+    """Peak fraction of the above-threshold excess removed per unit soil
+    moisture per step, in `simulate._evolve_temperature` [dimensionless, >=0].
+    `0.85` reproduces the historical hardcoded `_EVAP_COOL_COEFF_MAX` exactly.
+
+    The applied contraction is
+    `clip(season * evap_cooling_coeff * evap_cooling_strength * soil, 0, 1)`.
+    **The clip is a correctness guard, not a tuning choice** (added 2026-08-05):
+    without it the product exceeds 1 once
+    `evap_cooling_coeff * evap_cooling_strength > 1/soil`, at which point the
+    term removes more than the whole excess and *inverts* -- a cell hotter than
+    the threshold comes out colder than one at it, and the mapping stops being
+    monotonic in temperature. At the shipped defaults the product peaks at 0.85
+    so the clip never engages, but `evap_cooling_strength` above ~1.18 crossed
+    that line silently, which made the knob's own documented sweep range
+    partly meaningless. Audit process note 19's pattern: the bound and the
+    invariant next to it have to be checked together."""
 
     ocean_transport_coeff: float = 0.3
     """Poleward ocean heat flux scale [dimensionless].

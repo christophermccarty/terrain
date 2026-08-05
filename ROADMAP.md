@@ -99,6 +99,30 @@ can emerge on its own (jets, monsoons, real storm dynamics).
   > 64×128 / 128×256 / 256×512 — every tracked metric improves, nothing traded.**
   > Warmest-month threshold accuracy +4.2 / +4.5 / +3.0pp, the largest single
   > move any C1b session has produced.
+  > **Corrected 2026-08-05 (ACCURACY_AUDIT.md C1b-EVAP): "squareness is
+  > manufactured by *two* clamps" — the claim this entry has carried since
+  > 2026-08-03 — is wrong, and so is the next target it implied.** There is one
+  > clamp. The evapotranspiration cooling is applied on the line *before*
+  > `_land_cap_1d`, and `min(T − cooling, cap)` does not depend on `cooling`
+  > while the result is still above the cap, so **99.4% of the term is absorbed**
+  > and removing it entirely leaves group accuracy, both threshold accuracies and
+  > squareness bit-identical. The +0.66 of squareness attributed to it was read
+  > from a *forcing* stage the next line overwrites — now process note 23.
+  > Two real defects in the term were found and fixed as exact no-ops: its
+  > threshold and coefficient were hardcoded (290 K silently disables it on Mars),
+  > and the contraction **inverted** above `evap_cooling_strength` ≈ 1.18, where
+  > it removed more than the whole excess and a hotter cell came out colder. The
+  > square wave *is* removable from here (cycle error 5.44 → 2.77 at 128×256,
+  > flat top essentially gone) but every route costs H10 group accuracy, and
+  > **Cfc — the named falsifier — stays 0.00% at 128×256 throughout**. A
+  > shape-only `evap_cooling_amplitude` built to dodge the trade improves every
+  > bounded metric at 64×128 and **reverses sign at 128×256** (note 14's third
+  > instance). All three knobs ship inert. The real clamp, `_land_cap_1d`, binds
+  > on 45.1% of land-months and is latitude-only and moisture-blind — it caps the
+  > Sahara at 27.9 °C against a real ~35 °C July mean — and for the first time the
+  > overshoot it must absorb is small (35-45°N band-mean peak overshoot −0.19 K,
+  > against +11.54 K before this week), which is the condition
+  > `land_cap_softness_k` has always needed and never had.
   > **Scope narrowed 2026-08-03 (ACCURACY_AUDIT.md A6).** "A direct cause of the
   > model emitting no Mediterranean climate" is now only half true. **Csa was
   > recovered from precipitation alone** (0.01% → 1.93% of land, against Earth's

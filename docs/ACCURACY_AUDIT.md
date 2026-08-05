@@ -1601,6 +1601,120 @@ evapotranspiration cooling's contraction toward 290 K is the other clamp C1b-202
 and this session did not touch it. **That makes the evap-cooling clamp the well-posed next target,
 and Cfc the metric that will show whether it worked.** The two headline threshold defects are
 improved but not closed, and `_land_cap_1d` still binds.
+> **⚠️ Superseded 2026-08-05 the same week — see C1b-EVAP below before acting on this paragraph.**
+> That session was run and **the premise does not survive measurement**: the evapotranspiration
+> cooling is not a clamp on the output at all. `_land_cap_1d` sits immediately downstream and
+> absorbs **99.4%** of it, so the stage table C1b-2026-08-03 used to attribute +0.66 of squareness
+> to it was reading a forcing stage that the next line overwrites. Ablating the whole term end to
+> end leaves group accuracy, both threshold accuracies and squareness **bit-identical**. The square
+> wave *is* removable from here (cycle error 5.44 → 2.77 at 128×256) but every route costs H10 group
+> accuracy, and **Cfc — the falsifier named above — stays 0.00% at 128×256 at every setting tested**.
+
+#### C1b-EVAP. 🟢 The evapotranspiration cooling is not the clamp — 99.4% of it is absorbed by `_land_cap_1d`. Two real defects in it fixed; the square wave is removable but every route is net-negative, and Cfc never fires
+
+C1b-2026-08-05 closed by naming this as the well-posed next target, with Cfc as the metric that
+would show whether it worked. That session was run. **Neither half of the premise holds**, and the
+reason is worth more than the tuning would have been.
+
+**The term never reaches the output.** Measured on the tracked benchmark, the cooling is applied to
+**62.8%** of land-months at a mean of 0.73 K — and **0.6% of it survives the `_land_cap_1d` clamp on the
+very next line**. Ablating it entirely (`evap_cooling_strength=0.0`) leaves group accuracy, kappa,
+both threshold accuracies and squareness **identical to four decimals** at 64×128;
+`reference_error_score` moves 0.2109 → 0.2108. Confirmed at 128×256, where the whole term's removal
+is worth **≤0.10pp on every headline metric** (group 0.7232 → 0.7235, class 0.4401 → 0.4391, kappa
+0.6498 → 0.6502) and leaves coldest-month accuracy and 35-45°N squareness unchanged to four
+decimals. The stage table in C1b-2026-08-03 that credited it with +0.66 of squareness at 41.4°N is
+not wrong about the *forcing* — it is measuring a stage whose successor overwrites it. Absorption is
+one-sided, which is why the ablation reads as a flat zero: while `T − cooling` is still above the
+cap, `min(T − cooling, cap)` does not depend on `cooling` at all.
+
+**Independently reproduced on a second, unrelated fixture.** `test_param_wiring.py`'s 24×48
+synthetic run is byte-identical under `evap_cooling_coeff` 0.85 → 0.30 despite 185 of its 346 land
+cells sitting above the 290 K threshold — the same absorption, on different geography, at a
+different resolution, found by a test rather than by the probe that was looking for it.
+
+**Two real defects found in the term and fixed, both shipped as exact no-ops:**
+
+- **Its two constants were hardcoded** — `_EVAP_COOL_THRESHOLD_K = 290.0` and
+  `_EVAP_COOL_COEFF_MAX = 0.85`, ungated, in the middle of a function every other lever in this
+  document reaches through `PlanetParams`. Now `evap_cooling_threshold_k` and `evap_cooling_coeff`.
+  This is process note 6's convention and also audit C3: 290 K is an Earth constant that sits ~80 K
+  above any Mars surface temperature, silently disabling the term on that code path.
+- **The contraction inverted above `evap_cooling_strength` ≈ 1.18.** The removed fraction is
+  `season · coeff · strength · soil`, unbounded; once it exceeds 1 the term removes *more* than the
+  whole excess and the map from pre- to post-cooling temperature **runs backwards** — a hotter cell
+  comes out colder than a cooler one, and the contraction overshoots the reference it contracts
+  toward. The knob's own documented sweep range crossed that line silently. Now clipped to [0, 1] in
+  the shared `simulate._evap_cooling_fraction`, inert at the shipped defaults (peak product 0.85).
+  Process note 19's pattern again, and the fourth saturating-bound entry in this document.
+
+**The threshold is the term's *reach*, and that is why it cannot touch the model's largest remaining
+temperature error.** At 290 K (16.85 °C) the term is identically zero on every cell whose forcing
+stays below it. Scored anchor-free at 128×256, warmest month is the weak metric — **0.760 against
+coldest month's 0.900** — and the error is two-thirds one-signed: 17.3% of scorable land too warm
+against 6.7% too cold, rising to **39.1% too warm over reference-E land** and to 0.76–0.99 of every
+zone from −70 to −30. None of that land ever reaches 290 K, so no setting of `evap_cooling_strength`
+could ever have reached it either.
+
+**The square wave is genuinely removable — and every route to it is net-negative.** Raising the
+strength (now that the guard makes >1.18 meaningful) does exactly what C1b has wanted for five
+sessions, at both resolutions:
+
+| 128×256 | baseline | str 1.5 | str 1.75 | str 2.0 |
+|---|---|---|---|---|
+| `cycle_error_score` | 5.442 | 4.805 | 3.868 | **2.768** |
+| plateau excess 35-45N | 1.254 | 0.992 | 0.539 | **0.134** |
+| warmest-month accuracy | 0.7596 | 0.7587 | 0.7605 | **0.7607** |
+| `reference_error_score` | 0.1503 | 0.1502 | 0.1493 | **0.1476** |
+| **H10 group accuracy** | **0.7232** | 0.7225 | 0.7212 | 0.7200 |
+| **group kappa** | **0.6498** | 0.6490 | 0.6473 | 0.6458 |
+
+The flat top essentially disappears and the aggregate score improves, while group accuracy and kappa
+fall monotonically. **Where they fall is the diagnosis**: at strength 2.0 the loss is **0:10 −2.05pp,
+−20:−10 −1.08pp, −10:0 −0.90pp** while the **US Midwest gains +2.92pp**. Contracting toward a fixed
+290 K is a *shape* operation in the mid-latitudes and a *level* operation in the wet tropics, where
+land is hot, moist and has almost no seasonal cycle to flatten — so the term simply subtracts from
+the annual mean and pushes rainforest under Köppen's 18 °C A-boundary. The mechanism is right about
+the mid-latitudes and wrong about the tropics, from one term.
+
+**A shape-only sibling was built to fix exactly that, and it is a resolution artifact.**
+`evap_cooling_amplitude` damps the land seasonal *amplitude* by the same soil-moisture field, through
+`land_seasonal_amplitude_maritime`'s row-mean-preserving factor. It is exactly mean-preserving in
+time, so it cannot move any cell's annual mean and is inert by construction precisely where the
+threshold form does its damage — process note 20 applied deliberately rather than discovered. At
+64×128 it looks like a clean win, improving **every** bounded metric monotonically (at 0.3: group
++0.20pp, class +0.26pp, kappa +0.28pp, coldest-month +0.20pp), with a negative-strength control that
+degrades all four, so it is not noise. **At 128×256 all of it reverses sign** (group −0.06 / −0.32 /
+−0.55pp at 0.3 / 0.45 / 0.6). Process note 14's third documented instance, after A5-LEAD's and this
+document's own warnings — caught only because note 21's selection rule was applied *before* writing
+a recommendation. Combining it with the level form (which its whole design predicts should unblock
+the strength knob) does not rescue either: group accuracy still falls at every combination tried.
+
+**Cfc never fires.** The class C1b-2026-08-05 named as the falsifier reads **0.00% at 128×256 at
+every setting tested**, including those that cut cycle error by half. It shows 0.05% at 64×128, which
+is one coarse cell and is not evidence. Csb, Cfb and Dfb do move toward the reference under the
+strength knob, but not enough to pay for the group loss.
+
+**Shipped**: `evap_cooling_threshold_k` (290.0), `evap_cooling_coeff` (0.85) and
+`evap_cooling_amplitude` (0.0) — all three exact no-ops — plus the [0, 1] guard and
+`simulate._evap_cooling_fraction`, which de-duplicates the formula across the outer forcing path and
+`_temperature_bases_for_day`'s inner resample so the invariant lives in one place.
+`testing/test_evap_cooling.py` (11 tests). The guard tests call the shipped helper rather than
+asserting on a temperature field, **and the reason is itself the finding**: an output-level version
+was written first and **passed with the guard removed**, because the cap absorbs an inverted
+contraction down to ~2 K on 16 of 591 cells. Process note 19(b), caught by planting the violation.
+
+**Still open, and better-posed than before.** `_land_cap_1d` — not this term — is the clamp that
+writes the flat top, and it binds on **45.1% of land-months**. It is latitude-only and
+moisture-blind, which is wrong in a specific measurable way: it caps the Sahara's summer at 27.9 °C
+where the real July mean is ~35 °C. The physically-correct replacement is a cap that knows about soil
+moisture, letting the evapotranspiration term do the work on moist land while dry land runs hot —
+which is what this term's own 2026-07 docstring says was the intent that "did not happen." The
+overshoot it would have to absorb is now small for the first time (band-mean peak overshoot at 35-45°N
+is **−0.19 K**, against +11.54 K before C1b-2026-08-05), so `land_cap_softness_k` is finally
+operating in the regime its docstring requires. Swept here it improves cycle error and both threshold
+accuracies and produces the project's first nonzero Cfc, but costs group accuracy above k≈2 — the same
+trade, and the reason it is recorded as a lead rather than a result.
 
 ### C2. 🟢 Calendar aliasing — ANNUAL/MONTHLY seasonal-phase drift — fixed, verified 2026-08-01
 **Was**: the old `optimizer/headless.py`'s `_SUBSTEPS[ANNUAL]` advanced exactly 364.0 days per
@@ -1668,6 +1782,18 @@ looking).
 left, since `MARS.has_liquid_water_ocean=False` gates essentially all humidity physics off for the
 only non-Earth preset that exists, making it inert until a water-bearing exoplanet preset exists to
 exercise it. `terrain.py`'s references are comments/lookup prose, not computation.
+> **Two more found and fixed 2026-08-05 (C1b-EVAP)**, in a site this inventory never listed:
+> `_evolve_temperature`'s evapotranspiration cooling carried `_EVAP_COOL_THRESHOLD_K = 290.0` and
+> `_EVAP_COOL_COEFF_MAX = 0.85` as module-local literals. The threshold is the worse of the two —
+> it is an activation temperature, so on Mars it sits ~80 K above any surface temperature the model
+> produces and silently disables the whole term rather than merely mistuning it. Now
+> `PlanetParams.evap_cooling_threshold_k` / `evap_cooling_coeff`, Earth-bit-identical at their
+> historical values. Worth noting how it was found: not by the regression guard, which only carries
+> patterns for the elevation and lapse-rate constants, but incidentally while investigating the
+> term's physics. **A constant that is an activation *threshold* is a distinct and more dangerous
+> sub-class than a mistuned coefficient**, because its failure mode on another planet is silent
+> disablement rather than a wrong number — worth a pattern of its own next time this guard is
+> extended.
 
 ---
 
@@ -2344,6 +2470,24 @@ group score (a model that never emits Csa still scores C correctly if it emits C
    no trade at all. Cheap, too: the extra cost is a handful of 128×256 and 256×512 runs on the two or
    three finalists, not on the whole sweep.
 
+23. **A stage's contribution measured *before* a saturating stage is not a contribution at all**
+   (2026-08-05, C1b-EVAP). C1b-2026-08-03's stage-by-stage table showed the evapotranspiration
+   cooling adding +0.66 of squareness at 41.4°N — comparable to `_land_cap_1d`'s +0.72 — and two
+   later sessions, including this document, treated that as "there are two clamps" and named the
+   term as the next target. It is one clamp. The cooling is applied on the line *before* the cap,
+   and `min(T − cooling, cap)` does not depend on `cooling` at all while the result is still above
+   the cap, so **99.4% of the term is absorbed** and ablating it end to end changes nothing to four
+   decimals. The trap is specific and is a sibling of note 16: a cumulative stage decomposition is
+   only valid if every stage after it is non-saturating, and a *clamp* is the one thing that is
+   guaranteed not to be. **Practical rules**: (a) attribute a stage's effect by ablating it and
+   measuring at the *output*, never by differencing adjacent rows of a forcing-stage table; (b) when
+   a mechanism sits immediately upstream of a clamp, floor or ceiling, the question "does it change
+   the output" has a different answer from "does it change its own stage", and only the first one
+   matters; (c) one-sided absorption reads as a clean null, not as a small effect, which makes it
+   easy to mistake for the mechanism being weak rather than being overwritten. This document already
+   has five entries about saturating bounds (A5's `remove_frac`, A5-OROG's `precip_potential`, the
+   orographic gate, note 19's continentality clip, and now this) — it is the single most recurrent
+   bug class here, and the first place to look when a lever "does nothing".
 22. **A pathway can be dead for two independent reasons, and finding one does not excuse checking
    for the other** (2026-08-05, D3-COUPLING). The SST coupling was aimed at `subsidence_suppression`
    because that array is the one previously *demonstrated* to move land precipitation. It is dead
