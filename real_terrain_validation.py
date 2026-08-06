@@ -52,6 +52,29 @@ EARTH_ZONAL_REFERENCE: dict[str, dict[str, float]] = {
 
 @dataclass(frozen=True)
 class RealTerrainValidationConfig:
+    """Deterministic real-DEM validation run.
+
+    `spinup_years` is short on purpose (the whole benchmark is ~14 s, which is
+    what makes it usable for A/B direction-finding), but note what that does and
+    does not buy. The Köppen monthly bins have their own spin-up timescale,
+    separate from temperature/soil/ocean: each of the 12 bins is visited once per
+    simulated year in MONTHLY mode, so `spinup_years=1.0` gives every bin exactly
+    **one** real sample before evaluation begins.
+
+    That is sufficient only because `climate_averages.update_monthly_statistics`
+    now *discards* its flat spin-up seed on a bin's first real sample. While it
+    blended the seed instead, this config left ~13.5% of a zero-amplitude annual
+    cycle in the bins at evaluation time, which biased every seasonal-extremum
+    statistic (Köppen's "driest month >= 60 mm" above all) toward "less seasonal
+    than reality" -- and three separate calibration sessions fitted parameters to
+    that decaying transient. See ACCURACY_AUDIT.md process note 24 and A2.
+
+    **So: before calibrating anything against a statistic taken over the seasonal
+    cycle, re-run it at a longer `spinup_years` and confirm the number is
+    stationary.** Process note 14 says to confirm at a second resolution; this is
+    the same rule on the time axis, and it is cheaper (one long run, not a sweep).
+    """
+
     height: int = 64
     width: int = 128
     spinup_years: float = 1.0

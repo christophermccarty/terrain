@@ -21,11 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import masks as masks_module
 from masks import get_masks
 from planet_params import EARTH
 from simulate import (
     _maritime_proximity, _maritime_proximity_coarse, _maritime_transport_factor,
+    clear_simulation_caches,
 )
 
 R_KM = 6371.0
@@ -39,10 +39,20 @@ def _clear_mask_caches():
     cell, which that fingerprint can miss entirely once Python reuses an id --
     exactly the collision its own docstring warns about.  Clearing between tests
     keeps these deterministic in any order.
+
+    Uses `simulate.clear_simulation_caches` rather than `masks.clear_all_caches`
+    (which it calls anyway): `_maritime_proximity_coarse` consults its own
+    `_MARITIME_COARSE_CACHE`, with the same id+strided-fingerprint weakness, and
+    clearing only the mask caches left that one live. The fixture's "deterministic
+    in any order" promise was therefore not being kept -- adding an unrelated test
+    module to the same pytest run shifted allocation enough to make
+    `test_coarse_block_mean_is_over_land_cells_only` take a stale hit and read 0.0
+    for its lone land cell (2026-08-05). `clear_simulation_caches` was itself
+    missing that cache; fixed there too, so this is belt-and-braces.
     """
-    masks_module.clear_all_caches()
+    clear_simulation_caches()
     yield
-    masks_module.clear_all_caches()
+    clear_simulation_caches()
 
 
 def _continent(H: int = 64, W: int = 128) -> np.ndarray:
@@ -343,18 +353,40 @@ def test_improves_coldest_month_threshold_accuracy():
     too** (added 2026-08-05, audit C1b-2026-08-05). That knob expresses
     continentality through the seasonal *amplitude* rather than through this
     winter bonus, so the two overlap and this one's *incremental* gain on top of
-    it is only +0.0075 -- under this test's 0.01 bar, which is why it started
-    failing. Measured on the tracked 64x128 fixture, coldest-month accuracy:
+    it is small -- under this test's original 0.01 bar, which is why it started
+    failing. Isolating against "both off" keeps this a guard on *this*
+    mechanism's own contribution rather than on a number that moves whenever the
+    other one is retuned.
 
-        both off                0.8414   (C 0.6973 / D 0.7465)
-        amplitude only          0.8710   (C 0.7539 / D 0.7961)
-        this mechanism only     0.8590   (C 0.7221 / D 0.7828)
-        both on (shipped)       0.8785   (C 0.7719 / D 0.8048)
+    **REBASELINED 2026-08-05 (second time, A2-REOPEN), bar 0.01 -> 0.005.**
+    `climate_averages.update_monthly_statistics` stopped blending its flat
+    spin-up seed into the Köppen monthly bins. `_run` above uses
+    `spinup_years=0.0`, so each bin got exactly one real sample and the old code
+    left **36.8%** of a zero-amplitude annual cycle in it -- i.e. this test's
+    entire basis was a heavily damped seasonal cycle, which is precisely the
+    error both continentality mechanisms exist to correct. Coldest-month
+    accuracy on the tracked 64x128 fixture, before and after that fix:
 
-    Sub-additive but genuinely complementary, and the amplitude knob is the
-    stronger of the two. Isolating against "both off" keeps this a guard on
-    *this* mechanism's own contribution rather than on a number that moves
-    whenever the other one is retuned.
+        case                    before    after     C (after)   D (after)
+        both off                0.8414    0.8772     0.7579      0.8691
+        amplitude only          0.8710    0.8918     0.8164      0.9116
+        this mechanism only     0.8590    0.8868     0.7870      0.8843
+        both on (shipped)       0.8785    0.8959     0.8270      0.9205
+
+    The seed fix raises the "both off" floor by **+0.036**, which is *larger
+    than either mechanism's own contribution* -- so the artifact was a bigger
+    source of coldest-month error than the physics these knobs were built to add,
+    and they were partly compensating for it. Their measured value shrinks
+    accordingly: this one's aggregate delta goes +0.0176 -> **+0.0096**.
+
+    **What did not change is the property this test actually guards**: both
+    reference groups still improve together (C **+0.0291**, D **+0.0152**, with
+    the warmest month exactly neutral at +0.0000), which is the signature of an
+    added continentality *contrast* rather than a shifted band mean. Those
+    per-group assertions below are untouched and pass with room to spare; only
+    the aggregate bar moved, and it moved because its baseline did. 0.005 keeps a
+    real guard (the mechanism would have to lose ~half its remaining effect to
+    trip it) without re-encoding a floor that no longer exists.
     """
     off, _ = _run(land_transport_maritime_decay=0.0,
                   land_seasonal_amplitude_maritime=0.0)
@@ -366,7 +398,7 @@ def test_improves_coldest_month_threshold_accuracy():
     s_on = score_temperature_thresholds(np.asarray(on.monthly_temp))
     cold_off = s_off["coldest_month"]
     cold_on = s_on["coldest_month"]
-    assert cold_on["accuracy"] > cold_off["accuracy"] + 0.01
+    assert cold_on["accuracy"] > cold_off["accuracy"] + 0.005
     for group in ("C", "D"):
         assert (
             cold_on["by_reference_group"][group]["accuracy"]

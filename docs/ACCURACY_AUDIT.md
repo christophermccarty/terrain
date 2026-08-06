@@ -84,7 +84,34 @@ at any gyre strength from 0.0 to 3.0. The blocker is not the absence of cold wat
 future Atacama attempt should target that coupling pathway first and verify it transmits *before*
 building more ocean physics, or it will reproduce D5's null result.
 
-### A2. 🟢 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — resolved; the headline gap was largely a measurement bug
+### A2. 🟡 Tropical rainforest over-extent / savanna under-extent (Af vs Aw/Am) — reopened and re-fixed 2026-08-05; **both** the 08-02 gap *and* its fix were measurement bugs
+> **⚠️ SECOND MEASUREMENT BUG, FOUND 2026-08-05 — THE `k=2.0` RESULT BELOW IS AN ARTIFACT.**
+> Everything in this section dated 2026-08-01/02 reads Af/Am/Aw off runs of **two simulated years or
+> less** (the tracked benchmark's `spinup_years=1.0` + `evaluation_years=1.0`).
+> `climate_averages.update_monthly_statistics` used to *blend* its spin-up seed — all 12 monthly bins
+> set to one instantaneous field, i.e. an annual cycle of exactly **zero amplitude** — into the bins,
+> leaving `(1-alpha)**n` of it behind. At `window_years=1.0` that is **~13.5% still present after two
+> years**, and being flat it lands almost entirely on the bin that should be the year's *driest*. Worth
+> ~**+23 mm/month** in the deep tropics — enough on its own to carry Amazon/Congo/Borneo over Köppen's
+> 60 mm Af threshold. Same params, same grid (256×512), only spin-up changed:
+>
+> | spin-up | Af | driest-month median | wet/dry ratio |
+> |---|---|---|---|
+> | 1yr + 1yr (**the tracked config**) | 6.02% | 29.4 mm | 6.1 |
+> | 5yr + 1yr | 3.82% | 9.2 mm | 21.9 |
+> | `saves/test.npz`, 24yr | 2.61% | 8.2 mm | 24 |
+>
+> So "k=2.0 puts Af at 6.82%, essentially on target" was measuring the seed, not the climate — and the
+> user-visible symptom was a rainforest belt that appeared on load and then **visibly dissolved** over
+> the following simulated years as the residue decayed. The seed is now discarded on each bin's first
+> real sample (strictly *faster* spin-up than blending, so nothing is traded), which makes even the
+> 64×128 benchmark show the true signal. See process note 24, and
+> `PlanetParams.itcz_seasonal_target_min_fraction` for the structural flaw this masked: at `k=2.0` the
+> additive seasonal modulation demanded **negative** precipitation on every row within ~9° of the
+> equator and survived only on a bare `clip(0.05)` — a 95% dry-season shutoff of exactly the
+> rainforest band. Current shipped state: **Af 6.06% / Am 3.38% / Aw 9.67%** against Earth's
+> 6.0/4.0/10.0, *stable* under lengthening spin-up (2yr → 6yr moves Af 6.32 → 6.06).
+
 > **⚠️ READ THIS BEFORE TRUSTING ANY KÖPPEN PERCENTAGE ELSEWHERE IN THIS DOCUMENT.**
 > Every Köppen land-share figure recorded here before 2026-08-02 — in A1, A2, A4, A5, B3, and the
 > memory notes they cite — was computed as a **plain cell count on an equirectangular grid**, with no
@@ -2498,3 +2525,35 @@ group score (a model that never emits Csa still scores C correctly if it emits C
    reproduce on current code** — `coastal_upwelling_fog_strength`'s "Atacama 123→102 mm/yr" cannot,
    because A5 later drove that same array to its floor. Re-verify a cited effect before building on
    it, not just the number attached to it.
+
+24. **A spin-up placeholder that gets *blended* rather than *replaced* is a measurement bug with a
+   direction** (2026-08-05, A2-REOPEN). This is note 8's class again — "validate the metric before
+   optimizing against it" — but the corrupted quantity was not the aggregation, it was the *state
+   being aggregated*, which is why three separate calibration sessions and a tracked baseline all
+   agreed with each other and all were wrong. `update_monthly_statistics` seeded its 12 Köppen bins
+   with one instantaneous field for fast spin-up, then EMA-blended real samples on top, leaving
+   `(1-alpha)**n` of the seed behind. The seed's defect is specific: it is **flat**, so it carries a
+   zero-amplitude annual cycle, so its residue lands almost entirely on whichever bin should have
+   been the year's extreme. Every metric that reads an *extremum* over the seasonal cycle — and
+   Köppen's A-group split is exactly "driest month ≥ 60 mm" — was therefore biased toward "no
+   seasonality" by an amount that decays over years. Consequences worth naming:
+   - The tracked benchmark ran 1yr spin-up + 1yr eval, i.e. **~13.5% residual seed**, worth ~+23
+     mm/month in the deep tropics. `itcz_seasonal_target_response` was swept three times (1.0 → 1.7
+     → 2.0) against it, and the shipped value was the one that best *cancelled the artifact*.
+   - It produced a **confident, reproducible, wrong-signed** reading exactly like note 14's
+     resolution reversal, and it fooled the same defences: refErr was flat, deserts were flat, the
+     group shares were fine, and the value even re-validated after the note-8 area-weighting fix.
+     What it could not survive was changing the *run length* — a dimension nobody was sweeping.
+   - The direction is the tell: the artifact always makes climate look **less seasonal than it is**,
+     so it systematically hides any defect whose signature is excess seasonal amplitude. The real
+     defect here was a modulation demanding negative precipitation across the entire rainforest band.
+
+   **Practical rules**: (a) initialize a rolling statistic by *overwriting* on first real sample, not
+   by blending a placeholder — it is both correct and strictly faster to converge, so there is no
+   trade to weigh; (b) before calibrating anything against a statistic over a seasonal cycle, run the
+   instrument at two run lengths and confirm the number is stationary — this is note 14's
+   two-resolutions rule applied to the time axis, and it is cheaper (one long run, not a whole
+   sweep); (c) treat "spin-up" as a property of *every accumulator*, not just of temperature and soil
+   moisture — the bins feeding classification have their own, longer, timescale; (d) when a
+   long-standing metric finally agrees with Earth after a parameter sweep, check that the agreement
+   is not the sweep having fitted a decaying transient.

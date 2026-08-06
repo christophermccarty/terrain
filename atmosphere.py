@@ -3975,10 +3975,36 @@ def generate_precipitation(
                 ),
                 dtype=np.float64,
             )
-            _seasonal_target_mod = 1.0 + float(pp.itcz_seasonal_target_response) * (
+            # Per-row cap on the modulation strength so the dry-season trough can
+            # never remove more than (1 - min_fraction) of a row's annual-mean
+            # target (2026-08-05). The additive form below is unbounded below:
+            # its trough is `1 - k*(mean - window_min)`, which goes NEGATIVE for
+            # any row with `itcz_window_annual_mean > 1/k` -- at k=2.0 that is
+            # every row inside ~9 deg of the equator, i.e. exactly the rainforest
+            # band. Those rows were surviving only on the `clip(0.05)` floor
+            # below, which is a 95% dry-season shutoff and drove deep-tropical
+            # driest-month precipitation to <10 mm (Earth: 60-150 mm), erasing Af
+            # entirely. Capping `k` at `(1 - f)/window_mean` instead bounds the
+            # trough at `f + (1-f)*window_min/window_mean >= f` per row, and
+            # binds ONLY where the old form was already clipping: rows with
+            # `window_mean <= (1-f)/k` (|lat| >~ 10 deg at the defaults, i.e. the
+            # savanna belt this knob exists to serve) keep the full `k`.
+            # See PlanetParams.itcz_seasonal_target_min_fraction.
+            _k_seasonal = float(pp.itcz_seasonal_target_response)
+            _min_frac = float(pp.itcz_seasonal_target_min_fraction)
+            if _min_frac > 0.0:
+                _k_eff = np.minimum(
+                    _k_seasonal,
+                    (1.0 - _min_frac) / np.maximum(_itcz_window_mean, 1e-6),
+                )
+            else:
+                _k_eff = _k_seasonal
+            _seasonal_target_mod = 1.0 + _k_eff * (
                 itcz_window.astype(np.float64) - _itcz_window_mean
             )
-            _seasonal_target_mod = np.clip(_seasonal_target_mod, 0.05, None)
+            _seasonal_target_mod = np.clip(
+                _seasonal_target_mod, max(_min_frac, 0.05), None
+            )
             target_row_mm_day = (
                 target_row_mm_day.astype(np.float64) * _seasonal_target_mod
             ).astype(np.float32)

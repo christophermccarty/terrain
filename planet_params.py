@@ -2326,7 +2326,170 @@ class PlanetParams:
     tropical band (A total stays ~22% across the whole sweep); it cannot grow
     the band. That is fine -- area-weighted, A total is 22.0% against Earth's
     19.0%, i.e. the band was never actually too small. The old "Aw+Am is 2-4x
-    under-represented" framing was itself a product of the counting bug."""
+    under-represented" framing was itself a product of the counting bug.
+
+    **EVERY CALIBRATION ABOVE IS INVALID (2026-08-05).** All three sweeps read
+    Af/Am/Aw off runs of two simulated years or less (the tracked benchmark's
+    `spinup_years=1.0` + `evaluation_years=1.0`, or a short MONTHLY
+    continuation). `climate_averages.update_monthly_statistics` used to *blend*
+    its spin-up seed -- all 12 bins set to one instantaneous field, i.e. a
+    zero-amplitude annual cycle -- into the monthly bins, leaving
+    `(1-alpha)**n` of it behind. At `window_years=1.0` that is ~13.5% still
+    present after two years, and being flat it landed almost entirely on the
+    bin that should have been the year's driest: worth ~+23 mm/month in the
+    deep tropics, enough by itself to carry Amazon/Congo/Borneo over the 60 mm
+    Af threshold. Measured at 256x512, same params, only spin-up changed:
+
+        spin-up        Af      driest-month median   wet/dry ratio
+        1yr + 1yr    6.02%          29.4 mm              6.1
+        5yr + 1yr    3.82%           9.2 mm             21.9
+        (24yr save)  2.61%           8.2 mm             24
+
+    So "k=2.0 puts Af at 6.82%, essentially on target" was measuring the seed,
+    not the climate. The seed is now discarded on each bin's first real sample
+    (see that function), which makes even the 64x128 benchmark show the true
+    signal, and `itcz_seasonal_target_min_fraction` fixes the structural flaw
+    this masked. `k` itself is retained at 2.0 -- re-swept on the corrected
+    instrument it remains the best value, see that field's own table."""
+
+    itcz_seasonal_target_min_fraction: float = 0.10
+    """Floor on `itcz_seasonal_target_response`'s dry-season trough, as a
+    fraction of each row's own annual-mean precipitation target. `0.0` disables
+    the floor and restores the unbounded-additive behaviour (the 2026-08-05 bug
+    described below); `1.0` would suppress the modulation entirely.
+
+    **The flaw this fixes.** That knob's modulation is additive,
+    `1 + k*(itcz_window(day) - itcz_window_annual_mean)`, whose seasonal trough
+    is `1 - k*(mean - window_min)`. That is unbounded below, and goes negative
+    for any row with `itcz_window_annual_mean > 1/k`. At `k=2.0` the threshold
+    is `mean > 0.5`, which at `itcz_seasonal_response=0.4` and
+    `ITCZ_HALF_WIDTH_DEG=10` is **every row within ~9 deg of the equator** --
+    precisely the tropical rainforest band. Those rows were held up only by the
+    bare `clip(0.05)` in `atmosphere.generate_precipitation`, i.e. a 95%
+    dry-season shutoff of the target. Because the multiplicative swing peaks
+    where the *window mean* is large rather than where the window *changes*
+    most, the damage was concentrated in the deep tropics and left the savanna
+    latitudes this knob exists to serve barely affected -- the shape was
+    inverted. Measured on `saves/test.npz` (512x1024, 24yr), the model's
+    wet/dry precipitation ratio tracked the predicted target swing 1:1:
+
+        lat     measured wet/dry    predicted target swing
+        0 deg          3.4                  3.7
+        3 deg         13.9                 14.8
+        5 deg         36.6                 35.1  <- clip(0.05) binding
+        8 deg         36.1                 38.4  <- clip(0.05) binding
+        10 deg        14.4                 15.6
+        15 deg         3.2                  3.8
+        20 deg         1.9                  1.8
+
+    Earth's equatorial wet/dry ratio is 1.5-5, and driest-month precipitation in
+    the rainforest cores is 60-150 mm; the model was producing 4-30 mm. Since Af
+    vs Aw is decided purely on "driest month >= 60 mm", Af collapsed.
+
+    **Implementation.** `k` is capped per row at `(1 - f)/itcz_window_mean`,
+    which bounds the trough at `f + (1-f)*window_min/window_mean >= f`. This
+    binds only on rows where the additive form was already being clipped
+    (`window_mean <= (1-f)/k`); the savanna belt keeps the full `k` and its full
+    dry season, so the fix is targeted rather than a global weakening.
+    Physically it says the migrating ITCZ delivers only part of deep-tropical
+    rainfall -- the rest is year-round local convection and moisture recycling,
+    which a displaced ITCZ does not switch off -- while at savanna latitudes
+    essentially all rainfall is ITCZ-delivered and a displaced belt really does
+    mean a dry season.
+
+    **It also restores exact mean-preservation, which `k=2.0` had silently
+    broken.** Because the cap is time-independent (it divides by the window's
+    *annual mean*), the modulation's own time-average is still exactly 1.0, so
+    every annual-mean zonal/desert/continental calibration built on
+    `target_row_mm_day` is genuinely untouched -- which is why the sweep above
+    moves `reference_error_score` so little. The old form could not claim that:
+    its own docstring notes the `clip(0.05)` floor "stops being exactly
+    mean-preserving above k~1.0". Verified numerically over a dense sampling of
+    a full orbit at H=64/256/512, `f=0.10`, `k=2.0`:
+
+        quantity                              old form        capped form
+        raw trough minimum                     -0.010          +0.145
+        rows demanding NEGATIVE precip         2 / 6 / 10       none
+        (row, time) samples hitting the clip      0.6%          none
+        max |time-mean(modulation) - 1|         5.8e-3          5.4e-14
+        rows capped (i.e. affected at all)         --        |lat| <= ~10 deg
+
+    The old floor was not a safety net that happened to catch an edge case: it
+    was load-bearing, and it was carrying the rainforest band.
+
+    **Calibration (2026-08-05, `k` held at 2.0, seed fix in place -- so Af/Am/Aw
+    read off these runs are trustworthy for the first time). Swept at two
+    resolutions because the defect this fixes was originally introduced by
+    trusting 64x128 alone; `dryMed`/`ratio` are tropical-land (|lat|<=10)
+    driest-month median [mm] and wet/dry ratio, against Earth's ~60-150 mm and
+    1.5-5. Earth shares: Af 6.0%, Am 4.0%, Aw 10.0%.**
+
+    Tracked 64x128 benchmark (`RealTerrainValidationConfig()` defaults, ~14 s):
+
+        f      Af      Am     Aw    tropMAE  dryMed  ratio  cKappa  gMAE   refErr
+        0.0    5.12   2.98  11.90    1.27     10.3   22.3   0.3214  3.79   0.2118
+        0.10   7.38   3.51   9.41    0.82     27.9    5.6   0.3348  3.68   0.2116
+        0.15   7.87   4.04   8.43    1.16     33.5    4.8   0.3305  3.68   0.2116
+        0.25   9.34   3.74   7.56    2.01     43.4    3.7   0.3285  3.56   0.2116
+        0.35  11.91   1.95   7.17    3.60     51.0    3.0   0.3335  3.42   0.2115
+        0.50  13.81   1.12   6.29    4.80     63.0    2.3   0.3324  3.32   0.2111
+
+    256x512, `block_size=3` (nearer the 512x1024 production grid, ~90 s):
+
+        f      Af      Am     Aw    tropMAE  dryMed  ratio  cKappa  gMAE   refErr
+        0.0    3.95   1.86  13.25    2.48      9.1   21.6   0.3843  2.31   0.1364
+        0.10   6.32   3.35   9.55    0.47     37.9    4.6   0.3852  2.25   0.1376
+        0.15   7.08   3.37   8.81    0.97     42.6    4.0   0.3862  2.23   0.1381
+        0.20   7.79   3.57   7.98    1.41     46.9    3.5   0.3861  2.21   0.1382
+        0.25   8.76   3.38   7.28    2.03     51.8    3.1   0.3876  2.17   0.1387
+        0.35  11.08   2.60   5.89    3.53     61.1    2.5   0.3861  2.12   0.1384
+
+    **0.10 minimises the Af/Am/Aw error at BOTH resolutions** (tropMAE 0.82 and
+    0.47) and is the `class_kappa` optimum at 64x128, which is why it ships
+    rather than a value read off one grid. Higher `f` keeps improving the
+    group-share and `class_kappa` metrics marginally at 256x512, but overshoots
+    Af hard (11% at f=0.35, against Earth's 6%) and drains Aw below target --
+    the deep tropics stop having any dry season at all. `reference_error_score`
+    costs +0.0012 (0.1364 -> 0.1376) at 256x512 and *improves* slightly at
+    64x128; either way this is far cheaper than the +0.0022 zonal-magnitude cost
+    `itcz_seasonal_target_response` itself had to accept.
+
+    Deserts and continental boxes are flat across the entire sweep at both
+    resolutions (64x128: Sahara 173 mm/yr, Kalahari 138-139, Atacama 64, US
+    Midwest 937, Central Europe 923-924, SE US 986, S Japan 960 -- i.e. within
+    1 mm/yr at every `f`). That is structural, not luck: the cap only
+    ever *raises* a dry-season trough, and only on rows where `itcz_window`'s
+    annual mean is large, so it cannot reach a subtropical desert.
+
+    **Long-run behaviour, which is the actual point.** At 256x512 with 5yr spinup
+    + 1yr eval (seed-free and soil/ocean-equilibrated), f=0.0 gives Af 3.82% /
+    dryMed 9.2 mm / ratio 21.9 and f=0.10 gives Af 6.06% / 37.2 mm / 4.7. More
+    directly: continuing `saves/test.npz` itself (512x1024, the production grid,
+    already 24yr old and fully equilibrated on the *broken* physics) forward under
+    the fix, the band grows back in and **stabilises** rather than decaying --
+
+        state          Af     Am     Aw    tropMAE  dryMed  ratio  Amazon  Congo
+        as saved      2.61   1.75  11.16    2.27      8.2   23.9    17      45
+        +1 yr         4.27   3.15  10.55    1.04     27.5    6.9    50      70
+        +2 yr         5.59   3.16   9.88    0.46     34.8    5.3    67      80
+        +3 yr         6.10   3.17   9.50    0.48     37.5    4.9    73      84
+        +4 yr         6.32   3.15   9.33    0.61     38.4    4.8    76      85
+        Earth         6.00   4.00  10.00     --    60-150  1.5-5    60      80
+
+    -- i.e. the exact reverse of the reported symptom (a rainforest belt that
+    appeared and then dissolved). Convergence takes ~3 years because the monthly
+    bins must re-equilibrate at `window_years=1.0`; the Köppen shares land on
+    6.32 / 3.15 / 9.33 against Earth's 6.0 / 4.0 / 10.0, and the wet/dry ratio
+    lands inside Earth's 1.5-5 band.
+
+    **Remaining known gaps, NOT addressed here** (both are the separate
+    arid-overrepresentation defect -- BWh is 17.8% of land against Earth's ~9.5%
+    -- rather than this seasonality one, and both are *annual-total* shortfalls
+    that no seasonal-distribution knob can reach): Borneo's driest month is 58 mm
+    against ~150, New Guinea's 31 against ~120, and southern Congo's 36 against
+    ~55. Borneo's annual total is ~900 mm/yr against a real ~3000. BWh also
+    drifts up slightly across the continuation (16.98% -> 17.79%) as tropical
+    cells sharpen, which is a real if small cost."""
 
     precip_raw_shape_weight: float = 0.0
     """Strength [0-1] of blending `precip_potential`'s own row-relative raw

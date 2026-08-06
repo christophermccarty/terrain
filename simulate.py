@@ -3682,5 +3682,15 @@ def clear_simulation_caches() -> None:
     _CARBON_SLOW_CACHE.update({"key": None, "last_update_day": -9999.0, "biome": None})
     _MARITIME_CACHE.clear()
     _MARITIME_CACHE.update({"key": None, "field": None})
+    # `_maritime_proximity_coarse` has its OWN cache, and it was missing here
+    # (2026-08-05) -- both are keyed on `id(elevation)` plus a 512-sample strided
+    # fingerprint, so both can take a stale hit when a new elevation array lands
+    # on a reused id and differs only in cells the stride skips. That is exactly
+    # what this function exists to prevent on load/preset/new-sim. It surfaced as
+    # an order-dependent test failure (`test_maritime_transport.py::
+    # test_coarse_block_mean_is_over_land_cells_only` reading 0.0 for a lone land
+    # cell at flat index 1572, which a stride of 16 never samples).
+    _MARITIME_COARSE_CACHE.clear()
+    _MARITIME_COARSE_CACHE.update({"key": None, "field": None})
     clear_all_caches()
     clear_temperature_cache()

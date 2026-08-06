@@ -239,7 +239,12 @@ def update_monthly_statistics(
         monthly_temp = np.zeros((12, H, W), dtype=np.float32)
         monthly_precip = np.zeros((12, H, W), dtype=np.float32)
         monthly_sample_count = np.zeros(12, dtype=np.float32)
-        # Initialize all months with current values for faster spin-up
+        # Seed all months with current values so Köppen is classifiable from the
+        # very first step instead of being blank for a whole simulated year. The
+        # seed is a *placeholder*, not data: it gives all 12 bins the same
+        # instantaneous field, i.e. an annual cycle of exactly zero amplitude.
+        # It is therefore discarded on each bin's first real sample below --
+        # see the `first_visit` note for why blending it in was a measurement bug.
         for m in range(12):
             monthly_temp[m] = state.temperature.astype(np.float32)
             monthly_precip[m] = state.precipitation.astype(np.float32)
@@ -268,9 +273,31 @@ def update_monthly_statistics(
     tau_days = window_years * orbital_month_days
     alpha = 1.0 - math.exp(-dt_days / tau_days)
 
+    # A bin's FIRST real sample replaces the spin-up seed outright rather than
+    # blending with it (2026-08-05). The seed is all 12 bins set to one
+    # instantaneous field, so it carries a zero-amplitude annual cycle; blending
+    # it in leaves `(1-alpha)**n` of it behind, and because it is *flat* that
+    # residue lands almost entirely on the bin that should be the year's driest.
+    # At the previous defaults that was ~13.5% of the seed still present after
+    # two simulated years -- worth ~+23 mm/month on deep-tropical driest-month
+    # precipitation, enough on its own to carry Amazon/Congo/Borneo cells over
+    # Köppen's 60 mm Af/Aw threshold and show a rainforest belt that then
+    # visibly dissolved over the following years as the residue decayed. Every
+    # calibration that read Af/Am/Aw off the 1yr-spinup + 1yr-eval validation
+    # benchmark was reading that artifact (see
+    # `PlanetParams.itcz_seasonal_target_response`'s 2026-08-05 note).
+    #
+    # Overwriting is also strictly faster spin-up than blending -- the bin
+    # reaches its true first sample in one visit instead of asymptotically --
+    # so nothing is traded away here. `monthly_sample_count` is the natural
+    # visited-flag: it is zero only for a bin that has never been updated, and
+    # it round-trips through save/load alongside the bins themselves.
+    first_visit = float(monthly_sample_count[month]) <= 0.0
+    a = 1.0 if first_visit else alpha
+
     # Update current month's statistics
-    monthly_temp[month] = (1.0 - alpha) * monthly_temp[month] + alpha * state.temperature.astype(np.float32)
-    monthly_precip[month] = (1.0 - alpha) * monthly_precip[month] + alpha * state.precipitation.astype(np.float32)
+    monthly_temp[month] = (1.0 - a) * monthly_temp[month] + a * state.temperature.astype(np.float32)
+    monthly_precip[month] = (1.0 - a) * monthly_precip[month] + a * state.precipitation.astype(np.float32)
     monthly_sample_count[month] += dt_days
 
     return monthly_temp, monthly_precip, monthly_sample_count
