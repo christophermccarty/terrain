@@ -173,19 +173,92 @@ judgment call rather than something to resolve unilaterally: a single compact,
 short-duration screen is this project's own standing disqualifier for
 promotion (see Sections 5-7, 10-11), and `wind_terrain_pgf_scale` was reached
 by a diagnostic investigation into six orographic tiles, not by the
-document's usual bounded-sweep-then-scale-up protocol. `wind_terrain_pgf_scale`
-therefore remains at its default of 1.0, `orographic_linear.py` remains
-uncoupled, and no other default changed. The concrete next step is to run
-`wind_terrain_pgf_scale=0.0` through this project's full promotion protocol
-(a bounded sweep, then the 128x256 five-year-spinup/five-year-evaluation CRU
-benchmark) purely as a global wind-model candidate, independent of the
-orographic work -- and, given the observed non-monotonicity, to also consider
-redesigning the term itself (e.g. proportional to local relief/slope
-magnitude with synoptic-scale smoothing, rather than a raw absolute-elevation
-pressure wedge applied everywhere) rather than treating 0.0 as the only
-alternative to 1.0. Only after that global question is settled does it make
-sense to return to the four pairs (Cascades, Sierra Nevada, S Andes, Southern
-Alps) that still miss their targets even with the term disabled.
+document's usual bounded-sweep-then-scale-up protocol. That protocol was
+therefore run to completion.
+
+A bounded sweep at 64x128 (0.0, 0.05, 0.1, 0.25, versus the default 1.0)
+brackets the endpoint tightly, per the non-monotonicity already found above.
+Group Koppen accuracy is essentially flat and near its best across 0.0-0.1
+(0.7086, 0.7077, 0.7076) before degrading at 0.25 (0.6965) and 1.0 (0.6738);
+class accuracy, kappa, and group-share MAE follow the same shape. The
+six-pair orographic screen (256x512, stability 0.006 s-1) confirms this
+near-zero neighborhood is comparatively well-behaved, unlike the wild swings
+already documented between 0.25 and 0.75: at 0.05 Cascades is (10.3, 17.5)
+m s-1 (W/L 0.98), Sierra Nevada (1.5, 10.1) (W/L 1.19), Himalaya (-3.3, -25.4)
+(W/L 20.98); at 0.1, Cascades (9.7, 14.7) (W/L 1.07), Sierra Nevada (1.5, 6.6)
+(W/L 1.21), Himalaya (-1.0, -27.1) (W/L 21.49). Wind direction stays correctly
+signed and Himalaya stays close to its target across the whole 0.0-0.1 band,
+so 0.0 -- already measured in full above -- remains the clear best endpoint
+and no nearby value is worth separately carrying through the five-year gate.
+
+The bounded sweep did, however, surface one metric this document had not yet
+checked here: `reference_error_score`, the same area-weighted composite of
+regional precipitation-target error and zonal temperature/precipitation bias
+used to gate promotion in Sections 5-13. It moves the *opposite* direction
+from Koppen skill -- 0.2117 (scale 1.0) to 0.2154 (0.25) to 0.2170 (0.1) to
+0.2176 (0.05) to 0.2181 (0.0) -- monotonically *worsening* as the terrain term
+is reduced, a small (about 3%) but directionally consistent regression that
+the first compact check in this section did not surface because it only
+inspected `region_group_accuracy` (identical across scales) and not
+`regional_target_error_fraction` (which is not).
+
+Because this was a mixed rather than a clean-sweep result, the full protocol
+was still run rather than skipped, exactly matching the standing rule that a
+compact screen -- however positive on Koppen skill alone -- is never
+sufficient. No pre-existing tracked baseline exists at 128x256/five-plus-five
+years (`docs/CURRENT_BASELINE.md` pins the tracked baseline at 64x128,
+one-plus-one years), so scale 1.0 and scale 0.0 were both run at matched
+128x256, five-spin-up-year/five-evaluation-year configuration for a direct,
+apples-to-apples comparison (each deterministic; wall time 283s and 190s
+respectively):
+
+| Metric | scale=1.0 (default) | scale=0.0 |
+|---|---|---|
+| Koppen group accuracy | 0.7088 | **0.7195** |
+| Koppen class accuracy | 0.4223 | **0.4258** |
+| Group kappa | 0.6304 | **0.6443** |
+| Group-share MAE (pp) | 2.765 | **1.742** |
+| Global precipitation (mm/day) | 2.9611 | 2.9582 |
+| `reference_error_score` | **0.1720** | 0.1757 |
+
+At full resolution/duration the Koppen-skill gain not only survives, it grows
+relative to the compact screen, and global precipitation stays a near-wash.
+`reference_error_score` reproduces the same small, consistent regression seen
+in the compact sweep (0.1720 to 0.1757, about 2.1%), and at this scale it is
+traceable to specific regions rather than being diffuse: Atacama's
+target-error fraction worsens from 0.432 to 0.525 (precipitation rises 71.6
+to 76.2 mm/year -- a real desert getting measurably wetter, plausibly because
+the terrain-locked high over the Andes was reinforcing its rain-shadow dryness
+for reasons unrelated to the six orographic pairs), and US Midwest's
+`region_group_accuracy` softens from 0.765 to 0.735. The zonal breakdown shows
+the same pattern geographically: the 30-40N, 40-50N, and 50-60N group-accuracy
+bands -- the exact midlatitude belt the six orographic pairs sit in -- are
+each flat-to-slightly-worse at scale 0.0 (0.639 to 0.609, 0.587 to 0.584,
+0.814 to 0.756), so the large net Koppen gain is earned entirely outside that
+belt (concentrated at the equator, consistent with the compact screen).
+
+This does not clear the full gate cleanly. Four of six tracked axes favor
+scale 0.0 by a clear margin, one (global precipitation) is a wash, and one
+(`reference_error_score`) regresses by a small but consistent amount at both
+resolutions, concentrated in a named desert region and the same midlatitude
+belt this investigation started from. Per the task's own standing rule, a
+mixed long-run result is a genuine judgment call, not something to resolve by
+picking the axis that looks best. `wind_terrain_pgf_scale` therefore remains
+at its default of 1.0, `orographic_linear.py` remains uncoupled, and no other
+default changed; this section proposes -- rather than makes -- the change, for
+a human to weigh: is a large, broad Koppen-classification gain worth a small,
+regionally-concentrated regression in absolute precipitation-target accuracy,
+in a parameter that touches every cell of every simulation? If the answer is
+yes, `wind_terrain_pgf_scale=0.0` is fully validated by this section's own
+protocol and ready to flip. If the answer is no, or is "fix the regression
+first," the concrete next step is to understand why Atacama and the western
+midlatitude belt respond the opposite way from the equator -- most plausibly
+by redesigning the term to be proportional to local relief/slope magnitude
+with synoptic-scale smoothing (Andes rain-shadow forcing preserved, Cascades/
+Sierra Nevada's currently-uniform-with-elevation forcing removed) rather than
+a raw absolute-elevation pressure wedge applied everywhere -- before returning
+to the four orographic pairs (Cascades, Sierra Nevada, S Andes, Southern Alps)
+that still miss their W/L targets even with the term fully disabled.
 
 ## 2. Land: force-restore plus Penman--Monteith
 
