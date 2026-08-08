@@ -927,3 +927,209 @@ than treating 120 m/s or 1000 m/s as a default change from this diagnostic
 alone. Results are archived at
 `scripts/mass_flux_closure_throughflow_diagnostic.json`. No default changed;
 both closures remain default-off.
+
+## 14. Restoring overturning heating decouples the cap from both transport and composite score
+
+Section 13's cap scan intentionally used zero overturning heating to isolate
+the closure's own behavior. `scripts/sweep_mass_flux_cap_with_overturning.py`
+re-runs the same five cap values (20/40/60/80/120 m/s) with
+`enable_native_balanced_moist_static_energy_overturning` restored, at its
+10-day relaxation, crossed with both the ocean-transport and TOA-only
+radiative targets from Section 11 -- ten 32x64 one-year-spinup/one-year-eval
+runs in total:
+
+| Cap (m/s) | Ocean: Köppen group/class | Ocean: composite ref. error | Ocean: transport (PW) | TOA: Köppen group/class | TOA: composite ref. error | TOA: transport (PW) |
+|---|---|---|---|---|---|---|
+| 20 | 0.548/0.218 | 1.362 | -18.62 | 0.566/0.246 | 0.818 | -20.80 |
+| 40 | 0.611/0.231 | 0.847 | -23.65 | 0.606/0.241 | 0.984 | -13.98 |
+| 60 | 0.640/0.266 | 0.914 | -15.93 | 0.623/0.252 | **0.745** | -22.57 |
+| 80 | 0.632/0.257 | 1.050 | -15.05 | 0.649/0.275 | 1.071 | -20.24 |
+| 120 | 0.658/0.284 | 1.883 | -24.21 | **0.659/0.268** | 0.936 | -15.34 |
+
+Two things carry over from Section 13's zero-heating scan, and one does not.
+Köppen group accuracy still rises with the cap for both radiative targets
+(TOA rises on every single step, 0.566 to 0.659; ocean rises on every step
+except a small dip at 80), so the "12 m/s is too tight a bound" conclusion is
+confirmed with heating present, not an artifact of the zero-heating setup.
+
+What does *not* carry over is any usable relationship for the other two
+metrics. Cross-equatorial transport stays in the same -14 to -24 PW
+unphysical band regardless of cap or target, exactly as before, but here it
+is not even the same non-monotonic-with-a-visible-minimum shape Section 13
+showed (best at 120, worst at 1000) -- it is closer to noise, with the best
+and worst values both appearing at different caps for the two targets (worst
+ocean value at 120, worst TOA value at 60). The composite reference-error
+score is a third, independent story again: it does not track the cap at all
+(worst ocean value is also at 120 -- 1.883, nearly double every other row in
+the table -- while the single best composite score in this entire
+experimental family across Sections 11-14, 0.745, appears at TOA/60, a
+middling point for both Köppen skill and transport). No cap value is a joint
+winner across group accuracy, composite error, and transport at once; this
+is a genuine multi-objective trade-off between three metrics that move
+independently of one shared underlying variable, not a single dial. Nothing
+in this table clears the untouched compact baseline on all axes
+simultaneously, so nothing here is a promotion candidate.
+
+This sharpens, rather than resolves, the open question from Section 13.
+There, closing the *closure's own* local divergence residual (measured
+directly via its `residual_before_s`/`residual_after_s` diagnostic) tracked
+the cap cleanly and monotonically (6% to 86% closure). Whether that same
+clean relationship survives once overturning heating is present, or whether
+heating's own contribution to the pre-closure divergence field changes what
+the correction is actually closing, has not yet been measured directly in
+this run -- Section 13's instrumentation was zero-heating only. The next
+diagnostic step is to rerun that same `simulate.close_upper_mass_flux`
+recording wrapper (not a new mechanism, the one already built for Section 13)
+across a couple of cap values on one of this section's heated configurations,
+to check directly whether `residual_after_s` still closes cleanly with cap
+when heating is present. If it does, that would confirm the disconnect
+between "the closure works as intended" and "transport/composite score don't
+visibly improve" is real and structural -- i.e. locally closing divergence is
+provably not sufficient to control net meridional transport, and the next
+target for investigation becomes the resolved wind field feeding into the
+closure (the lower/middle/upper winds themselves, and specifically whatever
+`thermally_direct_overturning` and the balanced-pressure wind target
+contribute to them before the closure ever runs) rather than the closure's
+own correction. Results are archived at
+`scripts/mass_flux_cap_overturning_sweep_result.json`. No default changed;
+all four gates involved (`enable_three_level_horizontal_mass_flux_closure`,
+`enable_native_balanced_moist_static_energy_overturning`,
+`native_balanced_mse_use_toa_radiative_target`, and the cap itself) remain at
+their existing defaults.
+
+## 15. The mass closure and the transport pathology are provably different problems
+
+The direct check Section 14 called for is now done:
+`scripts/diagnose_mass_flux_closure_with_overturning.py` reruns the same
+`simulate.close_upper_mass_flux` recording wrapper from Section 13, this time
+on a heated (TOA target, 10-day relaxation) configuration, at cap values
+20/60/120 m/s.
+
+| Cap (m/s) | Residual before (s-1) | Residual closure | Transport (PW) |
+|---|---|---|---|
+| 20 | 9.37e-5 | 10.4% | -20.80 |
+| 60 | 9.48e-5 | 30.0% | -22.57 |
+| 120 | 9.36e-5 | 52.4% | -15.34 |
+
+Two confirmations. First, `residual_before_s` is essentially unchanged by
+heating (9.36-9.48e-5 s-1 here versus 9.29-9.44e-5 s-1 in Section 13's
+zero-heating scan) -- the overturning branches' contribution to the
+pre-closure divergence field is small compared to whatever already dominates
+it. Second, at the one cap value tested in both scans, closure fraction is
+essentially identical whether heating is present or not: 52.4% here at 120
+m/s versus 53.0% in Section 13's zero-heating run. (The transport and
+Köppen/precip numbers at each cap also reproduce Section 14's TOA row
+exactly, e.g. -20.80 PW at 20 m/s in both, which is a useful sanity check on
+top of the substantive result.) The closure's own local divergence-closing
+behavior is therefore provably independent of whether any diabatic heating
+is driving the circulation -- it is governed entirely by the cap and the
+pre-existing divergence field, not by the heating source this whole
+experimental family (Sections 8-14) has been varying.
+
+This is worth stating precisely, because it changes what the "residual
+transport" finding actually means. A closure that drives
+`equatorial_throughflow_after_m_s` to exactly zero is enforcing zero *net
+column mass flux* at the equator -- and a real Hadley circulation is
+*supposed* to have exactly that property while still carrying a large net
+*energy* transport: warm air rises and moves poleward aloft, sinks, and
+returns equatorward near the surface, with the three levels' mass fluxes
+cancelling by construction while their energy-per-unit-mass differs because
+temperature and geopotential differ by level. So driving the local,
+per-level mass-divergence residual toward zero was never mechanically
+guaranteed to shrink meridional *energy* transport, and Section 14's finding
+that the two move independently under the cap is the expected consequence of
+that, not a mysterious decoupling. The real anomaly is not "the closure
+doesn't reduce transport" -- it is that this experimental family's transport
+values (Section 11: -18 to -31 PW; Section 12-15: -14 to -25 PW) sit roughly
+3-5x above Earth's actual peak meridional Hadley-cell energy transport
+(observationally on the order of 5-6 PW), and do not scale in any consistent
+direction with either the heating source (Section 11) or the closure's own
+cap (Sections 13-15).
+
+That reframes the next diagnostic away from "tune the mass-flux closure
+further" (this family of experiments has now been tested from three
+different angles -- heating source in Section 11, heating magnitude in
+Section 12, and the closure's own cap in Sections 13-15 -- without finding a
+lever that reliably shrinks transport) and toward the resolved wind fields
+themselves. The next step is to measure the raw lower/middle/upper
+meridional wind magnitude and pattern directly from a heated run's final
+`PlanetState` (`state.wind_v`, `state.midlevel_wind_v`, `state.wind_v_aloft`
+-- no closure or transport-diagnostic code needed, just read the state
+returned by `run_real_terrain_validation`) and compare it against realistic
+Hadley-cell wind speeds by level, to check whether the branch speeds coming
+out of `thermally_direct_overturning` and/or the balanced-pressure wind
+target are simply too large for this configuration -- a much more direct
+target than continuing to vary the mass-flux closure that Sections 13-15 have
+now shown is not the mechanism. No default changed.
+
+## 16. The excess wind is the shared, already-calibrated jet-stream kernel, not an experimental artifact
+
+`scripts/diagnose_resolved_wind_magnitude.py` now runs two variants: the full
+Section 15 heated configuration, and a `kernel_only` variant with none of
+Sections 8-15's overturning/mass-flux-closure gates enabled at all (just the
+column-water/condensate/two-layer/three-level-pressure-column prerequisites).
+
+| Variant | Lower-v mean/max/RMS (m/s) | Mid-v mean/max/RMS (m/s) | Upper-v mean/max/RMS (m/s) | Cross-eq. transport (PW) |
+|---|---|---|---|---|
+| `kernel_only` | 0.57 / 0.96 / 0.63 | 6.90 / 13.66 / 32.07 | 24.14 / 45.71 / 29.45 | +1162.52 |
+| `full_heated` (Section 15 config) | 1.02 / 1.54 / 1.10 | 10.96 / 20.35 / 31.01 | 15.84 / 37.53 / 21.48 | -22.44 |
+
+The excess is not only present without any of Sections 8-15's additions, it
+is *larger* for the upper level (24.14 vs 15.84 m/s mean, 45.71 vs 37.53 m/s
+max) and comparable for the middle level. `kernel_only`'s +1162.52 PW also
+reproduces the same order-of-magnitude spurious pole-to-pole throughflow
+Section 12 found whenever the mass-flux closure is disabled (there +1183.95
+PW), this time with zero contribution from any diabatic-heating source --
+confirming again that the closure's null-mode projection, not the heating
+term, is what keeps the full configuration's transport in the -14 to -31 PW
+band rather than four figures.
+
+Tracing where `state.wind_v_aloft` (this diagnostic's "upper") actually comes
+from in `simulate.py` produces the important qualifier: `u2_full`/`v2_full`
+are first assigned at line 2384 by `_evolve_wind_substepped`, which calls
+`evolve_wind_aloft` (`atmosphere.py`) **unconditionally, on every step,
+regardless of any three-level or experimental gate** -- this is the same
+"1.5-layer atmosphere" aloft wind that has been the project's default,
+always-on jet-stream/baroclinic-jet model since the jet-stream feature work
+(see `docs/PRIOR_ART_IMPLEMENTATION_PLAN.md`-adjacent project history: pgf_amp
+was raised from 8 to 40 and subsequently to its current default of 90.0
+across that earlier, extensively validated jet-latitude calibration effort).
+The three-level/overturning/closure machinery in Sections 8-15 only *adds to*
+this same base array afterward (the balanced-pressure blend, the thermal-wind
+relaxation, `thermally_direct_overturning`'s upper branch, and the mass-flux
+closure's correction, in that order) -- it never replaces it. The
+experimental midlevel wind reuses the identical `evolve_wind_aloft` function
+at a reduced amplitude (`three_level_mid_wind_pgf_fraction=0.55`, giving an
+effective PGF amplitude of 49.5 against the upper level's 90.0, with its own
+stronger damping of 0.08 against the upper level's 0.05).
+
+This reframes the finding once more, and turns it into a genuine fork rather
+than a next sweep. `wind_upper_pgf_amp` and `wind_upper_damping` are not
+uncalibrated constants -- they are the same parameters behind the project's
+already-validated, default-on jet-stream latitude/speed behavior, tuned
+against that target in earlier, separate work. Everything measured in this
+section is that kernel's *meridional* (v) component, which was never itself
+a target of that calibration (the jet-stream work optimized zonal jet
+latitude and speed, i.e. u) and is not exercised by any default-on
+diagnostic -- the transport/Köppen impact only becomes visible once the
+three-level experimental path and its `circulation_scorecard` transport
+diagnostic are enabled. Turning `wind_upper_pgf_amp`/`wind_upper_damping` down
+to fix the experimental path's meridional-wind magnitude therefore risks
+regressing the already-validated default jet-stream behavior, since both
+paths share the exact same function and constants.
+
+This is a genuine design fork, not a numeric sweep, and per this project's
+practice of flagging real judgment calls rather than guessing, it is left
+open here rather than picked: (a) decouple the meridional PGF/damping term
+from the zonal one with a new parameter specific to the experimental
+three-level path (real new surface area, needs its own design and, ideally,
+a re-validation that it does not change the default jet-stream's zonal
+behavior at all), or (b) accept the shared kernel's meridional component as a
+known limitation and constrain the transport diagnostic/overturning
+calibration to be robust to it, rather than re-deriving the shared kernel.
+Sections 8-15's individual findings about the mass-flux closure's and
+overturning heating's own behavior remain valid characterizations of those
+mechanisms; what changes is the conclusion that any of them could reach a
+physically small transport residual on their own -- none of them were ever
+operating on a realistically scaled base wind field. No default changed;
+results are archived at `scripts/resolved_wind_magnitude_diagnostic.json`.
