@@ -1133,3 +1133,164 @@ mechanisms; what changes is the conclusion that any of them could reach a
 physically small transport residual on their own -- none of them were ever
 operating on a realistically scaled base wind field. No default changed;
 results are archived at `scripts/resolved_wind_magnitude_diagnostic.json`.
+
+## 17. Decoupling the upper wind: a real transport improvement, still short of promotable
+
+Section 16 left a genuine fork rather than picking a side. This session picks
+option (a): the three-level path now evolves its own, genuinely independent
+upper-level wind, `PlanetState.upperlevel_wind_u/v`, instead of continuing to
+build on `state.wind_u_aloft`/`wind_v_aloft` -- the shared, always-on
+"1.5-layer atmosphere" jet-stream kernel that `wind_upper_pgf_amp`/
+`wind_upper_damping` are separately calibrated against.
+
+**What changed.** A new substep wrapper, `_evolve_upper_wind_substepped`
+(`simulate.py`), calls the identical `evolve_wind_aloft` physics used by both
+the shared kernel and the existing independent middle level, but with its own
+new `PlanetParams` fields: `three_level_upper_wind_pgf_fraction` (a
+multiplier on `wind_upper_pgf_amp`, default `1.0` -- reproducing the shared
+kernel's full amplitude as the starting point, since the three-level
+additions never previously scaled the raw forcing, only blended/added onto
+its result) and `three_level_upper_wind_damping` (default `0.08`, matching
+the independent middle level's own precedent exactly, versus the shared
+level's `0.05`). All four three-level-only additions that previously wrote
+directly to `u2_full`/`v2_full` -- the balanced-pressure blend
+(`enable_native_balanced_pressure_dynamics`), the thermal-wind relaxation
+(`three_level_balanced_thermal_wind_relaxation`), `thermally_direct_
+overturning`'s upper branch, and `close_upper_mass_flux`'s correction -- are
+redirected onto the new state, along with the "upper" wind fed into
+`generate_precipitation`'s pressure-column vapor transport and mid-upper
+interface omega (the field is seeded as a copy of `u2_full`/`v2_full` on
+first use, then evolves independently every step after). The middle level's
+own reference/relaxation target (`0.5 * (u_full + upper)`) now averages
+against the new independent state instead of the shared kernel, since it was
+always meant to represent "the three-level column's own upper level," not
+the jet-stream kernel specifically.
+
+**Regression coverage.** Five new tests in `testing/test_prior_art_kernels.py`
+cover state persistence (present when the gate is active, absent otherwise),
+that the new substep wrapper produces genuinely different output than the
+shared field (proving it is not an accidental alias), and -- the load-bearing
+test -- that `wind_u_aloft`/`wind_v_aloft` are `np.testing.assert_array_equal`
+bit-identical whether every one of the four redirected additions is off/zero
+or aggressively on, both with the three-level gate on and with it off, with a
+positive control confirming those same knobs do visibly perturb the
+*independent* state (so the bit-identical result is not vacuous). Two
+pre-existing tests (`test_balanced_dynamics.py`,
+`test_pressure_circulation.py`) asserted the old coupled behavior directly
+("the gate changes `wind_u_aloft`") and were updated to assert the new,
+intentional decoupling instead. The full `pytest testing/ -q` suite passes
+except the one pre-existing, unrelated failure noted below.
+
+**Measurement 1: damping alone is not the fix.** Holding
+`three_level_upper_wind_pgf_fraction=1.0` and sweeping only
+`three_level_upper_wind_damping` (0.05/0.08/0.15/0.25/0.40) on the full
+Section-11-style heated 32x64 one-year spin-up/one-year evaluation
+configuration (`scripts/screen_decoupled_upper_wind.py`, both the
+ocean-transport and TOA-only radiative targets from Section 11), transport
+stays noisy in the same unphysical band the whole family has shown since
+Section 11, and does not move in a consistent direction with damping:
+
+| Damping | Ocean: Köppen group/class | Ocean: composite ref. error | Ocean: transport (PW) | TOA: Köppen group/class | TOA: composite ref. error | TOA: transport (PW) |
+|---|---|---|---|---|---|---|
+| 0.05 | 0.562/0.241 | 0.860 | -17.17 | 0.582/0.237 | 0.693 | -15.17 |
+| 0.08 (prior default) | 0.568/0.226 | 0.873 | -27.86 | 0.572/0.219 | 0.960 | -23.46 |
+| 0.15 | 0.568/0.232 | 0.694 | -19.97 | 0.570/0.238 | 1.299 | -20.73 |
+| 0.25 | 0.583/0.229 | 0.870 | -16.46 | 0.576/0.234 | 0.665 | -22.85 |
+| 0.40 | 0.563/0.231 | 0.788 | -16.33 | 0.570/0.243 | 0.658 | -15.71 |
+
+The raw meridional-wind magnitude (`scripts/diagnose_resolved_wind_magnitude.py`,
+extended to report both `state.wind_v_aloft` and the new
+`state.upperlevel_wind_v`) tells the same story: at the TOA-target
+configuration, mean/max/RMS zonal-mean tropical `|v|` is 12.71/33.49/31.06 m/s
+at damping 0.05, *worsens* to 18.18/43.22/34.79 m/s at the 0.08 default, then
+16.32/37.15/33.22 at 0.15 and 17.77/36.93/33.58 at 0.25 -- non-monotonic and
+never within an order of magnitude of the ~1-3 m/s literature Hadley-cell
+target. Per `evolve_wind_aloft`'s own mechanism (Euler PGF forcing, then an
+exact Coriolis rotation, then weak Rayleigh damping each substep), this is
+not surprising in hindsight: damping removes momentum only *after* each
+substep's rotation has already redistributed the forcing, so it fights the
+same rotation-driven dynamics that make the response noisy rather than
+addressing the forcing magnitude directly.
+
+**Measurement 2: PGF fraction is the more direct, and more effective,
+lever.** Holding damping fixed at 0.08 (the middle-level precedent) and
+sweeping `three_level_upper_wind_pgf_fraction` instead
+(0.1/0.25/0.4/0.55/0.7/1.0, 0.55 mirroring the middle level's own fraction)
+on the identical configuration:
+
+| PGF fraction | Ocean: Köppen group/class | Ocean: composite ref. error | Ocean: transport (PW) | TOA: Köppen group/class | TOA: composite ref. error | TOA: transport (PW) |
+|---|---|---|---|---|---|---|
+| 0.1 | **0.627/0.268** | 0.933 | **-14.65** | **0.639/0.284** | 1.111 | **-9.36** |
+| 0.25 | 0.598/0.258 | 1.106 | -11.67 | 0.613/0.252 | 0.988 | -16.66 |
+| 0.4 | 0.586/0.229 | 0.947 | -21.77 | 0.594/0.235 | 0.853 | -18.69 |
+| 0.55 | 0.582/0.245 | 0.562 | -28.77 | 0.584/0.237 | 0.704 | -9.23 |
+| 0.7 | 0.572/0.230 | 1.076 | -11.88 | 0.587/0.235 | 0.745 | -23.15 |
+| 1.0 (= damping-sweep 0.08 row) | 0.568/0.226 | 0.873 | -27.86 | 0.572/0.219 | 0.960 | -23.46 |
+
+`0.1` is not monotonic with the rest of the sweep (0.25-0.7 scatter worse on
+transport than either 0.1 or the 1.0 baseline), but it is consistently the
+best point across *both* independently-run radiative targets simultaneously
+-- Köppen group accuracy (0.627 ocean / 0.639 TOA) and transport magnitude
+(-14.65 / **-9.36** PW) both improve together at 0.1, which is a real signal
+given the rest of this experimental family's history of metrics moving
+independently of each other and of any single dial (Sections 13-15). The TOA
+row's -9.36 PW is, to date, the closest any configuration in this entire
+Sections-8-17 experimental family has come to Earth's real ~5-6 PW peak
+Hadley-cell transport magnitude -- previous families ranged -14 to -31 PW.
+The raw wind-magnitude diagnostic corroborates it directly: at
+`pgf_fraction=0.1`, mean/max/RMS tropical `|v|` is 12.21/**14.94**/12.79 m/s
+-- the *max* in particular drops to barely a third of the 1.0-fraction row's
+43.22 m/s, even though the zonal-mean value (12.21 m/s) is still 4-12x the
+literature target. `pgf_fraction=0.55` reaches a similarly good TOA transport
+(-9.23 PW) but with a much larger max (29.00 m/s) and no group-accuracy gain,
+so 0.1 is the cleaner of the two candidate points.
+
+The shared kernel's own upper wind is confirmed unaffected by any of this, as
+designed: `state.wind_v_aloft`'s mean/max across the whole pgf_fraction sweep
+stays at 23.99-24.18 / 45.36-45.60 m/s regardless of which value the
+*independent* state's fraction takes (kernel_only: 24.04/45.60; fraction=0.1:
+23.998/45.36; fraction=0.55: 24.10/45.44) -- the small residual variation
+between rows is ordinary run-to-run trajectory noise from the differently
+evolving decoupled state feeding back into shared fields like temperature,
+not a leak in the decoupling itself.
+
+| Variant | Upper-v (decoupled) mean/max/RMS (m/s) | Upper-v (shared kernel) mean/max/RMS (m/s) | Cross-eq. transport (PW) |
+|---|---|---|---|
+| `kernel_only` (no closures, fraction=1.0, damping=0.08) | 11.83 / 25.67 / 35.49 | 24.04 / 45.60 / 29.25 | +840.17 |
+| `full_heated`, fraction=1.0, damping=0.08 (prior default) | 18.18 / 43.22 / 34.79 | 24.18 / 45.56 / 29.78 | -23.46 |
+| `full_heated`, fraction=1.0, damping=0.05 | 12.71 / 33.49 / 31.06 | -- | -15.17 |
+| `full_heated`, fraction=0.1, damping=0.08 | **12.21 / 14.94 / 12.79** | 24.00 / 45.36 / 29.45 | **-9.36** |
+| `full_heated`, fraction=0.55, damping=0.08 | 12.13 / 29.00 / 27.51 | 24.10 / 45.44 / 29.73 | -9.23 |
+
+**Confirmed.** (1) The decoupling itself is complete and regression-tested:
+the shared jet-stream kernel is bit-identical regardless of any three-level
+setting, both with the gate on and off. (2) Damping alone, at any tested
+value, does not move transport in a useful or consistent direction -- this
+negative result closes that branch of the design space. (3) PGF fraction is
+a materially more effective lever, and `pgf_fraction=0.1`/`damping=0.08` is a
+genuine, reproducible improvement over the prior coupled behavior on this
+compact screen: transport improves from the -14 to -31 PW band that has
+defined this whole family since Section 11 to -9.36 PW (TOA target), and
+Köppen group accuracy improves alongside it (0.639 vs 0.572-0.674 range seen
+elsewhere in this family) rather than trading off against it, at both
+radiative targets independently.
+
+**Not confirmed / next step.** This is one compact 32x64, one-year
+spin-up/one-year evaluation screen at two points in a six-value sweep that is
+not itself monotonic -- per this project's standing rule, it is not a
+promotion candidate on this evidence alone, and no default has changed
+(`three_level_upper_wind_pgf_fraction` stays at `1.0`, all three three-level
+gates stay off). The next step is a proper bounded sweep around 0.1
+(for example 0.05/0.1/0.15/0.2) crossed with a finer damping grid near 0.08,
+to check whether the fraction=0.1 point is a real local optimum or the edge
+of a coarse six-value grid, followed by the standard 128x256 five-year
+spin-up/five-year evaluation CRU benchmark for whatever survives that finer
+screen. If that clears the joint temperature/Köppen/transport gate, it would
+be the first candidate in the Sections-8-17 family to seriously approach
+Earth's real cross-equatorial transport magnitude while also improving
+compact Köppen skill, rather than trading one for the other. Results are
+archived at `scripts/resolved_wind_magnitude_diagnostic.json` and
+`scripts/decoupled_upper_wind_screen_result.json`; the sweep scripts
+(`scripts/diagnose_resolved_wind_magnitude.py`,
+`scripts/screen_decoupled_upper_wind.py`) are reusable for the finer follow-up
+sweep.

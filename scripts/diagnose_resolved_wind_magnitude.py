@@ -75,8 +75,22 @@ VARIANTS: dict[str, dict] = {
 
 # Section 17 decoupled-upper-wind damping sweep: same full_heated configuration,
 # varying only three_level_upper_wind_damping to see how the new independent
-# state's magnitude responds. Populated below in main() once the field exists.
+# state's magnitude responds. Result: transport stays in the same -15 to -23 PW
+# band non-monotonically and magnitude bounces 12.7-18.2 m/s across this range
+# -- damping alone is not the fix (see PRIOR_ART_IMPLEMENTATION_PLAN.md
+# Section 17).
 UPPER_DAMPING_SWEEP = (0.05, 0.08, 0.15, 0.25)
+
+# Follow-up: sweep three_level_upper_wind_pgf_fraction instead, at a fixed
+# damping (0.08, matching the midlevel wind's own precedent and this
+# sweep's own default). Unlike damping (which removes momentum after each
+# substep's Coriolis rotation has already redistributed it), the PGF
+# fraction scales the forcing itself before that rotation acts, so it is
+# the more direct lever on the equilibrium wind magnitude per
+# evolve_wind_aloft's own Euler-PGF-then-Coriolis-rotation mechanism.
+# 0.55 mirrors the existing independent middle wind's own fraction.
+UPPER_PGF_FRACTION_SWEEP = (0.1, 0.25, 0.4, 0.55, 0.7, 1.0)
+UPPER_PGF_FRACTION_FIXED_DAMPING = 0.08
 
 HADLEY_EDGE_DEG = 24.0
 
@@ -138,6 +152,17 @@ def main() -> int:
     for damping in UPPER_DAMPING_SWEEP:
         name = f"full_heated_upper_damping_{damping}"
         overrides = dict(VARIANTS["full_heated"], three_level_upper_wind_damping=damping)
+        all_results[name] = _run_one(overrides)
+        print(f"--- {name} ---")
+        print(json.dumps(all_results[name], indent=2, default=str))
+
+    for pgf_fraction in UPPER_PGF_FRACTION_SWEEP:
+        name = f"full_heated_upper_pgf_fraction_{pgf_fraction}"
+        overrides = dict(
+            VARIANTS["full_heated"],
+            three_level_upper_wind_pgf_fraction=pgf_fraction,
+            three_level_upper_wind_damping=UPPER_PGF_FRACTION_FIXED_DAMPING,
+        )
         all_results[name] = _run_one(overrides)
         print(f"--- {name} ---")
         print(json.dumps(all_results[name], indent=2, default=str))
