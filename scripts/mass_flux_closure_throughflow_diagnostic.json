@@ -1,0 +1,50 @@
+[
+  {
+    "cross_equatorial_total_energy_transport_pw": -19.770138679628126,
+    "equatorial_throughflow_after_m_s_mean_abs": 6.551242345326729e-16,
+    "global_precip_mm_day": 2.618321241299652,
+    "koppen_class_accuracy": 0.22970643547016026,
+    "koppen_group_accuracy": 0.5652212555634185,
+    "max_speed_m_s": 12.0,
+    "num_calls": 121,
+    "residual_after_s_mean": 8.736222948253204e-05,
+    "residual_before_s_mean": 9.292171543332788e-05,
+    "residual_closure_fraction": 0.05982978171324038
+  },
+  {
+    "cross_equatorial_total_energy_transport_pw": -17.091868244376165,
+    "equatorial_throughflow_after_m_s_mean_abs": 5.813769819671796e-16,
+    "global_precip_mm_day": 2.59198394471078,
+    "koppen_class_accuracy": 0.24977583488978203,
+    "koppen_group_accuracy": 0.6135034527073494,
+    "max_speed_m_s": 40.0,
+    "num_calls": 121,
+    "residual_after_s_mean": 7.488482719007254e-05,
+    "residual_before_s_mean": 9.436860722331372e-05,
+    "residual_closure_fraction": 0.2064646348667073
+  },
+  {
+    "cross_equatorial_total_energy_transport_pw": -14.103636099366836,
+    "equatorial_throughflow_after_m_s_mean_abs": 3.804501264645767e-16,
+    "global_precip_mm_day": 2.5507802335966074,
+    "koppen_class_accuracy": 0.2849735772942497,
+    "koppen_group_accuracy": 0.6598530367168994,
+    "max_speed_m_s": 120.0,
+    "num_calls": 121,
+    "residual_after_s_mean": 4.400293937847653e-05,
+    "residual_before_s_mean": 9.357005975385376e-05,
+    "residual_closure_fraction": 0.5297326998162547
+  },
+  {
+    "cross_equatorial_total_energy_transport_pw": -20.892507296722943,
+    "equatorial_throughflow_after_m_s_mean_abs": 4.0906589553936763e-16,
+    "global_precip_mm_day": 2.5449905830444446,
+    "koppen_class_accuracy": 0.2822390471588066,
+    "koppen_group_accuracy": 0.6744153823072639,
+    "max_speed_m_s": 1000.0,
+    "num_calls": 121,
+    "residual_after_s_mean": 1.2890197542918596e-05,
+    "residual_before_s_mean": 9.34524305484179e-05,
+    "residual_closure_fraction": 0.8620667491763079
+  }
+]

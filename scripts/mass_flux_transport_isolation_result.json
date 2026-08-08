@@ -1,0 +1,29 @@
+{
+  "mass_flux_closure_only_zero_heating": {
+    "cross_equatorial_dry_static_energy_transport_pw": -18.090952056930576,
+    "cross_equatorial_latent_energy_transport_pw": -1.6791866226975483,
+    "cross_equatorial_total_energy_transport_pw": -19.770138679628126,
+    "global_precip_mm_day": 2.618321241299652,
+    "koppen_class_accuracy": 0.22970643547016026,
+    "koppen_group_accuracy": 0.5652212555634185,
+    "reference_error_score": 0.7770946135829472
+  },
+  "neither_closure": {
+    "cross_equatorial_dry_static_energy_transport_pw": 1174.8129259654852,
+    "cross_equatorial_latent_energy_transport_pw": 9.132886777454685,
+    "cross_equatorial_total_energy_transport_pw": 1183.94581274294,
+    "global_precip_mm_day": 2.6913805277468144,
+    "koppen_class_accuracy": 0.2573462781391443,
+    "koppen_group_accuracy": 0.47861391552030164,
+    "reference_error_score": 0.6894756504744
+  },
+  "reproduce_section11_ocean_10day": {
+    "cross_equatorial_dry_static_energy_transport_pw": -28.142229285062967,
+    "cross_equatorial_latent_energy_transport_pw": 3.043215082696408,
+    "cross_equatorial_total_energy_transport_pw": -25.09901420236656,
+    "global_precip_mm_day": 2.612558816475804,
+    "koppen_class_accuracy": 0.22666689816626184,
+    "koppen_group_accuracy": 0.5451290346815658,
+    "reference_error_score": 1.1118368318184209
+  }
+}

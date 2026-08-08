@@ -554,6 +554,44 @@ class PlanetParams:
     differences the wind and precip substep gates address. See
     `testing/test_land_seasonal_cycle.py`, which pins both halves."""
 
+    enable_land_surface_energy: bool = False
+    """Enable the gated prognostic land surface-energy tendency.
+
+    The existing land branch relaxes toward a prescribed seasonal baseline.
+    This optional closure additionally integrates net radiation minus bulk
+    sensible and latent heat fluxes through a finite land heat capacity. It is
+    off by default until CRU regional-temperature validation demonstrates a
+    joint improvement in temperature, rainfall, and Köppen skill.
+    """
+
+    land_surface_heat_capacity_j_m2_k: float = 1_500_000.0
+    """Effective active land-layer heat capacity [J m-2 K-1] when enabled."""
+
+    land_surface_energy_strength: float = 1.0
+    """Dimensionless multiplier for the gated land surface-energy tendency."""
+
+    enable_force_restore_land: bool = False
+    """Use the gated two-reservoir force-restore land replacement path.
+
+    Unlike ``enable_land_surface_energy``, this branch does *not* blend land
+    toward the legacy latitude-only seasonal baseline and therefore does not
+    apply the historical seasonal-amplitude stack or ``_land_cap_1d`` to the
+    land surface.  It is deliberately off until it passes regional CRU and
+    Köppen promotion gates.
+    """
+
+    land_force_restore_days: float = 30.0
+    """Surface-to-deep-soil restore time scale [days] in the gated land path."""
+
+    land_deep_heat_capacity_j_m2_k: float = 12_000_000.0
+    """Heat capacity [J m-2 K-1] of the gated deep-soil reservoir."""
+
+    land_surface_resistance_min_s_m: float = 70.0
+    """Wet-surface resistance [s m-1] for Penman--Monteith evaporation."""
+
+    land_surface_resistance_dry_s_m: float = 2_000.0
+    """Additional dry-soil resistance [s m-1] in the gated land path."""
+
     land_transport_seasonality: float = 0.0
     """Seasonal modulation of atmospheric heat transport into land
     [dimensionless, 0-1]. `0.0` is an exact no-op reproducing the previous
@@ -828,6 +866,13 @@ class PlanetParams:
     Default 0.0 (exact no-op) until calibrated against
     `scripts/check_real_terrain_koppen.py --wind-diagnostics`
     (known-physics-gaps.md item 3b)."""
+
+    wind_terrain_pgf_scale: float = 1.0
+    """Multiplier for the resolved-terrain pressure-gradient forcing in the
+    prognostic surface-wind solver. ``1.0`` preserves the historical 900-Pa
+    scale exactly; values below one are a gated diagnostic for excessive local
+    terrain deflection overwhelming the Earth-like midlatitude westerly target.
+    This does not change terrain height, drag, or precipitation directly."""
 
     # ------------------------------------------------------------------ #
     # Ocean circulation — AMOC / ACC bonus magnitudes
@@ -1315,6 +1360,287 @@ class PlanetParams:
     measured effect on every benchmark metric is under 0.1pp at any strength.
     Process note 9's rule (check which side of the rescale a mechanism sits on)
     applied to ocean coupling, exactly as A5-OROG had to apply it to orography.
+    """
+
+    enable_prognostic_condensate: bool = False
+    """Enable the gated bulk vapor-to-condensate-to-rain closure.
+
+    When enabled, resolved ascent and relative humidity transfer a conserved
+    column-water mixing ratio from vapor into a persistent condensate reservoir;
+    fallout then becomes precipitation.  The current target allocator remains
+    active during calibration, so this switch supports a clean A/B measurement
+    before the allocator is retired.  ``False`` preserves the established
+    rainfall path exactly.
+    """
+
+    enable_stability_aware_condensation: bool = False
+    """Use the gated CAPE-plus-resolved-ascent condensation closure.
+
+    This replaces the simple relative-humidity/ascent activation inside the
+    existing condensate reservoir with a one-column moist-stability estimate:
+    a parcel lifts dry-adiabatically to its LCL, then moist-adiabatically to a
+    fixed lower-tropospheric reference height.  Positive CAPE-like buoyancy
+    and resolved convergence must both be present before vapor above the
+    critical RH relaxes into condensate.  Requires
+    ``enable_prognostic_condensate``; default ``False`` preserves all current
+    precipitation behavior.
+    """
+
+    stability_condensation_critical_rh: float = 0.70
+    """Reference RH for stability-aware condensation (SBM-like 70% default)."""
+
+    stability_condensation_reference_height_m: float = 3500.0
+    """Parcel-evaluation height [m] for the one-column CAPE proxy."""
+
+    stability_condensation_cape_scale_j_kg: float = 50.0
+    """CAPE-like e-folding scale [J kg-1] for stability-aware activation."""
+
+    enable_two_layer_convective_adjustment: bool = False
+    """Persist a mid-tropospheric thermal layer for stability-aware convection.
+
+    With the stability-aware condensate gate, this carries a 3.5-km
+    environmental temperature between calls.  It relaxes toward the resolved
+    lower-tropospheric lapse profile and receives latent heating from local
+    condensation, giving buoyancy a physical memory without creating a second
+    water reservoir.  Requires ``enable_stability_aware_condensation`` and is
+    off by default.
+    """
+
+    two_layer_midlevel_relaxation_days: float = 10.0
+    """Radiative/dynamical relaxation time [days] for midlevel temperature."""
+
+    two_layer_upper_humidity_fraction: float = 0.25
+    """Initial fraction [0-1] of conserved vapor assigned to the upper layer."""
+
+    two_layer_entrainment_days: float = 2.0
+    """Resolved-ascent exchange time [days] between lower and upper vapor."""
+
+    two_layer_vertical_mixing_days: float = 5.0
+    """Thermodynamic exchange time [days] between midlevel and resolved air."""
+
+    two_layer_upper_mass_fraction: float = 0.25
+    """Mass fraction [0-1] represented by the midlevel thermodynamic layer."""
+
+    two_layer_cloud_radiative_weight: float = 0.50
+    """Cloud-fraction weight [0-1] diagnosed from suspended midlevel condensate."""
+
+    two_layer_cloud_reference_q: float = 0.004
+    """Midlevel condensate mixing ratio corresponding to unit cloud fraction."""
+
+    two_layer_pressure_depth_pa: float = 35_000.0
+    """Pressure thickness [Pa] between the surface and midlevel reservoir."""
+
+    two_layer_vertical_velocity_scale_pa_s: float = 0.05
+    """Pressure-vertical-velocity scale [Pa s-1] for layer exchange activation."""
+
+    enable_three_level_pressure_column: bool = False
+    """Enable the experimental native lower/mid/upper pressure-column state."""
+
+    enforce_three_level_mass_closure: bool = False
+    """Close mass-weighted lower/mid/upper divergence before diagnosing omega."""
+
+    enable_three_level_horizontal_mass_flux_closure: bool = False
+    """Apply a bounded resolved divergent-wind closure to the upper pressure level.
+
+    This experimental gate corrects the layer-weighted horizontal mass-flux
+    residual after all three momentum levels evolve.  It is distinct from the
+    local algebraic omega closure above and remains opt-in pending climate
+    validation.
+    """
+
+    three_level_horizontal_mass_flux_strength: float = 1.0
+    """Fraction [0-1] of diagnosed three-level mass-flux residual corrected per step."""
+
+    three_level_horizontal_mass_flux_max_speed_m_s: float = 12.0
+    """Maximum magnitude [m s-1] of one horizontal mass-flux correction step."""
+    three_level_horizontal_mass_flux_throughflow_max_speed_m_s: float = 80.0
+    """Upper-wind bound [m s-1] for removing the divergence-free column throughflow mode."""
+
+    three_level_divergence_filter_strength: float = 0.0
+    """Weight [0-1] of conservative small-scale filtering before omega diagnosis."""
+
+    three_level_divergence_filter_passes: int = 0
+    """Number of divergence-filter passes for the experimental pressure column."""
+
+    three_level_balanced_thermal_wind_relaxation: float = 0.0
+    """Per-step [0-1] relaxation of upper wind toward resolved thermal-wind shear."""
+
+    three_level_thermal_wind_upper_pressure_pa: float = 30_000.0
+    """Pressure [Pa] assigned to the balanced upper thermal-wind target."""
+
+    enable_native_balanced_pressure_dynamics: bool = False
+    """Blend pressure-level winds toward native hydrostatic geostrophic balance."""
+
+    native_balanced_pressure_relaxation: float = 0.0
+    """Per-step [0-1] relaxation of middle/upper winds toward balanced targets."""
+
+    native_balanced_ageostrophic_timescale_hours: float = 0.0
+    """Cross-isobar adjustment timescale [h]; zero keeps the target geostrophic."""
+
+    native_balanced_mid_pressure_pa: float = 65_000.0
+    """Pressure [Pa] assigned to the native balanced middle-wind target."""
+    native_balanced_surface_pressure_pa: float = 90_000.0
+    """Pressure [Pa] assigned to the native balanced lower-wind target."""
+    native_balanced_overturning_speed_m_s: float = 0.0
+    """Lower-branch speed [m s-1] for the thermally centred native Hadley closure; zero disables it."""
+    enable_native_balanced_diabatic_overturning: bool = False
+    """Diagnose native Hadley overturning strength from persistent midlevel diabatic heating."""
+    native_balanced_diabatic_overturning_max_speed_m_s: float = 2.0
+    """Physical cap [m s-1] on the diagnosed native diabatic lower branch."""
+
+    enable_native_balanced_moist_static_energy_overturning: bool = False
+    """Diagnose native Hadley overturning from a full lower/mid moist-static-energy budget.
+
+    Supersedes ``enable_native_balanced_diabatic_overturning`` when both are
+    enabled.  Instead of inferring heating solely from the persistent midlevel
+    temperature anomaly, this sums two independently diagnosed terms before
+    converting to pressure velocity: latent heating from actual resolved
+    condensation (the previous step's precipitation field, falling back to the
+    midlevel anomaly memory when unavailable) and a resolved radiative/thermal
+    heating rate toward the model's own seasonal equilibrium-temperature
+    target.  Both remain zonal-mean, tropical-band scalars; the mass-conserving
+    three-level structure is still supplied by ``thermally_direct_overturning``.
+    """
+    native_balanced_mse_overturning_max_speed_m_s: float = 2.0
+    """Physical cap [m s-1] on the moist-static-energy-diagnosed native lower branch."""
+    native_balanced_mse_radiative_relaxation_days: float = 10.0
+    """Relaxation time [days] converting the resolved thermal-equilibrium anomaly into a heating rate."""
+    native_balanced_mse_use_toa_radiative_target: bool = False
+    """Use a genuine top-of-atmosphere radiative-equilibrium target instead of the ocean-transport target.
+
+    When False (default), the radiative term relaxes toward
+    ``_compute_T_base_ocean_full()`` -- the same seasonal target used for the
+    SST field, which bakes in AMOC/ACC bonuses, hemisphere asymmetry, and
+    ocean thermal lag.  When True, it relaxes toward
+    ``temperature.temperature_kelvin_for_lat`` evaluated directly at the
+    current day, with no transport terms.  This isolates whether the MSE
+    closure's skill gain (PRIOR_ART_IMPLEMENTATION_PLAN.md Section 10) is
+    genuine radiative-heating physics or borrowed transport asymmetry.
+    """
+
+    three_level_upper_humidity_fraction: float = 0.15
+    """Initial fraction [0-1] of total vapor placed in the upper reservoir."""
+
+    three_level_mid_upper_pressure_depth_pa: float = 30_000.0
+    """Pressure thickness [Pa] between the mid and upper reservoirs."""
+
+    three_level_upper_height_m: float = 8000.0
+    """Reference height [m] of the upper temperature and humidity reservoir."""
+
+    three_level_mid_wind_pgf_fraction: float = 0.55
+    """Fraction of upper-level thermal pressure forcing used for middle wind."""
+
+    three_level_mid_wind_damping: float = 0.08
+    """Rayleigh damping [day-1] of the prognostic middle-wind level."""
+
+    three_level_mid_wind_relaxation: float = 0.10
+    """Per-step relaxation of middle wind toward adjacent resolved wind levels."""
+
+    enable_prognostic_column_water: bool = False
+    """Use the experimental raw conserved-column-water precipitation path.
+
+    When enabled, precipitation is removed only from the local prognostic
+    humidity reservoir and bypasses both imposed zonal row-target rescale
+    variants.  The existing humidity transport, evaporation, and condensation
+    machinery remain in place; the gate makes its local water sink observable
+    without target-rainfall correction.  It is intentionally ``False`` by
+    default until long climate validation establishes a better complete closure.
+    """
+
+    enable_energy_limited_evaporation: bool = False
+    """Limit raw-column evaporation by available surface radiative energy.
+
+    The legacy precipitation path uses empirical target correction and is left
+    bit-identical.  The opt-in conserved-column path instead needs an explicit
+    surface energy bound: an unlimited humidity-deficit flux can otherwise
+    recycle substantially more water than a terrestrial surface can supply.
+    """
+
+    evaporation_surface_shortwave_transmissivity: float = 0.50
+    """Atmospheric transmission of daily-mean shortwave used by the experimental evaporation energy cap."""
+
+    evaporation_latent_energy_fraction: float = 0.75
+    """Share [0-1] of available surface shortwave permitted to become latent heat in the experimental cap."""
+
+    evaporation_downwelling_longwave_w_m2: float = 0.0
+    """Additional downwelling longwave energy [W m-2] available to experimental energy-limited evaporation."""
+
+    enable_humidity_dependent_downwelling_longwave: bool = False
+    """Diagnose the experimental longwave increment from lower-air humidity and cloud instead of a spatial constant."""
+
+    evaporation_longwave_clear_sky_emissivity_floor: float = 0.70
+    """Lower bound for Brutsaert clear-sky longwave emissivity in the experimental surface-energy closure."""
+
+    evaporation_longwave_cloud_emissivity_weight: float = 0.50
+    """Fraction of the remaining sky-emissivity deficit filled by cloud fraction in the experimental closure."""
+
+    evaporation_longwave_reference_emissivity: float = 0.80
+    """Dry-reference emissivity already implicit in the surface-energy approximation; only excess back-radiation is added."""
+
+    enable_cloud_precipitating_condensate_partition: bool = False
+    """Diagnose excess bulk condensate as precipitating, not optically active cloud.
+
+    The existing condensate reservoir conserves cloud water and hydrometeors
+    together.  This experimental radiation split caps the cloud-water portion
+    while retaining the excess as precipitating mass for the unchanged fallout
+    budget.  It is a transition toward separate cloud/precipitating reservoirs.
+    """
+
+    cloud_optical_condensate_cap_q: float = 0.001
+    """Maximum optically active cloud-condensate mixing ratio in the partitioned bulk reservoir."""
+
+    condensate_autoconversion_timescale_days: float = 0.25
+    """Cloud-water-to-precipitating-hydrometeor conversion time in the separated-reservoir path."""
+
+    enable_separate_precipitating_hydrometeors: bool = False
+    """Persist a distinct precipitating-hydrometeor reservoir in the experimental column closure."""
+
+    enable_hydrometeor_transport: bool = False
+    """Advect persisted precipitating hydrometeors with the resolved cloud-layer wind before sedimentation."""
+
+    enable_simplified_betts_miller_convection: bool = False
+    """Use an opt-in resolved-ascent Betts--Miller humidity relaxation instead of the slab-CAPE condensation closure."""
+
+    betts_miller_relaxation_hours: float = 2.0
+    """Convective humidity-adjustment timescale [hours] in the simplified Betts--Miller closure."""
+
+    betts_miller_target_relative_humidity: float = 0.85
+    """Boundary-layer reference relative humidity approached by convectively ascending air in the simplified Betts--Miller closure."""
+
+    betts_miller_midlevel_target_relative_humidity: float = 0.70
+    """Mid-tropospheric reference RH in the simplified Betts--Miller vertical target profile."""
+
+    betts_miller_upper_target_relative_humidity: float = 0.50
+    """Upper-tropospheric reference RH in the simplified Betts--Miller vertical target profile."""
+
+    three_level_diabatic_ascent_scale: float = 0.0
+    """Resolved tropical diabatic-ascent contribution for the experimental pressure column; zero preserves divergence-only ascent."""
+
+    enable_three_level_flux_form_exchange: bool = False
+    """Use finite-volume pressure-flux exchange |omega| dt / dp in the native three-level column."""
+
+    column_water_use_bulk_condensate_rainfall: bool = False
+    """With both prognostic-water gates enabled, omit empirical vapor rainout.
+
+    This selects the structural vapor -> bulk condensate -> fallout closure:
+    resolved ascent and saturation form condensate, and only condensate fallout
+    (plus mandatory supersaturation adjustment) reaches the surface.  It is a
+    nested experimental switch so the conservative transport migration can be
+    evaluated separately from replacing the established empirical rain chain.
+    """
+
+    condensate_condensation_timescale_days: float = 0.5
+    """Bulk-condensation relaxation time [days] for active ascending air."""
+
+    condensate_fallout_timescale_days: float = 1.0
+    """Bulk condensate fallout time [days]; shorter values rain sooner."""
+
+    condensate_transport_scale: float = 1.0
+    """Blend [0-1] of CFL-safe horizontal transport for suspended condensate.
+
+    This only applies while ``enable_prognostic_condensate`` is enabled.
+    ``1.0`` carries condensate with the resolved wind before fallout; ``0.0``
+    is the local-reservoir ablation used to isolate the transport contribution.
     """
 
     sst_land_coupling_km: float = 600.0

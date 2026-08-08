@@ -71,3 +71,14 @@ class PlanetState(NamedTuple):
     runoff_to_ocean_mm_day: np.ndarray | None = None
     land_ice_thickness: np.ndarray | None = None
     sea_level_change_m: float = 0.0
+    atmospheric_condensate: np.ndarray | None = None
+    precipitating_hydrometeors: np.ndarray | None = None
+    land_deep_temperature: np.ndarray | None = None
+    midlevel_temperature: np.ndarray | None = None
+    midlevel_humidity: np.ndarray | None = None
+    upperlevel_temperature: np.ndarray | None = None
+    upperlevel_humidity: np.ndarray | None = None
+    midlevel_wind_u: np.ndarray | None = None
+    midlevel_wind_v: np.ndarray | None = None
+    omega_lower_mid_pa_s: np.ndarray | None = None
+    omega_mid_upper_pa_s: np.ndarray | None = None

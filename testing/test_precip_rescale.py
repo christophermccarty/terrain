@@ -92,4 +92,9 @@ def test_generate_precipitation_exposes_budget_diagnostics():
     assert np.all(humidity >= 0.0)
     assert "precip_rescale_capacity_limited" in debug
     assert "precip_rescale_unmet_mm_day" in debug
+    assert "precipitation_raw_mm_day" in debug
+    assert "precipitation_final_mm_day" in debug
+    assert "rainout_raw_dq" in debug
     assert debug["precip_rescale_capacity_limited"].shape == (H,)
+    assert debug["precipitation_raw_mm_day"].shape == (H, W)
+    assert debug["precipitation_final_mm_day"].shape == (H, W)
