@@ -1,0 +1,130 @@
+{
+  "full_heated": {
+    "circulation": {
+      "hadley_edge_deg": {
+        "nh_deg": 25.941308092460297,
+        "sh_deg": 11.108161652324304
+      },
+      "horizontal_divergence_s": {
+        "mean": -8.758024584948075e-08,
+        "rms": 9.744836285562527e-07
+      },
+      "jet_latitude_deg": {
+        "nh_deg": 59.0625,
+        "sh_deg": -64.6875
+      },
+      "meridional_transport": {
+        "cross_equatorial_dry_static_energy_transport_pw": -22.391615043515984,
+        "cross_equatorial_latent_energy_transport_pw": -0.05081336355582611,
+        "cross_equatorial_moisture_flux_kg_m_s": -0.5083629645117291,
+        "cross_equatorial_total_energy_transport_pw": -22.442428407071812,
+        "peak_northward_energy_transport_pw": 929.0116917378189,
+        "peak_southward_energy_transport_pw": -2175.3350696230823
+      },
+      "midlevel_hadley_edge_deg": {
+        "nh_deg": NaN,
+        "sh_deg": 13.458635706448343
+      },
+      "midlevel_jet_latitude_deg": {
+        "nh_deg": 25.3125,
+        "sh_deg": -36.5625
+      },
+      "omega_lower_mid_pa_s": {
+        "mean": 0.07652230233482271,
+        "rms": 4.65152001909443
+      },
+      "omega_mid_upper_pa_s": {
+        "mean": 0.13135871357676443,
+        "rms": 4.49916751975955
+      },
+      "upper_hadley_edge_deg": {
+        "nh_deg": 9.036147307478712,
+        "sh_deg": NaN
+      },
+      "upper_jet_latitude_deg": {
+        "nh_deg": 30.9375,
+        "sh_deg": -36.5625
+      }
+    },
+    "lower_v": {
+      "area_weighted_tropical_rms_m_s": 1.1008093848798446,
+      "zonal_mean_tropical_max_abs_m_s": 1.5443732496351004,
+      "zonal_mean_tropical_mean_abs_m_s": 1.0202833112562075
+    },
+    "midlevel_v": {
+      "area_weighted_tropical_rms_m_s": 31.011884633419765,
+      "zonal_mean_tropical_max_abs_m_s": 20.346712401136756,
+      "zonal_mean_tropical_mean_abs_m_s": 10.958493936457671
+    },
+    "reference_earth_hadley_zonal_mean_v_m_s": "~1-3 (literature, zonal-mean, all levels)",
+    "upper_v": {
+      "area_weighted_tropical_rms_m_s": 21.477957511600586,
+      "zonal_mean_tropical_max_abs_m_s": 37.53327959775925,
+      "zonal_mean_tropical_mean_abs_m_s": 15.842946413904428
+    }
+  },
+  "kernel_only": {
+    "circulation": {
+      "hadley_edge_deg": {
+        "nh_deg": 25.862547035215396,
+        "sh_deg": 37.52070084349819
+      },
+      "horizontal_divergence_s": {
+        "mean": -9.729277267902521e-08,
+        "rms": 7.874897219467231e-07
+      },
+      "jet_latitude_deg": {
+        "nh_deg": 59.0625,
+        "sh_deg": -64.6875
+      },
+      "meridional_transport": {
+        "cross_equatorial_dry_static_energy_transport_pw": 1138.4606757121082,
+        "cross_equatorial_latent_energy_transport_pw": 24.05949656736257,
+        "cross_equatorial_moisture_flux_kg_m_s": 240.7035500849444,
+        "cross_equatorial_total_energy_transport_pw": 1162.5201722794707,
+        "peak_northward_energy_transport_pw": 2135.1197874046097,
+        "peak_southward_energy_transport_pw": -1237.2150319688017
+      },
+      "midlevel_hadley_edge_deg": {
+        "nh_deg": NaN,
+        "sh_deg": 84.46568737250486
+      },
+      "midlevel_jet_latitude_deg": {
+        "nh_deg": 36.5625,
+        "sh_deg": -30.9375
+      },
+      "omega_lower_mid_pa_s": {
+        "mean": 0.09530273569399128,
+        "rms": 5.162470528429542
+      },
+      "omega_mid_upper_pa_s": {
+        "mean": 0.14817206026950203,
+        "rms": 4.442167636732727
+      },
+      "upper_hadley_edge_deg": {
+        "nh_deg": NaN,
+        "sh_deg": 12.2594479202698
+      },
+      "upper_jet_latitude_deg": {
+        "nh_deg": 19.6875,
+        "sh_deg": -36.5625
+      }
+    },
+    "lower_v": {
+      "area_weighted_tropical_rms_m_s": 0.6334646040347891,
+      "zonal_mean_tropical_max_abs_m_s": 0.9557063095271587,
+      "zonal_mean_tropical_mean_abs_m_s": 0.5736779253052191
+    },
+    "midlevel_v": {
+      "area_weighted_tropical_rms_m_s": 32.07440531641322,
+      "zonal_mean_tropical_max_abs_m_s": 13.657706076279283,
+      "zonal_mean_tropical_mean_abs_m_s": 6.904610220808536
+    },
+    "reference_earth_hadley_zonal_mean_v_m_s": "~1-3 (literature, zonal-mean, all levels)",
+    "upper_v": {
+      "area_weighted_tropical_rms_m_s": 29.44887027832949,
+      "zonal_mean_tropical_max_abs_m_s": 45.70736539363861,
+      "zonal_mean_tropical_mean_abs_m_s": 24.139605334989028
+    }
+  }
+}

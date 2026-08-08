@@ -1,0 +1,29 @@
+[
+  {
+    "cap_m_s": 20.0,
+    "cross_equatorial_total_energy_transport_pw": -20.80125144770716,
+    "equatorial_throughflow_after_m_s_mean_abs": 5.886026070241408e-16,
+    "num_calls": 121,
+    "residual_after_s_mean": 8.397352292075978e-05,
+    "residual_before_s_mean": 9.368179464303509e-05,
+    "residual_closure_fraction": 0.10363029187546724
+  },
+  {
+    "cap_m_s": 60.0,
+    "cross_equatorial_total_energy_transport_pw": -22.571124571161597,
+    "equatorial_throughflow_after_m_s_mean_abs": 4.459968680527252e-16,
+    "num_calls": 121,
+    "residual_after_s_mean": 6.637263051033049e-05,
+    "residual_before_s_mean": 9.482704973166535e-05,
+    "residual_closure_fraction": 0.3000664821045588
+  },
+  {
+    "cap_m_s": 120.0,
+    "cross_equatorial_total_energy_transport_pw": -15.33995314293698,
+    "equatorial_throughflow_after_m_s_mean_abs": 3.873603472531785e-16,
+    "num_calls": 121,
+    "residual_after_s_mean": 4.4595785922728016e-05,
+    "residual_before_s_mean": 9.363702915159977e-05,
+    "residual_closure_fraction": 0.5237377101047624
+  }
+]
