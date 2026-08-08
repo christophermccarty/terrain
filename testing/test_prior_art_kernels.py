@@ -632,6 +632,148 @@ def test_three_level_explicit_middle_wind_controls_both_pressure_interfaces():
     )
 
 
+# --------------------------------------------------------------------------
+# Section 17 (PRIOR_ART_IMPLEMENTATION_PLAN.md): the three-level path's own
+# independent upper-level wind, decoupled from the shared, always-on
+# jet-stream kernel (state.wind_u_aloft/wind_v_aloft).
+# --------------------------------------------------------------------------
+
+
+def _three_level_common_gates() -> dict:
+    return dict(
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+    )
+
+
+def test_upperlevel_wind_state_persists_when_three_level_active():
+    elevation = np.zeros((12, 24), dtype=np.float32)
+    planet = dataclasses.replace(EARTH, **_three_level_common_gates())
+    state = create_initial_state(elevation, planet_params=planet)
+    evolved, _ = simulate_step(state, days=1.0, planet_params=planet)
+    assert evolved.upperlevel_wind_u is not None
+    assert evolved.upperlevel_wind_v is not None
+    assert evolved.upperlevel_wind_u.shape == elevation.shape
+    assert evolved.upperlevel_wind_v.shape == elevation.shape
+    assert np.all(np.isfinite(evolved.upperlevel_wind_u))
+    assert np.all(np.isfinite(evolved.upperlevel_wind_v))
+
+
+def test_upperlevel_wind_state_remains_absent_without_three_level_gate():
+    elevation = np.zeros((12, 24), dtype=np.float32)
+    state = create_initial_state(elevation, planet_params=EARTH)
+    evolved, _ = simulate_step(state, days=1.0, planet_params=EARTH)
+    assert evolved.upperlevel_wind_u is None
+    assert evolved.upperlevel_wind_v is None
+
+
+def test_upperlevel_wind_diverges_from_shared_kernel_via_its_own_damping():
+    """The new independent upper wind must not merely mirror the shared kernel.
+
+    Even with every three-level "addition" (balanced blend, thermal-wind
+    relaxation, overturning, mass-flux closure) left at its default-off/zero
+    setting, the new state's own ``three_level_upper_wind_damping`` (0.08)
+    differs from the shared kernel's ``wind_upper_damping`` (0.05), so a
+    genuinely independent substep integration must diverge from the shared
+    field over a few days -- proving ``_evolve_upper_wind_substepped`` is not
+    silently a no-op or an alias for the shared field.
+    """
+    elevation = np.zeros((16, 32), dtype=np.float32)
+    planet = dataclasses.replace(
+        EARTH, **_three_level_common_gates(), wind_prognostic_substep_days=1.0,
+    )
+    state = create_initial_state(elevation, planet_params=planet)
+    evolved, _ = simulate_step(state, days=5.0, planet_params=planet)
+    assert not np.allclose(evolved.upperlevel_wind_u, evolved.wind_u_aloft)
+    assert not np.allclose(evolved.upperlevel_wind_v, evolved.wind_v_aloft)
+
+
+def test_shared_upper_wind_kernel_bit_identical_regardless_of_three_level_additions():
+    """The single most important regression test in this session's change set.
+
+    PRIOR_ART_IMPLEMENTATION_PLAN.md Section 16 found that the three-level
+    path's balanced-pressure blend, thermal-wind relaxation,
+    ``thermally_direct_overturning``'s upper branch, and
+    ``close_upper_mass_flux``'s correction were all being applied directly to
+    ``state.wind_u_aloft``/``wind_v_aloft`` -- the same shared, always-on,
+    separately-calibrated jet-stream kernel ``main.py``'s jet overlay renders
+    and ``evolve_wind``'s surface relaxation reads. Section 17 redirects
+    every one of those onto a new, independent ``upperlevel_wind_u/v`` state
+    instead.
+
+    This proves the redirection is complete: with the three-level gate on,
+    turning every one of those additions from off/zero to aggressively on
+    must leave ``wind_u_aloft``/``wind_v_aloft`` bit-for-bit unchanged, while
+    visibly perturbing the new independent state (a positive control proving
+    the additions are not simply inert in this configuration, so the
+    bit-identical result above is not a vacuous pass).
+    """
+    elevation = np.zeros((16, 32), dtype=np.float32)
+    common = _three_level_common_gates()
+    additions_off = dataclasses.replace(
+        EARTH,
+        **common,
+        enable_native_balanced_pressure_dynamics=False,
+        native_balanced_pressure_relaxation=0.0,
+        three_level_balanced_thermal_wind_relaxation=0.0,
+        enable_native_balanced_diabatic_overturning=False,
+        enable_native_balanced_moist_static_energy_overturning=False,
+        native_balanced_overturning_speed_m_s=0.0,
+        enable_three_level_horizontal_mass_flux_closure=False,
+    )
+    additions_on = dataclasses.replace(
+        EARTH,
+        **common,
+        enable_native_balanced_pressure_dynamics=True,
+        native_balanced_pressure_relaxation=0.5,
+        three_level_balanced_thermal_wind_relaxation=0.5,
+        enable_native_balanced_moist_static_energy_overturning=True,
+        native_balanced_mse_radiative_relaxation_days=10.0,
+        enable_three_level_horizontal_mass_flux_closure=True,
+    )
+    state = create_initial_state(elevation, planet_params=additions_off)
+    evolved_off, _ = simulate_step(state, days=1.0, planet_params=additions_off)
+    evolved_on, _ = simulate_step(state, days=1.0, planet_params=additions_on)
+
+    np.testing.assert_array_equal(evolved_off.wind_u_aloft, evolved_on.wind_u_aloft)
+    np.testing.assert_array_equal(evolved_off.wind_v_aloft, evolved_on.wind_v_aloft)
+
+    # Positive control: the additions are not simply inert in this
+    # configuration -- they visibly perturb the *independent* state.
+    assert not np.allclose(evolved_off.upperlevel_wind_u, evolved_on.upperlevel_wind_u)
+
+
+def test_shared_upper_wind_kernel_bit_identical_with_three_level_gate_off():
+    """Companion to the gate-on regression above: with the three-level gate
+    off entirely, `wind_u_aloft`/`wind_v_aloft` must be bit-identical to a
+    run where every Section 17-touched PlanetParams field is left at its
+    (irrelevant, since the gate is off) default -- i.e. toggling those fields
+    has zero effect on anything when `enable_three_level_pressure_column` is
+    False, which is the other half of "gate-off behavior is bit-identical to
+    before this change."
+    """
+    elevation = np.zeros((12, 24), dtype=np.float32)
+    state = create_initial_state(elevation, planet_params=EARTH)
+    baseline, _ = simulate_step(state, days=1.0, planet_params=EARTH)
+    perturbed_params = dataclasses.replace(
+        EARTH,
+        three_level_upper_wind_pgf_fraction=3.0,
+        three_level_upper_wind_damping=0.9,
+        enable_native_balanced_pressure_dynamics=True,
+        native_balanced_pressure_relaxation=0.9,
+        enable_three_level_horizontal_mass_flux_closure=True,
+    )
+    perturbed, _ = simulate_step(state, days=1.0, planet_params=perturbed_params)
+    np.testing.assert_array_equal(baseline.wind_u_aloft, perturbed.wind_u_aloft)
+    np.testing.assert_array_equal(baseline.wind_v_aloft, perturbed.wind_v_aloft)
+    assert perturbed.upperlevel_wind_u is None
+    assert perturbed.upperlevel_wind_v is None
+
+
 def test_three_level_diabatic_ascent_raises_tropical_condensation_driver():
     shape = (24, 32)
     common = dict(

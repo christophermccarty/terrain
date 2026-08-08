@@ -82,3 +82,5 @@ class PlanetState(NamedTuple):
     midlevel_wind_v: np.ndarray | None = None
     omega_lower_mid_pa_s: np.ndarray | None = None
     omega_mid_upper_pa_s: np.ndarray | None = None
+    upperlevel_wind_u: np.ndarray | None = None
+    upperlevel_wind_v: np.ndarray | None = None

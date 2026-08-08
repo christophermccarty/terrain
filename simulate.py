@@ -320,6 +320,56 @@ def _evolve_middle_wind_substepped(
     return u, v
 
 
+def _evolve_upper_wind_substepped(
+    u, v, *, temperature, dt_days_total: float, substep_days: float,
+    pgf_temp_scale: float, upper_pgf_amp: float, damping_rate: float,
+    vmax_clip: float, planet_params, hadley_edge_deg: float,
+):
+    """Advance the native three-level column's own independent upper wind.
+
+    PRIOR_ART_IMPLEMENTATION_PLAN.md Section 16 found that the three-level
+    experimental path's excess cross-equatorial transport traces back to the
+    fact that it was building its upper-level circulation directly on top of
+    ``state.wind_u_aloft``/``wind_v_aloft`` -- the same always-on "1.5-layer
+    atmosphere" jet-stream kernel that ``wind_upper_pgf_amp``/
+    ``wind_upper_damping`` are extensively calibrated against for real
+    jet-latitude/speed skill, via the exact same ``evolve_wind_aloft``
+    function and constants. Any attempt to tame that field's meridional
+    magnitude for the experimental path therefore risked regressing the
+    already-validated default jet stream.
+
+    This wrapper gives the three-level path its own, genuinely independent
+    upper-level wind state instead: same free-tropospheric momentum kernel as
+    both the shared upper level and the existing independent middle level
+    (mirrors ``_evolve_middle_wind_substepped`` exactly), but with its own
+    ``three_level_upper_wind_pgf_fraction`` (a fraction of
+    ``wind_upper_pgf_amp``) and ``three_level_upper_wind_damping`` (starts
+    higher than the shared level's ``wind_upper_damping``, per the middle
+    level's own precedent and Section 16's magnitude finding). The shared
+    ``wind_u_aloft``/``wind_v_aloft`` field and its calibrated jet-stream
+    behavior are never read or written by this function.
+    """
+    dt_days_total = float(dt_days_total)
+    if substep_days <= 0.0 or substep_days >= dt_days_total:
+        n_sub = 1
+    else:
+        n_sub = max(1, int(round(dt_days_total / substep_days)))
+    sub_dt = dt_days_total / n_sub
+    for _ in range(n_sub):
+        u, v = evolve_wind_aloft(
+            u, v,
+            temperature=temperature,
+            dt_days=sub_dt,
+            pgf_temp_scale=pgf_temp_scale,
+            upper_pgf_amp=upper_pgf_amp,
+            damping_rate=damping_rate,
+            vmax_clip=vmax_clip,
+            planet_params=planet_params,
+            hadley_edge_deg=hadley_edge_deg,
+        )
+    return u, v
+
+
 def _soft_min_cap(x: np.ndarray, cap: np.ndarray, width: float) -> np.ndarray:
     """Smooth, strictly-monotonic replacement for ``np.minimum(x, cap)``.
 
@@ -2424,7 +2474,58 @@ def simulate_step(
     )
     midlevel_wind_u_full = state.midlevel_wind_u
     midlevel_wind_v_full = state.midlevel_wind_v
+    # Section 17: the three-level path's own independent upper wind, genuinely
+    # decoupled from the shared, always-on jet-stream kernel (u2_full/v2_full,
+    # persisted as state.wind_u_aloft/wind_v_aloft). See
+    # PRIOR_ART_IMPLEMENTATION_PLAN.md Section 16/17 and
+    # `_evolve_upper_wind_substepped`'s docstring.
+    upperlevel_wind_u_full = state.upperlevel_wind_u
+    upperlevel_wind_v_full = state.upperlevel_wind_v
     if _three_level_midwind_active:
+        if (
+            upperlevel_wind_u_full is None
+            or upperlevel_wind_v_full is None
+            or upperlevel_wind_u_full.shape != u2_full.shape
+            or upperlevel_wind_v_full.shape != v2_full.shape
+        ):
+            # Warm-start as a copy of the shared kernel's current value --
+            # mirrors u2_full/v2_full's own lazy-init ("copy of the surface
+            # wind" as a physically-reasonable warm start) and reproduces this
+            # step's pre-Section-17 upper-wind value exactly as the starting
+            # point before the two states evolve independently from here on.
+            upperlevel_wind_u_full = u2_full.copy()
+            upperlevel_wind_v_full = v2_full.copy()
+
+        # Own prognostic momentum step -- the same free-tropospheric kernel as
+        # the shared upper level and the independent middle level, but with
+        # this level's own PGF fraction/damping (three_level_upper_wind_*),
+        # entirely independent of the shared kernel's own evolution above.
+        _upper_wind_temperature = (
+            upperlevel_temperature_for_precip
+            if upperlevel_temperature_for_precip is not None
+            and upperlevel_temperature_for_precip.shape == upperlevel_wind_u_full.shape
+            else state.air_temperature
+            if state.air_temperature is not None
+            and state.air_temperature.shape == upperlevel_wind_u_full.shape
+            else _compute_T_base_ocean_full()
+        )
+        upperlevel_wind_u_full, upperlevel_wind_v_full = _evolve_upper_wind_substepped(
+            upperlevel_wind_u_full,
+            upperlevel_wind_v_full,
+            temperature=_upper_wind_temperature,
+            dt_days_total=days,
+            substep_days=_wind_substep_days if _prognostic_gate_active else 0.0,
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            upper_pgf_amp=(
+                float(pp.wind_upper_pgf_amp)
+                * float(pp.three_level_upper_wind_pgf_fraction)
+            ),
+            damping_rate=float(pp.three_level_upper_wind_damping),
+            vmax_clip=float(wind_vmax_clip),
+            planet_params=pp,
+            hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+        )
+
         _balanced_pressure_relaxation = (
             float(np.clip(pp.native_balanced_pressure_relaxation, 0.0, 1.0))
             if bool(pp.enable_native_balanced_pressure_dynamics)
@@ -2475,25 +2576,29 @@ def simulate_step(
                 (1.0 - _balanced_pressure_relaxation) * v_full
                 + _balanced_pressure_relaxation * _lower_balanced.v
             ).astype(np.float32, copy=False)
+            # Section 17: this three-level-only blend now applies to the
+            # independent upper-level state, never to the shared jet-stream
+            # kernel (u2_full/v2_full) -- see PRIOR_ART_IMPLEMENTATION_PLAN.md
+            # Section 16/17.
             _upper_balanced_temperature = (
                 upperlevel_temperature_for_precip
                 if upperlevel_temperature_for_precip is not None
-                and upperlevel_temperature_for_precip.shape == u2_full.shape
+                and upperlevel_temperature_for_precip.shape == upperlevel_wind_u_full.shape
                 else state.air_temperature
                 if state.air_temperature is not None
-                and state.air_temperature.shape == u2_full.shape
+                and state.air_temperature.shape == upperlevel_wind_u_full.shape
                 else _compute_T_base_ocean_full()
             )
             _upper_balanced = _balanced_target(
                 _upper_balanced_temperature,
                 pp.three_level_thermal_wind_upper_pressure_pa,
             )
-            u2_full = (
-                (1.0 - _balanced_pressure_relaxation) * u2_full
+            upperlevel_wind_u_full = (
+                (1.0 - _balanced_pressure_relaxation) * upperlevel_wind_u_full
                 + _balanced_pressure_relaxation * _upper_balanced.u
             ).astype(np.float32, copy=False)
-            v2_full = (
-                (1.0 - _balanced_pressure_relaxation) * v2_full
+            upperlevel_wind_v_full = (
+                (1.0 - _balanced_pressure_relaxation) * upperlevel_wind_v_full
                 + _balanced_pressure_relaxation * _upper_balanced.v
             ).astype(np.float32, copy=False)
         _thermal_wind_relaxation = float(np.clip(
@@ -2519,12 +2624,19 @@ def simulate_step(
                 hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
                 gas_constant_dry=float(pp.gas_constant_dry),
             )
-            u2_full = (
-                (1.0 - _thermal_wind_relaxation) * u2_full
+            # Section 17: redirected to the independent upper-level state (see
+            # the balanced-pressure blend above for the same rationale).
+            upperlevel_wind_u_full = (
+                (1.0 - _thermal_wind_relaxation) * upperlevel_wind_u_full
                 + _thermal_wind_relaxation * _thermal_wind_target
             ).astype(np.float32, copy=False)
-        _mid_wind_reference_u = 0.5 * (u_full + u2_full)
-        _mid_wind_reference_v = 0.5 * (v_full + v2_full)
+        # Section 17: the midlevel wind's reference/relaxation target now
+        # averages the surface with the three-level path's own independent
+        # upper wind, not the shared jet-stream kernel -- consistent with the
+        # goal of the middle level no longer being pinned to a shared field
+        # that the three-level path does not otherwise touch.
+        _mid_wind_reference_u = 0.5 * (u_full + upperlevel_wind_u_full)
+        _mid_wind_reference_v = 0.5 * (v_full + upperlevel_wind_v_full)
         if (
             midlevel_wind_u_full is None
             or midlevel_wind_v_full is None
@@ -2673,16 +2785,24 @@ def simulate_step(
             midlevel_wind_v_full = (
                 midlevel_wind_v_full + _overturning.middle_v
             ).astype(np.float32, copy=False)
-            v2_full = (v2_full + _overturning.upper_v).astype(np.float32, copy=False)
+            # Section 17: the overturning's upper branch feeds the independent
+            # upper-level state, not the shared jet-stream kernel.
+            upperlevel_wind_v_full = (
+                upperlevel_wind_v_full + _overturning.upper_v
+            ).astype(np.float32, copy=False)
 
         if bool(pp.enable_three_level_horizontal_mass_flux_closure):
+            # Section 17: the mass-flux closure's "upper" level is now the
+            # independent three-level upper wind, not the shared kernel --
+            # both the divergence residual it measures and the correction it
+            # applies are scoped to the decoupled state.
             _mass_closure = close_upper_mass_flux(
                 u_full,
                 v_full,
                 midlevel_wind_u_full,
                 midlevel_wind_v_full,
-                u2_full,
-                v2_full,
+                upperlevel_wind_u_full,
+                upperlevel_wind_v_full,
                 radius_m=float(pp.radius_m),
                 strength=float(np.clip(
                     pp.three_level_horizontal_mass_flux_strength, 0.0, 1.0,
@@ -2694,10 +2814,10 @@ def simulate_step(
                       pp.three_level_horizontal_mass_flux_throughflow_max_speed_m_s,
                   ),
               )
-            u2_full = (u2_full + _mass_closure.upper_u_correction).astype(
+            upperlevel_wind_u_full = (upperlevel_wind_u_full + _mass_closure.upper_u_correction).astype(
                 np.float32, copy=False,
             )
-            v2_full = (v2_full + _mass_closure.upper_v_correction).astype(
+            upperlevel_wind_v_full = (upperlevel_wind_v_full + _mass_closure.upper_v_correction).astype(
                 np.float32, copy=False,
             )
 
@@ -2875,7 +2995,17 @@ def simulate_step(
     if T_deep_full is None and pp.has_liquid_water_ocean and T_full is not None:
         T_deep_full = np.clip(T_full - 15.0, 271.0, 285.0).astype(np.float32, copy=False)
 
-    
+    # Section 17: the "upper" wind fed into precipitation's pressure-column
+    # physics (upper-reservoir vapor transport, the mid-upper interface omega)
+    # is the three-level path's own independent state when that path is
+    # active, so its column physics stops building on the shared jet-stream
+    # kernel too -- not only the tendency terms in the block above. When the
+    # three-level gate is off (including the plain two-layer-only path, which
+    # has no independent upper state), this is exactly u2_full/v2_full,
+    # unchanged from before this change.
+    _precip_wind_u_aloft = upperlevel_wind_u_full if _three_level_midwind_active else u2_full
+    _precip_wind_v_aloft = upperlevel_wind_v_full if _three_level_midwind_active else v2_full
+
     if state.elevation is not None:
         # Run precipitation at half resolution (block_size=2) for large grids where
         # the half-resolution cell size (~0.7°) still resolves the subtropical dry belt
@@ -2890,7 +3020,7 @@ def simulate_step(
             # are independently optional, all sharing the same (_Hcp, _Wcp, _pbs) grid.
             _group_p_in: dict[str, np.ndarray] = {
                 "T": T_full, "u": u_full, "v": v_full,
-                "u2": u2_full, "v2": v2_full,
+                "u2": _precip_wind_u_aloft, "v2": _precip_wind_v_aloft,
             }
             if _three_level_midwind_active:
                 _group_p_in["u_mid"] = midlevel_wind_u_full
@@ -2968,7 +3098,7 @@ def simulate_step(
             P_full, humidity_next, soil_next, soil_deep_next, condensate_next, midlevel_temperature_next, midlevel_humidity_next, upperlevel_temperature_next, upperlevel_humidity_next, hydrometeors_next = _generate_precipitation_substepped(
                 H, W, state.elevation,
                 temperature=T_full, wind_u=u_full, wind_v=v_full,
-                wind_u_aloft=u2_full, wind_v_aloft=v2_full,
+                wind_u_aloft=_precip_wind_u_aloft, wind_v_aloft=_precip_wind_v_aloft,
                 wind_u_midlevel=(
                     midlevel_wind_u_full if _three_level_midwind_active else None
                 ),
@@ -3040,6 +3170,8 @@ def simulate_step(
         upperlevel_humidity_next = state.upperlevel_humidity
         midlevel_wind_u_full = state.midlevel_wind_u
         midlevel_wind_v_full = state.midlevel_wind_v
+        upperlevel_wind_u_full = state.upperlevel_wind_u
+        upperlevel_wind_v_full = state.upperlevel_wind_v
 
     if pp.enable_surface_hydrology and P_full is not None and soil_next is not None:
         from hydrology import route_surface_water
@@ -3493,6 +3625,12 @@ def simulate_step(
         midlevel_wind_v=midlevel_wind_v_full,
         omega_lower_mid_pa_s=omega_lower_mid_full,
         omega_mid_upper_pa_s=omega_mid_upper_full,
+        # Section 17: the three-level path's own independent upper-level wind
+        # (never fed by, nor feeding back into, the shared jet-stream kernel
+        # above). ``None`` while the three-level gate has never been active,
+        # matching the midlevel-wind precedent's old-save/gate-off behavior.
+        upperlevel_wind_u=upperlevel_wind_u_full,
+        upperlevel_wind_v=upperlevel_wind_v_full,
         # Preserve the scenario baseline; `pp` may be a time-varying effective
         # Milankovitch snapshot and must not become the next cycle's baseline.
         planet_params=base_pp,
