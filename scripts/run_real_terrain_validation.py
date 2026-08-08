@@ -40,6 +40,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--precip-block-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--initial-state", type=Path)
     parser.add_argument(
+        "--monthly-climatology",
+        type=Path,
+        help=(
+            "Versioned NPZ monthly temperature/precipitation reference. "
+            "It is regridded area-conservatively to the validation grid."
+        ),
+    )
+    parser.add_argument(
         "--param",
         action="append",
         default=[],
@@ -104,6 +112,7 @@ def main() -> int:
         config,
         planet_params=planet,
         initial_state_path=args.initial_state,
+        monthly_climatology_path=args.monthly_climatology,
     )
     if args.output:
         save_validation_report(report, args.output)

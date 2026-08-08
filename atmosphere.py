@@ -16,6 +16,15 @@ import numpy as np
 from temperature import temperature_kelvin_for_lat
 from planet_params import PlanetParams, EARTH
 from masks import get_masks, get_continentality
+from condensate import (
+    evolve_bulk_condensate,
+    separate_cloud_and_hydrometeor_reservoirs,
+    simplified_betts_miller_condensation,
+    stability_aware_condensation,
+)
+from column_water import evolve_column_water
+from pressure_column import evolve_three_level_column
+from pressure_circulation import smooth_spherical_scalar
 
 # Numba JIT compilation for performance
 try:
@@ -79,6 +88,24 @@ def _wind_static_grids(H: int, W: int, pp: PlanetParams):
     grids = (lat_2d, dx, dy, f, eq_window, lon_1d)
     _WIND_GRID_CACHE.update({"key": key, "grids": grids})
     return grids
+
+
+@lru_cache(maxsize=16)
+def _column_water_spherical_geometry(H: int, W: int, radius_m: float):
+    """Exact finite-volume geometry for the gated column-water transport."""
+    dlat = np.pi / float(H)
+    dlon = 2.0 * np.pi / float(W)
+    edges = np.pi / 2.0 - np.arange(H + 1, dtype=np.float64) * dlat
+    area_row = radius_m ** 2 * dlon * (np.sin(edges[:-1]) - np.sin(edges[1:]))
+    area = np.broadcast_to(area_row[:, None], (H, W)).copy()
+    # East/west faces run north-south.  North/south faces follow a latitude
+    # circle and therefore shrink to zero at the poles.
+    x_face_length = np.full((H, W), radius_m * dlat, dtype=np.float64)
+    y_face_length = np.broadcast_to(
+        (radius_m * np.maximum(np.cos(edges), 0.0) * dlon)[:, None],
+        (H + 1, W),
+    ).copy()
+    return area, x_face_length, y_face_length
 
 
 # ---------------------------------------------------------------------------
@@ -2906,10 +2933,20 @@ def generate_precipitation(
     temperature: np.ndarray | None = None,
     wind_u: np.ndarray | None = None,
     wind_v: np.ndarray | None = None,
+    wind_u_aloft: np.ndarray | None = None,
+    wind_v_aloft: np.ndarray | None = None,
+    wind_u_midlevel: np.ndarray | None = None,
+    wind_v_midlevel: np.ndarray | None = None,
     humidity: np.ndarray | None = None,
     soil_moisture: np.ndarray | None = None,
     soil_moisture_deep: np.ndarray | None = None,
     cloud_fraction: np.ndarray | None = None,
+    condensate: np.ndarray | None = None,
+    precipitating_hydrometeors: np.ndarray | None = None,
+    midlevel_temperature: np.ndarray | None = None,
+    midlevel_humidity: np.ndarray | None = None,
+    upperlevel_temperature: np.ndarray | None = None,
+    upperlevel_humidity: np.ndarray | None = None,
     day_of_year: float = 80.0,
     dt_days: float = 1.0,
     evap_coeff: float = 1.0,
@@ -2920,9 +2957,14 @@ def generate_precipitation(
     surface_pressure_hpa: float = 1013.25,
     planet_params: PlanetParams | None = None,
     debug_fields: dict | None = None,
+    return_condensate: bool = False,
+    return_midlevel_temperature: bool = False,
+    return_midlevel_humidity: bool = False,
+    return_upperlevel_state: bool = False,
+    return_precipitating_hydrometeors: bool = False,
     _static_cache: dict | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (precip_mm_day, humidity, soil_moisture, soil_moisture_deep).
+) -> tuple:
+    """Return precipitation, vapor, and soil reservoirs (plus condensate on request).
 
     `debug_fields`, if provided (an empty dict to populate), receives the
     `div`/`ascent`/`conv` wind-convergence driver arrays used internally.
@@ -3409,6 +3451,42 @@ def generate_precipitation(
         base_q = np.where(sea_mask, 0.013, 0.009).astype(np.float32, copy=False)
     else:
         base_q = humidity.astype(np.float32, copy=False)
+    convective_closure_active = (
+        bool(pp.enable_stability_aware_condensation)
+        or bool(pp.enable_simplified_betts_miller_convection)
+    )
+    two_layer_active = (
+        bool(pp.enable_prognostic_column_water)
+        and convective_closure_active
+        and bool(pp.enable_two_layer_convective_adjustment)
+    )
+    three_level_active = two_layer_active and bool(pp.enable_three_level_pressure_column)
+    if two_layer_active:
+        upper_q_in = (
+            base_q * float(pp.two_layer_upper_humidity_fraction)
+            if midlevel_humidity is None
+            else np.asarray(midlevel_humidity, dtype=np.float32)
+        )
+        if upper_q_in.shape != base_q.shape:
+            raise ValueError("midlevel_humidity must match precipitation grid")
+        upper_q_in = np.clip(upper_q_in, 0.0, base_q)
+        upperlevel_q_in = (
+            base_q * float(pp.three_level_upper_humidity_fraction)
+            if three_level_active and upperlevel_humidity is None
+            else np.zeros_like(base_q)
+            if not three_level_active
+            else np.asarray(upperlevel_humidity, dtype=np.float32)
+        )
+        if upperlevel_q_in.shape != base_q.shape:
+            raise ValueError("upperlevel_humidity must match precipitation grid")
+        upperlevel_q_in = np.clip(upperlevel_q_in, 0.0, base_q - upper_q_in)
+        lower_base_q = base_q - upper_q_in - upperlevel_q_in
+    else:
+        upper_q_in = np.zeros_like(base_q)
+        upperlevel_q_in = np.zeros_like(base_q)
+        lower_base_q = base_q
+    midlevel_humidity_next = midlevel_humidity
+    upperlevel_humidity_next = upperlevel_humidity
 
     if soil_moisture is None:
         soil = np.where(land_mask, 0.55, 0.0).astype(np.float32, copy=False)
@@ -3429,7 +3507,7 @@ def generate_precipitation(
 
     # Evaporation and evapotranspiration sources
     wind_norm = np.clip(wind_speed / 15.0, 0.0, 1.5)
-    ocean_evap = evap_coeff * sea_f * (0.45 + 0.55 * wind_norm) * np.clip(qsat - base_q, 0.0, None)
+    ocean_evap = evap_coeff * sea_f * (0.45 + 0.55 * wind_norm) * np.clip(qsat - lower_base_q, 0.0, None)
     # Soil factor draws from whichever layer has more effective moisture: the fast
     # surface layer directly, or the slow deep/root-zone reservoir at reduced
     # efficiency (root uptake) via soil_deep_evap_weight. Lets deep moisture
@@ -3441,11 +3519,105 @@ def generate_precipitation(
         * land_f
         * (0.20 + 0.65 * temp_norm)
         * (0.35 + 0.65 * soil_evap_factor)
-        * np.clip(qsat - base_q, 0.0, None)
+        * np.clip(qsat - lower_base_q, 0.0, None)
         * subsidence_suppression
     )
+    if (
+        bool(pp.enable_prognostic_column_water)
+        and bool(pp.enable_energy_limited_evaporation)
+    ):
+        # A conserved moisture column needs an independent energy constraint at
+        # its lower boundary.  The humidity-deficit bulk flux above is useful
+        # for *partitioning* ocean/land evaporation, but on its own permits an
+        # arbitrarily large latent flux whenever circulation exports vapor.  A
+        # daily-mean top-of-atmosphere insolation calculation supplies the
+        # available surface shortwave; atmospheric transmission, albedo, and
+        # the latent-heat share then give an upper bound in the same mm/day
+        # column units as the moisture source.
+        _lat_rad = np.radians(lat_deg.astype(np.float64))
+        _declination = float(pp.solar_declination(day_of_year))
+        _hour_angle = np.arccos(np.clip(
+            -np.tan(_lat_rad) * math.tan(_declination), -1.0, 1.0
+        ))
+        _daily_toa_w_m2 = (
+            float(pp.solar_constant) / math.pi
+            * (
+                _hour_angle * np.sin(_lat_rad) * math.sin(_declination)
+                + np.cos(_lat_rad) * math.cos(_declination) * np.sin(_hour_angle)
+            )
+        )[:, None]
+        _surface_albedo = 0.06 * sea_f + 0.20 * land_f
+        _cloud_for_evap = (
+            np.zeros_like(lower_base_q)
+            if cloud_fraction is None
+            else np.clip(np.asarray(cloud_fraction, dtype=np.float32), 0.0, 1.0)
+        )
+        _longwave_increment_w_m2 = np.full_like(
+            lower_base_q,
+            float(max(pp.evaporation_downwelling_longwave_w_m2, 0.0)),
+            dtype=np.float32,
+        )
+        if bool(pp.enable_humidity_dependent_downwelling_longwave):
+            # Brutsaert's clear-sky emissivity relation uses vapour pressure in
+            # hPa.  The shortwave-only cap already represents a dry reference
+            # surface-energy budget, so add only the emissivity excess above
+            # that reference rather than double-counting the full atmospheric
+            # longwave flux.  Cloud fills part of the remaining emissivity
+            # deficit, approaching a blackbody sky as cloud fraction grows.
+            _vapour_pressure_hpa = (
+                np.clip(lower_base_q, 0.0, None)
+                * float(pp.surface_pressure_pa)
+                / (0.622 + 0.378 * np.clip(lower_base_q, 0.0, None))
+                / 100.0
+            )
+            _clear_emissivity = np.clip(
+                1.24 * np.power(
+                    _vapour_pressure_hpa / np.maximum(temperature, 180.0),
+                    1.0 / 7.0,
+                ),
+                float(np.clip(pp.evaporation_longwave_clear_sky_emissivity_floor, 0.0, 1.0)),
+                1.0,
+            )
+            _sky_emissivity = np.clip(
+                _clear_emissivity
+                + (1.0 - _clear_emissivity)
+                * _cloud_for_evap
+                * float(np.clip(pp.evaporation_longwave_cloud_emissivity_weight, 0.0, 1.0)),
+                0.0,
+                1.0,
+            )
+            _longwave_increment_w_m2 = _longwave_increment_w_m2 + np.maximum(
+                _sky_emissivity
+                - float(np.clip(pp.evaporation_longwave_reference_emissivity, 0.0, 1.0)),
+                0.0,
+            ) * (5.670374419e-8 * np.maximum(temperature, 180.0) ** 4)
+
+        _surface_energy_w_m2 = (
+            _daily_toa_w_m2
+            * float(np.clip(pp.evaporation_surface_shortwave_transmissivity, 0.0, 1.0))
+            * (1.0 - _surface_albedo)
+            * (1.0 - 0.50 * _cloud_for_evap)
+            + _longwave_increment_w_m2
+        )
+        _latent_cap_mm_day = np.maximum(
+            _surface_energy_w_m2
+            * float(np.clip(pp.evaporation_latent_energy_fraction, 0.0, 1.0))
+            * 86400.0 / 2.5e6,
+            0.0,
+        )
+        _unconstrained_evap_q_day = ocean_evap + land_evap
+        _energy_cap_q_day = _latent_cap_mm_day / 2000.0
+        _energy_fraction = np.minimum(
+            1.0,
+            _energy_cap_q_day / (_unconstrained_evap_q_day + 1e-12),
+        )
+        ocean_evap = ocean_evap * _energy_fraction
+        land_evap = land_evap * _energy_fraction
+    else:
+        _latent_cap_mm_day = None
+        _energy_fraction = None
     sources = (ocean_evap + land_evap) * dt_evap
-    q = np.clip(base_q + sources, 0.0, qsat)
+    q = np.clip(lower_base_q + sources, 0.0, qsat)
     if debug_fields is not None:
         debug_fields["temp_norm"] = temp_norm
         debug_fields["qsat"] = qsat
@@ -3455,6 +3627,16 @@ def generate_precipitation(
         debug_fields["soil_evap_factor"] = soil_evap_factor
         debug_fields["land_evap"] = land_evap
         debug_fields["ocean_evap"] = ocean_evap
+        if _latent_cap_mm_day is not None:
+            debug_fields["energy_limited_evaporation_cap_mm_day"] = (
+                _latent_cap_mm_day.astype(np.float32)
+            )
+            debug_fields["energy_limited_evaporation_fraction"] = (
+                _energy_fraction.astype(np.float32)
+            )
+            debug_fields["energy_limited_downwelling_longwave_w_m2"] = (
+                _longwave_increment_w_m2.astype(np.float32)
+            )
 
     # Moisture advection: hybrid of the old short-range donor-cell blend
     # (kept as the base term) plus an additional longer-range transport
@@ -3521,7 +3703,101 @@ def generate_precipitation(
             _sc["u_scale"] = u_scale
             _sc["v_scale"] = v_scale
     q_short = q
-    if NUMBA_AVAILABLE:
+    if pp.enable_prognostic_column_water:
+        # The experimental path transports actual column depth, not the
+        # legacy donor-cell blending proxy.  The source is the amount that
+        # survived the same local saturation limiter used by the established
+        # evaporation code, so no new water is invented at this boundary.
+        # Saturation limiting can make ``q`` lower than its carried-in value
+        # over a cold cell.  That is not negative evaporation: the explicit
+        # supersaturation rainout below owns that sink.  Passing it here as a
+        # source would double-remove water and, after the transport kernel's
+        # positivity guard, silently violate the column budget.
+        effective_evaporation_q_day = np.maximum(q - lower_base_q, 0.0) / dt
+        area_m2, x_face_length_m, y_face_length_m = _column_water_spherical_geometry(
+            H, W, float(pp.radius_m)
+        )
+        column_step = evolve_column_water(
+            lower_base_q * 2000.0,
+            effective_evaporation_q_day * 2000.0,
+            np.zeros_like(q),
+            u,
+            v,
+            dx_m=dx_grid,
+            dy_m=float(dy_grid),
+            dt_days=dt,
+            cell_area_m2=area_m2,
+            x_face_length_m=x_face_length_m,
+            y_face_length_m=y_face_length_m,
+        )
+        q_short = column_step.water_mm / 2000.0
+        if two_layer_active:
+            upper_u = u if wind_u_aloft is None else np.asarray(wind_u_aloft)
+            upper_v = v if wind_v_aloft is None else np.asarray(wind_v_aloft)
+            if upper_u.shape != q.shape or upper_v.shape != q.shape:
+                raise ValueError("upper-level wind fields must match precipitation grid")
+            mid_u = (
+                np.asarray(wind_u_midlevel)
+                if three_level_active and wind_u_midlevel is not None
+                else 0.5 * (u + upper_u)
+                if three_level_active
+                else upper_u
+            )
+            mid_v = (
+                np.asarray(wind_v_midlevel)
+                if three_level_active and wind_v_midlevel is not None
+                else 0.5 * (v + upper_v)
+                if three_level_active
+                else upper_v
+            )
+            if mid_u.shape != q.shape or mid_v.shape != q.shape:
+                raise ValueError("midlevel wind fields must match precipitation grid")
+            upper_step = evolve_column_water(
+                upper_q_in * 2000.0,
+                np.zeros_like(q),
+                np.zeros_like(q),
+                mid_u,
+                mid_v,
+                dx_m=dx_grid,
+                dy_m=float(dy_grid),
+                dt_days=dt,
+                cell_area_m2=area_m2,
+                x_face_length_m=x_face_length_m,
+                y_face_length_m=y_face_length_m,
+            )
+            midlevel_humidity_next = upper_step.water_mm / 2000.0
+            if three_level_active:
+                upperlevel_step = evolve_column_water(
+                    upperlevel_q_in * 2000.0,
+                    np.zeros_like(q),
+                    np.zeros_like(q),
+                    upper_u,
+                    upper_v,
+                    dx_m=dx_grid,
+                    dy_m=float(dy_grid),
+                    dt_days=dt,
+                    cell_area_m2=area_m2,
+                    x_face_length_m=x_face_length_m,
+                    y_face_length_m=y_face_length_m,
+                )
+                upperlevel_humidity_next = upperlevel_step.water_mm / 2000.0
+        if debug_fields is not None:
+            debug_fields["column_water_transport_tendency_mm_day"] = (
+                column_step.transport_tendency_mm_day
+            )
+            debug_fields["column_water_transport_residual_mm_m2"] = column_step.residual_mm
+            debug_fields["column_water_transport_relative_residual"] = (
+                column_step.relative_residual
+            )
+            if two_layer_active:
+                debug_fields["midlevel_humidity_transport_relative_residual"] = (
+                    upper_step.relative_residual
+                )
+                if three_level_active:
+                    debug_fields["upperlevel_humidity_transport_relative_residual"] = (
+                        upperlevel_step.relative_residual
+                    )
+    elif NUMBA_AVAILABLE:
         for _ in range(3):
             # _advect_humidity_numba always allocates a fresh output (np.zeros_like
             # internally), so q_short is a unique array from here on -- safe to mutate
@@ -3546,7 +3822,7 @@ def generate_precipitation(
             np.clip(q_short, 0.0, qsat, out=q_short)
 
     _blend = float(pp.moisture_advection_scale)
-    if _blend > 0.0:
+    if _blend > 0.0 and not pp.enable_prognostic_column_water:
         q_long = _advect_scalar_flux_eulerian(q, u, v, dt * 86400.0, dx_grid, dy_grid)
         # Gate the long-range contribution by the same subsidence_suppression
         # that already gates land_evap, so imported moisture is damped in
@@ -3610,16 +3886,155 @@ def generate_precipitation(
     else:
         ascent = np.clip(-div, 0.0, None)
         ascent = ascent / (np.mean(ascent) + 1e-6)
+        if three_level_active and float(pp.three_level_diabatic_ascent_scale) > 0.0:
+            # Tropical radiative/latent heating supplies a resolved diabatic
+            # mass-flux contribution in addition to horizontal convergence.
+            # This is confined to the migrating ITCZ and remains opt-in.
+            ascent = ascent + (
+                float(pp.three_level_diabatic_ascent_scale) * itcz_window[:, None]
+            )
         ascent = np.clip(ascent + 0.15 * _lap(ascent.astype(np.float32)), 0.0, 3.0)
         if _sc is not None:
             ascent = ascent.astype(np.float32, copy=False)
             ascent.flags.writeable = False
             _sc["ascent"] = ascent
 
+    if two_layer_active:
+        # Pressure-coordinate vertical velocity from mass continuity.  With
+        # omega positive downward, d(omega)/dp = -div(V); a convergent lower
+        # layer beneath a divergent upper layer therefore gives omega < 0
+        # (upward motion) at the interface.  The half-layer difference is a
+        # compact centred estimate that uses both resolved wind levels instead
+        # of treating surface convergence and upper descent as unrelated
+        # empirical triggers.
+        upper_u_for_omega = u if wind_u_aloft is None else np.asarray(wind_u_aloft)
+        upper_v_for_omega = v if wind_v_aloft is None else np.asarray(wind_v_aloft)
+        if upper_u_for_omega.shape != q.shape or upper_v_for_omega.shape != q.shape:
+            raise ValueError("upper-level wind fields must match precipitation grid")
+        _unit_mass = np.ones_like(q, dtype=np.float32)
+        _lat_rad = np.radians(lat_deg.astype(np.float64))
+        lower_divergence_si = flux_divergence_spherical(
+            _unit_mass, u, v, _lat_rad, radius_m=float(pp.radius_m)
+        )
+        upper_divergence_si = flux_divergence_spherical(
+            _unit_mass, upper_u_for_omega, upper_v_for_omega, _lat_rad,
+            radius_m=float(pp.radius_m),
+        )
+        omega_scale = float(pp.two_layer_vertical_velocity_scale_pa_s)
+        if three_level_active:
+            # The interpolated midlevel wind supplies the third divergence
+            # profile. It is deliberately explicit here (rather than hidden in
+            # a scalar ascent proxy) so the native three-level path has two
+            # independently diagnosed pressure interfaces.
+            mid_u_for_omega = (
+                np.asarray(wind_u_midlevel)
+                if wind_u_midlevel is not None
+                else 0.5 * (u + upper_u_for_omega)
+            )
+            mid_v_for_omega = (
+                np.asarray(wind_v_midlevel)
+                if wind_v_midlevel is not None
+                else 0.5 * (v + upper_v_for_omega)
+            )
+            mid_divergence_si = flux_divergence_spherical(
+                _unit_mass, mid_u_for_omega, mid_v_for_omega, _lat_rad,
+                radius_m=float(pp.radius_m),
+            )
+            _divergence_filter_passes = int(pp.three_level_divergence_filter_passes)
+            _divergence_filter_strength = float(pp.three_level_divergence_filter_strength)
+            if _divergence_filter_passes > 0 and _divergence_filter_strength > 0.0:
+                lower_divergence_si = smooth_spherical_scalar(
+                    lower_divergence_si,
+                    strength=_divergence_filter_strength,
+                    passes=_divergence_filter_passes,
+                )
+                mid_divergence_si = smooth_spherical_scalar(
+                    mid_divergence_si,
+                    strength=_divergence_filter_strength,
+                    passes=_divergence_filter_passes,
+                )
+                upper_divergence_si = smooth_spherical_scalar(
+                    upper_divergence_si,
+                    strength=_divergence_filter_strength,
+                    passes=_divergence_filter_passes,
+                )
+            three_level_step = evolve_three_level_column(
+                q + midlevel_humidity_next + upperlevel_humidity_next,
+                temperature,
+                lower_divergence_si,
+                mid_divergence_si,
+                upper_divergence_si,
+                midlevel_humidity=midlevel_humidity_next,
+                upperlevel_humidity=upperlevel_humidity_next,
+                midlevel_temperature_k=midlevel_temperature,
+                upperlevel_temperature_k=upperlevel_temperature,
+                dt_days=dt,
+                lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
+                vertical_velocity_scale_pa_s=omega_scale,
+                exchange_days=float(pp.two_layer_entrainment_days),
+                midlevel_fraction=float(pp.two_layer_upper_humidity_fraction),
+                upperlevel_fraction=float(pp.three_level_upper_humidity_fraction),
+                midlevel_height_m=float(pp.stability_condensation_reference_height_m),
+                upperlevel_height_m=float(pp.three_level_upper_height_m),
+                thermal_relaxation_days=float(pp.two_layer_midlevel_relaxation_days),
+                use_flux_form_exchange=bool(pp.enable_three_level_flux_form_exchange),
+                enforce_column_mass_closure=bool(pp.enforce_three_level_mass_closure),
+            )
+            q = three_level_step.lower_humidity
+            midlevel_humidity_next = three_level_step.midlevel_humidity
+            upperlevel_humidity_next = three_level_step.upperlevel_humidity
+            three_level_mid_temperature_next = three_level_step.midlevel_temperature
+            upperlevel_temperature_next = three_level_step.upperlevel_temperature
+            omega_midlevel_pa_s = three_level_step.omega_lower_mid_pa_s
+            omega_upperlevel_pa_s = three_level_step.omega_mid_upper_pa_s
+            upward_motion = np.clip(-omega_midlevel_pa_s / omega_scale, 0.0, 6.0)
+            downward_motion = np.clip(omega_midlevel_pa_s / omega_scale, 0.0, 6.0)
+            upperlevel_upward_motion = np.clip(
+                -omega_upperlevel_pa_s / omega_scale, 0.0, 6.0
+            )
+            entrained_q = np.zeros_like(q)
+            detrained_q = np.zeros_like(q)
+        else:
+            omega_midlevel_pa_s = 0.5 * float(pp.two_layer_pressure_depth_pa) * (
+                lower_divergence_si - upper_divergence_si
+            )
+            upward_motion = np.clip(-omega_midlevel_pa_s / omega_scale, 0.0, 6.0)
+            downward_motion = np.clip(omega_midlevel_pa_s / omega_scale, 0.0, 6.0)
+            # Resolved upward mass flux lofts lower-layer vapor into the
+            # independently transported midlevel partition. This is an internal
+            # transfer, so it cannot create or destroy conserved column water.
+            entrainment_fraction = 1.0 - np.exp(
+                -dt * (upward_motion / (1.0 + upward_motion))
+                / float(pp.two_layer_entrainment_days)
+            )
+            entrained_q = q * entrainment_fraction
+            q = q - entrained_q
+            midlevel_humidity_next = midlevel_humidity_next + entrained_q
+            # The compensating descending branch returns upper vapor to the lower
+            # reservoir. Without it, every ascent event becomes a one-way water
+            # trap aloft; this is the minimal conservative overturning circulation
+            # for the two-layer column rather than a storage-only split.
+            detrainment_fraction = 1.0 - np.exp(
+                -dt * (downward_motion / (1.0 + downward_motion))
+                / float(pp.two_layer_entrainment_days)
+            )
+            detrained_q = midlevel_humidity_next * detrainment_fraction
+            midlevel_humidity_next = midlevel_humidity_next - detrained_q
+            q = q + detrained_q
+
     if debug_fields is not None:
         debug_fields["div"] = div
         debug_fields["ascent"] = ascent
         debug_fields["conv"] = conv
+        if two_layer_active:
+            debug_fields["two_layer_entrained_q"] = entrained_q
+            debug_fields["two_layer_detrained_q"] = detrained_q
+            debug_fields["midlevel_omega_pa_s"] = omega_midlevel_pa_s.astype(np.float32)
+            debug_fields["midlevel_upward_motion"] = upward_motion.astype(np.float32)
+            if three_level_active:
+                debug_fields["upperlevel_omega_pa_s"] = omega_upperlevel_pa_s.astype(np.float32)
+                debug_fields["upperlevel_upward_motion"] = upperlevel_upward_motion.astype(np.float32)
 
     # Orographic uplift signal.
     # gy must be the physical NORTHWARD slope (row index increases southward),
@@ -3709,6 +4124,384 @@ def generate_precipitation(
             rain_shadow_suppression.flags.writeable = False
             _sc["orog"] = orog
             _sc["rain_shadow_suppression"] = rain_shadow_suppression
+
+    condensate_next = condensate
+    hydrometeors_next = precipitating_hydrometeors
+    midlevel_temperature_next = (
+        three_level_mid_temperature_next if three_level_active else midlevel_temperature
+    )
+    upperlevel_temperature_next = (
+        upperlevel_temperature_next if three_level_active else upperlevel_temperature
+    )
+    condensate_precipitation = np.zeros_like(q, dtype=np.float32)
+    lowerlevel_condensate_precipitation = np.zeros_like(q, dtype=np.float32)
+    midlevel_condensate_precipitation = np.zeros_like(q, dtype=np.float32)
+    upperlevel_condensate_precipitation = np.zeros_like(q, dtype=np.float32)
+    if bool(pp.enable_prognostic_condensate):
+        condensate_in = (
+            np.zeros_like(q) if condensate is None else np.asarray(condensate, dtype=np.float64)
+        )
+        hydrometeors_for_microphysics = precipitating_hydrometeors
+        if (
+            bool(pp.enable_separate_precipitating_hydrometeors)
+            and bool(pp.enable_hydrometeor_transport)
+            and bool(pp.enable_prognostic_column_water)
+            and precipitating_hydrometeors is not None
+        ):
+            # Hydrometeors are not stationary cloud water: while they fall,
+            # the resolved cloud-layer flow displaces them horizontally.  Use
+            # the conservative column-water transport kernel for no longer
+            # than their sedimentation lifetime; transporting for an entire
+            # coarse climate step would imply that rain remains aloft after it
+            # has already reached the surface.
+            _hydrometeor_u = (
+                np.asarray(wind_u_midlevel)
+                if three_level_active and wind_u_midlevel is not None
+                else np.asarray(wind_u_aloft)
+                if wind_u_aloft is not None
+                else u
+            )
+            _hydrometeor_v = (
+                np.asarray(wind_v_midlevel)
+                if three_level_active and wind_v_midlevel is not None
+                else np.asarray(wind_v_aloft)
+                if wind_v_aloft is not None
+                else v
+            )
+            _hydrometeor_transport = evolve_column_water(
+                np.asarray(precipitating_hydrometeors, dtype=np.float64) * 2000.0,
+                np.zeros_like(q),
+                np.zeros_like(q),
+                _hydrometeor_u,
+                _hydrometeor_v,
+                dx_m=dx_grid,
+                dy_m=float(dy_grid),
+                dt_days=min(dt, float(pp.condensate_fallout_timescale_days)),
+                cell_area_m2=area_m2,
+                x_face_length_m=x_face_length_m,
+                y_face_length_m=y_face_length_m,
+            )
+            hydrometeors_for_microphysics = _hydrometeor_transport.water_mm / 2000.0
+            if debug_fields is not None:
+                debug_fields["hydrometeor_transport_relative_residual"] = (
+                    _hydrometeor_transport.relative_residual
+                )
+        transport_scale = float(np.clip(pp.condensate_transport_scale, 0.0, 1.0))
+        if transport_scale > 0.0:
+            if pp.enable_prognostic_column_water:
+                # The vapor leg is already in finite-volume column units in
+                # this mode.  Carry suspended condensate through the identical
+                # geometry, so the vapor+condensate budget does not mix a
+                # conservative and a non-conservative transport operator.
+                # In the active vertical closure, suspended condensate belongs
+                # to the midlevel cloud layer and therefore follows the
+                # resolved upper wind, not the near-surface circulation used
+                # by legacy condensate.  The fallback keeps every older gate
+                # bit-identical.
+                condensate_u = (
+                    u if not two_layer_active or wind_u_aloft is None
+                    else np.asarray(wind_u_aloft)
+                )
+                condensate_v = (
+                    v if not two_layer_active or wind_v_aloft is None
+                    else np.asarray(wind_v_aloft)
+                )
+                condensate_transport = evolve_column_water(
+                    condensate_in * 2000.0,
+                    np.zeros_like(condensate_in),
+                    np.zeros_like(condensate_in),
+                    condensate_u,
+                    condensate_v,
+                    dx_m=dx_grid,
+                    dy_m=float(dy_grid),
+                    dt_days=dt,
+                    cell_area_m2=area_m2,
+                    x_face_length_m=x_face_length_m,
+                    y_face_length_m=y_face_length_m,
+                )
+                condensate_advected = condensate_transport.water_mm / 2000.0
+                if debug_fields is not None:
+                    debug_fields["condensate_transport_relative_residual"] = (
+                        condensate_transport.relative_residual
+                    )
+                    debug_fields["condensate_transport_layer"] = (
+                        "midlevel" if two_layer_active else "surface"
+                    )
+            else:
+                condensate_advected = _advect_scalar_flux_eulerian(
+                    condensate_in,
+                    u,
+                    v,
+                    dt * 86400.0,
+                    dx_grid,
+                    dy_grid,
+                )
+            condensate_in = (1.0 - transport_scale) * condensate_in + transport_scale * condensate_advected
+        if convective_closure_active:
+            use_two_layer_adjustment = bool(pp.enable_two_layer_convective_adjustment)
+            upper_condensed_q = np.zeros_like(q)
+            upper_rainout_q = np.zeros_like(q)
+            upperlevel_condensed_q = np.zeros_like(q)
+            upperlevel_rainout_q = np.zeros_like(q)
+            upper_qsat = None
+            reference_midlevel_temperature = temperature - (
+                6.5e-3 * float(pp.stability_condensation_reference_height_m)
+            )
+            if use_two_layer_adjustment:
+                midlevel_in = (
+                    reference_midlevel_temperature
+                    if midlevel_temperature_next is None
+                    else np.asarray(midlevel_temperature_next, dtype=np.float64)
+                )
+                if midlevel_in.shape != q.shape:
+                    raise ValueError("midlevel_temperature must match precipitation grid")
+            else:
+                midlevel_in = None
+            _midlevel_target_rh = float(
+                pp.betts_miller_midlevel_target_relative_humidity
+                if pp.enable_simplified_betts_miller_convection
+                else pp.stability_condensation_critical_rh
+            )
+            _upperlevel_target_rh = float(
+                pp.betts_miller_upper_target_relative_humidity
+                if pp.enable_simplified_betts_miller_convection
+                else pp.stability_condensation_critical_rh
+            )
+            if pp.enable_simplified_betts_miller_convection and not all(
+                0.0 < value < 1.0
+                for value in (
+                    float(pp.betts_miller_target_relative_humidity),
+                    _midlevel_target_rh,
+                    _upperlevel_target_rh,
+                )
+            ):
+                raise ValueError("Betts--Miller vertical target humidities must lie strictly between zero and one")
+            q_before_condensation = q
+            if bool(pp.enable_simplified_betts_miller_convection):
+                q, condensate_next, condensate_rainout, _bm_condensed_q = (
+                    simplified_betts_miller_condensation(
+                        q,
+                        qsat,
+                        ascent,
+                        condensate_in,
+                        dt_days=dt,
+                        relaxation_hours=float(pp.betts_miller_relaxation_hours),
+                        target_relative_humidity=float(pp.betts_miller_target_relative_humidity),
+                        fallout_timescale_days=float(pp.condensate_fallout_timescale_days),
+                    )
+                )
+                cape_proxy = np.zeros_like(q, dtype=np.float32)
+                stability_activation = (ascent / (1.0 + ascent)).astype(np.float32)
+            else:
+                (
+                    q,
+                    condensate_next,
+                    condensate_rainout,
+                    cape_proxy,
+                    stability_activation,
+                ) = stability_aware_condensation(
+                    q,
+                    qsat,
+                    temperature,
+                    ascent,
+                    condensate_in,
+                    environment_temperature_k=midlevel_in,
+                    surface_pressure_hpa=surface_pressure_hpa,
+                    dt_days=dt,
+                    condensation_timescale_days=float(pp.condensate_condensation_timescale_days),
+                    fallout_timescale_days=float(pp.condensate_fallout_timescale_days),
+                    critical_relative_humidity=float(pp.stability_condensation_critical_rh),
+                    reference_height_m=float(pp.stability_condensation_reference_height_m),
+                    cape_scale_j_kg=float(pp.stability_condensation_cape_scale_j_kg),
+                )
+            if use_two_layer_adjustment:
+                relax_fraction = 1.0 - np.exp(
+                    -dt / float(pp.two_layer_midlevel_relaxation_days)
+                )
+                # Latent heating is deposited aloft, opposing continued deep
+                # convection until radiation/dynamics restore the background
+                # lapse profile.  Water remains in the single conserved column;
+                # this is only the companion thermal tendency.
+                latent_heating_k = 0.40 * (2.5e6 / 1004.0) * (
+                    q_before_condensation - q
+                )
+                midlevel_temperature_next = np.clip(
+                    midlevel_in
+                    + relax_fraction * (reference_midlevel_temperature - midlevel_in)
+                    + latent_heating_k,
+                    150.0,
+                    350.0,
+                ).astype(np.float32)
+            if two_layer_active:
+                # The upper partition is an active layer, not merely a storage
+                # bin.  Diagnose saturation at its reference pressure and let
+                # resolved ascent condense water above the same RH threshold as
+                # the lower stability closure.  Any true supersaturation is
+                # removed regardless of ascent so a numerical humidity clip is
+                # never allowed to act as an untracked sink.
+                upper_pressure_hpa = float(surface_pressure_hpa) * math.exp(
+                    -float(pp.stability_condensation_reference_height_m) / 8000.0
+                )
+                upper_temperature = np.asarray(midlevel_temperature_next, dtype=np.float64)
+                upper_tc = np.clip(upper_temperature - 273.15, -60.0, 60.0)
+                upper_es = 6.112 * np.exp(17.67 * upper_tc / (upper_tc + 243.5))
+                upper_qsat = np.clip(
+                    0.622 * upper_es / upper_pressure_hpa, 0.0, 0.035
+                )
+                upper_threshold = _midlevel_target_rh * upper_qsat
+                upper_excess = np.maximum(midlevel_humidity_next - upper_threshold, 0.0)
+                ascent_activation = upward_motion / (1.0 + upward_motion)
+                condensation_fraction = 1.0 - np.exp(
+                    -dt / float(pp.condensate_condensation_timescale_days)
+                )
+                upper_condensed_q = np.maximum(
+                    upper_excess * ascent_activation * condensation_fraction,
+                    np.maximum(midlevel_humidity_next - upper_qsat, 0.0),
+                )
+                upper_condensed_q = np.minimum(upper_condensed_q, midlevel_humidity_next)
+                upper_rainout_q = upper_condensed_q * (
+                    1.0 - np.exp(-dt / float(pp.condensate_fallout_timescale_days))
+                )
+                midlevel_humidity_next = midlevel_humidity_next - upper_condensed_q
+                condensate_next = np.asarray(condensate_next, dtype=np.float64) + (
+                    upper_condensed_q - upper_rainout_q
+                )
+                # Latent heat from both layers remains in the persistent upper
+                # temperature reservoir, which is exchanged with resolved air
+                # by simulate_step on the next temperature advance.
+                midlevel_temperature_next = np.clip(
+                    np.asarray(midlevel_temperature_next, dtype=np.float64)
+                    + 0.40 * (2.5e6 / 1004.0) * upper_condensed_q,
+                    150.0,
+                    350.0,
+                ).astype(np.float32)
+            if three_level_active:
+                # The third reservoir has its own, colder pressure level and
+                # interface ascent.  It shares the suspended condensate pool
+                # only after a conservative vapor-to-condensate transfer, so
+                # the existing fallout and cloud-radiation plumbing can remain
+                # a single auditable column-water budget.
+                upperlevel_pressure_hpa = float(surface_pressure_hpa) * math.exp(
+                    -float(pp.three_level_upper_height_m) / 8000.0
+                )
+                upperlevel_temperature = np.asarray(upperlevel_temperature_next, dtype=np.float64)
+                upperlevel_tc = np.clip(upperlevel_temperature - 273.15, -60.0, 60.0)
+                upperlevel_es = 6.112 * np.exp(
+                    17.67 * upperlevel_tc / (upperlevel_tc + 243.5)
+                )
+                upperlevel_qsat = np.clip(
+                    0.622 * upperlevel_es / upperlevel_pressure_hpa, 0.0, 0.035
+                )
+                upperlevel_threshold = _upperlevel_target_rh * upperlevel_qsat
+                upperlevel_excess = np.maximum(
+                    upperlevel_humidity_next - upperlevel_threshold, 0.0
+                )
+                upperlevel_activation = (
+                    upperlevel_upward_motion / (1.0 + upperlevel_upward_motion)
+                )
+                upperlevel_condensed_q = np.maximum(
+                    upperlevel_excess * upperlevel_activation * condensation_fraction,
+                    np.maximum(upperlevel_humidity_next - upperlevel_qsat, 0.0),
+                )
+                upperlevel_condensed_q = np.minimum(
+                    upperlevel_condensed_q, upperlevel_humidity_next
+                )
+                upperlevel_rainout_q = upperlevel_condensed_q * (
+                    1.0 - np.exp(-dt / float(pp.condensate_fallout_timescale_days))
+                )
+                upperlevel_humidity_next = (
+                    upperlevel_humidity_next - upperlevel_condensed_q
+                )
+                condensate_next = np.asarray(condensate_next, dtype=np.float64) + (
+                    upperlevel_condensed_q - upperlevel_rainout_q
+                )
+                upperlevel_temperature_next = np.clip(
+                    upperlevel_temperature
+                    + 0.40 * (2.5e6 / 1004.0) * upperlevel_condensed_q,
+                    150.0,
+                    350.0,
+                ).astype(np.float32)
+        else:
+            q, condensate_next, condensate_rainout = evolve_bulk_condensate(
+                q,
+                qsat,
+                ascent,
+                condensate_in,
+                dt_days=dt,
+                condensation_timescale_days=float(pp.condensate_condensation_timescale_days),
+                fallout_timescale_days=float(pp.condensate_fallout_timescale_days),
+            )
+        if bool(pp.enable_separate_precipitating_hydrometeors):
+            # Reconstruct the cloud mass before the legacy immediate-fallout
+            # step, then advance explicit cloud and hydrometeor reservoirs.
+            # This gate keeps older paths byte-for-byte intact while the new
+            # state contract is threaded through every caller.
+            _cloud_available = np.asarray(condensate_next, dtype=np.float64) + condensate_rainout
+            if convective_closure_active and two_layer_active:
+                _cloud_available = _cloud_available + upper_rainout_q
+            if convective_closure_active and three_level_active:
+                _cloud_available = _cloud_available + upperlevel_rainout_q
+            condensate_next, hydrometeors_next, condensate_rainout = (
+                separate_cloud_and_hydrometeor_reservoirs(
+                    np.zeros_like(_cloud_available),
+                    hydrometeors_for_microphysics,
+                    _cloud_available,
+                    dt_days=dt,
+                    autoconversion_timescale_days=float(pp.condensate_autoconversion_timescale_days),
+                    fallout_timescale_days=float(pp.condensate_fallout_timescale_days),
+                    cloud_retention_q=float(pp.cloud_optical_condensate_cap_q),
+                )
+            )
+            upper_rainout_q = np.zeros_like(condensate_rainout)
+            upperlevel_rainout_q = np.zeros_like(condensate_rainout)
+        condensate_precipitation = (
+            condensate_rainout * (2000.0 / dt)
+        ).astype(np.float32, copy=False)
+        lowerlevel_condensate_precipitation = condensate_precipitation.copy()
+        if convective_closure_active and two_layer_active:
+            midlevel_condensate_precipitation = (
+                upper_rainout_q * (2000.0 / dt)
+            ).astype(np.float32, copy=False)
+            condensate_precipitation = (
+                condensate_precipitation + midlevel_condensate_precipitation
+            )
+        if convective_closure_active and three_level_active:
+            upperlevel_condensate_precipitation = (
+                upperlevel_rainout_q * (2000.0 / dt)
+            ).astype(np.float32, copy=False)
+            condensate_precipitation = (
+                condensate_precipitation + upperlevel_condensate_precipitation
+            )
+        if debug_fields is not None:
+            debug_fields["condensate_rainout_dq"] = condensate_rainout
+            debug_fields["condensate_precipitation_mm_day"] = condensate_precipitation
+            debug_fields["lowerlevel_condensate_precipitation_mm_day"] = (
+                lowerlevel_condensate_precipitation
+            )
+            debug_fields["midlevel_condensate_precipitation_mm_day"] = (
+                midlevel_condensate_precipitation
+            )
+            debug_fields["upperlevel_condensate_precipitation_mm_day"] = (
+                upperlevel_condensate_precipitation
+            )
+            debug_fields["condensate_closure"] = (
+                "betts_miller" if pp.enable_simplified_betts_miller_convection
+                else "stability_aware" if pp.enable_stability_aware_condensation
+                else "rh_ascent"
+            )
+            if convective_closure_active:
+                debug_fields["stability_cape_proxy_j_kg"] = cape_proxy
+                debug_fields["stability_condensation_activation"] = stability_activation
+                if bool(pp.enable_two_layer_convective_adjustment):
+                    debug_fields["midlevel_temperature_k"] = midlevel_temperature_next
+                if two_layer_active:
+                    debug_fields["midlevel_qsat"] = upper_qsat.astype(np.float32)
+                    debug_fields["midlevel_condensed_q"] = upper_condensed_q.astype(np.float32)
+                    debug_fields["midlevel_rainout_q"] = upper_rainout_q.astype(np.float32)
+                if three_level_active:
+                    debug_fields["upperlevel_qsat"] = upperlevel_qsat.astype(np.float32)
+                    debug_fields["upperlevel_condensed_q"] = upperlevel_condensed_q.astype(np.float32)
+                    debug_fields["upperlevel_rainout_q"] = upperlevel_rainout_q.astype(np.float32)
 
     # Phase 2: Enhanced convective precipitation with CAPE-like triggering
     # This significantly improves tropical rainfall (ITCZ) realism
@@ -3868,12 +4661,34 @@ def generate_precipitation(
         float(pp.precip_rain_out_ceiling),
     )
     dq = np.clip(remove_frac * q, 0.0, q)
+    use_bulk_condensate_rainfall = (
+        bool(pp.enable_prognostic_column_water)
+        and bool(pp.enable_prognostic_condensate)
+        and bool(pp.column_water_use_bulk_condensate_rainfall)
+    )
+    if use_bulk_condensate_rainfall:
+        # In the fully experimental closure vapor can reach the surface only
+        # after entering the persistent condensate reservoir.  Retain the
+        # saturation adjustment below as a non-negotiable numerical/physical
+        # safeguard, but do not stack empirical potential rain on top of it.
+        dq = np.zeros_like(q)
     column_mm_per_q = 2000.0  # ~20 mm PW for q=0.01
     P = dq * (column_mm_per_q / dt)
     if debug_fields is not None:
         debug_fields["q"] = q
+        # Closure accounting: these are the physical rainout terms before the
+        # target-side moisture-budget allocator changes the result. Validation
+        # uses them to distinguish a better precipitation mechanism from a
+        # better post-hoc fit to the same zonal target.
+        debug_fields["humidity_before_rainout"] = q
+        debug_fields["rainout_raw_dq"] = dq
+        debug_fields["precipitation_raw_mm_day"] = P
         debug_fields["precip_potential_prerescale"] = precip_potential
         debug_fields["remove_frac_prerescale"] = remove_frac
+        debug_fields["column_water_precipitation_closure"] = (
+            "bulk_condensate" if use_bulk_condensate_rainfall
+            else "empirical_vapor_rainout"
+        )
         debug_fields["rh_release"] = rh_release
         debug_fields["conv_driver"] = conv_driver
         debug_fields["ascent_driver"] = ascent_driver
@@ -4010,6 +4825,20 @@ def generate_precipitation(
             ).astype(np.float32)
             if debug_fields is not None:
                 debug_fields["itcz_seasonal_target_modulation"] = _seasonal_target_mod.astype(np.float32)
+        # The prognostic condensate path is already physical rainfall. Let it
+        # satisfy the same row target before allocating any additional vapor
+        # rain, rather than adding a second independent rainfall total after
+        # the allocator. The unadjusted target is retained for diagnostics.
+        target_row_total_mm_day = target_row_mm_day.copy()
+        if bool(pp.enable_prognostic_condensate):
+            condensate_row_mm_day = np.mean(
+                condensate_precipitation, axis=1, dtype=np.float64
+            ).astype(np.float32)
+            target_row_mm_day = np.maximum(
+                target_row_mm_day - condensate_row_mm_day, 0.0
+            ).astype(np.float32)
+            if debug_fields is not None:
+                debug_fields["condensate_target_share_mm_day"] = condensate_row_mm_day
         dq_before = dq.copy()
         # Terrain-shaped per-cell target weight (mean=1.0 per row by
         # construction, so it reshapes each row's target -- and thus the
@@ -4245,7 +5074,17 @@ def generate_precipitation(
                 debug_fields["sst_target_factor"] = _sst_target_factor
         _row_norm = np.mean(_desert_factor, axis=1, dtype=np.float64).astype(np.float32)
         cell_weight = _desert_factor / (_row_norm[:, None] + 1e-6)
-        if pp.moisture_budget_precip_rescale:
+        # The column-water migration deliberately starts by removing the two
+        # imposed row-target corrections.  ``dq`` is already capped by the
+        # available local vapour above; leaving it unscaled therefore gives a
+        # directly auditable precipitation sink for the existing prognostic
+        # humidity reservoir.  This remains opt-in until the climate score
+        # establishes that its source/sink closure is an improvement.
+        use_row_target_rescale = (
+            bool(pp.moisture_budget_precip_rescale)
+            and not bool(pp.enable_prognostic_column_water)
+        )
+        if use_row_target_rescale:
             # Regime-varying removal caps (2026-08-01, A5 follow-up): raises
             # both the total- and per-step-added removal-fraction caps inside
             # the ITCZ only, via `moisture_budget_tropical_cap_boost` (0.0 =
@@ -4294,7 +5133,7 @@ def generate_precipitation(
                 max_added_removal_fraction=added_cap_row,
             )
             scale_row = budget_diag["effective_scale"]
-        else:
+        elif not pp.enable_prognostic_column_water:
             # dtype=float64 accumulation: headless vs. threaded/blocked call paths can
             # feed this reduction the same float32 values in a different summation
             # order (chunk boundaries), which float32 accumulation is sensitive enough
@@ -4313,6 +5152,11 @@ def generate_precipitation(
                 flat_scale + zonal_blend_row * (raw_zonal_scale - flat_scale), 0.15, 5.0
             ).astype(np.float32)
             dq = np.clip(dq * scale_row[:, None], 0.0, q)
+        else:
+            # Diagnostic raw-conservation path: neither the bounded allocator
+            # nor the legacy multiplicative row rescale may alter the local
+            # condensation sink.
+            scale_row = np.ones(q.shape[0], dtype=np.float32)
         P = dq * (column_mm_per_q / dt)
         if debug_fields is not None:
             debug_fields["zonal_rescale_factor"] = scale_row
@@ -4321,7 +5165,12 @@ def generate_precipitation(
             # rescale have to work overall" number still get one.
             debug_fields["global_rescale_factor"] = float(np.mean(scale_row))
             debug_fields["precip_rescale_dq_added"] = np.maximum(dq - dq_before, 0.0)
-            if pp.moisture_budget_precip_rescale:
+            debug_fields["column_water_mode"] = (
+                "raw_prognostic" if pp.enable_prognostic_column_water
+                else "row_target_budget" if use_row_target_rescale
+                else "legacy_row_rescale"
+            )
+            if use_row_target_rescale:
                 debug_fields["precip_target_achieved_fraction"] = budget_diag[
                     "target_achieved_fraction"
                 ]
@@ -4378,7 +5227,7 @@ def generate_precipitation(
         # would bias the net result toward drying, not just reshaping). Only
         # the legacy (non-budget) path still needs it applied here, since that
         # path has no other terrain-aware mechanism at all.
-        if not pp.moisture_budget_precip_rescale:
+        if not use_row_target_rescale and not pp.enable_prognostic_column_water:
             dq = np.clip(dq * cell_weight, 0.0, q)
         P = dq * (column_mm_per_q / dt)
         if debug_fields is not None:
@@ -4389,21 +5238,29 @@ def generate_precipitation(
         1.06,
     ).astype(np.float32, copy=False)
     dq = np.clip(dq * rain_export_factor, 0.0, q)
-    if pp.moisture_budget_precip_rescale and target_mean_mm_day > 0.0:
+    if use_row_target_rescale and target_mean_mm_day > 0.0:
         dq = np.minimum(dq, budget_dq_cap)
     P = dq * (column_mm_per_q / dt)
     if max_precip_mm_day > 0.0:
         cap = np.minimum(1.0, max_precip_mm_day / (P + 1e-9))
         dq = dq * cap
         P = P * cap
+    if pp.enable_prognostic_column_water:
+        # Conservative transport can carry humid air into a colder cell.  Rain
+        # out any resulting supersaturation explicitly instead of letting the
+        # final humidity clip silently discard that column water.
+        dq = np.clip(np.maximum(dq, q - qsat), 0.0, q)
+        P = dq * (column_mm_per_q / dt)
+    vapor_precipitation = P.copy()
+    P = P + condensate_precipitation
     if (
         debug_fields is not None
-        and pp.moisture_budget_precip_rescale
+        and use_row_target_rescale
         and target_mean_mm_day > 0.0
     ):
         final_row_mean = np.mean(P, axis=1, dtype=np.float64)
         final_achieved = final_row_mean / (
-            np.asarray(target_row_mm_day, dtype=np.float64) + 1e-12
+            np.asarray(target_row_total_mm_day, dtype=np.float64) + 1e-12
         )
         final_scale = np.mean(dq, axis=1, dtype=np.float64) / (
             np.mean(dq_before, axis=1, dtype=np.float64) + 1e-12
@@ -4413,12 +5270,102 @@ def generate_precipitation(
         debug_fields["precip_target_achieved_fraction"] = final_achieved.astype(np.float32)
         debug_fields["precip_rescale_capacity_limited"] = final_achieved < 0.999
         debug_fields["precip_rescale_unmet_mm_day"] = np.maximum(
-            np.asarray(target_row_mm_day, dtype=np.float64) - final_row_mean,
+            np.asarray(target_row_total_mm_day, dtype=np.float64) - final_row_mean,
             0.0,
         ).astype(np.float32)
 
+    if debug_fields is not None:
+        debug_fields["precipitation_final_mm_day"] = P
+        debug_fields["vapor_precipitation_mm_day"] = vapor_precipitation
+
     # Update humidity and soil moisture reservoirs
-    humidity_next = np.clip(q - dq, 0.0, qsat)
+    lower_humidity_next = np.clip(q - dq, 0.0, qsat)
+    if two_layer_active:
+        midlevel_humidity_next = np.clip(midlevel_humidity_next, 0.0, 0.035)
+        if three_level_active:
+            upperlevel_humidity_next = np.clip(upperlevel_humidity_next, 0.0, 0.035)
+            humidity_next = (
+                lower_humidity_next + midlevel_humidity_next + upperlevel_humidity_next
+            )
+        else:
+            humidity_next = lower_humidity_next + midlevel_humidity_next
+    else:
+        humidity_next = lower_humidity_next
+    if debug_fields is not None:
+        # Transitional column-water accounting.  ``q`` is still the legacy
+        # mixing-ratio proxy, but these fields express every storage/removal in
+        # the same mm-column units used by the future prognostic closure.  The
+        # equality below is a local identity for allocator rain; any mismatch
+        # is explicitly reported instead of being hidden by row rescaling.
+        # Outside the gated two-layer experiment ``q`` remains the complete
+        # legacy humidity reservoir, and there is no upper partition to add.
+        # Keeping that branch explicit preserves the long-standing diagnostic
+        # identity for every default configuration.
+        vapor_before_precip = (
+            q + midlevel_humidity_next + upperlevel_humidity_next
+            if three_level_active
+            else q + midlevel_humidity_next
+            if two_layer_active
+            else q
+        )
+        before_precip_mm = vapor_before_precip * column_mm_per_q
+        allocator_removal_mm = dq * column_mm_per_q
+        after_precip_mm = humidity_next * column_mm_per_q
+        debug_fields["column_water_before_precip_mm"] = before_precip_mm.astype(np.float32)
+        debug_fields["column_water_after_precip_mm"] = after_precip_mm.astype(np.float32)
+        debug_fields["column_water_rainout_removal_mm"] = allocator_removal_mm.astype(np.float32)
+        # Compatibility name retained while diagnostics migrate; in raw mode
+        # this is a physical rainout sink, not an allocator adjustment.
+        debug_fields["column_water_allocator_removal_mm"] = allocator_removal_mm.astype(np.float32)
+        debug_fields["column_water_allocator_residual_mm"] = (
+            after_precip_mm - (before_precip_mm - allocator_removal_mm)
+        ).astype(np.float32)
+        debug_fields["column_water_evaporation_source_mm"] = (
+            (ocean_evap + land_evap) * dt_evap * column_mm_per_q
+        ).astype(np.float32)
+        if pp.enable_prognostic_column_water:
+            # Whole-call closure for the experimental system.  Transport may
+            # redistribute individual cells, so this is intentionally
+            # area-weighted globally rather than a false per-cell assertion.
+            condensate_start = (
+                np.zeros_like(base_q)
+                if condensate is None
+                else np.asarray(condensate, dtype=np.float64)
+            )
+            condensate_end = (
+                np.zeros_like(base_q)
+                if condensate_next is None
+                else np.asarray(condensate_next, dtype=np.float64)
+            )
+            hydrometeor_start = (
+                np.zeros_like(base_q)
+                if precipitating_hydrometeors is None
+                else np.asarray(precipitating_hydrometeors, dtype=np.float64)
+            )
+            hydrometeor_end = (
+                np.zeros_like(base_q)
+                if hydrometeors_next is None
+                else np.asarray(hydrometeors_next, dtype=np.float64)
+            )
+            # ``q`` has since been transported and rained out; reconstruct the
+            # actual source from the pre-transport saturation-limited value.
+            source_q = np.maximum(
+                np.clip(lower_base_q + sources, 0.0, qsat) - lower_base_q,
+                0.0,
+            )
+            effective_source_mm = source_q * column_mm_per_q
+            water_before_mm = (base_q + condensate_start + hydrometeor_start) * column_mm_per_q
+            water_after_mm = (humidity_next + condensate_end + hydrometeor_end) * column_mm_per_q
+            rainout_mm = P * dt
+            expected_after_mm = water_before_mm + effective_source_mm - rainout_mm
+            closure_residual = float(np.sum((water_after_mm - expected_after_mm) * area_m2))
+            closure_scale = max(
+                float(np.sum(np.abs(water_before_mm) * area_m2)), 1.0
+            )
+            debug_fields["column_water_total_budget_residual_mm_m2"] = closure_residual
+            debug_fields["column_water_total_budget_relative_residual"] = (
+                closure_residual / closure_scale
+            )
 
     # Both terms must scale with the *same* elapsed-time basis. The precip
     # replenishment previously didn't scale with dt at all (a no-op bug at dt=1
@@ -4486,9 +5433,56 @@ def generate_precipitation(
     soil = np.where(land_mask, np.clip(soil, 0.05, 1.0), 0.0)
     soil_deep = np.where(land_mask, np.clip(soil_deep, 0.0, 1.0), 0.0)
 
-    return (
+    result = (
         P.astype(np.float32),
         humidity_next.astype(np.float32),
         soil.astype(np.float32),
         soil_deep.astype(np.float32),
     )
+    if return_condensate:
+        if condensate_next is None:
+            condensate_next = np.zeros_like(q, dtype=np.float32)
+        if return_midlevel_temperature:
+            if midlevel_temperature_next is None:
+                midlevel_temperature_next = np.zeros_like(q, dtype=np.float32)
+            if return_midlevel_humidity:
+                if midlevel_humidity_next is None:
+                    midlevel_humidity_next = np.zeros_like(q, dtype=np.float32)
+                if return_upperlevel_state:
+                    if upperlevel_temperature_next is None:
+                        upperlevel_temperature_next = np.zeros_like(q, dtype=np.float32)
+                    if upperlevel_humidity_next is None:
+                        upperlevel_humidity_next = np.zeros_like(q, dtype=np.float32)
+                    if return_precipitating_hydrometeors:
+                        if hydrometeors_next is None:
+                            hydrometeors_next = np.zeros_like(q, dtype=np.float32)
+                        return (
+                            *result,
+                            np.asarray(condensate_next, dtype=np.float32),
+                            np.asarray(midlevel_temperature_next, dtype=np.float32),
+                            np.asarray(midlevel_humidity_next, dtype=np.float32),
+                            np.asarray(upperlevel_temperature_next, dtype=np.float32),
+                            np.asarray(upperlevel_humidity_next, dtype=np.float32),
+                            np.asarray(hydrometeors_next, dtype=np.float32),
+                        )
+                    return (
+                        *result,
+                        np.asarray(condensate_next, dtype=np.float32),
+                        np.asarray(midlevel_temperature_next, dtype=np.float32),
+                        np.asarray(midlevel_humidity_next, dtype=np.float32),
+                        np.asarray(upperlevel_temperature_next, dtype=np.float32),
+                        np.asarray(upperlevel_humidity_next, dtype=np.float32),
+                    )
+                return (
+                    *result,
+                    np.asarray(condensate_next, dtype=np.float32),
+                    np.asarray(midlevel_temperature_next, dtype=np.float32),
+                    np.asarray(midlevel_humidity_next, dtype=np.float32),
+                )
+            return (
+                *result,
+                np.asarray(condensate_next, dtype=np.float32),
+                np.asarray(midlevel_temperature_next, dtype=np.float32),
+            )
+        return (*result, np.asarray(condensate_next, dtype=np.float32))
+    return result

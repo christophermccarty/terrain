@@ -4,6 +4,7 @@
 /testing/__pycache__/
 /testing/results/
 /testing/results/**/*.json
+/testing/reference_data/
 settings.json
 
 # Simulation save states -- NEVER commit these.
