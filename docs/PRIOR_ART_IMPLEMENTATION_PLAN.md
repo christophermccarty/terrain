@@ -1520,3 +1520,81 @@ archived at `scripts/resolved_wind_magnitude_diagnostic.json` and
 (`scripts/diagnose_resolved_wind_magnitude.py`,
 `scripts/screen_decoupled_upper_wind.py`) are reusable for the finer follow-up
 sweep.
+
+## 18. The finer joint sweep: transport is noise at this protocol, group accuracy is not
+
+Section 17's own next step, run: `scripts/screen_decoupled_upper_wind_fine.py`
+crosses `three_level_upper_wind_pgf_fraction` (0.05/0.1/0.15/0.2, bracketing
+the 0.1 candidate) with `three_level_upper_wind_damping` (0.04/0.06/0.08/0.1/
+0.12, a finer grid around the 0.08 precedent) jointly, at both radiative
+targets, on the identical 32x64 one-year spin-up/one-year evaluation
+protocol -- 40 runs total. The single `frac=0.1`/`damp=0.08`/TOA point was
+first re-verified in isolation and reproduced Section 17's exact -9.36 PW
+bit-for-bit, confirming the harness itself is deterministic and correct.
+
+**Result: cross-equatorial transport does not survive being crossed.** Within
+each fixed fraction, transport ranges over 5-11 PW of within-row spread as
+damping alone varies (e.g. ocean/frac=0.05: -1.09 to -26.48 PW across just
+five damping values), and neither axis is monotonic once the other is held
+fixed -- full per-row means/stdevs:
+
+| Fraction | Ocean transport mean/stdev (PW) | TOA transport mean/stdev (PW) |
+|---|---|---|
+| 0.05 | -14.74 / 10.35 | -17.47 / 2.53 |
+| 0.1 | -15.02 / 4.37 | -16.85 / 5.88 |
+| 0.15 | -20.89 / 5.92 | -13.22 / 6.88 |
+| 0.2 | -12.45 / 5.43 | -18.51 / 6.04 |
+
+The grid's overall spread (mean -15.8 PW ocean / -16.5 PW TOA, pstdev 7.6 /
+5.9 PW across all 20 points per target) is roughly as wide as the entire
+-14 to -31 PW band this metric has occupied since Section 11, and the
+individual-row stdevs are comparable in size to the differences *between*
+row means. Section 17's -9.36 PW at `frac=0.1`/`damp=0.08` was a real,
+reproducible output of that exact configuration, but the surrounding grid
+gives no evidence it sits in a real minimum rather than being one favorable
+draw among many similarly-sized swings -- the same class of error this
+project's testing-methodology lesson (`known-physics-gaps.md`) already warns
+about, here appearing as parameter-space noise rather than time-axis noise:
+a single 32x64/1yr+1yr point is not resolved enough to certify a location in
+this two-parameter space, only to sample it.
+
+**What is not noise: Köppen group accuracy tracks `pgf_fraction` cleanly and
+monotonically, independent of damping**, at both targets:
+
+| Fraction | Ocean group accuracy (mean over damping) | TOA group accuracy (mean over damping) |
+|---|---|---|
+| 0.05 | 0.6478 | 0.6495 |
+| 0.1 | 0.6345 | 0.6320 |
+| 0.15 | 0.6225 | 0.6263 |
+| 0.2 | 0.6124 | 0.6118 |
+
+This extends Section 17's coarse-sweep finding (accuracy improving as
+fraction fell from 1.0 toward 0.1) below 0.1 as well -- 0.05 is the best
+point in this finer grid on this axis, at both targets, with damping barely
+perturbing it (row stdevs on group accuracy, not tabulated above, stayed
+under 0.01 throughout, versus transport's 2.5-10 PW row stdevs). Group
+accuracy is evidently governed almost entirely by the forcing magnitude
+(`pgf_fraction`) and not by how it is damped, which is a clean, physically
+sensible result independent of the transport metric's noise.
+
+**How to apply.** Per this project's standing rule that a short-run gain is
+not evidence, `frac=0.1`/`damp=0.08` is *not* a promotion candidate on this
+evidence -- the finer sweep just called for by Section 17 found that its
+apparent transport win does not generalize to neighboring points in the same
+grid it was drawn from. No default changed (`three_level_upper_wind_pgf_
+fraction` stays `1.0`, all three three-level gates stay off). Two real
+options going forward, not picked here: (a) treat cross-equatorial transport
+as unreliable at this compact protocol and stop trying to select a
+`pgf_fraction`/damping point by it -- select by group accuracy alone (which
+*is* stable here, and argues for something at or below 0.05, lower than
+anything tested in Section 17) and treat transport as a diagnostic to
+re-check only at the full 128x256 five-year benchmark, where longer
+averaging may suppress the noise this compact protocol cannot; or (b) before
+trusting any transport number at this protocol again, first characterize the
+metric's own run-to-run noise floor directly -- e.g. reruns of the identical
+`frac=0.1`/`damp=0.08` configuration with only the terrain-independent RNG
+seed (if any) or a trivially perturbed initial condition varied, to learn
+whether 5-10 PW of swing is intrinsic to a 32x64/1yr+1yr evaluation window
+regardless of which parameter moved. Results archived at
+`scripts/decoupled_upper_wind_fine_screen_result.json`; sweep script is
+`scripts/screen_decoupled_upper_wind_fine.py`.
