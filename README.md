@@ -35,16 +35,29 @@ the GUI falls back to deterministic procedural terrain.
 # Routine verification
 .\.venv\Scripts\python.exe -m pytest testing -m "not slow"
 
-# Complete suite, including long climate integrations
+# Long climate integrations and drift regressions (run separately or in scheduled CI)
+.\.venv\Scripts\python.exe -m pytest testing -m slow
+
+# Complete suite (this can take a substantial amount of time)
 .\.venv\Scripts\python.exe -m pytest testing
 
 # One test module
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 446 tests (verify with `--collect-only -q`, since
-this count changes frequently). Slow tests cover multi-decadal climate drift,
-conservation, circulation, seasonal behavior, and reanalysis anchors.
+The suite currently collects 644 tests: 555 routine and 89 marked slow (verify
+with `--collect-only -q`, since this count changes frequently). Slow tests
+cover multi-year climate response, multi-decadal drift, conservation,
+circulation, seasonal behavior, and reanalysis anchors.
+
+## Climate-calibration workflow
+
+Use `scripts/sweep_condensate_closure.py` with a CRU reference and a same-grid
+baseline report for bounded 64x128 screening. Only an accepted screen result
+may advance to a matched 128x256, 5-year spin-up/5-year evaluation pair; check
+that pair with `scripts/promote_climate_candidate.py`, then run the slow suite
+before changing a default parameter. See `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md`
+for the reference-data setup and current measured baseline.
 
 ## Headless runs and benchmarks
 
@@ -92,6 +105,9 @@ weather processes.
 - `docs/FINDINGS_SUMMARY.md` — durable findings promoted from local experiments
 - `docs/ARCHITECTURE.md` — module boundaries and compatibility contracts
 - `docs/REAL_TERRAIN_VALIDATION.md` — regional/zonal benchmark workflow
+
+- `docs/CURRENT_BASELINE.md` — generated compact current regression contract
+- `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` — optional gridded monthly T/P reference format
 
 ## Save-file security
 

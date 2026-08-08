@@ -11,7 +11,16 @@ import numpy as np
 from PIL import Image
 
 from atmosphere import generate_precipitation
+from balanced_dynamics import pressure_level_geopotential
+from circulation_diagnostics import circulation_scorecard
 from masks import get_masks
+from temperature import elevation_to_alt_km
+from monthly_climatology import (
+    MonthlyClimatology,
+    load_monthly_climatology,
+    regrid_monthly_climatology,
+    score_monthly_climatology,
+)
 from planet_params import EARTH, PlanetParams
 from regional_validation import (
     EARTH_PRECIP_REGIONS,
@@ -19,6 +28,7 @@ from regional_validation import (
     orographic_contrast,
     precipitation_by_region_mm_year,
     region_mean,
+    region_mask,
     target_error_fraction,
 )
 from simulate import (
@@ -516,7 +526,7 @@ def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, A
         return {}
     debug: dict[str, Any] = {}
     H, W = state.elevation.shape
-    generate_precipitation(
+    final_precipitation, _, _, _ = generate_precipitation(
         H,
         W,
         state.elevation,
@@ -536,16 +546,21 @@ def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, A
     scale = np.asarray(debug.get("zonal_rescale_factor", []), dtype=np.float64)
     if scale.size == 0:
         return {}
-    budget_strategy = bool(pp.moisture_budget_precip_rescale)
-    metrics: dict[str, float | str] = {
-        "strategy": "moisture_budget" if budget_strategy else "legacy_multiplier",
+    raw_column_strategy = bool(pp.enable_prognostic_column_water)
+    budget_strategy = bool(pp.moisture_budget_precip_rescale) and not raw_column_strategy
+    metrics: dict[str, Any] = {
+        "strategy": (
+            "raw_conserved_column" if raw_column_strategy
+            else "moisture_budget" if budget_strategy else "legacy_multiplier"
+        ),
+        "row_target_rescale_applied": not raw_column_strategy,
         "mean": float(np.mean(scale)),
         "max": float(np.max(scale)),
         # Only the legacy strategy has a hard 5x multiplier ceiling. Large
         # effective ratios under the budget strategy occur when a near-zero raw
         # row receives bounded moisture and are not ceiling saturation.
         "saturated_fraction": (
-            0.0 if budget_strategy else float(np.mean(scale >= 4.999))
+            0.0 if (budget_strategy or raw_column_strategy) else float(np.mean(scale >= 4.999))
         ),
     }
     capacity_limited = np.asarray(
@@ -561,7 +576,84 @@ def _precip_rescale_metrics(state: PlanetState, pp: PlanetParams) -> dict[str, A
         metrics["mean_unmet_mm_day"] = float(np.mean(unmet))
     if achieved.size:
         metrics["mean_target_achieved_fraction"] = float(np.mean(achieved))
+
+    # The rescale diagnostics above say whether the target was met, but not how
+    # much the target-side allocator changed the raw physical rainout. Keep that
+    # distinction explicit: the replacement closure must reduce this dependency,
+    # not merely find another way to hit the same target. The adjustment is
+    # signed because seasonal raw production may also exceed a row target.
+    raw_precipitation = np.asarray(
+        debug.get("precipitation_raw_mm_day", []), dtype=np.float64
+    )
+    raw_dq = np.asarray(debug.get("rainout_raw_dq", []), dtype=np.float64)
+    humidity = np.asarray(debug.get("humidity_before_rainout", []), dtype=np.float64)
+    if raw_precipitation.shape == final_precipitation.shape:
+        raw_mean = _area_weighted_mean(raw_precipitation)
+        final_mean = _area_weighted_mean(final_precipitation)
+        metrics["closure"] = {
+            "raw_precip_mm_day": raw_mean,
+            "final_precip_mm_day": final_mean,
+            "target_adjustment_mm_day": (
+                0.0 if raw_column_strategy else final_mean - raw_mean
+            ),
+            "raw_to_final_ratio": (
+                raw_mean / final_mean if final_mean > 1e-12 else float("nan")
+            ),
+        }
+        if raw_dq.shape == humidity.shape and raw_dq.size:
+            metrics["closure"]["raw_column_rainout_fraction"] = _area_weighted_mean(
+                np.divide(raw_dq, humidity, out=np.zeros_like(raw_dq), where=humidity > 1e-12)
+            )
     return metrics
+
+
+def _monthly_climatology_metrics(
+    state: PlanetState,
+    land_mask: np.ndarray,
+    reference: MonthlyClimatology | None,
+) -> dict[str, Any]:
+    """Score the same twelve fields used by Köppen against a fixed reference."""
+    if reference is None or state.monthly_temp is None or state.monthly_precip is None:
+        return {}
+    return score_monthly_climatology(
+        state.monthly_temp,
+        state.monthly_precip,
+        reference,
+        model_land_mask=land_mask,
+    )
+
+
+def _regional_land_temperature_metrics(
+    state: PlanetState,
+    land_mask: np.ndarray,
+    reference: MonthlyClimatology | None,
+) -> dict[str, dict[str, float]]:
+    """CRU monthly-temperature errors for the existing named land regions."""
+    if reference is None or state.monthly_temp is None:
+        return {}
+    model = np.asarray(state.monthly_temp, dtype=np.float64)
+    observed = np.asarray(reference.temperature_k, dtype=np.float64)
+    if model.shape != observed.shape:
+        return {}
+    result: dict[str, dict[str, float]] = {}
+    for region in EARTH_PRECIP_REGIONS:
+        mask = region_mask(model.shape[1:], region, cell_mask=land_mask)
+        if reference.land_fraction is not None:
+            mask &= np.asarray(reference.land_fraction >= 0.5, dtype=bool)
+        if not np.any(mask):
+            continue
+        model_series = np.mean(model[:, mask], axis=1)
+        observed_series = np.mean(observed[:, mask], axis=1)
+        delta_c = model_series - observed_series
+        result[region.name] = {
+            "annual_bias_c": float(np.mean(delta_c)),
+            "monthly_rmse_c": float(np.sqrt(np.mean(delta_c**2))),
+            "model_seasonal_range_c": float(np.max(model_series) - np.min(model_series)),
+            "reference_seasonal_range_c": float(
+                np.max(observed_series) - np.min(observed_series)
+            ),
+        }
+    return result
 
 
 def summarize_real_terrain_climate(
@@ -572,9 +664,74 @@ def summarize_real_terrain_climate(
     mean_cloud_fraction: np.ndarray,
     mean_soil_moisture: np.ndarray,
     planet_params: PlanetParams,
+    monthly_climatology: MonthlyClimatology | None = None,
 ) -> dict[str, Any]:
     """Compute stable global, zonal, and named-region validation metrics."""
     sea_mask, land_mask = get_masks(state.elevation, use_cache=False)
+    circulation: dict[str, Any] = {}
+    if state.wind_u is not None and state.wind_v is not None:
+        # Hydrostatic geopotential (g*z) at each level's nominal pressure, so the
+        # transport diagnostic's dry-static-energy term is cp*T + g*z rather than
+        # cp*T alone.  Best-effort: only supplied where the elevation field lines
+        # up with the temperature grid actually being scored.
+        elevation_m = elevation_to_alt_km(
+            state.elevation, max_elevation_km=float(planet_params.max_elevation_km),
+        ) * 1000.0
+        lower_gz = mid_gz = upper_gz = None
+        if elevation_m.shape == mean_temperature_k.shape:
+            lower_gz = pressure_level_geopotential(
+                elevation_m, mean_temperature_k,
+                gravity_m_s2=float(planet_params.surface_gravity),
+                gas_constant_dry=float(planet_params.gas_constant_dry),
+                surface_pressure_pa=float(planet_params.surface_pressure_pa),
+                level_pressure_pa=float(planet_params.native_balanced_surface_pressure_pa),
+            )
+            if (
+                state.midlevel_temperature is not None
+                and state.midlevel_temperature.shape == elevation_m.shape
+            ):
+                mid_gz = pressure_level_geopotential(
+                    elevation_m, state.midlevel_temperature,
+                    gravity_m_s2=float(planet_params.surface_gravity),
+                    gas_constant_dry=float(planet_params.gas_constant_dry),
+                    surface_pressure_pa=float(planet_params.surface_pressure_pa),
+                    level_pressure_pa=float(planet_params.native_balanced_mid_pressure_pa),
+                )
+            if (
+                state.upperlevel_temperature is not None
+                and state.upperlevel_temperature.shape == elevation_m.shape
+            ):
+                upper_gz = pressure_level_geopotential(
+                    elevation_m, state.upperlevel_temperature,
+                    gravity_m_s2=float(planet_params.surface_gravity),
+                    gas_constant_dry=float(planet_params.gas_constant_dry),
+                    surface_pressure_pa=float(planet_params.surface_pressure_pa),
+                    level_pressure_pa=float(planet_params.three_level_thermal_wind_upper_pressure_pa),
+                )
+        circulation = circulation_scorecard(
+            state.wind_u,
+            state.wind_v,
+            mid_u=state.midlevel_wind_u,
+            mid_v=state.midlevel_wind_v,
+            upper_u=state.wind_u_aloft,
+            upper_v=state.wind_v_aloft,
+            omega_lower_mid_pa_s=state.omega_lower_mid_pa_s,
+            omega_mid_upper_pa_s=state.omega_mid_upper_pa_s,
+            temperature_k=mean_temperature_k,
+            humidity=state.humidity,
+            radius_m=float(planet_params.radius_m),
+            surface_pressure_pa=float(planet_params.surface_pressure_pa),
+            gravity_m_s2=float(planet_params.surface_gravity),
+            cp_dry_j_kg_k=float(planet_params.cp_dry),
+            midlevel_temperature_k=state.midlevel_temperature,
+            midlevel_humidity=state.midlevel_humidity,
+            upperlevel_temperature_k=state.upperlevel_temperature,
+            upperlevel_humidity=state.upperlevel_humidity,
+            layer_mass_fractions=(0.40, 0.35, 0.25),
+            lower_geopotential_m2_s2=lower_gz,
+            midlevel_geopotential_m2_s2=mid_gz,
+            upperlevel_geopotential_m2_s2=upper_gz,
+        )
     period = float(planet_params.orbital_period_days)
     regional_precip = precipitation_by_region_mm_year(
         mean_precipitation_mm_day,
@@ -659,7 +816,14 @@ def summarize_real_terrain_climate(
         "koppen_temperature_thresholds": _koppen_temperature_thresholds(
             state, land_mask
         ),
+        "monthly_climatology": _monthly_climatology_metrics(
+            state, land_mask, monthly_climatology
+        ),
+        "regional_land_temperature": _regional_land_temperature_metrics(
+            state, land_mask, monthly_climatology
+        ),
         "precip_rescale": _precip_rescale_metrics(state, planet_params),
+        "circulation": circulation,
         "reference_error_score": reference_error_score,
     }
 
@@ -696,10 +860,16 @@ def run_real_terrain_validation(
     *,
     planet_params: PlanetParams = EARTH,
     initial_state_path: str | Path | None = None,
+    monthly_climatology_path: str | Path | None = None,
 ) -> tuple[PlanetState, dict[str, Any]]:
     """Run a deterministic real-DEM spinup/evaluation and return state plus report."""
     config.validate()
     mode = TimeScaleMode[config.time_scale]
+    monthly_climatology = None
+    if monthly_climatology_path is not None:
+        monthly_climatology = regrid_monthly_climatology(
+            load_monthly_climatology(monthly_climatology_path), config.height, config.width
+        )
     clear_simulation_caches()
     if initial_state_path is None:
         elevation = load_bundled_earth_dem(config.height, config.width)
@@ -767,6 +937,7 @@ def run_real_terrain_validation(
         mean_cloud_fraction=means["cloud"],
         mean_soil_moisture=means["soil"],
         planet_params=planet_params,
+        monthly_climatology=monthly_climatology,
     )
     report = {
         "schema_version": VALIDATION_SCHEMA_VERSION,
@@ -778,6 +949,9 @@ def run_real_terrain_validation(
             "eccentricity": planet_params.eccentricity,
         },
         "planet_params": asdict(planet_params),
+        "monthly_climatology_reference": (
+            dict(monthly_climatology.metadata) if monthly_climatology is not None else None
+        ),
         "simulation": {
             "spinup_cycles": spinup_cycles,
             "evaluation_cycles": evaluation_cycles,
@@ -820,8 +994,17 @@ def compare_validation_reports(
     """Return human-readable regressions against a same-configuration baseline."""
     if current.get("config") != baseline.get("config"):
         return ["validation configuration differs from baseline"]
-    current_planet = json.dumps(current.get("planet_params"), sort_keys=True)
-    baseline_planet = json.dumps(baseline.get("planet_params"), sort_keys=True)
+    # Reference reports predate new default-off research gates. Compare every
+    # parameter the baseline actually recorded, while requiring each of those
+    # keys to still exist; newly added defaults must not invalidate an otherwise
+    # identical climate regression fixture before its metrics are evaluated.
+    current_params = current.get("planet_params") or {}
+    baseline_params = baseline.get("planet_params") or {}
+    current_planet = json.dumps(
+        {name: current_params.get(name, "__missing__") for name in baseline_params},
+        sort_keys=True,
+    )
+    baseline_planet = json.dumps(baseline_params, sort_keys=True)
     if current_planet != baseline_planet:
         return ["planet parameters differ from baseline"]
     failures: list[str] = []

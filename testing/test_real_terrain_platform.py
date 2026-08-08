@@ -5,6 +5,7 @@ import copy
 import numpy as np
 import pytest
 
+from monthly_climatology import MonthlyClimatology
 from planet_params import EARTH
 from real_terrain_validation import (
     DEFAULT_BASELINE_PATH,
@@ -65,6 +66,40 @@ def test_climate_summary_contains_global_regional_and_zonal_metrics():
     )
     assert "40-50N" in metrics["zonal"]
     assert np.isfinite(metrics["reference_error_score"])
+
+
+def test_climate_summary_scores_optional_monthly_climatology():
+    shape = (16, 32)
+    elevation = np.zeros(shape, dtype=np.float32)
+    elevation[4:12, 4:28] = 0.5
+    monthly_temperature = np.full((12, *shape), 288.0, dtype=np.float32)
+    monthly_precipitation = np.full((12, *shape), 2.0, dtype=np.float32)
+    state = PlanetState(
+        day_of_year=80.0,
+        elevation=elevation,
+        planet_params=EARTH,
+        monthly_temp=monthly_temperature,
+        monthly_precip=monthly_precipitation,
+    )
+    reference = MonthlyClimatology(
+        temperature_k=monthly_temperature,
+        precipitation_mm_day=monthly_precipitation,
+        land_fraction=np.ones(shape, dtype=np.float32),
+        metadata={"source": "synthetic", "period": "1991-2020", "license": "test-only"},
+    )
+    metrics = summarize_real_terrain_climate(
+        state,
+        mean_temperature_k=monthly_temperature.mean(axis=0),
+        mean_precipitation_mm_day=monthly_precipitation.mean(axis=0),
+        mean_cloud_fraction=np.full(shape, 0.5, dtype=np.float32),
+        mean_soil_moisture=np.full(shape, 0.4, dtype=np.float32),
+        planet_params=EARTH,
+        monthly_climatology=reference,
+    )
+    assert metrics["monthly_climatology"]["temperature_c"]["monthly_rmse"] == pytest.approx(0.0)
+    assert metrics["monthly_climatology"]["precipitation_mm_day"]["monthly_log_rmse"] == pytest.approx(0.0)
+    assert metrics["regional_land_temperature"]["Sahara"]["annual_bias_c"] == pytest.approx(0.0)
+    assert metrics["regional_land_temperature"]["US Midwest"]["monthly_rmse_c"] == pytest.approx(0.0)
 
 
 def test_baseline_comparison_reports_material_regression():
