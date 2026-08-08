@@ -52,6 +52,14 @@ from climate_averages import (
 )
 from masks import get_masks
 from planet_params import PlanetParams, EARTH
+from pressure_circulation import balanced_thermal_wind_u, close_upper_mass_flux
+from balanced_dynamics import (
+    balanced_pressure_wind,
+    diabatic_overturning_speed,
+    moist_static_energy_overturning_speed,
+    pressure_level_geopotential,
+    thermally_direct_overturning,
+)
 
 # Numba JIT compilation for performance
 try:
@@ -98,25 +106,50 @@ _LAND_TRANSPORT_DEFICIT_REF_K = 273.15
 
 
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
+                                        wind_u_aloft, wind_v_aloft,
+                                        wind_u_midlevel, wind_v_midlevel,
                                         humidity, soil_moisture, soil_moisture_deep,
+                                        condensate, precipitating_hydrometeors,
+                                        midlevel_temperature,
+                                        midlevel_humidity,
+                                        upperlevel_temperature,
+                                        upperlevel_humidity,
                                         cloud_fraction,
                                         day_of_year, dt_days,
                                         surface_pressure_hpa=1013.25,
-                                        planet_params=None):
+                                        planet_params=None,
+                                        debug_fields=None):
     dt_days = float(dt_days)
     _pp_substep = float(planet_params.precip_substep_days) if planet_params is not None else 0.0
     substep_days = _pp_substep if _pp_substep > 0.0 else _PRECIP_SUBSTEP_DAYS
     if dt_days <= substep_days:
         return generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
+            wind_u_aloft=wind_u_aloft, wind_v_aloft=wind_v_aloft,
+            wind_u_midlevel=wind_u_midlevel, wind_v_midlevel=wind_v_midlevel,
             humidity=humidity, soil_moisture=soil_moisture,
             soil_moisture_deep=soil_moisture_deep,
+            condensate=condensate,
+            precipitating_hydrometeors=precipitating_hydrometeors,
+            midlevel_temperature=midlevel_temperature,
+            midlevel_humidity=midlevel_humidity,
+            upperlevel_temperature=upperlevel_temperature,
+            upperlevel_humidity=upperlevel_humidity,
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
+            return_condensate=True, return_midlevel_temperature=True,
+            return_midlevel_humidity=True,
+            return_upperlevel_state=True,
+            return_precipitating_hydrometeors=True,
+            debug_fields=debug_fields,
         )
     n_sub = max(1, int(round(dt_days / substep_days)))
     sub_dt = dt_days / n_sub
-    hum, soil, soil_deep = humidity, soil_moisture, soil_moisture_deep
+    hum, soil, soil_deep, cond, hydro, mid, mid_q, upper_t, upper_q = (
+        humidity, soil_moisture, soil_moisture_deep, condensate,
+        precipitating_hydrometeors, midlevel_temperature, midlevel_humidity,
+        upperlevel_temperature, upperlevel_humidity,
+    )
     P_accum = None
     period_days = float(
         planet_params.orbital_period_days if planet_params is not None else 365.2422
@@ -128,18 +161,53 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
     # pass. Compute them once and reuse via this cache (see its docstring); the
     # result is identical to recomputing them every substep.
     _static_cache: dict = {}
+    _debug_accumulators: dict[str, np.ndarray | float] = {}
     for _ in range(n_sub):
         sub_day = (sub_day + sub_dt) % period_days
-        P_i, hum, soil, soil_deep = generate_precipitation(
+        _sub_debug: dict | None = {} if debug_fields is not None else None
+        P_i, hum, soil, soil_deep, cond, mid, mid_q, upper_t, upper_q, hydro = generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
+            wind_u_aloft=wind_u_aloft, wind_v_aloft=wind_v_aloft,
+            wind_u_midlevel=wind_u_midlevel, wind_v_midlevel=wind_v_midlevel,
             humidity=hum, soil_moisture=soil, soil_moisture_deep=soil_deep,
+            condensate=cond,
+            precipitating_hydrometeors=hydro,
+            midlevel_temperature=mid,
+            midlevel_humidity=mid_q,
+            upperlevel_temperature=upper_t,
+            upperlevel_humidity=upper_q,
             cloud_fraction=cloud_fraction,
             day_of_year=sub_day, dt_days=sub_dt,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
-            _static_cache=_static_cache,
+            _static_cache=_static_cache, return_condensate=True,
+            return_midlevel_temperature=True,
+            return_midlevel_humidity=True,
+            return_upperlevel_state=True,
+            return_precipitating_hydrometeors=True,
+            debug_fields=_sub_debug,
         )
+        if _sub_debug is not None:
+            # A precipitation debug rate is meaningful only as a time average
+            # across the daily microphysics calls that make up a long outer
+            # timestep.  Keep this deliberately narrow rather than exposing
+            # one arbitrary substep's state under a misleading monthly label.
+            for _name, _value in _sub_debug.items():
+                if _name.endswith("_precipitation_mm_day"):
+                    _weighted = np.asarray(_value) * (sub_dt / dt_days)
+                    _debug_accumulators[_name] = (
+                        _weighted
+                        if _name not in _debug_accumulators
+                        else _debug_accumulators[_name] + _weighted
+                    )
+                elif _name in {"midlevel_omega_pa_s", "upperlevel_omega_pa_s"}:
+                    # These are wind-derived instantaneous diagnostics.  They
+                    # are unchanged through the moisture-only substeps, so one
+                    # copy is the meaningful state diagnostic for this step.
+                    _debug_accumulators[_name] = np.asarray(_value)
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
-    return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil, soil_deep
+    if debug_fields is not None:
+        debug_fields.update(_debug_accumulators)
+    return (P_accum / n_sub).astype(np.float32, copy=False), hum, soil, soil_deep, cond, mid, mid_q, upper_t, upper_q, hydro
 
 
 def _evolve_wind_substepped(
@@ -216,6 +284,40 @@ def _evolve_wind_substepped(
             v_aloft=v2,
         )
     return u, v, u2, v2
+
+
+def _evolve_middle_wind_substepped(
+    u, v, *, temperature, dt_days_total: float, substep_days: float,
+    pgf_temp_scale: float, upper_pgf_amp: float, damping_rate: float,
+    vmax_clip: float, planet_params, hadley_edge_deg: float,
+):
+    """Advance the native three-level column's independent middle wind.
+
+    The middle level uses the same free-tropospheric momentum kernel as the
+    existing upper level, but its weaker thermal forcing and stronger damping
+    place it between the boundary layer and upper-tropospheric jet.  Splitting
+    long prognostic wind steps here keeps its integration cadence consistent
+    with the other two resolved wind levels.
+    """
+    dt_days_total = float(dt_days_total)
+    if substep_days <= 0.0 or substep_days >= dt_days_total:
+        n_sub = 1
+    else:
+        n_sub = max(1, int(round(dt_days_total / substep_days)))
+    sub_dt = dt_days_total / n_sub
+    for _ in range(n_sub):
+        u, v = evolve_wind_aloft(
+            u, v,
+            temperature=temperature,
+            dt_days=sub_dt,
+            pgf_temp_scale=pgf_temp_scale,
+            upper_pgf_amp=upper_pgf_amp,
+            damping_rate=damping_rate,
+            vmax_clip=vmax_clip,
+            planet_params=planet_params,
+            hadley_edge_deg=hadley_edge_deg,
+        )
+    return u, v
 
 
 def _soft_min_cap(x: np.ndarray, cap: np.ndarray, width: float) -> np.ndarray:
@@ -586,6 +688,7 @@ def _evolve_temperature_substepped(
     sub_dt = days / n_sub
     T_sst, T_air = T_prev, T_air_prev
     cloud_cover, T_deep, cloud_water = prev_cloud_cover, T_deep_ocean, prev_cloud_water
+    land_deep = kwargs.get("land_deep_temperature")
     day = float(day_of_year) - days
     t = (float(total_days) - days) if total_days is not None else None
     cloud_c = snow_c = components = None
@@ -600,6 +703,7 @@ def _evolve_temperature_substepped(
         )
         kwargs_i = dict(kwargs)
         kwargs_i["T_base_land"] = T_base_land_i
+        kwargs_i["land_deep_temperature"] = land_deep
         T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water = _evolve_temperature(
             T_sst, T_base_i, elevation, Hc, Wc, block_size, H, W,
             day_of_year=day, days=sub_dt,
@@ -609,6 +713,7 @@ def _evolve_temperature_substepped(
             **kwargs_i,
         )
         cloud_cover = cloud_c
+        land_deep = components.get("_land_deep_temperature", land_deep)
     return T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water
 
 
@@ -848,6 +953,7 @@ def simulate_step(
     co2_climate_feedback: float | None = None,  # None → pp.co2_climate_feedback
     debug_log: bool = False,
     track_components: bool = False,
+    precipitation_debug: dict | None = None,
     planet_params: PlanetParams | None = None,
     time_scale: TimeScaleMode = TimeScaleMode.DAILY,
     feedback_flags: dict[str, bool] | None = None,
@@ -894,6 +1000,12 @@ def simulate_step(
         pp = base_pp
     if precip_block_size not in (None, 1, 2):
         raise ValueError("precip_block_size must be None, 1, or 2")
+    # Retain pressure-vertical velocity when its three-level source exists,
+    # without enabling the wider (and more expensive) precipitation debug path
+    # for ordinary one/two-level simulations.
+    _precipitation_diagnostics = precipitation_debug
+    if _precipitation_diagnostics is None and bool(pp.enable_three_level_pressure_column):
+        _precipitation_diagnostics = {}
 
     # Resolve parameters that default to None → pp.<field> (allows per-planet tuning
     # while still permitting explicit overrides from the optimizer or tests).
@@ -1853,7 +1965,27 @@ def simulate_step(
                             + ocean_seasonal_frac_full * (T_lat_ocean_full_lagged - T_lat_annual_mean_full))
         return np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32, copy=False) + co2_temp_offset
 
-    
+    def _compute_T_toa_equilibrium_full() -> np.ndarray:
+        """Full-resolution top-of-atmosphere radiative-equilibrium temperature.
+
+        Unlike ``_compute_T_base_ocean_full``, this carries no AMOC/ACC bonus,
+        hemisphere asymmetry, or ocean seasonal lag -- it is
+        ``temperature_kelvin_for_lat`` evaluated directly at the current
+        (unlagged) day, plus the same CO2 forcing offset applied everywhere
+        else.  It exists to isolate genuine radiative-heating skill from the
+        transport-borrowed asymmetry that ``_compute_T_base_ocean_full``
+        bakes in, per PRIOR_ART_IMPLEMENTATION_PLAN.md Section 10.
+        """
+        lat_full = (0.5 - (np.arange(H, dtype=np.float32) + 0.5) / H) * np.pi
+        T_lat_toa_full = temperature_kelvin_for_lat(
+            lat_full,
+            day_of_year=new_day,
+            polar_cooling_scale=polar_cooling_scale,
+            planet_params=pp,
+        )
+        return np.repeat(T_lat_toa_full[:, None], W, axis=1).astype(np.float32, copy=False) + co2_temp_offset
+
+
     # Blend based on land fraction (will be calculated in _evolve_temperature)
     # Use ocean-lagged temperature as base; _evolve_temperature will handle land/ocean mixing
     T_base = T_base_ocean  # Start with ocean (lagged), land will be corrected in evolution
@@ -1888,6 +2020,94 @@ def simulate_step(
     T_air_coarse = _group_a_out["T_air"] if "T_air" in _group_a_out else T_prev_coarse.copy()
     ice_prev_coarse = _group_a_out.get("ice")
     ice_thick_prev_coarse = _group_a_out.get("ice_thick")
+
+    # Gated two-layer thermodynamic feedback.  Latent heating accumulated in
+    # the persistent midlevel reservoir is not allowed to remain diagnostically
+    # isolated: a mass-weighted vertical exchange transfers its anomaly into
+    # the resolved air field before this step's radiation/advection update.
+    # The companion adjustment to ``midlevel_temperature_for_precip`` removes
+    # the same layer-energy anomaly, so this is an exchange rather than an
+    # untracked temperature source.
+    _two_layer_thermo_active = (
+        bool(pp.enable_prognostic_column_water)
+        and bool(pp.enable_stability_aware_condensation)
+        and bool(pp.enable_two_layer_convective_adjustment)
+    )
+    midlevel_temperature_for_precip = state.midlevel_temperature
+    upperlevel_temperature_for_precip = state.upperlevel_temperature
+    if _two_layer_thermo_active and state.midlevel_temperature is not None:
+        _lower_temperature_before_vertical_exchange = T_air_coarse
+        _midlevel_coarse = _coarsen(
+            state.midlevel_temperature, Hc, Wc, block_size
+        )
+        _reference_midlevel = _lower_temperature_before_vertical_exchange - (
+            6.5e-3 * float(pp.stability_condensation_reference_height_m)
+        )
+        _exchange_fraction = 1.0 - np.exp(
+            -float(days) / float(pp.two_layer_vertical_mixing_days)
+        )
+        _midlevel_exchange_coarse = _exchange_fraction * (
+            _midlevel_coarse - _reference_midlevel
+        )
+        _midlevel_mass_fraction = float(
+            np.clip(pp.two_layer_upper_mass_fraction, 0.05, 0.95)
+        )
+        _upperlevel_mass_fraction = (
+            float(np.clip(pp.three_level_upper_humidity_fraction, 0.01, 0.50))
+            if bool(pp.enable_three_level_pressure_column)
+            else 0.0
+        )
+        _lower_mass_fraction = max(
+            1.0 - _midlevel_mass_fraction - _upperlevel_mass_fraction, 0.05
+        )
+        _air_temperature_exchange = (
+            _midlevel_mass_fraction / _lower_mass_fraction
+        ) * _midlevel_exchange_coarse
+        _upperlevel_exchange_coarse = None
+        if (
+            bool(pp.enable_three_level_pressure_column)
+            and state.upperlevel_temperature is not None
+        ):
+            _upperlevel_coarse = _coarsen(
+                state.upperlevel_temperature, Hc, Wc, block_size
+            )
+            _reference_upperlevel = _lower_temperature_before_vertical_exchange - (
+                6.5e-3 * float(pp.three_level_upper_height_m)
+            )
+            _upperlevel_exchange_coarse = _exchange_fraction * (
+                _upperlevel_coarse - _reference_upperlevel
+            )
+            _air_temperature_exchange = _air_temperature_exchange + (
+                _upperlevel_mass_fraction / _lower_mass_fraction
+            ) * _upperlevel_exchange_coarse
+        T_air_coarse = np.clip(
+            _lower_temperature_before_vertical_exchange + _air_temperature_exchange,
+            150.0,
+            350.0,
+        ).astype(np.float32, copy=False)
+        if block_size > 1:
+            _midlevel_exchange_full = _upsample_bilinear_many(
+                {"exchange": _midlevel_exchange_coarse}, H, W, block_size
+            )["exchange"]
+        else:
+            _midlevel_exchange_full = _midlevel_exchange_coarse
+        midlevel_temperature_for_precip = np.clip(
+            state.midlevel_temperature - _midlevel_exchange_full,
+            150.0,
+            350.0,
+        ).astype(np.float32, copy=False)
+        if _upperlevel_exchange_coarse is not None:
+            if block_size > 1:
+                _upperlevel_exchange_full = _upsample_bilinear_many(
+                    {"exchange": _upperlevel_exchange_coarse}, H, W, block_size
+                )["exchange"]
+            else:
+                _upperlevel_exchange_full = _upperlevel_exchange_coarse
+            upperlevel_temperature_for_precip = np.clip(
+                state.upperlevel_temperature - _upperlevel_exchange_full,
+                150.0,
+                350.0,
+            ).astype(np.float32, copy=False)
     
     # ------------------------------------------------------
     # Jet stream dynamics: persistent meander index + blocking events
@@ -2019,6 +2239,19 @@ def simulate_step(
     # MONTHLY/ANNUAL runs). Wind still evolves prognostically when no wind
     # exists yet (first step).
     _do_evolve_wind = bool(update_wind) or state.wind_u is None or state.wind_v is None
+    # The legacy one-level wind path has a prescribed 3-cell zonal-mean
+    # meridional target.  A native pressure-coordinate balanced core must not
+    # simultaneously be forced toward those 6--10 m/s empirical cells: its
+    # overturning has to arise from the resolved pressure/temperature state.
+    # Keep the historical target untouched outside this explicitly gated path.
+    _native_balanced_momentum_active = bool(
+        pp.enable_native_balanced_pressure_dynamics
+        and pp.enable_three_level_pressure_column
+        and _two_layer_thermo_active
+    )
+    _wind_cell_relax_days = (
+        0.0 if _native_balanced_momentum_active else float(wind_cell_relax_days)
+    )
 
     # Opt-in (PlanetParams.wind_prognostic_substep_days, default 0.0/off): when
     # the caller requested the diagnostic MONTHLY/ANNUAL wind (update_wind=
@@ -2093,13 +2326,13 @@ def simulate_step(
             time_days_end=float(new_total_days),
             damping=float(wind_damping),
             pgf_temp_scale=float(wind_pgf_temp_scale),
-            pgf_terrain_scale=float(wind_pgf_terrain_scale),
+            pgf_terrain_scale=float(wind_pgf_terrain_scale) * float(pp.wind_terrain_pgf_scale),
             drag_base=float(wind_drag_base),
             drag_elev_scale=float(wind_drag_elev_scale),
             vmax_clip=float(wind_vmax_clip),
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
-            cell_relax_days=float(wind_cell_relax_days),
+            cell_relax_days=_wind_cell_relax_days,
             planet_params=pp,
             jet_index_nh=jet_index_nh_new,
             jet_index_sh=jet_index_sh_new,
@@ -2158,13 +2391,13 @@ def simulate_step(
             time_days_end=float(new_total_days),
             damping=float(wind_damping),
             pgf_temp_scale=float(wind_pgf_temp_scale),
-            pgf_terrain_scale=float(wind_pgf_terrain_scale),
+            pgf_terrain_scale=float(wind_pgf_terrain_scale) * float(pp.wind_terrain_pgf_scale),
             drag_base=float(wind_drag_base),
             drag_elev_scale=float(wind_drag_elev_scale),
             vmax_clip=float(wind_vmax_clip),
             baroclinic_jet_amp=float(wind_baroclinic_jet_amp),
             baroclinic_mix=float(wind_baroclinic_mix),
-            cell_relax_days=float(wind_cell_relax_days),
+            cell_relax_days=_wind_cell_relax_days,
             planet_params=pp,
             jet_index_nh=jet_index_nh_new,
             jet_index_sh=jet_index_sh_new,
@@ -2180,6 +2413,293 @@ def simulate_step(
             a = float(np.clip(wind_relax, 0.0, 1.0))
             u_full = (1.0 - a) * u_full + a * u_diag
             v_full = (1.0 - a) * v_full + a * v_diag
+
+    # Native three-level pressure-coordinate momentum.  The middle pressure
+    # level has an independent prognostic circulation, not a diagnostic mean
+    # of the surface and upper winds.  Its divergence closes both vapor
+    # exchange interfaces in generate_precipitation.
+    _three_level_midwind_active = (
+        _two_layer_thermo_active
+        and bool(pp.enable_three_level_pressure_column)
+    )
+    midlevel_wind_u_full = state.midlevel_wind_u
+    midlevel_wind_v_full = state.midlevel_wind_v
+    if _three_level_midwind_active:
+        _balanced_pressure_relaxation = (
+            float(np.clip(pp.native_balanced_pressure_relaxation, 0.0, 1.0))
+            if bool(pp.enable_native_balanced_pressure_dynamics)
+            else 0.0
+        )
+        _balanced_elevation_m = 1000.0 * elevation_to_alt_km(
+            state.elevation, max_elevation_km=float(pp.max_elevation_km),
+        )
+        _balanced_ageo_hours = float(
+            pp.native_balanced_ageostrophic_timescale_hours
+        )
+        def _balanced_target(level_temperature, level_pressure_pa):
+            _phi = pressure_level_geopotential(
+                _balanced_elevation_m,
+                level_temperature,
+                gravity_m_s2=float(pp.surface_gravity),
+                gas_constant_dry=float(pp.gas_constant_dry),
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                level_pressure_pa=float(level_pressure_pa),
+            )
+            return balanced_pressure_wind(
+                _phi,
+                radius_m=float(pp.radius_m),
+                sidereal_day_hours=float(pp.sidereal_day_hours),
+                hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+                ageostrophic_timescale_hours=_balanced_ageo_hours,
+            )
+
+        if _balanced_pressure_relaxation > 0.0:
+            _lower_balanced_temperature = (
+                state.air_temperature
+                if state.air_temperature is not None
+                and state.air_temperature.shape == u_full.shape
+                else state.temperature
+                if state.temperature is not None
+                and state.temperature.shape == u_full.shape
+                else _compute_T_base_ocean_full()
+            )
+            _lower_balanced = _balanced_target(
+                _lower_balanced_temperature,
+                pp.native_balanced_surface_pressure_pa,
+            )
+            u_full = (
+                (1.0 - _balanced_pressure_relaxation) * u_full
+                + _balanced_pressure_relaxation * _lower_balanced.u
+            ).astype(np.float32, copy=False)
+            v_full = (
+                (1.0 - _balanced_pressure_relaxation) * v_full
+                + _balanced_pressure_relaxation * _lower_balanced.v
+            ).astype(np.float32, copy=False)
+            _upper_balanced_temperature = (
+                upperlevel_temperature_for_precip
+                if upperlevel_temperature_for_precip is not None
+                and upperlevel_temperature_for_precip.shape == u2_full.shape
+                else state.air_temperature
+                if state.air_temperature is not None
+                and state.air_temperature.shape == u2_full.shape
+                else _compute_T_base_ocean_full()
+            )
+            _upper_balanced = _balanced_target(
+                _upper_balanced_temperature,
+                pp.three_level_thermal_wind_upper_pressure_pa,
+            )
+            u2_full = (
+                (1.0 - _balanced_pressure_relaxation) * u2_full
+                + _balanced_pressure_relaxation * _upper_balanced.u
+            ).astype(np.float32, copy=False)
+            v2_full = (
+                (1.0 - _balanced_pressure_relaxation) * v2_full
+                + _balanced_pressure_relaxation * _upper_balanced.v
+            ).astype(np.float32, copy=False)
+        _thermal_wind_relaxation = float(np.clip(
+            pp.three_level_balanced_thermal_wind_relaxation, 0.0, 1.0,
+        ))
+        if _thermal_wind_relaxation > 0.0:
+            _thermal_wind_temperature = (
+                state.air_temperature
+                if state.air_temperature is not None
+                and state.air_temperature.shape == u_full.shape
+                else state.temperature
+                if state.temperature is not None
+                and state.temperature.shape == u_full.shape
+                else _compute_T_base_ocean_full()
+            )
+            _thermal_wind_target = balanced_thermal_wind_u(
+                u_full,
+                _thermal_wind_temperature,
+                radius_m=float(pp.radius_m),
+                sidereal_day_hours=float(pp.sidereal_day_hours),
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                upper_pressure_pa=float(pp.three_level_thermal_wind_upper_pressure_pa),
+                hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+                gas_constant_dry=float(pp.gas_constant_dry),
+            )
+            u2_full = (
+                (1.0 - _thermal_wind_relaxation) * u2_full
+                + _thermal_wind_relaxation * _thermal_wind_target
+            ).astype(np.float32, copy=False)
+        _mid_wind_reference_u = 0.5 * (u_full + u2_full)
+        _mid_wind_reference_v = 0.5 * (v_full + v2_full)
+        if (
+            midlevel_wind_u_full is None
+            or midlevel_wind_v_full is None
+            or midlevel_wind_u_full.shape != u_full.shape
+            or midlevel_wind_v_full.shape != v_full.shape
+        ):
+            midlevel_wind_u_full = _mid_wind_reference_u
+            midlevel_wind_v_full = _mid_wind_reference_v
+
+        _mid_wind_temperature = midlevel_temperature_for_precip
+        if (
+            _mid_wind_temperature is None
+            or _mid_wind_temperature.shape != u_full.shape
+        ):
+            _mid_wind_temperature = (
+                state.air_temperature
+                if state.air_temperature is not None
+                and state.air_temperature.shape == u_full.shape
+                else state.temperature
+                if state.temperature is not None
+                and state.temperature.shape == u_full.shape
+                else _compute_T_base_ocean_full()
+            )
+        midlevel_wind_u_full, midlevel_wind_v_full = _evolve_middle_wind_substepped(
+            midlevel_wind_u_full,
+            midlevel_wind_v_full,
+            temperature=_mid_wind_temperature,
+            dt_days_total=days,
+            substep_days=_wind_substep_days if _prognostic_gate_active else 0.0,
+            pgf_temp_scale=float(wind_pgf_temp_scale),
+            upper_pgf_amp=(
+                float(pp.wind_upper_pgf_amp)
+                * float(pp.three_level_mid_wind_pgf_fraction)
+            ),
+            damping_rate=float(pp.three_level_mid_wind_damping),
+            vmax_clip=float(wind_vmax_clip),
+            planet_params=pp,
+            hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+        )
+        _mid_wind_relaxation = float(np.clip(
+            pp.three_level_mid_wind_relaxation, 0.0, 1.0
+        ))
+        midlevel_wind_u_full = (
+            (1.0 - _mid_wind_relaxation) * midlevel_wind_u_full
+            + _mid_wind_relaxation * _mid_wind_reference_u
+        ).astype(np.float32, copy=False)
+        midlevel_wind_v_full = (
+            (1.0 - _mid_wind_relaxation) * midlevel_wind_v_full
+            + _mid_wind_relaxation * _mid_wind_reference_v
+        ).astype(np.float32, copy=False)
+
+        if _balanced_pressure_relaxation > 0.0:
+            _mid_balanced_temperature = (
+                midlevel_temperature_for_precip
+                if midlevel_temperature_for_precip is not None
+                and midlevel_temperature_for_precip.shape == midlevel_wind_u_full.shape
+                else _compute_T_base_ocean_full()
+            )
+            _mid_balanced = _balanced_target(
+                _mid_balanced_temperature,
+                pp.native_balanced_mid_pressure_pa,
+            )
+            midlevel_wind_u_full = (
+                (1.0 - _balanced_pressure_relaxation) * midlevel_wind_u_full
+                + _balanced_pressure_relaxation * _mid_balanced.u
+            ).astype(np.float32, copy=False)
+            midlevel_wind_v_full = (
+                (1.0 - _balanced_pressure_relaxation) * midlevel_wind_v_full
+                + _balanced_pressure_relaxation * _mid_balanced.v
+            ).astype(np.float32, copy=False)
+
+        _overturning_speed = float(max(pp.native_balanced_overturning_speed_m_s, 0.0))
+        if (
+            bool(pp.enable_native_balanced_moist_static_energy_overturning)
+            and midlevel_temperature_for_precip is not None
+            and midlevel_temperature_for_precip.shape == u_full.shape
+        ):
+            _lower_for_mse = (
+                state.air_temperature
+                if state.air_temperature is not None
+                and state.air_temperature.shape == u_full.shape
+                else _compute_T_base_ocean_full()
+            )
+            _precip_for_mse = (
+                state.precipitation
+                if state.precipitation is not None
+                and state.precipitation.shape == u_full.shape
+                else None
+            )
+            _mse_radiative_target = (
+                _compute_T_toa_equilibrium_full()
+                if bool(pp.native_balanced_mse_use_toa_radiative_target)
+                else _compute_T_base_ocean_full()
+            )
+            _mse_overturning = moist_static_energy_overturning_speed(
+                _lower_for_mse,
+                midlevel_temperature_for_precip,
+                radiative_equilibrium_temperature_k=_mse_radiative_target,
+                precipitation_mm_day=_precip_for_mse,
+                radius_m=float(pp.radius_m),
+                hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+                layer_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                midlevel_height_m=float(pp.stability_condensation_reference_height_m),
+                latent_relaxation_days=float(pp.two_layer_midlevel_relaxation_days),
+                radiative_relaxation_days=float(pp.native_balanced_mse_radiative_relaxation_days),
+                max_speed_m_s=float(pp.native_balanced_mse_overturning_max_speed_m_s),
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                gravity_m_s2=float(pp.surface_gravity),
+                cp_dry_j_kg_k=float(pp.cp_dry),
+            )
+            _overturning_speed = _mse_overturning.speed_m_s
+        elif (
+            bool(pp.enable_native_balanced_diabatic_overturning)
+            and midlevel_temperature_for_precip is not None
+            and midlevel_temperature_for_precip.shape == u_full.shape
+        ):
+            _lower_for_diabatic = (
+                state.air_temperature
+                if state.air_temperature is not None
+                and state.air_temperature.shape == u_full.shape
+                else _compute_T_base_ocean_full()
+            )
+            _overturning_speed = diabatic_overturning_speed(
+                _lower_for_diabatic,
+                midlevel_temperature_for_precip,
+                radius_m=float(pp.radius_m),
+                hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+                layer_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                midlevel_height_m=float(pp.stability_condensation_reference_height_m),
+                relaxation_days=float(pp.two_layer_midlevel_relaxation_days),
+                max_speed_m_s=float(pp.native_balanced_diabatic_overturning_max_speed_m_s),
+            )
+        if _overturning_speed > 0.0:
+            _overturning_temperature = (
+                state.air_temperature
+                if state.air_temperature is not None
+                and state.air_temperature.shape == u_full.shape
+                else _compute_T_base_ocean_full()
+            )
+            _overturning = thermally_direct_overturning(
+                _overturning_temperature,
+                hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+                lower_branch_speed_m_s=_overturning_speed,
+            )
+            v_full = (v_full + _overturning.lower_v).astype(np.float32, copy=False)
+            midlevel_wind_v_full = (
+                midlevel_wind_v_full + _overturning.middle_v
+            ).astype(np.float32, copy=False)
+            v2_full = (v2_full + _overturning.upper_v).astype(np.float32, copy=False)
+
+        if bool(pp.enable_three_level_horizontal_mass_flux_closure):
+            _mass_closure = close_upper_mass_flux(
+                u_full,
+                v_full,
+                midlevel_wind_u_full,
+                midlevel_wind_v_full,
+                u2_full,
+                v2_full,
+                radius_m=float(pp.radius_m),
+                strength=float(np.clip(
+                    pp.three_level_horizontal_mass_flux_strength, 0.0, 1.0,
+                )),
+                  max_speed_m_s=float(
+                      pp.three_level_horizontal_mass_flux_max_speed_m_s,
+                  ),
+                  throughflow_max_speed_m_s=float(
+                      pp.three_level_horizontal_mass_flux_throughflow_max_speed_m_s,
+                  ),
+              )
+            u2_full = (u2_full + _mass_closure.upper_u_correction).astype(
+                np.float32, copy=False,
+            )
+            v2_full = (v2_full + _mass_closure.upper_v_correction).astype(
+                np.float32, copy=False,
+            )
 
     # Winds to couple into temperature evolution operate on the temperature grid (Hc,Wc).
     if block_size > 1:
@@ -2197,6 +2717,10 @@ def simulate_step(
     _group_c_in: dict[str, np.ndarray] = {}
     if state.humidity is not None:
         _group_c_in["humidity"] = state.humidity
+    if state.soil_moisture is not None:
+        _group_c_in["soil_moisture"] = state.soil_moisture
+    if state.soil_moisture_deep is not None:
+        _group_c_in["soil_moisture_deep"] = state.soil_moisture_deep
     if state.snow_depth is not None:
         _group_c_in["snow_depth"] = state.snow_depth
     if state.precipitation is not None:
@@ -2205,6 +2729,8 @@ def simulate_step(
         _group_c_in["biomass"] = state.vegetation_biomass
     _group_c_out = _coarsen_many(_group_c_in, Hc, Wc, block_size)
     humidity_coarse = _group_c_out.get("humidity")
+    soil_moisture_coarse = _group_c_out.get("soil_moisture")
+    soil_moisture_deep_coarse = _group_c_out.get("soil_moisture_deep")
     snow_depth_coarse = _group_c_out.get("snow_depth")
     precipitation_coarse = _group_c_out.get("precipitation")
     biomass_coarse = _group_c_out.get("biomass")
@@ -2251,10 +2777,16 @@ def simulate_step(
         _group_c2_in["T_deep"] = state.T_deep_ocean
     if state.cloud_water is not None:
         _group_c2_in["cloud_water"] = state.cloud_water
+    if _two_layer_thermo_active and state.atmospheric_condensate is not None:
+        _group_c2_in["midlevel_condensate"] = state.atmospheric_condensate
+    if state.land_deep_temperature is not None:
+        _group_c2_in["land_deep"] = state.land_deep_temperature
     _group_c2_out = _coarsen_many(_group_c2_in, Hc, Wc, block_size)
     cloud_cover_coarse = _group_c2_out.get("cloud_cover")
     T_deep_coarse = _group_c2_out.get("T_deep")
     cloud_water_coarse = _group_c2_out.get("cloud_water")
+    midlevel_condensate_coarse = _group_c2_out.get("midlevel_condensate")
+    land_deep_coarse = _group_c2_out.get("land_deep")
     # ice_thick_prev_coarse already computed above
 
     # Always track components for diagnostics (minimal overhead)
@@ -2276,6 +2808,8 @@ def simulate_step(
         epsilon_pole=eps_pole,
         ice_albedo_strength=ice_albedo_strength,
         humidity=humidity_coarse,
+        soil_moisture=soil_moisture_coarse,
+        soil_moisture_deep=soil_moisture_deep_coarse,
         track_components=track_components,
         precipitation=precipitation_coarse,
         vegetation_biomass=biomass_coarse,
@@ -2293,6 +2827,8 @@ def simulate_step(
         T_deep_ocean=T_deep_coarse,            # Feature 5: deep ocean layer
         ice_thickness=ice_thick_prev_coarse,   # Feature 6: thickness-dependent albedo
         prev_cloud_water=cloud_water_coarse,   # Feature: prognostic cloud water
+        midlevel_condensate=midlevel_condensate_coarse,
+        land_deep_temperature=land_deep_coarse,
         temperature_bases_for_day=_temperature_bases_for_day,
     )
     T_coarse = T_sst_coarse  # alias: T_coarse continues to mean T_sst going forward
@@ -2309,6 +2845,8 @@ def simulate_step(
                 # Scalar or already full resolution
                 temp_components_full[name] = field
         temp_components = temp_components_full
+
+    land_deep_full = temp_components.pop("_land_deep_temperature", None)
     
     if block_size > 1:
         _up_fields: dict[str, np.ndarray] = {"T": T_coarse, "cloud": cloud_c, "T_air": T_air_coarse_new}
@@ -2326,6 +2864,9 @@ def simulate_step(
         T_air_full = T_air_coarse_new
         T_deep_full = T_deep_coarse_new
         cloud_water_full = cloud_water_coarse_new
+
+    if land_deep_full is None:
+        land_deep_full = state.land_deep_temperature
 
     # Feature 5: initialize deep ocean on first step (SST - 15K, clamped to 271-285K).
     # Use the same value for land and ocean so coarsening never produces unphysical averages.
@@ -2347,7 +2888,13 @@ def simulate_step(
             _elev_p = _coarsen_elevation_cached(state.elevation, _Hcp, _Wcp, _pbs)
             # Batched (see `_coarsen_many`): T/u/v are unconditional, humidity/soil/cloud
             # are independently optional, all sharing the same (_Hcp, _Wcp, _pbs) grid.
-            _group_p_in: dict[str, np.ndarray] = {"T": T_full, "u": u_full, "v": v_full}
+            _group_p_in: dict[str, np.ndarray] = {
+                "T": T_full, "u": u_full, "v": v_full,
+                "u2": u2_full, "v2": v2_full,
+            }
+            if _three_level_midwind_active:
+                _group_p_in["u_mid"] = midlevel_wind_u_full
+                _group_p_in["v_mid"] = midlevel_wind_v_full
             if state.humidity is not None:
                 _group_p_in["hum"] = state.humidity
             if state.soil_moisture is not None:
@@ -2356,46 +2903,143 @@ def simulate_step(
                 _group_p_in["soil_deep"] = state.soil_moisture_deep
             if cloud_full is not None:
                 _group_p_in["cloud"] = cloud_full
+            if state.atmospheric_condensate is not None:
+                _group_p_in["condensate"] = state.atmospheric_condensate
+            if state.precipitating_hydrometeors is not None:
+                _group_p_in["hydrometeors"] = state.precipitating_hydrometeors
+            if midlevel_temperature_for_precip is not None:
+                _group_p_in["midlevel_temperature"] = midlevel_temperature_for_precip
+            if state.midlevel_humidity is not None:
+                _group_p_in["midlevel_humidity"] = state.midlevel_humidity
+            if upperlevel_temperature_for_precip is not None:
+                _group_p_in["upperlevel_temperature"] = upperlevel_temperature_for_precip
+            if state.upperlevel_humidity is not None:
+                _group_p_in["upperlevel_humidity"] = state.upperlevel_humidity
             _group_p_out = _coarsen_many(_group_p_in, _Hcp, _Wcp, _pbs)
             _T_p = _group_p_out["T"]
             _u_p = _group_p_out["u"]
             _v_p = _group_p_out["v"]
+            _u2_p = _group_p_out["u2"]
+            _v2_p = _group_p_out["v2"]
+            _umid_p = _group_p_out.get("u_mid")
+            _vmid_p = _group_p_out.get("v_mid")
             _hum_p = _group_p_out.get("hum")
             _soil_p = _group_p_out.get("soil")
             _soil_deep_p = _group_p_out.get("soil_deep")
             _cloud_p = _group_p_out.get("cloud")
-            P_p, hum_p_next, soil_p_next, soil_deep_p_next = _generate_precipitation_substepped(
+            _condensate_p = _group_p_out.get("condensate")
+            _hydrometeors_p = _group_p_out.get("hydrometeors")
+            _midlevel_temperature_p = _group_p_out.get("midlevel_temperature")
+            _midlevel_humidity_p = _group_p_out.get("midlevel_humidity")
+            _upperlevel_temperature_p = _group_p_out.get("upperlevel_temperature")
+            _upperlevel_humidity_p = _group_p_out.get("upperlevel_humidity")
+            P_p, hum_p_next, soil_p_next, soil_deep_p_next, condensate_p_next, midlevel_temperature_p_next, midlevel_humidity_p_next, upperlevel_temperature_p_next, upperlevel_humidity_p_next, hydrometeors_p_next = _generate_precipitation_substepped(
                 _Hcp, _Wcp, _elev_p,
                 temperature=_T_p, wind_u=_u_p, wind_v=_v_p,
+                wind_u_aloft=_u2_p, wind_v_aloft=_v2_p,
+                wind_u_midlevel=_umid_p, wind_v_midlevel=_vmid_p,
                 humidity=_hum_p, soil_moisture=_soil_p, soil_moisture_deep=_soil_deep_p,
+                condensate=_condensate_p,
+                precipitating_hydrometeors=_hydrometeors_p,
+                midlevel_temperature=_midlevel_temperature_p,
+                midlevel_humidity=_midlevel_humidity_p,
+                upperlevel_temperature=_upperlevel_temperature_p,
+                upperlevel_humidity=_upperlevel_humidity_p,
                 cloud_fraction=_cloud_p,
                 day_of_year=new_day, dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
                 planet_params=pp,
+                debug_fields=_precipitation_diagnostics,
             )
             _up = _upsample_bilinear_many(
-                {"P": P_p, "q": hum_p_next, "soil": soil_p_next, "soil_deep": soil_deep_p_next}, H, W, _pbs
+                {"P": P_p, "q": hum_p_next, "soil": soil_p_next, "soil_deep": soil_deep_p_next, "condensate": condensate_p_next, "hydrometeors": hydrometeors_p_next, "midlevel_temperature": midlevel_temperature_p_next, "midlevel_humidity": midlevel_humidity_p_next, "upperlevel_temperature": upperlevel_temperature_p_next, "upperlevel_humidity": upperlevel_humidity_p_next}, H, W, _pbs
             )
             P_full: np.ndarray | None = _up["P"]
             humidity_next: np.ndarray | None = _up["q"]
             soil_next: np.ndarray | None = _up["soil"]
             soil_deep_next: np.ndarray | None = _up["soil_deep"]
+            condensate_next: np.ndarray | None = _up["condensate"]
+            hydrometeors_next: np.ndarray | None = _up["hydrometeors"]
+            midlevel_temperature_next: np.ndarray | None = _up["midlevel_temperature"]
+            midlevel_humidity_next: np.ndarray | None = _up["midlevel_humidity"]
+            upperlevel_temperature_next: np.ndarray | None = _up["upperlevel_temperature"]
+            upperlevel_humidity_next: np.ndarray | None = _up["upperlevel_humidity"]
         else:
-            P_full, humidity_next, soil_next, soil_deep_next = _generate_precipitation_substepped(
+            P_full, humidity_next, soil_next, soil_deep_next, condensate_next, midlevel_temperature_next, midlevel_humidity_next, upperlevel_temperature_next, upperlevel_humidity_next, hydrometeors_next = _generate_precipitation_substepped(
                 H, W, state.elevation,
                 temperature=T_full, wind_u=u_full, wind_v=v_full,
+                wind_u_aloft=u2_full, wind_v_aloft=v2_full,
+                wind_u_midlevel=(
+                    midlevel_wind_u_full if _three_level_midwind_active else None
+                ),
+                wind_v_midlevel=(
+                    midlevel_wind_v_full if _three_level_midwind_active else None
+                ),
                 humidity=state.humidity, soil_moisture=state.soil_moisture,
                 soil_moisture_deep=state.soil_moisture_deep,
+                condensate=state.atmospheric_condensate,
+                precipitating_hydrometeors=state.precipitating_hydrometeors,
+                midlevel_temperature=midlevel_temperature_for_precip,
+                midlevel_humidity=state.midlevel_humidity,
+                upperlevel_temperature=upperlevel_temperature_for_precip,
+                upperlevel_humidity=state.upperlevel_humidity,
                 cloud_fraction=cloud_full,
                 day_of_year=new_day, dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
                 planet_params=pp,
+                debug_fields=_precipitation_diagnostics,
             )
     else:
         P_full = None
         humidity_next = None
         soil_next = None
         soil_deep_next = None
+        condensate_next = None
+        midlevel_temperature_next = None
+        midlevel_humidity_next = None
+        upperlevel_temperature_next = None
+        upperlevel_humidity_next = None
+        hydrometeors_next = None
+
+    omega_lower_mid_full = (
+        None if _precipitation_diagnostics is None
+        else _precipitation_diagnostics.get("midlevel_omega_pa_s")
+    )
+    omega_mid_upper_full = (
+        None if _precipitation_diagnostics is None
+        else _precipitation_diagnostics.get("upperlevel_omega_pa_s")
+    )
+    if state.elevation is not None and _pbs > 1:
+        _omega_fields = {
+            name: np.asarray(value)
+            for name, value in {
+                "lower": omega_lower_mid_full,
+                "upper": omega_mid_upper_full,
+            }.items()
+            if value is not None and np.asarray(value).shape == (_Hcp, _Wcp)
+        }
+        if _omega_fields:
+            _omega_full = _upsample_bilinear_many(_omega_fields, H, W, _pbs)
+            omega_lower_mid_full = _omega_full.get("lower", omega_lower_mid_full)
+            omega_mid_upper_full = _omega_full.get("upper", omega_mid_upper_full)
+    if not _three_level_midwind_active:
+        omega_lower_mid_full = None
+        omega_mid_upper_full = None
+
+    # Preserve the historical state representation exactly while the new
+    # closure is gated off; a zero array is not equivalent to an absent
+    # reservoir for persistence/golden-state comparisons.
+    if not pp.enable_prognostic_condensate:
+        condensate_next = state.atmospheric_condensate
+        hydrometeors_next = state.precipitating_hydrometeors
+    if not pp.enable_two_layer_convective_adjustment:
+        midlevel_temperature_next = state.midlevel_temperature
+        midlevel_humidity_next = state.midlevel_humidity
+    if not pp.enable_three_level_pressure_column:
+        upperlevel_temperature_next = state.upperlevel_temperature
+        upperlevel_humidity_next = state.upperlevel_humidity
+        midlevel_wind_u_full = state.midlevel_wind_u
+        midlevel_wind_v_full = state.midlevel_wind_v
 
     if pp.enable_surface_hydrology and P_full is not None and soil_next is not None:
         from hydrology import route_surface_water
@@ -2797,6 +3441,13 @@ def simulate_step(
         soil_moisture_deep=soil_deep_next,
         cloud_cover=cloud_full,
         cloud_water=cloud_water_full,
+        atmospheric_condensate=condensate_next,
+        precipitating_hydrometeors=hydrometeors_next,
+        land_deep_temperature=land_deep_full,
+        midlevel_temperature=midlevel_temperature_next,
+        midlevel_humidity=midlevel_humidity_next,
+        upperlevel_temperature=upperlevel_temperature_next,
+        upperlevel_humidity=upperlevel_humidity_next,
         snow_depth=snow_depth_new,
         ice_cover=ice_full,
         co2_atmosphere=co2_atm_new,
@@ -2836,6 +3487,12 @@ def simulate_step(
         # Feature 8: 1.5-layer atmosphere upper-level wind
         wind_u_aloft=u2_full,
         wind_v_aloft=v2_full,
+        # Native pressure-column middle-level circulation (gated; old saves
+        # retain ``None`` while the experimental path is disabled).
+        midlevel_wind_u=midlevel_wind_u_full,
+        midlevel_wind_v=midlevel_wind_v_full,
+        omega_lower_mid_pa_s=omega_lower_mid_full,
+        omega_mid_upper_pa_s=omega_mid_upper_full,
         # Preserve the scenario baseline; `pp` may be a time-varying effective
         # Milankovitch snapshot and must not become the next cycle's baseline.
         planet_params=base_pp,
@@ -2927,6 +3584,8 @@ def _evolve_temperature(
     epsilon_pole: float = 0.50,
     ice_albedo_strength: float = 1.0,
     humidity: np.ndarray | None = None,
+    soil_moisture: np.ndarray | None = None,
+    soil_moisture_deep: np.ndarray | None = None,
     track_components: bool = False,
     precipitation: np.ndarray | None = None,
     vegetation_biomass: np.ndarray | None = None,
@@ -2941,6 +3600,8 @@ def _evolve_temperature(
     T_deep_ocean: np.ndarray | None = None,       # Feature 5: deep ocean layer
     ice_thickness: np.ndarray | None = None,      # Feature 6: thickness-dependent albedo
     prev_cloud_water: np.ndarray | None = None,   # Feature: prognostic cloud water
+    midlevel_condensate: np.ndarray | None = None,
+    land_deep_temperature: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray | None, np.ndarray | None]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -2989,6 +3650,7 @@ def _evolve_temperature(
     #        Advected by wind, diffused, and coupled to T_sst through surface exchange.
     T_sst = T_prev.copy().astype(np.float32, copy=False)
     T_air = (T_air_prev.copy() if T_air_prev is not None else T_prev.copy()).astype(np.float32, copy=False)
+    land_deep_out: np.ndarray | None = None
 
     # === PASS 1: T_air dynamics — advection, diffusion, surface exchange ===
     lat_1d = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
@@ -3226,6 +3888,41 @@ def _evolve_temperature(
             0.0, 1.0
         ).astype(np.float32, copy=False)
 
+    # The experimental vertical closure carries suspended condensate in its
+    # midlevel reservoir.  Feed that *actual persistent mass* into cloud
+    # fraction before radiative terms are diagnosed, rather than asking an
+    # unrelated RH proxy to stand in for anvil/stratiform cloud.  It remains
+    # gated, so default cloud behavior is exactly unchanged.
+    if (
+        bool(_pp.enable_prognostic_column_water)
+        and bool(_pp.enable_stability_aware_condensation)
+        and bool(_pp.enable_two_layer_convective_adjustment)
+        and midlevel_condensate is not None
+    ):
+        _midlevel_condensate = np.asarray(midlevel_condensate, dtype=np.float32)
+        if _midlevel_condensate.shape != cloud_fraction.shape:
+            raise ValueError("midlevel_condensate must match temperature grid")
+        # Bulk condensate contains both suspended cloud water and falling
+        # hydrometeors.  When the experimental partition is active, only the
+        # bounded suspended portion participates in optical cloud cover; the
+        # remaining mass stays in the same conserved fallout reservoir.
+        if bool(_pp.enable_cloud_precipitating_condensate_partition):
+            _midlevel_condensate = np.minimum(
+                _midlevel_condensate,
+                float(max(_pp.cloud_optical_condensate_cap_q, 1e-8)),
+            )
+        _condensate_cloud = np.clip(
+            _midlevel_condensate / float(_pp.two_layer_cloud_reference_q),
+            0.0,
+            1.0,
+        )
+        _condensate_cloud = float(_pp.two_layer_cloud_radiative_weight) * _condensate_cloud
+        cloud_fraction = np.clip(
+            1.0 - (1.0 - cloud_fraction) * (1.0 - _condensate_cloud),
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+
     # Albedo (with vegetation feedback - Phase 4)
     # Ocean: 0.06, Sea Ice: 0.75, Snow: 0.8, Cloud: 0.5
     # Land albedo now depends on vegetation/biome type
@@ -3412,7 +4109,7 @@ def _evolve_temperature(
         T_sst = (T_sst - evap_cooling * float(days)).astype(np.float32, copy=False)
     
     # --- Land surface blend toward seasonal baseline ---
-    if T_base_land is not None:
+    if T_base_land is not None and not bool(_pp.enable_force_restore_land):
         T_base_land = T_base_land - lapse_rate * alt_km
         # This is the land's *only* thermal inertia, and 0.2 is a fraction per
         # CALL rather than per day -- so its effective time constant is set by
@@ -3435,6 +4132,79 @@ def _evolve_temperature(
             _land_rate = 0.2
         land_blend = np.where(land_mask, _land_rate, 0.0)
         T_sst = ((1.0 - land_blend) * T_sst + land_blend * T_base_land).astype(np.float32, copy=False)
+
+    # --- Gated prognostic land surface-energy closure ---
+    # The baseline branch above supplies the calibrated seasonal large-scale
+    # forcing. This optional tendency adds the missing local closure: net
+    # radiation is partitioned between sensible and latent heat, then stored in
+    # a finite active land layer. It distinguishes dry/hot land from humid or
+    # windy land at the same latitude without changing the default path.
+    if bool(_pp.enable_land_surface_energy) and not bool(_pp.enable_force_restore_land):
+        if wind_u is not None and wind_v is not None and humidity is not None:
+            wind_speed_land = np.sqrt(wind_u**2 + wind_v**2)
+            T_c_land = np.clip(T_sst - 273.15, -60.0, 60.0)
+            es_land = 6.112 * np.exp(17.67 * T_c_land / (T_c_land + 243.5))
+            qsat_land = np.clip(
+                0.622 * es_land / (_pp.surface_pressure_pa / 100.0), 1e-6, 0.035
+            )
+            vapor_deficit = np.maximum(0.0, qsat_land - humidity)
+            rho_air = 1.2
+            bulk_exchange = 1.3e-3
+            sensible_flux = (
+                rho_air * float(_pp.cp_dry) * bulk_exchange * wind_speed_land * (T_sst - T_air)
+            )
+            latent_flux = (
+                rho_air * 2.5e6 * bulk_exchange * wind_speed_land * vapor_deficit
+            )
+            net_land_flux = R_net - sensible_flux - latent_flux
+            heat_capacity = max(float(_pp.land_surface_heat_capacity_j_m2_k), 1.0e4)
+            land_tendency = np.clip(
+                net_land_flux * float(days) * 86400.0 / heat_capacity,
+                -6.0,
+                6.0,
+            )
+            T_sst = (
+                T_sst
+                + land_mask.astype(np.float32)
+                * float(_pp.land_surface_energy_strength)
+                * land_tendency
+            ).astype(np.float32, copy=False)
+
+    # --- Gated force-restore / Penman--Monteith replacement path ---
+    # This path is intentionally mutually exclusive with the legacy seasonal
+    # baseline blend and cap.  It is an A/B-able replacement, not another term
+    # calibrated around mechanisms it is meant to retire.
+    if bool(_pp.enable_force_restore_land) and float(days) > 0.0:
+        from land_surface import force_restore_penman_monteith
+
+        soil_for_land = (
+            np.full_like(T_sst, 0.55, dtype=np.float32)
+            if soil_moisture is None else np.clip(soil_moisture, 0.0, 1.0)
+        )
+        # The slow/root-zone bucket (`state.soil_moisture_deep`) was previously
+        # not threaded into this call at all, so the deep reservoir's own
+        # thermal properties and the dry-resistance term never saw it -- see
+        # `land_surface.force_restore_penman_monteith`'s moisture-scaled heat
+        # capacity and root-zone resistance blend. `None` here falls back to
+        # the shallow bucket inside that function, reproducing the old
+        # behaviour exactly when the deep bucket is unavailable (e.g. before
+        # it has spun up).
+        soil_deep_for_land = (
+            None if soil_moisture_deep is None else np.clip(soil_moisture_deep, 0.0, 1.0)
+        )
+        wind_for_land = np.sqrt(u * u + v * v)
+        land_step = force_restore_penman_monteith(
+            T_sst, T_air, land_deep_temperature, soil_for_land, wind_for_land,
+            R_net, land_mask, dt_days=float(days),
+            surface_heat_capacity_j_m2_k=float(_pp.land_surface_heat_capacity_j_m2_k),
+            deep_heat_capacity_j_m2_k=float(_pp.land_deep_heat_capacity_j_m2_k),
+            restore_days=float(_pp.land_force_restore_days),
+            surface_resistance_min_s_m=float(_pp.land_surface_resistance_min_s_m),
+            surface_resistance_dry_s_m=float(_pp.land_surface_resistance_dry_s_m),
+            soil_moisture_deep=soil_deep_for_land,
+        )
+        T_sst = land_step.temperature
+        land_deep_out = land_step.deep_temperature
 
     # --- Equal-and-opposite air–surface sensible heat exchange (OCEAN ONLY) ---
     # The land branch of `k_couple` was 0.25 until 2026-07-25. Combined with
@@ -3639,6 +4409,13 @@ def _evolve_temperature(
 
     # Track component contributions
     components = {}
+    if land_deep_out is not None:
+        # Private transport channel; simulate_step removes it before exposing
+        # public temperature diagnostics, preserving this function's API.
+        components["_land_deep_temperature"] = land_deep_out
+        if track_components:
+            components["land_latent_heat_w_m2"] = land_step.latent_heat_w_m2
+            components["land_sensible_heat_w_m2"] = land_step.sensible_heat_w_m2
     if track_components:
         components['advection'] = T_air - T_before_advection  # type: ignore[operator]
         components['diffusion'] = T_air - T_before_diffusion  # type: ignore[operator]
