@@ -708,13 +708,30 @@ def summarize_real_terrain_climate(
                     surface_pressure_pa=float(planet_params.surface_pressure_pa),
                     level_pressure_pa=float(planet_params.three_level_thermal_wind_upper_pressure_pa),
                 )
+        # Section 17 (PRIOR_ART_IMPLEMENTATION_PLAN.md): the three-level path's
+        # upper level is now decoupled from the shared, always-on jet-stream
+        # kernel (state.wind_u_aloft/wind_v_aloft). Score the independent
+        # state whenever it has been populated (i.e. the three-level gate has
+        # been active), so the transport/jet diagnostics that motivated this
+        # investigation measure the level that the three-level physics
+        # actually evolves. Falls back to the shared kernel exactly as before
+        # for states that never ran the three-level path (state.upperlevel_wind_u
+        # is None), so legacy/two-layer-only runs are unaffected.
         circulation = circulation_scorecard(
             state.wind_u,
             state.wind_v,
             mid_u=state.midlevel_wind_u,
             mid_v=state.midlevel_wind_v,
-            upper_u=state.wind_u_aloft,
-            upper_v=state.wind_v_aloft,
+            upper_u=(
+                state.upperlevel_wind_u
+                if state.upperlevel_wind_u is not None
+                else state.wind_u_aloft
+            ),
+            upper_v=(
+                state.upperlevel_wind_v
+                if state.upperlevel_wind_v is not None
+                else state.wind_v_aloft
+            ),
             omega_lower_mid_pa_s=state.omega_lower_mid_pa_s,
             omega_mid_upper_pa_s=state.omega_mid_upper_pa_s,
             temperature_k=mean_temperature_k,

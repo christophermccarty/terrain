@@ -1,0 +1,332 @@
+{
+  "ocean_damping0.05": {
+    "cross_equatorial_total_energy_transport_pw": -17.168940562523844,
+    "global_precip_mm_day": 2.633876164865537,
+    "koppen_class_accuracy": 0.24125158709327552,
+    "koppen_group_accuracy": 0.5623146350636627,
+    "reference_error_score": 0.8599871234393127,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -36.5625
+    }
+  },
+  "ocean_damping0.08": {
+    "cross_equatorial_total_energy_transport_pw": -27.863172110310988,
+    "global_precip_mm_day": 2.634780455429557,
+    "koppen_class_accuracy": 0.22596004477022766,
+    "koppen_group_accuracy": 0.5682817795546173,
+    "reference_error_score": 0.8730272942299327,
+    "upper_hadley_edge_deg": {
+      "nh_deg": 18.6692023478615,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -59.0625
+    }
+  },
+  "ocean_damping0.15": {
+    "cross_equatorial_total_energy_transport_pw": -19.967968863245282,
+    "global_precip_mm_day": 2.6438958436889597,
+    "koppen_class_accuracy": 0.23228140424772437,
+    "koppen_group_accuracy": 0.5676118065588883,
+    "reference_error_score": 0.6935532085696463,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -53.4375
+    }
+  },
+  "ocean_damping0.25": {
+    "cross_equatorial_total_energy_transport_pw": -16.462785225186387,
+    "global_precip_mm_day": 2.6403738352049224,
+    "koppen_class_accuracy": 0.22893051585079827,
+    "koppen_group_accuracy": 0.5827222272084995,
+    "reference_error_score": 0.8695558091717608,
+    "upper_hadley_edge_deg": {
+      "nh_deg": 13.550809129614173,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -36.5625
+    }
+  },
+  "ocean_damping0.4": {
+    "cross_equatorial_total_energy_transport_pw": -16.334528409008115,
+    "global_precip_mm_day": 2.6320111843787464,
+    "koppen_class_accuracy": 0.23129867393183898,
+    "koppen_group_accuracy": 0.5631472814314733,
+    "reference_error_score": 0.7884429657651915,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -36.5625
+    }
+  },
+  "ocean_pgf_fraction0.1": {
+    "cross_equatorial_total_energy_transport_pw": -14.647868558190149,
+    "global_precip_mm_day": 2.5645864343403852,
+    "koppen_class_accuracy": 0.2676799513588313,
+    "koppen_group_accuracy": 0.6272871167263183,
+    "reference_error_score": 0.9325307443853902,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 19.6875,
+      "sh_deg": -36.5625
+    }
+  },
+  "ocean_pgf_fraction0.25": {
+    "cross_equatorial_total_energy_transport_pw": -11.670921480270707,
+    "global_precip_mm_day": 2.5901782813751697,
+    "koppen_class_accuracy": 0.2575384483684307,
+    "koppen_group_accuracy": 0.5976516319913727,
+    "reference_error_score": 1.1055301976425613,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 19.6875,
+      "sh_deg": -42.1875
+    }
+  },
+  "ocean_pgf_fraction0.4": {
+    "cross_equatorial_total_energy_transport_pw": -21.767702800847985,
+    "global_precip_mm_day": 2.5924909733303085,
+    "koppen_class_accuracy": 0.22856520109033174,
+    "koppen_group_accuracy": 0.5855331653377183,
+    "reference_error_score": 0.9473085064612199,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 19.6875,
+      "sh_deg": -47.8125
+    }
+  },
+  "ocean_pgf_fraction0.55": {
+    "cross_equatorial_total_energy_transport_pw": -28.768933814269182,
+    "global_precip_mm_day": 2.621912082046966,
+    "koppen_class_accuracy": 0.24532502310028348,
+    "koppen_group_accuracy": 0.5817380987701817,
+    "reference_error_score": 0.5617986843154325,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 36.5625,
+      "sh_deg": -64.6875
+    }
+  },
+  "ocean_pgf_fraction0.7": {
+    "cross_equatorial_total_energy_transport_pw": -11.878076819383104,
+    "global_precip_mm_day": 2.633276474677783,
+    "koppen_class_accuracy": 0.2296350744373704,
+    "koppen_group_accuracy": 0.572110813183781,
+    "reference_error_score": 1.0764613895074198,
+    "upper_hadley_edge_deg": {
+      "nh_deg": 18.284022778782045,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 36.5625,
+      "sh_deg": -53.4375
+    }
+  },
+  "ocean_pgf_fraction1.0": {
+    "cross_equatorial_total_energy_transport_pw": -27.863172110310988,
+    "global_precip_mm_day": 2.634780455429557,
+    "koppen_class_accuracy": 0.22596004477022766,
+    "koppen_group_accuracy": 0.5682817795546173,
+    "reference_error_score": 0.8730272942299327,
+    "upper_hadley_edge_deg": {
+      "nh_deg": 18.6692023478615,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -59.0625
+    }
+  },
+  "toa_damping0.05": {
+    "cross_equatorial_total_energy_transport_pw": -15.173177433229469,
+    "global_precip_mm_day": 2.6211071610046353,
+    "koppen_class_accuracy": 0.23671117047758716,
+    "koppen_group_accuracy": 0.5820400771036436,
+    "reference_error_score": 0.6927587896174435,
+    "upper_hadley_edge_deg": {
+      "nh_deg": 12.152365670073813,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -36.5625
+    }
+  },
+  "toa_damping0.08": {
+    "cross_equatorial_total_energy_transport_pw": -23.460687445797397,
+    "global_precip_mm_day": 2.6195065908218753,
+    "koppen_class_accuracy": 0.21946144042199264,
+    "koppen_group_accuracy": 0.5720336978756377,
+    "reference_error_score": 0.959941346608562,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -36.5625
+    }
+  },
+  "toa_damping0.15": {
+    "cross_equatorial_total_energy_transport_pw": -20.730923389821356,
+    "global_precip_mm_day": 2.6386000918112726,
+    "koppen_class_accuracy": 0.23760372308959934,
+    "koppen_group_accuracy": 0.5702956926543177,
+    "reference_error_score": 1.2991688244486288,
+    "upper_hadley_edge_deg": {
+      "nh_deg": 15.02750931156845,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -36.5625
+    }
+  },
+  "toa_damping0.25": {
+    "cross_equatorial_total_energy_transport_pw": -22.854212585526902,
+    "global_precip_mm_day": 2.6190809819506677,
+    "koppen_class_accuracy": 0.23378956827226569,
+    "koppen_group_accuracy": 0.5756947436781801,
+    "reference_error_score": 0.6654451439646689,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -42.1875
+    }
+  },
+  "toa_damping0.4": {
+    "cross_equatorial_total_energy_transport_pw": -15.708404982495221,
+    "global_precip_mm_day": 2.626502819732348,
+    "koppen_class_accuracy": 0.24349675348731983,
+    "koppen_group_accuracy": 0.5698365220214442,
+    "reference_error_score": 0.658153029351083,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -47.8125
+    }
+  },
+  "toa_pgf_fraction0.1": {
+    "cross_equatorial_total_energy_transport_pw": -9.363325776003506,
+    "global_precip_mm_day": 2.5706712712105033,
+    "koppen_class_accuracy": 0.28424772906289414,
+    "koppen_group_accuracy": 0.6394246505359553,
+    "reference_error_score": 1.1105440219654377,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 19.6875,
+      "sh_deg": -19.6875
+    }
+  },
+  "toa_pgf_fraction0.25": {
+    "cross_equatorial_total_energy_transport_pw": -16.655809757320498,
+    "global_precip_mm_day": 2.6059523643465505,
+    "koppen_class_accuracy": 0.2523156374414399,
+    "koppen_group_accuracy": 0.6125754790134982,
+    "reference_error_score": 0.9880629471906545,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 19.6875,
+      "sh_deg": -42.1875
+    }
+  },
+  "toa_pgf_fraction0.4": {
+    "cross_equatorial_total_energy_transport_pw": -18.689503278933813,
+    "global_precip_mm_day": 2.614322985684264,
+    "koppen_class_accuracy": 0.23467595220009496,
+    "koppen_group_accuracy": 0.5943853855055645,
+    "reference_error_score": 0.8528508902572295,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 19.6875,
+      "sh_deg": -42.1875
+    }
+  },
+  "toa_pgf_fraction0.55": {
+    "cross_equatorial_total_energy_transport_pw": -9.227851471517795,
+    "global_precip_mm_day": 2.6279567052988617,
+    "koppen_class_accuracy": 0.23676099699007055,
+    "koppen_group_accuracy": 0.5838125167022522,
+    "reference_error_score": 0.703933344336053,
+    "upper_hadley_edge_deg": {
+      "nh_deg": 12.797374419137345,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 36.5625,
+      "sh_deg": -42.1875
+    }
+  },
+  "toa_pgf_fraction0.7": {
+    "cross_equatorial_total_energy_transport_pw": -23.150556848949464,
+    "global_precip_mm_day": 2.633460487114076,
+    "koppen_class_accuracy": 0.23478547736219577,
+    "koppen_group_accuracy": 0.5871521352896998,
+    "reference_error_score": 0.7445907701726932,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -59.0625
+    }
+  },
+  "toa_pgf_fraction1.0": {
+    "cross_equatorial_total_energy_transport_pw": -23.460687445797397,
+    "global_precip_mm_day": 2.6195065908218753,
+    "koppen_class_accuracy": 0.21946144042199264,
+    "koppen_group_accuracy": 0.5720336978756377,
+    "reference_error_score": 0.959941346608562,
+    "upper_hadley_edge_deg": {
+      "nh_deg": NaN,
+      "sh_deg": NaN
+    },
+    "upper_jet_latitude_deg": {
+      "nh_deg": 30.9375,
+      "sh_deg": -36.5625
+    }
+  }
+}

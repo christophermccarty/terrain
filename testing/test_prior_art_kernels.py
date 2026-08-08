@@ -75,6 +75,97 @@ def test_force_restore_initializes_an_unknown_deep_reservoir_at_surface_equilibr
     np.testing.assert_allclose(step.deep_temperature, surface)
 
 
+def test_force_restore_soil_moisture_deep_none_matches_shallow_fallback():
+    """`soil_moisture_deep=None` must reproduce passing the shallow bucket twice.
+
+    This is the exact-backward-compatibility contract documented on
+    `force_restore_penman_monteith`: callers that predate the deep-bucket wiring
+    (or run before the deep bucket has spun up) get identical output.
+    """
+    shape = (4, 8)
+    common = dict(
+        surface_temperature_k=np.full(shape, 303.0),
+        air_temperature_k=np.full(shape, 295.0),
+        deep_temperature_k=np.full(shape, 296.0),
+        soil_moisture=np.full(shape, 0.3),
+        wind_speed_m_s=np.full(shape, 4.0),
+        net_radiation_w_m2=np.full(shape, 350.0),
+        land_mask=np.ones(shape, dtype=bool),
+        dt_days=1.0,
+        surface_heat_capacity_j_m2_k=1_500_000.0,
+        deep_heat_capacity_j_m2_k=12_000_000.0,
+        restore_days=30.0,
+        surface_resistance_min_s_m=70.0,
+        surface_resistance_dry_s_m=2_000.0,
+    )
+    implicit = force_restore_penman_monteith(**common)
+    explicit = force_restore_penman_monteith(soil_moisture_deep=np.full(shape, 0.3), **common)
+    np.testing.assert_array_equal(implicit.temperature, explicit.temperature)
+    np.testing.assert_array_equal(implicit.deep_temperature, explicit.deep_temperature)
+
+
+def test_force_restore_wetter_deep_soil_damps_the_deep_reservoir_step():
+    """Wetter deep soil should carry more thermal inertia (a smaller step).
+
+    Holds the shallow bucket, radiation, and restore flux conditions fixed and
+    only varies `soil_moisture_deep`; the moisture-scaled deep heat capacity
+    should make the wetter case's deep-temperature step smaller in magnitude.
+    """
+    shape = (3, 5)
+    common = dict(
+        surface_temperature_k=np.full(shape, 305.0),
+        air_temperature_k=np.full(shape, 295.0),
+        deep_temperature_k=np.full(shape, 290.0),
+        soil_moisture=np.full(shape, 0.4),
+        wind_speed_m_s=np.full(shape, 3.0),
+        net_radiation_w_m2=np.full(shape, 300.0),
+        land_mask=np.ones(shape, dtype=bool),
+        dt_days=5.0,
+        surface_heat_capacity_j_m2_k=1_500_000.0,
+        deep_heat_capacity_j_m2_k=12_000_000.0,
+        restore_days=30.0,
+        surface_resistance_min_s_m=70.0,
+        surface_resistance_dry_s_m=2_000.0,
+    )
+    dry_deep = force_restore_penman_monteith(soil_moisture_deep=np.full(shape, 0.05), **common)
+    wet_deep = force_restore_penman_monteith(soil_moisture_deep=np.full(shape, 0.95), **common)
+    dry_step = np.abs(dry_deep.deep_temperature - 290.0)
+    wet_step = np.abs(wet_deep.deep_temperature - 290.0)
+    assert float(np.mean(wet_step)) < float(np.mean(dry_step))
+
+
+def test_force_restore_root_zone_resistance_blends_shallow_and_deep():
+    """A dry shallow layer over wet deep soil should evapotranspire more than
+    dry-over-dry, because the resistance term is root-zone (blended), not
+    shallow-only.
+    """
+    shape = (2, 4)
+    common = dict(
+        surface_temperature_k=np.full(shape, 305.0),
+        air_temperature_k=np.full(shape, 295.0),
+        deep_temperature_k=np.full(shape, 296.0),
+        soil_moisture=np.full(shape, 0.05),
+        wind_speed_m_s=np.full(shape, 4.0),
+        net_radiation_w_m2=np.full(shape, 350.0),
+        land_mask=np.ones(shape, dtype=bool),
+        dt_days=1.0,
+        surface_heat_capacity_j_m2_k=1_500_000.0,
+        deep_heat_capacity_j_m2_k=12_000_000.0,
+        restore_days=30.0,
+        surface_resistance_min_s_m=70.0,
+        surface_resistance_dry_s_m=2_000.0,
+    )
+    dry_shallow_dry_deep = force_restore_penman_monteith(
+        soil_moisture_deep=np.full(shape, 0.05), **common
+    )
+    dry_shallow_wet_deep = force_restore_penman_monteith(
+        soil_moisture_deep=np.full(shape, 0.95), **common
+    )
+    assert float(np.mean(dry_shallow_wet_deep.latent_heat_w_m2)) > float(
+        np.mean(dry_shallow_dry_deep.latent_heat_w_m2)
+    )
+
+
 def test_column_water_transport_conserves_mass_without_sources_or_sinks():
     water = np.zeros((8, 16), dtype=np.float32)
     water[:, 4:8] = 20.0
@@ -539,6 +630,148 @@ def test_three_level_explicit_middle_wind_controls_both_pressure_interfaces():
         explicit_debug["upperlevel_omega_pa_s"],
         diagnostic_debug["upperlevel_omega_pa_s"],
     )
+
+
+# --------------------------------------------------------------------------
+# Section 17 (PRIOR_ART_IMPLEMENTATION_PLAN.md): the three-level path's own
+# independent upper-level wind, decoupled from the shared, always-on
+# jet-stream kernel (state.wind_u_aloft/wind_v_aloft).
+# --------------------------------------------------------------------------
+
+
+def _three_level_common_gates() -> dict:
+    return dict(
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+    )
+
+
+def test_upperlevel_wind_state_persists_when_three_level_active():
+    elevation = np.zeros((12, 24), dtype=np.float32)
+    planet = dataclasses.replace(EARTH, **_three_level_common_gates())
+    state = create_initial_state(elevation, planet_params=planet)
+    evolved, _ = simulate_step(state, days=1.0, planet_params=planet)
+    assert evolved.upperlevel_wind_u is not None
+    assert evolved.upperlevel_wind_v is not None
+    assert evolved.upperlevel_wind_u.shape == elevation.shape
+    assert evolved.upperlevel_wind_v.shape == elevation.shape
+    assert np.all(np.isfinite(evolved.upperlevel_wind_u))
+    assert np.all(np.isfinite(evolved.upperlevel_wind_v))
+
+
+def test_upperlevel_wind_state_remains_absent_without_three_level_gate():
+    elevation = np.zeros((12, 24), dtype=np.float32)
+    state = create_initial_state(elevation, planet_params=EARTH)
+    evolved, _ = simulate_step(state, days=1.0, planet_params=EARTH)
+    assert evolved.upperlevel_wind_u is None
+    assert evolved.upperlevel_wind_v is None
+
+
+def test_upperlevel_wind_diverges_from_shared_kernel_via_its_own_damping():
+    """The new independent upper wind must not merely mirror the shared kernel.
+
+    Even with every three-level "addition" (balanced blend, thermal-wind
+    relaxation, overturning, mass-flux closure) left at its default-off/zero
+    setting, the new state's own ``three_level_upper_wind_damping`` (0.08)
+    differs from the shared kernel's ``wind_upper_damping`` (0.05), so a
+    genuinely independent substep integration must diverge from the shared
+    field over a few days -- proving ``_evolve_upper_wind_substepped`` is not
+    silently a no-op or an alias for the shared field.
+    """
+    elevation = np.zeros((16, 32), dtype=np.float32)
+    planet = dataclasses.replace(
+        EARTH, **_three_level_common_gates(), wind_prognostic_substep_days=1.0,
+    )
+    state = create_initial_state(elevation, planet_params=planet)
+    evolved, _ = simulate_step(state, days=5.0, planet_params=planet)
+    assert not np.allclose(evolved.upperlevel_wind_u, evolved.wind_u_aloft)
+    assert not np.allclose(evolved.upperlevel_wind_v, evolved.wind_v_aloft)
+
+
+def test_shared_upper_wind_kernel_bit_identical_regardless_of_three_level_additions():
+    """The single most important regression test in this session's change set.
+
+    PRIOR_ART_IMPLEMENTATION_PLAN.md Section 16 found that the three-level
+    path's balanced-pressure blend, thermal-wind relaxation,
+    ``thermally_direct_overturning``'s upper branch, and
+    ``close_upper_mass_flux``'s correction were all being applied directly to
+    ``state.wind_u_aloft``/``wind_v_aloft`` -- the same shared, always-on,
+    separately-calibrated jet-stream kernel ``main.py``'s jet overlay renders
+    and ``evolve_wind``'s surface relaxation reads. Section 17 redirects
+    every one of those onto a new, independent ``upperlevel_wind_u/v`` state
+    instead.
+
+    This proves the redirection is complete: with the three-level gate on,
+    turning every one of those additions from off/zero to aggressively on
+    must leave ``wind_u_aloft``/``wind_v_aloft`` bit-for-bit unchanged, while
+    visibly perturbing the new independent state (a positive control proving
+    the additions are not simply inert in this configuration, so the
+    bit-identical result above is not a vacuous pass).
+    """
+    elevation = np.zeros((16, 32), dtype=np.float32)
+    common = _three_level_common_gates()
+    additions_off = dataclasses.replace(
+        EARTH,
+        **common,
+        enable_native_balanced_pressure_dynamics=False,
+        native_balanced_pressure_relaxation=0.0,
+        three_level_balanced_thermal_wind_relaxation=0.0,
+        enable_native_balanced_diabatic_overturning=False,
+        enable_native_balanced_moist_static_energy_overturning=False,
+        native_balanced_overturning_speed_m_s=0.0,
+        enable_three_level_horizontal_mass_flux_closure=False,
+    )
+    additions_on = dataclasses.replace(
+        EARTH,
+        **common,
+        enable_native_balanced_pressure_dynamics=True,
+        native_balanced_pressure_relaxation=0.5,
+        three_level_balanced_thermal_wind_relaxation=0.5,
+        enable_native_balanced_moist_static_energy_overturning=True,
+        native_balanced_mse_radiative_relaxation_days=10.0,
+        enable_three_level_horizontal_mass_flux_closure=True,
+    )
+    state = create_initial_state(elevation, planet_params=additions_off)
+    evolved_off, _ = simulate_step(state, days=1.0, planet_params=additions_off)
+    evolved_on, _ = simulate_step(state, days=1.0, planet_params=additions_on)
+
+    np.testing.assert_array_equal(evolved_off.wind_u_aloft, evolved_on.wind_u_aloft)
+    np.testing.assert_array_equal(evolved_off.wind_v_aloft, evolved_on.wind_v_aloft)
+
+    # Positive control: the additions are not simply inert in this
+    # configuration -- they visibly perturb the *independent* state.
+    assert not np.allclose(evolved_off.upperlevel_wind_u, evolved_on.upperlevel_wind_u)
+
+
+def test_shared_upper_wind_kernel_bit_identical_with_three_level_gate_off():
+    """Companion to the gate-on regression above: with the three-level gate
+    off entirely, `wind_u_aloft`/`wind_v_aloft` must be bit-identical to a
+    run where every Section 17-touched PlanetParams field is left at its
+    (irrelevant, since the gate is off) default -- i.e. toggling those fields
+    has zero effect on anything when `enable_three_level_pressure_column` is
+    False, which is the other half of "gate-off behavior is bit-identical to
+    before this change."
+    """
+    elevation = np.zeros((12, 24), dtype=np.float32)
+    state = create_initial_state(elevation, planet_params=EARTH)
+    baseline, _ = simulate_step(state, days=1.0, planet_params=EARTH)
+    perturbed_params = dataclasses.replace(
+        EARTH,
+        three_level_upper_wind_pgf_fraction=3.0,
+        three_level_upper_wind_damping=0.9,
+        enable_native_balanced_pressure_dynamics=True,
+        native_balanced_pressure_relaxation=0.9,
+        enable_three_level_horizontal_mass_flux_closure=True,
+    )
+    perturbed, _ = simulate_step(state, days=1.0, planet_params=perturbed_params)
+    np.testing.assert_array_equal(baseline.wind_u_aloft, perturbed.wind_u_aloft)
+    np.testing.assert_array_equal(baseline.wind_v_aloft, perturbed.wind_v_aloft)
+    assert perturbed.upperlevel_wind_u is None
+    assert perturbed.upperlevel_wind_v is None
 
 
 def test_three_level_diabatic_ascent_raises_tropical_condensation_driver():

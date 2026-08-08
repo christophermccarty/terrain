@@ -1536,6 +1536,49 @@ class PlanetParams:
     three_level_mid_wind_relaxation: float = 0.10
     """Per-step relaxation of middle wind toward adjacent resolved wind levels."""
 
+    three_level_upper_wind_pgf_fraction: float = 1.0
+    """Fraction of the shared upper-level thermal pressure forcing used for the
+    three-level path's own, independent upper wind (``PlanetState.upperlevel_wind_u/v``).
+
+    PRIOR_ART_IMPLEMENTATION_PLAN.md Section 16 found that the three-level
+    experimental path's excess cross-equatorial transport traces back to
+    `state.wind_u_aloft`/`wind_v_aloft` -- the same always-on, default-on
+    "1.5-layer atmosphere" jet-stream kernel (`atmosphere.evolve_wind_aloft`,
+    called unconditionally every step regardless of any experimental gate)
+    that `wind_upper_pgf_amp`/`wind_upper_damping` were extensively calibrated
+    against for real jet-latitude/speed skill. The three-level path's balanced-
+    pressure blend, thermal-wind relaxation, `thermally_direct_overturning`'s
+    upper branch, and `close_upper_mass_flux`'s correction were all applying
+    directly to that shared, already-validated field -- so any attempt to tame
+    its magnitude for the experimental path risked silently regressing the
+    default jet stream, since both consumers shared the exact same array and
+    constants. Section 17 decouples them: the three-level path now evolves its
+    own independent upper wind, using the same `evolve_wind_aloft` physics but
+    through this fraction (multiplying `wind_upper_pgf_amp`) and its own
+    `three_level_upper_wind_damping`, so it can be tuned freely without ever
+    touching the shared kernel. `1.0` reproduces the shared kernel's full PGF
+    amplitude as the starting point (the three-level additions previously
+    never scaled the raw forcing term itself, only blended/added onto its
+    result), mirroring how `three_level_mid_wind_pgf_fraction` already gives
+    the independent middle level its own fraction (0.55) of this same term.
+    """
+
+    three_level_upper_wind_damping: float = 0.08
+    """Rayleigh damping [day-1] of the three-level path's independent upper
+    wind (see `three_level_upper_wind_pgf_fraction` docstring for the full
+    rationale). Deliberately starts higher than the shared kernel's
+    `wind_upper_damping=0.05`: Section 16 measured the shared kernel's raw
+    meridional wind at 5-30x the ~1-3 m/s literature Hadley-cell value, and
+    both the project's own precedent (the independent middle level already
+    uses 0.08 against the shared level's 0.05) and that measurement point the
+    same direction -- stronger damping tames excess magnitude without
+    eliminating the underlying thermal-wind mechanism entirely. This matches
+    `three_level_mid_wind_damping` exactly as the most directly precedented
+    starting value; Section 17's own damping sweep
+    (`scripts/diagnose_resolved_wind_magnitude.py`) reports whether a
+    stronger value is warranted for this level specifically.
+    """
+
     enable_prognostic_column_water: bool = False
     """Use the experimental raw conserved-column-water precipitation path.
 

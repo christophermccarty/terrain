@@ -123,4 +123,11 @@ def test_pressure_column_gate_plumbs_closure_into_persisted_upper_wind():
     assert np.all(np.isfinite(closed.wind_u_aloft))
     assert np.all(np.isfinite(closed.omega_lower_mid_pa_s))
     assert np.all(np.isfinite(closed.omega_mid_upper_pa_s))
-    assert float(np.mean(np.abs(closed.wind_u_aloft - control.wind_u_aloft))) > 1e-3
+    # Section 17 (PRIOR_ART_IMPLEMENTATION_PLAN.md): the mass-flux closure's
+    # correction now applies to the three-level path's own independent
+    # upperlevel_wind_u/v state, not the shared, always-on jet-stream kernel
+    # -- so the gate must change the former and leave the latter
+    # bit-identical.
+    assert closed.upperlevel_wind_u is not None
+    assert float(np.mean(np.abs(closed.upperlevel_wind_u - control.upperlevel_wind_u))) > 1e-3
+    np.testing.assert_array_equal(closed.wind_u_aloft, control.wind_u_aloft)

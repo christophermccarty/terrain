@@ -110,7 +110,14 @@ def test_balanced_pressure_gate_changes_middle_and_upper_wind_states():
     assert balanced.wind_u_aloft is not None
     assert float(np.mean(np.abs(balanced.wind_u - control.wind_u))) > 1e-3
     assert float(np.mean(np.abs(balanced.midlevel_wind_u - control.midlevel_wind_u))) > 1e-3
-    assert float(np.mean(np.abs(balanced.wind_u_aloft - control.wind_u_aloft))) > 1e-3
+    # Section 17 (PRIOR_ART_IMPLEMENTATION_PLAN.md): the balanced-pressure
+    # blend's "upper" target now applies to the three-level path's own
+    # independent upperlevel_wind_u/v state, not the shared, always-on
+    # jet-stream kernel (wind_u_aloft/wind_v_aloft) -- so the gate must
+    # change the former and leave the latter bit-identical.
+    assert balanced.upperlevel_wind_u is not None
+    assert float(np.mean(np.abs(balanced.upperlevel_wind_u - control.upperlevel_wind_u))) > 1e-3
+    np.testing.assert_array_equal(balanced.wind_u_aloft, control.wind_u_aloft)
 
 
 def test_moist_static_energy_overturning_speed_is_zero_without_heating():

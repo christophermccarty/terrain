@@ -17,6 +17,15 @@ literature range for the Hadley cell's zonal-mean meridional wind (weak,
 typically on the order of 1-3 m/s despite carrying a large mass/energy flux
 over a deep pressure layer), to check whether the branch speeds feeding the
 transport diagnostic are simply too large for this configuration.
+
+Section 16 root-caused the upper-level excess to the shared, always-on
+`evolve_wind_aloft` jet-stream kernel (`state.wind_u_aloft`/`wind_v_aloft`),
+not to any of the three-level experimental gates. Section 17 decouples the
+three-level path's own upper wind into an independent state
+(`state.upperlevel_wind_u`/`upperlevel_wind_v`), so this script now also
+reports that new field (when present) alongside the shared kernel's, to
+compare the decoupled upper-level magnitude against the same literature
+target.
 """
 from __future__ import annotations
 
@@ -64,6 +73,25 @@ VARIANTS: dict[str, dict] = {
     ),
 }
 
+# Section 17 decoupled-upper-wind damping sweep: same full_heated configuration,
+# varying only three_level_upper_wind_damping to see how the new independent
+# state's magnitude responds. Result: transport stays in the same -15 to -23 PW
+# band non-monotonically and magnitude bounces 12.7-18.2 m/s across this range
+# -- damping alone is not the fix (see PRIOR_ART_IMPLEMENTATION_PLAN.md
+# Section 17).
+UPPER_DAMPING_SWEEP = (0.05, 0.08, 0.15, 0.25)
+
+# Follow-up: sweep three_level_upper_wind_pgf_fraction instead, at a fixed
+# damping (0.08, matching the midlevel wind's own precedent and this
+# sweep's own default). Unlike damping (which removes momentum after each
+# substep's Coriolis rotation has already redistributed it), the PGF
+# fraction scales the forcing itself before that rotation acts, so it is
+# the more direct lever on the equilibrium wind magnitude per
+# evolve_wind_aloft's own Euler-PGF-then-Coriolis-rotation mechanism.
+# 0.55 mirrors the existing independent middle wind's own fraction.
+UPPER_PGF_FRACTION_SWEEP = (0.1, 0.25, 0.4, 0.55, 0.7, 1.0)
+UPPER_PGF_FRACTION_FIXED_DAMPING = 0.08
+
 HADLEY_EDGE_DEG = 24.0
 
 
@@ -102,8 +130,13 @@ def _run_one(overrides: dict) -> dict:
             np.asarray(state.midlevel_wind_v, dtype=np.float64), latitude
         )
     if state.wind_v_aloft is not None:
-        results["upper_v"] = _tropical_stats(
+        results["upper_v_shared_jet_kernel"] = _tropical_stats(
             np.asarray(state.wind_v_aloft, dtype=np.float64), latitude
+        )
+    upperlevel_v = getattr(state, "upperlevel_wind_v", None)
+    if upperlevel_v is not None:
+        results["upper_v_decoupled_three_level"] = _tropical_stats(
+            np.asarray(upperlevel_v, dtype=np.float64), latitude
         )
     results["circulation"] = report["metrics"].get("circulation")
     return results
@@ -112,6 +145,24 @@ def _run_one(overrides: dict) -> dict:
 def main() -> int:
     all_results = {}
     for name, overrides in VARIANTS.items():
+        all_results[name] = _run_one(overrides)
+        print(f"--- {name} ---")
+        print(json.dumps(all_results[name], indent=2, default=str))
+
+    for damping in UPPER_DAMPING_SWEEP:
+        name = f"full_heated_upper_damping_{damping}"
+        overrides = dict(VARIANTS["full_heated"], three_level_upper_wind_damping=damping)
+        all_results[name] = _run_one(overrides)
+        print(f"--- {name} ---")
+        print(json.dumps(all_results[name], indent=2, default=str))
+
+    for pgf_fraction in UPPER_PGF_FRACTION_SWEEP:
+        name = f"full_heated_upper_pgf_fraction_{pgf_fraction}"
+        overrides = dict(
+            VARIANTS["full_heated"],
+            three_level_upper_wind_pgf_fraction=pgf_fraction,
+            three_level_upper_wind_damping=UPPER_PGF_FRACTION_FIXED_DAMPING,
+        )
         all_results[name] = _run_one(overrides)
         print(f"--- {name} ---")
         print(json.dumps(all_results[name], indent=2, default=str))
