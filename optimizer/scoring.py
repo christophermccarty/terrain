@@ -59,6 +59,27 @@ class ClimateMetrics:
     circulation_score: float = 0.0
     """Pre-computed diagnostics circulation score (from diagnostics.py)."""
 
+    cru_temp_correlation: float = 0.0
+    """Area-weighted monthly land-temperature correlation vs CRU TS v4.10 [-1..1].
+    Only populated when run_simulation is given monthly_climatology_path AND run on
+    real (not synthetic) terrain -- see that function's docstring. 0.0 (its default)
+    combined with ReferenceClimate's default weight=0.0 is an exact no-op."""
+
+    cru_temp_rmse: float = 0.0
+    """Area-weighted monthly land-temperature RMSE vs CRU TS v4.10 [K]. See
+    cru_temp_correlation for when this is actually populated vs. left at its inert
+    default."""
+
+    cru_precip_log_correlation: float = 0.0
+    """Area-weighted monthly land log-precipitation correlation vs CRU TS v4.10
+    [-1..1]. Log-space matches monthly_climatology.score_monthly_climatology's own
+    convention (arid-region errors stay measurable). See cru_temp_correlation for
+    when this is actually populated."""
+
+    cru_precip_log_rmse: float = 0.0
+    """Area-weighted monthly land log-precipitation RMSE vs CRU TS v4.10. See
+    cru_temp_correlation for when this is actually populated."""
+
     has_nan: bool = False
     """True if the simulation produced any NaN values."""
 
@@ -92,6 +113,21 @@ class ReferenceClimate:
     wind_midlat_mean: tuple[float, float, float] = (5.0, 11.0, 1.0)
     wind_itcz_conv: tuple[float, float, float] = (0.02, 10.0, 1.0)
     seasonal_amplitude_nh: tuple[float, float, float] = (28.0, 55.0, 1.0)
+
+    # CRU TS v4.10 real-reanalysis map-correlation targets. Default weight 0.0:
+    # an exact no-op for every existing sweep/config, matching this project's
+    # standing convention for real-but-not-yet-promoted mechanisms (see e.g.
+    # PlanetParams.moisture_advection_scale). Set weight > 0 (and pass
+    # run_simulation a real elevation + monthly_climatology_path) to fold
+    # real-terrain CRU accuracy into the score. Bounds carry headroom over the
+    # measured current 64x128/1yr baseline (temp 6.28C RMSE/0.930 correlation;
+    # precip 1.406 log-RMSE/0.463 log-correlation -- see
+    # docs/MONTHLY_CLIMATOLOGY_REFERENCE.md), the same headroom convention as
+    # testing/test_reanalysis_validation.py's CRU regression gates.
+    cru_temp_correlation: tuple[float, float, float] = (0.88, 1.0, 0.0)
+    cru_temp_rmse: tuple[float, float, float] = (0.0, 7.5, 0.0)
+    cru_precip_log_correlation: tuple[float, float, float] = (0.35, 1.0, 0.0)
+    cru_precip_log_rmse: tuple[float, float, float] = (0.0, 1.6, 0.0)
 
     penalty_factor: float = 3.0
     """Width of the decay zone as a multiple of the target range width.
@@ -142,6 +178,10 @@ class ClimateScore:
             ("wind_midlat_mean", ref.wind_midlat_mean[2]),
             ("wind_itcz_conv", ref.wind_itcz_conv[2]),
             ("seasonal_amplitude_nh", ref.seasonal_amplitude_nh[2]),
+            ("cru_temp_correlation", ref.cru_temp_correlation[2]),
+            ("cru_temp_rmse", ref.cru_temp_rmse[2]),
+            ("cru_precip_log_correlation", ref.cru_precip_log_correlation[2]),
+            ("cru_precip_log_rmse", ref.cru_precip_log_rmse[2]),
         ]
 
     def _component(self, name: str, value: float) -> float:

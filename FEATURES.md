@@ -111,11 +111,31 @@ RMSE/0.930 correlation; precip -0.109 mm/day bias/1.406 log-RMSE/0.463 log-corre
 note. The old zonal-band tests were kept (cheap, terrain-independent general sanity checks) rather
 than replaced.
 
-**What's still open, if this is picked up again**: wind isn't scored (no wind reanalysis reference
-built yet, only T/P), and `diagnostics.py` itself was never touched -- the scoring logic lives
-entirely in `monthly_climatology.py` instead, which turned out to be a perfectly reasonable home
-for it and not worth moving. The optimizer's `ClimateScore`/`ReferenceClimate` integration
-mentioned below also remains undone.
+**Optimizer integration -- done 2026-08-09.** `ClimateMetrics` gained four fields
+(`cru_temp_correlation`, `cru_temp_rmse`, `cru_precip_log_correlation`, `cru_precip_log_rmse`) and
+`ReferenceClimate` matching `(lo, hi, weight)` targets, weight defaulting to `0.0` (exact no-op for
+every existing sweep, same convention as this project's other real-but-inert mechanisms).
+`optimizer/headless.run_simulation` gained an optional `monthly_climatology_path` argument that
+scores the run's own native monthly Köppen bins (`state.monthly_temp`/`monthly_precip`, already
+maintained every step regardless) against the reference via `monthly_climatology.
+score_monthly_climatology`, reusing `state`'s existing fields rather than adding new accumulation
+logic. Meaningless on `run_simulation`'s default synthetic terrain -- map correlation needs real
+geography -- so it must be paired with a real elevation (e.g.
+`real_terrain_validation.load_bundled_earth_dem`). 4 new tests in `testing/test_optimizer_scoring.py`
+cover the no-op default, opt-in weight actually moving the score, real-terrain population, and that
+omitting the path leaves the fields untouched. `diagnostics.py` itself was never touched -- the
+scoring logic lives entirely in `monthly_climatology.py`, which turned out to be a perfectly
+reasonable home for it and not worth moving.
+
+**What's still open, and now genuinely blocked, not just undone**: wind cannot be scored against
+CRU TS -- verified 2026-08-09 by listing the actual CRU TS v4.10 server directory
+(`crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/.../`): it publishes only `cld, dtr, frs, pet, pre,
+tmn, tmp, tmx, vap, wet` -- no wind variable exists in this dataset at all, in any version
+currently served. Wind reanalysis would need a different provider (e.g. ERA5 via the Copernicus
+CDS API, or NCEP/NCAR Reanalysis 1 via NOAA PSL, which is anonymously downloadable but a coarser
+~2.5deg product and a different measurement basis than CRU). Needs a real provider decision (and,
+for ERA5, user-supplied CDS API credentials) before any implementation attempt -- do not assume
+CRU's existing pattern extends to wind.
 
 ### 5. Prognostic AMOC + freshwater hosing
 **Effort: medium. Touches: `simulate.py`, `PlanetParams`.**

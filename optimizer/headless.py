@@ -30,6 +30,8 @@ from planet_params import PlanetParams, EARTH
 from simulate import PlanetState, simulate_step, create_initial_state, TimeScaleMode
 from time_policy import cycle_days, substeps_for_mode
 from optimizer.scoring import ClimateMetrics
+from masks import get_masks
+from monthly_climatology import load_monthly_climatology, regrid_monthly_climatology, score_monthly_climatology
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +185,7 @@ def run_simulation(
     spinup_time_scale: TimeScaleMode = TimeScaleMode.MONTHLY,
     eval_time_scale: TimeScaleMode = TimeScaleMode.DAILY,
     eval_snapshots: int = 12,
+    monthly_climatology_path: str | Path | None = None,
     **physics_kwargs,
 ) -> tuple[PlanetState, ClimateMetrics]:
     """Run a headless simulation and return the final state + climate metrics.
@@ -210,6 +213,20 @@ def run_simulation(
         Time-scale mode for the evaluation phase (default: DAILY for accuracy).
     eval_snapshots:
         Number of snapshots to average over during evaluation (default: 12).
+    monthly_climatology_path:
+        Optional path to a versioned MonthlyClimatology reference (e.g.
+        `testing/reference_data/cru_ts_v4.10_1991_2020.npz`, see
+        docs/MONTHLY_CLIMATOLOGY_REFERENCE.md). When given, scores the run's
+        native monthly Köppen bins (`state.monthly_temp`/`monthly_precip`,
+        already maintained every step regardless of this parameter) against
+        the reference and populates `ClimateMetrics.cru_*`. Meaningless on
+        the synthetic default terrain -- map correlation against a real
+        gridded reference needs real geography -- so pass a real elevation
+        (e.g. `real_terrain_validation.load_bundled_earth_dem(H, W)`)
+        whenever this is set. `ReferenceClimate.cru_*` weights default to
+        0.0 (exact no-op) so setting this alone does not change any
+        existing sweep's score; it only populates the metrics for a caller
+        that also raises those weights.
     **physics_kwargs:
         Extra keyword arguments forwarded to ``simulate_step`` (e.g.
         ``thermal_diffusion``, ``ice_albedo_strength``).
@@ -270,6 +287,8 @@ def run_simulation(
         float(max(midlat_temps) - min(midlat_temps)) if len(midlat_temps) >= 2 else 0.0
     )
 
+    cru_fields = _score_against_cru(state, monthly_climatology_path) if monthly_climatology_path else {}
+
     metrics = ClimateMetrics(
         global_mean_t=_mean_snap("global_mean_t"),
         gradient_nh=_mean_snap("gradient_nh"),
@@ -283,8 +302,35 @@ def run_simulation(
         seasonal_amplitude_nh=seasonal_amplitude_nh,
         has_nan=has_nan,
         has_inf=has_inf,
+        **cru_fields,
     )
     return state, metrics
+
+
+def _score_against_cru(state: PlanetState, monthly_climatology_path: str | Path) -> dict[str, float]:
+    """Score the run's native monthly bins against a versioned CRU-style reference.
+
+    Returns an empty dict (leaving ClimateMetrics.cru_* at their inert 0.0
+    defaults) if the run hasn't produced monthly bins yet -- e.g. a spinup
+    too short for update_monthly_statistics's first-sample-overwrites-seed
+    bins to have been visited (see docs/MONTHLY_CLIMATOLOGY_REFERENCE.md and
+    the monthly-bin seed-contamination lesson in project history) -- rather
+    than scoring a still-seeded field.
+    """
+    if state.monthly_temp is None or state.monthly_precip is None:
+        return {}
+    height, width = state.monthly_temp.shape[1:]
+    reference = regrid_monthly_climatology(load_monthly_climatology(monthly_climatology_path), height, width)
+    _, land_mask = get_masks(state.elevation)
+    scored = score_monthly_climatology(
+        state.monthly_temp, state.monthly_precip, reference, model_land_mask=land_mask,
+    )
+    return {
+        "cru_temp_correlation": scored["temperature_c"]["monthly_correlation"],
+        "cru_temp_rmse": scored["temperature_c"]["monthly_rmse"],
+        "cru_precip_log_correlation": scored["precipitation_mm_day"]["monthly_log_correlation"],
+        "cru_precip_log_rmse": scored["precipitation_mm_day"]["monthly_log_rmse"],
+    }
 
 
 def _extract_long_snapshot(state: PlanetState, H: int, year: int) -> dict:

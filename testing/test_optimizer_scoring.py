@@ -244,6 +244,108 @@ def test_results_save_load_roundtrip(tmp_path):
     assert pytest.approx(scores[1], abs=0.01) == 68.1
 
 
+# ---------------------------------------------------------------------------
+# CRU TS v4.10 real-reanalysis integration (ReferenceClimate.cru_* / run_simulation)
+# ---------------------------------------------------------------------------
+
+CRU_REFERENCE_PATH = ROOT / "testing" / "reference_data" / "cru_ts_v4.10_1991_2020.npz"
+_cru_reference_missing = not CRU_REFERENCE_PATH.exists()
+_cru_skip_reason = (
+    f"CRU TS reference not built locally: {CRU_REFERENCE_PATH} is missing. "
+    "Run `python scripts/build_cru_ts_reference.py` to fetch and build it."
+)
+
+
+def test_cru_reference_weights_default_to_zero_no_op():
+    """ReferenceClimate's new cru_* fields must not change any existing score."""
+    from optimizer.scoring import ClimateScore, ClimateMetrics, EARTH_REFERENCE
+
+    baseline = ClimateMetrics(
+        global_mean_t=288.0, gradient_nh=52.0, gradient_sh=50.0,
+        ice_frac_nh=0.05, ice_frac_sh=0.07, mean_precip=2.7,
+        wind_trade_mean=6.5, wind_midlat_mean=8.0, wind_itcz_conv=0.5,
+        seasonal_amplitude_nh=40.0,
+    )
+    score = ClimateScore(EARTH_REFERENCE).score(baseline)
+    assert score == pytest.approx(100.0)
+
+    # Wildly "bad" cru_* values must not move the score while weight stays 0.0.
+    perturbed = ClimateMetrics(
+        global_mean_t=288.0, gradient_nh=52.0, gradient_sh=50.0,
+        ice_frac_nh=0.05, ice_frac_sh=0.07, mean_precip=2.7,
+        wind_trade_mean=6.5, wind_midlat_mean=8.0, wind_itcz_conv=0.5,
+        seasonal_amplitude_nh=40.0,
+        cru_temp_correlation=-1.0, cru_temp_rmse=50.0,
+        cru_precip_log_correlation=-1.0, cru_precip_log_rmse=50.0,
+    )
+    assert ClimateScore(EARTH_REFERENCE).score(perturbed) == pytest.approx(100.0)
+
+
+def test_cru_reference_weight_opt_in_changes_score():
+    """Raising a cru_* weight makes bad cru_* values actually cost points."""
+    import dataclasses
+    from optimizer.scoring import ClimateScore, ClimateMetrics, EARTH_REFERENCE
+
+    ref = dataclasses.replace(EARTH_REFERENCE, cru_temp_correlation=(0.88, 1.0, 2.0))
+    perfect = ClimateMetrics(
+        global_mean_t=288.0, gradient_nh=52.0, gradient_sh=50.0,
+        ice_frac_nh=0.05, ice_frac_sh=0.07, mean_precip=2.7,
+        wind_trade_mean=6.5, wind_midlat_mean=8.0, wind_itcz_conv=0.5,
+        seasonal_amplitude_nh=40.0, cru_temp_correlation=0.95,
+    )
+    bad = dataclasses.replace(perfect, cru_temp_correlation=-1.0)
+    assert ClimateScore(ref).score(perfect) == pytest.approx(100.0)
+    assert ClimateScore(ref).score(bad) < 100.0
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(_cru_reference_missing, reason=_cru_skip_reason)
+def test_run_simulation_populates_cru_metrics_on_real_terrain():
+    """monthly_climatology_path on the real bundled Earth DEM populates cru_* fields."""
+    from optimizer.headless import run_simulation
+    from planet_params import EARTH
+    from simulate import TimeScaleMode
+    from real_terrain_validation import load_bundled_earth_dem
+
+    elevation = load_bundled_earth_dem(32, 64)
+    _, metrics = run_simulation(
+        EARTH,
+        spinup_years=1.0,
+        eval_years=1.0,
+        H=32, W=64,
+        elevation=elevation,
+        spinup_time_scale=TimeScaleMode.MONTHLY,
+        eval_time_scale=TimeScaleMode.MONTHLY,
+        monthly_climatology_path=CRU_REFERENCE_PATH,
+    )
+    assert not metrics.has_nan and not metrics.has_inf
+    assert -1.0 <= metrics.cru_temp_correlation <= 1.0
+    assert metrics.cru_temp_correlation != 0.0, "cru_temp_correlation left at its inert default"
+    assert metrics.cru_temp_rmse > 0.0
+    assert -1.0 <= metrics.cru_precip_log_correlation <= 1.0
+    assert metrics.cru_precip_log_rmse > 0.0
+
+
+def test_run_simulation_without_climatology_path_leaves_cru_fields_inert():
+    """Not passing monthly_climatology_path must not touch the cru_* fields at all."""
+    from optimizer.headless import run_simulation
+    from planet_params import EARTH
+    from simulate import TimeScaleMode
+
+    _, metrics = run_simulation(
+        EARTH,
+        spinup_years=0.1,
+        eval_years=0.05,
+        H=32, W=64,
+        spinup_time_scale=TimeScaleMode.MONTHLY,
+        eval_time_scale=TimeScaleMode.DAILY,
+    )
+    assert metrics.cru_temp_correlation == 0.0
+    assert metrics.cru_temp_rmse == 0.0
+    assert metrics.cru_precip_log_correlation == 0.0
+    assert metrics.cru_precip_log_rmse == 0.0
+
+
 def test_results_top_n():
     """top_n returns the highest-scoring entries."""
     from optimizer.results import top_n
