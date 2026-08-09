@@ -1,7 +1,7 @@
 """Deterministic real-terrain climate validation and regression scoring."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace as dataclasses_replace
 import json
 from pathlib import Path
 import time
@@ -611,15 +611,31 @@ def _monthly_climatology_metrics(
     state: PlanetState,
     land_mask: np.ndarray,
     reference: MonthlyClimatology | None,
+    mean_wind_speed_ms: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Score the same twelve fields used by Köppen against a fixed reference."""
-    if reference is None or state.monthly_temp is None or state.monthly_precip is None:
+    """Score the same twelve fields used by Köppen against a fixed reference.
+
+    Wind is scored separately from temperature/precipitation: it uses the
+    caller's simple evaluation-period time-mean (not the monthly Köppen
+    bins) against the reference's own annual mean, since no wind reference
+    here carries genuine monthly resolution on the model side yet -- see
+    monthly_climatology.score_monthly_climatology's docstring. Still scored
+    even if reference lacks temperature/precipitation (a wind-only
+    reference) or the model's monthly bins aren't ready yet.
+    """
+    if reference is None:
+        return {}
+    monthly_temp = state.monthly_temp if reference.temperature_k is not None else None
+    monthly_precip = state.monthly_precip if reference.precipitation_mm_day is not None else None
+    wind_speed = mean_wind_speed_ms if reference.wind_speed_ms is not None else None
+    if monthly_temp is None and monthly_precip is None and wind_speed is None:
         return {}
     return score_monthly_climatology(
-        state.monthly_temp,
-        state.monthly_precip,
+        monthly_temp,
+        monthly_precip,
         reference,
         model_land_mask=land_mask,
+        annual_mean_wind_speed_ms=wind_speed,
     )
 
 
@@ -665,6 +681,7 @@ def summarize_real_terrain_climate(
     mean_soil_moisture: np.ndarray,
     planet_params: PlanetParams,
     monthly_climatology: MonthlyClimatology | None = None,
+    mean_wind_speed_ms: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Compute stable global, zonal, and named-region validation metrics."""
     sea_mask, land_mask = get_masks(state.elevation, use_cache=False)
@@ -834,7 +851,7 @@ def summarize_real_terrain_climate(
             state, land_mask
         ),
         "monthly_climatology": _monthly_climatology_metrics(
-            state, land_mask, monthly_climatology
+            state, land_mask, monthly_climatology, mean_wind_speed_ms
         ),
         "regional_land_temperature": _regional_land_temperature_metrics(
             state, land_mask, monthly_climatology
@@ -878,8 +895,18 @@ def run_real_terrain_validation(
     planet_params: PlanetParams = EARTH,
     initial_state_path: str | Path | None = None,
     monthly_climatology_path: str | Path | None = None,
+    wind_climatology_path: str | Path | None = None,
 ) -> tuple[PlanetState, dict[str, Any]]:
-    """Run a deterministic real-DEM spinup/evaluation and return state plus report."""
+    """Run a deterministic real-DEM spinup/evaluation and return state plus report.
+
+    monthly_climatology_path and wind_climatology_path are independent and
+    both optional: CRU TS (temperature/precipitation) and NCEP/NCAR
+    Reanalysis 1 (wind) are different providers at different native
+    resolutions with no wind/T-P overlap (CRU publishes no wind variable at
+    all -- see scripts/build_ncep_wind_reference.py), so they are loaded and
+    regridded separately, then merged into one MonthlyClimatology for
+    scoring. Either may be given without the other.
+    """
     config.validate()
     mode = TimeScaleMode[config.time_scale]
     monthly_climatology = None
@@ -887,6 +914,24 @@ def run_real_terrain_validation(
         monthly_climatology = regrid_monthly_climatology(
             load_monthly_climatology(monthly_climatology_path), config.height, config.width
         )
+    if wind_climatology_path is not None:
+        wind_reference = regrid_monthly_climatology(
+            load_monthly_climatology(wind_climatology_path), config.height, config.width
+        )
+        if monthly_climatology is None:
+            monthly_climatology = wind_reference
+        else:
+            # Two different providers merged into one object for scoring;
+            # preserve wind's own attribution separately so the report does
+            # not silently mislabel wind_speed_ms's provenance as CRU's.
+            merged_metadata = dict(monthly_climatology.metadata)
+            merged_metadata["wind_source"] = wind_reference.metadata["source"]
+            merged_metadata["wind_period"] = wind_reference.metadata["period"]
+            monthly_climatology = dataclasses_replace(
+                monthly_climatology,
+                wind_speed_ms=wind_reference.wind_speed_ms,
+                metadata=merged_metadata,
+            )
     clear_simulation_caches()
     if initial_state_path is None:
         elevation = load_bundled_earth_dem(config.height, config.width)
@@ -918,6 +963,7 @@ def run_real_terrain_validation(
         "cloud": None,
         "soil": None,
     }
+    wind_speed_accumulator: np.ndarray | None = None
     sampled_days = 0.0
     cycle_duration = cycle_days(mode, planet_params)
     for _ in range(evaluation_cycles):
@@ -938,6 +984,20 @@ def run_real_terrain_validation(
             accumulators[name] = (
                 weighted if accumulators[name] is None else accumulators[name] + weighted
             )
+        # Optional: not every configuration guarantees wind (unlike the
+        # required fields above), so this stays best-effort rather than
+        # raising -- mean_wind_speed_ms is simply None (no CRU wind score)
+        # if wind was never present.
+        if state.wind_u is not None and state.wind_v is not None:
+            speed = np.sqrt(
+                np.asarray(state.wind_u, dtype=np.float64) ** 2
+                + np.asarray(state.wind_v, dtype=np.float64) ** 2
+            )
+            weighted_speed = speed * cycle_duration
+            wind_speed_accumulator = (
+                weighted_speed if wind_speed_accumulator is None
+                else wind_speed_accumulator + weighted_speed
+            )
         sampled_days += cycle_duration
 
     if sampled_days <= 0.0:
@@ -947,6 +1007,9 @@ def run_real_terrain_validation(
         for name, value in accumulators.items()
         if value is not None
     }
+    mean_wind_speed_ms = (
+        wind_speed_accumulator / sampled_days if wind_speed_accumulator is not None else None
+    )
     metrics = summarize_real_terrain_climate(
         state,
         mean_temperature_k=means["temperature"],
@@ -955,6 +1018,7 @@ def run_real_terrain_validation(
         mean_soil_moisture=means["soil"],
         planet_params=planet_params,
         monthly_climatology=monthly_climatology,
+        mean_wind_speed_ms=mean_wind_speed_ms,
     )
     report = {
         "schema_version": VALIDATION_SCHEMA_VERSION,

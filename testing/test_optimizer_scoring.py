@@ -344,6 +344,63 @@ def test_run_simulation_without_climatology_path_leaves_cru_fields_inert():
     assert metrics.cru_temp_rmse == 0.0
     assert metrics.cru_precip_log_correlation == 0.0
     assert metrics.cru_precip_log_rmse == 0.0
+    assert metrics.ncep_wind_correlation == 0.0
+    assert metrics.ncep_wind_rmse == 0.0
+
+
+NCEP_WIND_REFERENCE_PATH = ROOT / "testing" / "reference_data" / "ncep_ncar_wind_1991_2020.npz"
+_ncep_wind_reference_missing = not NCEP_WIND_REFERENCE_PATH.exists()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    _ncep_wind_reference_missing,
+    reason=f"NCEP/NCAR wind reference not built: run scripts/build_ncep_wind_reference.py "
+           f"({NCEP_WIND_REFERENCE_PATH} is missing)",
+)
+def test_run_simulation_populates_wind_metrics_on_real_terrain():
+    """wind_climatology_path on the real bundled Earth DEM populates ncep_wind_* fields."""
+    from optimizer.headless import run_simulation
+    from planet_params import EARTH
+    from simulate import TimeScaleMode
+    from real_terrain_validation import load_bundled_earth_dem
+
+    elevation = load_bundled_earth_dem(32, 64)
+    _, metrics = run_simulation(
+        EARTH,
+        spinup_years=0.5,
+        eval_years=0.2,
+        H=32, W=64,
+        elevation=elevation,
+        spinup_time_scale=TimeScaleMode.MONTHLY,
+        eval_time_scale=TimeScaleMode.DAILY,
+        wind_climatology_path=NCEP_WIND_REFERENCE_PATH,
+    )
+    assert not metrics.has_nan and not metrics.has_inf
+    assert -1.0 <= metrics.ncep_wind_correlation <= 1.0
+    assert metrics.ncep_wind_rmse > 0.0
+    # cru_* (temperature/precipitation) must stay inert -- only wind was requested.
+    assert metrics.cru_temp_correlation == 0.0
+
+
+def test_ncep_wind_reference_weight_defaults_to_zero_no_op():
+    """ReferenceClimate's ncep_wind_* fields must not change any existing score."""
+    import dataclasses
+    from optimizer.scoring import ClimateScore, ClimateMetrics, EARTH_REFERENCE
+
+    baseline = ClimateMetrics(
+        global_mean_t=288.0, gradient_nh=52.0, gradient_sh=50.0,
+        ice_frac_nh=0.05, ice_frac_sh=0.07, mean_precip=2.7,
+        wind_trade_mean=6.5, wind_midlat_mean=8.0, wind_itcz_conv=0.5,
+        seasonal_amplitude_nh=40.0, ncep_wind_correlation=-1.0, ncep_wind_rmse=50.0,
+    )
+    assert ClimateScore(EARTH_REFERENCE).score(baseline) == pytest.approx(100.0)
+
+    ref = dataclasses.replace(EARTH_REFERENCE, ncep_wind_correlation=(0.0, 1.0, 2.0))
+    good = dataclasses.replace(baseline, ncep_wind_correlation=0.9)
+    bad = dataclasses.replace(baseline, ncep_wind_correlation=-1.0)
+    assert ClimateScore(ref).score(good) == pytest.approx(100.0)
+    assert ClimateScore(ref).score(bad) < 100.0
 
 
 def test_results_top_n():

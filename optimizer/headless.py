@@ -186,6 +186,7 @@ def run_simulation(
     eval_time_scale: TimeScaleMode = TimeScaleMode.DAILY,
     eval_snapshots: int = 12,
     monthly_climatology_path: str | Path | None = None,
+    wind_climatology_path: str | Path | None = None,
     **physics_kwargs,
 ) -> tuple[PlanetState, ClimateMetrics]:
     """Run a headless simulation and return the final state + climate metrics.
@@ -227,6 +228,18 @@ def run_simulation(
         0.0 (exact no-op) so setting this alone does not change any
         existing sweep's score; it only populates the metrics for a caller
         that also raises those weights.
+    wind_climatology_path:
+        Optional path to a versioned wind-speed MonthlyClimatology (e.g.
+        `testing/reference_data/ncep_ncar_wind_1991_2020.npz`, see
+        scripts/build_ncep_wind_reference.py -- CRU publishes no wind
+        variable at all, so this is a separate reference/provider from
+        monthly_climatology_path and may be given independently of it).
+        Populates `ClimateMetrics.ncep_wind_*` from the eval period's own
+        time-mean wind-speed field (not true monthly, unlike temperature/
+        precipitation -- see score_monthly_climatology's docstring) against
+        the reference's global annual mean. Same real-terrain requirement
+        and same weight=0.0 inert-by-default convention as
+        monthly_climatology_path.
     **physics_kwargs:
         Extra keyword arguments forwarded to ``simulate_step`` (e.g.
         ``thermal_diffusion``, ``ice_albedo_strength``).
@@ -260,6 +273,8 @@ def run_simulation(
     sample_interval = max(1, n_eval // eval_snapshots)
 
     snapshots: list[dict[str, float]] = []
+    wind_speed_sum: np.ndarray | None = None
+    wind_speed_count = 0
     for i in range(n_eval):
         state = _advance_one_cycle(
             state, eval_time_scale, planet_params=planet_params, **physics_kwargs
@@ -268,6 +283,10 @@ def run_simulation(
             snap = _extract_snapshot(state, H)
             if snap:
                 snapshots.append(snap)
+        if wind_climatology_path is not None and state.wind_u is not None and state.wind_v is not None:
+            speed = np.sqrt(state.wind_u ** 2 + state.wind_v ** 2)
+            wind_speed_sum = speed if wind_speed_sum is None else wind_speed_sum + speed
+            wind_speed_count += 1
 
     # --- Aggregate metrics ---
     if not snapshots:
@@ -288,6 +307,9 @@ def run_simulation(
     )
 
     cru_fields = _score_against_cru(state, monthly_climatology_path) if monthly_climatology_path else {}
+    if wind_climatology_path is not None and wind_speed_sum is not None:
+        mean_wind_speed = wind_speed_sum / wind_speed_count
+        cru_fields.update(_score_against_wind(mean_wind_speed, wind_climatology_path, H, W))
 
     metrics = ClimateMetrics(
         global_mean_t=_mean_snap("global_mean_t"),
@@ -330,6 +352,24 @@ def _score_against_cru(state: PlanetState, monthly_climatology_path: str | Path)
         "cru_temp_rmse": scored["temperature_c"]["monthly_rmse"],
         "cru_precip_log_correlation": scored["precipitation_mm_day"]["monthly_log_correlation"],
         "cru_precip_log_rmse": scored["precipitation_mm_day"]["monthly_log_rmse"],
+    }
+
+
+def _score_against_wind(
+    mean_wind_speed_ms: np.ndarray, wind_climatology_path: str | Path, height: int, width: int,
+) -> dict[str, float]:
+    """Score an eval-period time-mean wind-speed field against a wind reference.
+
+    Unlike _score_against_cru, this needs no state.monthly_* precondition --
+    the caller already accumulated a plain time-mean over the eval loop
+    (wind has no native monthly-bin machinery like Köppen's temp/precip do).
+    """
+    reference = regrid_monthly_climatology(load_monthly_climatology(wind_climatology_path), height, width)
+    scored = score_monthly_climatology(reference=reference, annual_mean_wind_speed_ms=mean_wind_speed_ms)
+    wind = scored["wind_speed_ms"]
+    return {
+        "ncep_wind_correlation": wind["annual_correlation"],
+        "ncep_wind_rmse": wind["annual_rmse"],
     }
 
 

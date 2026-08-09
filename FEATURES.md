@@ -127,15 +127,34 @@ omitting the path leaves the fields untouched. `diagnostics.py` itself was never
 scoring logic lives entirely in `monthly_climatology.py`, which turned out to be a perfectly
 reasonable home for it and not worth moving.
 
-**What's still open, and now genuinely blocked, not just undone**: wind cannot be scored against
-CRU TS -- verified 2026-08-09 by listing the actual CRU TS v4.10 server directory
-(`crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/.../`): it publishes only `cld, dtr, frs, pet, pre,
-tmn, tmp, tmx, vap, wet` -- no wind variable exists in this dataset at all, in any version
-currently served. Wind reanalysis would need a different provider (e.g. ERA5 via the Copernicus
-CDS API, or NCEP/NCAR Reanalysis 1 via NOAA PSL, which is anonymously downloadable but a coarser
-~2.5deg product and a different measurement basis than CRU). Needs a real provider decision (and,
-for ERA5, user-supplied CDS API credentials) before any implementation attempt -- do not assume
-CRU's existing pattern extends to wind.
+**Wind -- done 2026-08-09, via a second provider.** CRU TS cannot supply wind (verified by listing
+its actual server directory: only `cld, dtr, frs, pet, pre, tmn, tmp, tmx, vap, wet` exist, no wind
+variable in any version currently served), so wind uses NCEP/NCAR Reanalysis 1 instead -- a global
+land+ocean model reanalysis, anonymously downloadable from NOAA PSL (no API key, unlike ERA5/CDS),
+with a ready-made 1991-2020 monthly climatology at its native 2.5deg grid
+(`scripts/build_ncep_wind_reference.py` -> `testing/reference_data/ncep_ncar_wind_1991_2020.npz`).
+
+Required generalizing `monthly_climatology.MonthlyClimatology` so `temperature_k`/
+`precipitation_mm_day`/`wind_speed_ms` are each independently optional (a wind-only reference from
+a provider with no T/P has nothing to put in those fields) -- audited every call site first; all
+already used keyword arguments, so this was not a breaking change. `score_monthly_climatology`
+scores wind differently from temperature/precipitation on two axes, both documented in its own
+docstring: **globally** (plain `cos(lat)` weights, no land mask -- wind is physically meaningful
+over ocean) and as an **annual mean only**, not true monthly, on the model side (no wind reference
+here has genuine monthly resolution end-to-end yet). `real_terrain_validation.
+run_real_terrain_validation` gained an independent `wind_climatology_path` argument (mergeable with
+`monthly_climatology_path` or used alone -- different providers, different resolutions, loaded and
+regridded separately then merged into one `MonthlyClimatology` for scoring, with source attribution
+for each variable preserved separately in the report rather than collapsed to one provider label).
+`optimizer.headless.run_simulation` got the matching `wind_climatology_path` argument and two new
+inert-by-default `ClimateMetrics`/`ReferenceClimate` fields (`ncep_wind_correlation`,
+`ncep_wind_rmse`), same weight=0.0 convention as the T/P fields. New pytest gates in both
+`testing/test_reanalysis_validation.py` (`test_ncep_wind_speed_map_correlation_and_error`,
+deliberately loose bounds -- the model's single-layer wind is far cruder than a full reanalysis, so
+this catches a real pipeline break, not enforces unreached realism) and
+`testing/test_optimizer_scoring.py`. Measured baseline (64x128/1yr+1yr, real Earth DEM): -1.10 m/s
+bias, 2.73 m/s RMSE, 0.15 correlation. New dependency: `h5py` (NCEP's files are HDF5/NetCDF4;
+scipy's NetCDF3-only reader, already used for CRU, can't open them), added to `requirements.txt`.
 
 ### 5. Prognostic AMOC + freshwater hosing
 **Effort: medium. Touches: `simulate.py`, `PlanetParams`.**

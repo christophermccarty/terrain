@@ -48,6 +48,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--wind-climatology",
+        type=Path,
+        help=(
+            "Versioned NPZ monthly wind-speed reference (e.g. "
+            "testing/reference_data/ncep_ncar_wind_1991_2020.npz, see "
+            "scripts/build_ncep_wind_reference.py). Independent of "
+            "--monthly-climatology and may be given with or without it."
+        ),
+    )
+    parser.add_argument(
         "--param",
         action="append",
         default=[],
@@ -113,6 +123,7 @@ def main() -> int:
         planet_params=planet,
         initial_state_path=args.initial_state,
         monthly_climatology_path=args.monthly_climatology,
+        wind_climatology_path=args.wind_climatology,
     )
     if args.output:
         save_validation_report(report, args.output)

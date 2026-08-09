@@ -218,3 +218,73 @@ def test_cru_scored_area_fraction_is_meaningful(cru_scored_report):
         f"CRU scored land-area fraction {cru_scored_report['scored_area_fraction']:.3f} "
         "is implausibly low (measured baseline 0.258) -- check the regrid/mask pipeline"
     )
+
+
+# ---------------------------------------------------------------------------
+# NCEP/NCAR Reanalysis 1 wind map-correlation gate (real bundled Earth DEM)
+# ---------------------------------------------------------------------------
+#
+# CRU TS publishes no wind variable at all (verified by listing its actual
+# server directory: only cld/dtr/frs/pet/pre/tmn/tmp/tmx/vap/wet exist), so
+# wind uses a separate provider -- NCEP/NCAR Reanalysis 1, a global
+# land+ocean model reanalysis, anonymously downloadable, same 1991-2020
+# period. Unlike temperature/precipitation, wind is scored as a single
+# evaluation-period time-mean against the reference's own annual mean, not
+# true month-by-month (see monthly_climatology.score_monthly_climatology's
+# docstring) -- a documented current limitation, not an oversight.
+
+NCEP_WIND_REFERENCE_PATH = ROOT / "testing" / "reference_data" / "ncep_ncar_wind_1991_2020.npz"
+_ncep_wind_reference_missing = not NCEP_WIND_REFERENCE_PATH.exists()
+_ncep_wind_skip_reason = (
+    f"NCEP/NCAR wind reference not built locally: {NCEP_WIND_REFERENCE_PATH} is missing. "
+    "Run `python scripts/build_ncep_wind_reference.py` to fetch and build it "
+    "(see docs/MONTHLY_CLIMATOLOGY_REFERENCE.md); it is a reproducible, gitignored "
+    "local artifact, not a committed fixture."
+)
+
+
+@pytest.fixture(scope="module")
+def ncep_wind_scored_report():
+    """Run the real-DEM validation harness scored against NCEP/NCAR Reanalysis 1 wind.
+
+    Same 64x128, one-year spin-up / one-year evaluation configuration as
+    cru_scored_report, on the real bundled Earth DEM, scored against wind
+    only (no --monthly-climatology) so this gate is independent of whether
+    the CRU reference happens to be present too.
+    """
+    from real_terrain_validation import RealTerrainValidationConfig, run_real_terrain_validation
+
+    config = RealTerrainValidationConfig(
+        height=64, width=128, spinup_years=1.0, evaluation_years=1.0,
+    )
+    _, report = run_real_terrain_validation(
+        config, wind_climatology_path=NCEP_WIND_REFERENCE_PATH,
+    )
+    return report["metrics"]["monthly_climatology"]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(_ncep_wind_reference_missing, reason=_ncep_wind_skip_reason)
+def test_ncep_wind_speed_map_correlation_and_error(ncep_wind_scored_report):
+    """Regression gate, not an accuracy target.
+
+    The model's single-layer, largely-diagnostic wind field is far cruder
+    than a full reanalysis, so bounds here are deliberately loose -- this
+    exists to catch a real pipeline break (e.g. a broken regrid or a sign
+    error), not to enforce realism the model was never designed to reach.
+    """
+    wind = ncep_wind_scored_report["wind_speed_ms"]
+    assert wind["source"].startswith("NCEP/NCAR"), f"unexpected wind source: {wind['source']}"
+    assert abs(wind["annual_bias"]) < 6.0, (
+        f"NCEP wind speed bias {wind['annual_bias']:+.2f} m/s exceeds regression bound "
+        "(measured baseline -1.10 m/s)"
+    )
+    assert wind["annual_rmse"] < 6.0, (
+        f"NCEP wind speed RMSE {wind['annual_rmse']:.2f} m/s exceeds regression bound "
+        "(measured baseline 2.73 m/s)"
+    )
+    assert wind["annual_correlation"] > -0.2, (
+        f"NCEP wind speed correlation {wind['annual_correlation']:.3f} exceeds regression "
+        "bound (measured baseline 0.151) -- a strongly negative correlation would suggest "
+        "a real pipeline defect (e.g. a longitude misalignment), not just weak realism"
+    )

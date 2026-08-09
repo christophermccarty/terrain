@@ -80,6 +80,20 @@ class ClimateMetrics:
     """Area-weighted monthly land log-precipitation RMSE vs CRU TS v4.10. See
     cru_temp_correlation for when this is actually populated."""
 
+    ncep_wind_correlation: float = 0.0
+    """Global-area-weighted annual-mean wind-speed correlation vs NCEP/NCAR
+    Reanalysis 1 [-1..1] (CRU publishes no wind variable at all -- a
+    different provider). Global, not land-only (wind is meaningful over
+    ocean too), and annual-mean-only on the model side, not true monthly --
+    see run_simulation's monthly_climatology_path docstring and
+    monthly_climatology.score_monthly_climatology's own docstring for why.
+    0.0 default + ReferenceClimate's default weight=0.0 is an exact no-op."""
+
+    ncep_wind_rmse: float = 0.0
+    """Global-area-weighted annual-mean wind-speed RMSE vs NCEP/NCAR
+    Reanalysis 1 [m/s]. See ncep_wind_correlation for when this is actually
+    populated vs. left at its inert default."""
+
     has_nan: bool = False
     """True if the simulation produced any NaN values."""
 
@@ -128,6 +142,15 @@ class ReferenceClimate:
     cru_temp_rmse: tuple[float, float, float] = (0.0, 7.5, 0.0)
     cru_precip_log_correlation: tuple[float, float, float] = (0.35, 1.0, 0.0)
     cru_precip_log_rmse: tuple[float, float, float] = (0.0, 1.6, 0.0)
+
+    # NCEP/NCAR Reanalysis 1 wind targets (CRU has no wind variable -- see
+    # ClimateMetrics.ncep_wind_correlation). Global, annual-mean-only, and
+    # loose by design: the model's wind is far cruder than the T/P physics,
+    # so these bounds match testing/test_reanalysis_validation.py's
+    # regression-gate looseness (catch a real pipeline break, not enforce
+    # unreached realism), not the tighter headroom convention used above.
+    ncep_wind_correlation: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    ncep_wind_rmse: tuple[float, float, float] = (0.0, 6.0, 0.0)
 
     penalty_factor: float = 3.0
     """Width of the decay zone as a multiple of the target range width.
@@ -182,6 +205,8 @@ class ClimateScore:
             ("cru_temp_rmse", ref.cru_temp_rmse[2]),
             ("cru_precip_log_correlation", ref.cru_precip_log_correlation[2]),
             ("cru_precip_log_rmse", ref.cru_precip_log_rmse[2]),
+            ("ncep_wind_correlation", ref.ncep_wind_correlation[2]),
+            ("ncep_wind_rmse", ref.ncep_wind_rmse[2]),
         ]
 
     def _component(self, name: str, value: float) -> float:

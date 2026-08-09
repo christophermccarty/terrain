@@ -79,3 +79,44 @@ Do not commit a source dataset until its licence permits redistribution. Commit
 the provenance metadata and the preprocessing script alongside any derived
 fixture; the source period should match the 1991-2020 Köppen reference whenever
 possible.
+
+## Wind reference (NCEP/NCAR Reanalysis 1)
+
+CRU TS publishes no wind variable at all (verified by listing its actual server
+directory: only `cld, dtr, frs, pet, pre, tmn, tmp, tmx, vap, wet` exist), so
+wind uses a second, independent provider: **NCEP/NCAR Reanalysis 1**, a global
+land+ocean model reanalysis, anonymously downloadable from NOAA PSL (no API
+key). Build it with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_ncep_wind_reference.py
+```
+
+This fetches the official `uwnd.sig995.mon.ltm.1991-2020.nc` /
+`vwnd.sig995.mon.ltm.1991-2020.nc` files (near-surface sigma-0.995 monthly
+long-term means, the same 1991-2020 period as the CRU reference though a
+different native grid: 2.5deg, pole-inclusive) and derives
+`wind_speed_ms = sqrt(uwnd^2 + vwnd^2)`. The 73-row pole-to-pole point grid is
+averaged down to 72 cell-center rows (adjacent-pair mean) to match
+`MonthlyClimatology`'s cell-center 2:1 grid convention -- see the builder's own
+comments for why this differs from CRU's grid, which needed no such
+adjustment. Requires `h5py` (NCEP's files are HDF5/NetCDF4; the NetCDF3-only
+reader already used for CRU can't open them).
+
+Unlike temperature/precipitation, wind is scored **globally** (no land mask --
+wind is physically meaningful over ocean) and as an **annual mean only** on the
+model side, not true month-by-month (no wind reference here has genuine
+monthly resolution end-to-end yet) -- both documented in
+`monthly_climatology.score_monthly_climatology`'s own docstring. Use
+`--wind-climatology path\to\ncep_ncar_wind_1991_2020.npz` on
+`scripts\run_real_terrain_validation.py`, independently of
+`--monthly-climatology` (different providers; either or both may be given).
+
+**Initial measured baseline** (64x128, one-year spin-up/one-year evaluation,
+real bundled Earth DEM): -1.10 m/s bias, 2.73 m/s RMSE, 0.151 correlation. Weak
+correlation is expected and not itself evidence of a bug -- the model's
+single-layer, largely-diagnostic wind field is far cruder than a full
+reanalysis; `testing/test_reanalysis_validation.py`'s wind gate bounds are
+deliberately loose for exactly this reason (catch a real pipeline break, e.g.
+a longitude misalignment, not enforce realism the model was never designed to
+reach).
