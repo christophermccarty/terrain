@@ -1,0 +1,875 @@
+{
+  "config": {
+    "block_size": 4,
+    "evaluation_years": 1.0,
+    "height": 64,
+    "precip_block_size": 1,
+    "spinup_years": 1.0,
+    "start_day": 80.0,
+    "time_scale": "MONTHLY",
+    "width": 128,
+    "wind_block_size": 4
+  },
+  "metrics": {
+    "circulation": {
+      "hadley_edge_deg": {
+        "nh_deg": 29.91073863474749,
+        "sh_deg": 30.928763458814846
+      },
+      "horizontal_divergence_s": {
+        "mean": 6.362291199576266e-08,
+        "rms": 1.84244066939745e-06
+      },
+      "jet_latitude_deg": {
+        "nh_deg": 52.03125,
+        "sh_deg": -54.84375
+      },
+      "meridional_transport": {
+        "cross_equatorial_dry_static_energy_transport_pw": -26.055423397385486,
+        "cross_equatorial_latent_energy_transport_pw": -3.4685166860223453,
+        "cross_equatorial_moisture_flux_kg_m_s": -34.66946397468989,
+        "cross_equatorial_total_energy_transport_pw": -29.52394008340783,
+        "peak_northward_energy_transport_pw": 226.76796187940994,
+        "peak_southward_energy_transport_pw": -331.8029318550398
+      },
+      "upper_hadley_edge_deg": {
+        "nh_deg": NaN,
+        "sh_deg": 14.127250387559297
+      },
+      "upper_jet_latitude_deg": {
+        "nh_deg": 29.53125,
+        "sh_deg": -29.53125
+      }
+    },
+    "continental_minus_desert_precip_mm_year": 654.8316789498194,
+    "global": {
+      "cloud_fraction": 0.16094765830582888,
+      "land_soil_floor_fraction": 0.0,
+      "land_soil_moisture": 0.5152571222702749,
+      "nh_midlat_soil_floor_fraction": 0.0,
+      "ocean_temperature_k": 292.76385421882856,
+      "polar_precip_mm_day": 0.3841447907126373,
+      "precip_mm_day": 2.995585005101028,
+      "temperature_k": 291.11156546652694
+    },
+    "koppen_land_percent": {
+      "arid": 30.164124403462917,
+      "humid_temperate_continental": 35.243000814781496,
+      "polar": 14.296573167788871,
+      "tropical": 20.296301613966698
+    },
+    "koppen_map_skill": {
+      "class_accuracy": 0.38846145850142866,
+      "class_kappa": 0.33479809947665157,
+      "group_accuracy": 0.6737522732391313,
+      "group_accuracy_by_zone": {
+        "-10:0": 0.6727511601963683,
+        "-20:-10": 0.4863978193664603,
+        "-30:-20": 0.7153722251247394,
+        "-40:-30": 0.6910337709920125,
+        "-50:-40": 0.30637659514954924,
+        "-60:-50": 0.0,
+        "-70:-60": 0.441136932130927,
+        "-80:-70": 0.9549356084354482,
+        "-90:-80": 0.9929103595888968,
+        "0:10": 0.7304214495422524,
+        "10:20": 0.630967427134687,
+        "20:30": 0.6665381636251646,
+        "30:40": 0.6216453516876556,
+        "40:50": 0.6131103754404036,
+        "50:60": 0.7724050595803079,
+        "60:70": 0.6286087984046249,
+        "70:80": 0.8634603382364143,
+        "80:90": 1.0
+      },
+      "group_kappa": 0.5868225262887489,
+      "group_share_mae_pp": 3.675024518002375,
+      "region_group_accuracy": {
+        "Atacama": 0.6740565071727328,
+        "Canadian Prairies": 1.0,
+        "Central Europe": 0.0,
+        "East China": 0.4980405892118354,
+        "Kalahari": 1.0,
+        "S Japan": 1.0,
+        "SE US": 0.6231607652692794,
+        "Sahara": 1.0,
+        "US Midwest": 0.48887521292412733
+      },
+      "scored_cells": 3523
+    },
+    "koppen_temperature_thresholds": {
+      "coldest_month": {
+        "accuracy": 0.8995752161559718,
+        "by_reference_group": {
+          "A": {
+            "accuracy": 0.928913004448143,
+            "model_mean_c": 23.161591263919124,
+            "scored_cells": 499,
+            "too_cold_fraction": 0.071086995551857,
+            "too_warm_fraction": 0.0
+          },
+          "C": {
+            "accuracy": 0.8310435082447818,
+            "model_mean_c": 7.6189463069118135,
+            "scored_cells": 409,
+            "too_cold_fraction": 0.07800184481126976,
+            "too_warm_fraction": 0.0909546469439484
+          },
+          "D": {
+            "accuracy": 0.9200317912650572,
+            "model_mean_c": -16.58731962585176,
+            "scored_cells": 723,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.07996820873494279
+          }
+        },
+        "by_zone": {
+          "-10:0": {
+            "accuracy": 0.9940647545899769,
+            "model_mean_c": 23.972575600664126,
+            "scored_cells": 167,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.00593524541002324
+          },
+          "-20:-10": {
+            "accuracy": 0.6994290850596191,
+            "model_mean_c": 19.724245173893454,
+            "scored_cells": 96,
+            "too_cold_fraction": 0.15441022590526693,
+            "too_warm_fraction": 0.14616068903511398
+          },
+          "-30:-20": {
+            "accuracy": 0.7270083714328477,
+            "model_mean_c": 14.169608072352778,
+            "scored_cells": 45,
+            "too_cold_fraction": 0.2501272495703696,
+            "too_warm_fraction": 0.02286437899678244
+          },
+          "-40:-30": {
+            "accuracy": 1.0,
+            "model_mean_c": 7.263503826243155,
+            "scored_cells": 40,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.0
+          },
+          "-50:-40": {
+            "accuracy": 0.9004460525095498,
+            "model_mean_c": 1.2478371205132177,
+            "scored_cells": 19,
+            "too_cold_fraction": 0.09955394749045014,
+            "too_warm_fraction": 0.0
+          },
+          "-60:-50": {
+            "accuracy": 0.0,
+            "model_mean_c": -9.777522786458311,
+            "scored_cells": 3,
+            "too_cold_fraction": 1.0,
+            "too_warm_fraction": 0.0
+          },
+          "0:10": {
+            "accuracy": 0.9862371461158289,
+            "model_mean_c": 25.759031736894684,
+            "scored_cells": 145,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.013762853884170841
+          },
+          "10:20": {
+            "accuracy": 0.9576818298531183,
+            "model_mean_c": 22.428746064949564,
+            "scored_cells": 70,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.04231817014688176
+          },
+          "20:30": {
+            "accuracy": 0.781396429242305,
+            "model_mean_c": 14.24911666314714,
+            "scored_cells": 97,
+            "too_cold_fraction": 0.11636307618004063,
+            "too_warm_fraction": 0.10224049457765419
+          },
+          "30:40": {
+            "accuracy": 0.9048508602900084,
+            "model_mean_c": 6.967087969977231,
+            "scored_cells": 104,
+            "too_cold_fraction": 0.01868794545569311,
+            "too_warm_fraction": 0.07646119425429825
+          },
+          "40:50": {
+            "accuracy": 0.8571389119574975,
+            "model_mean_c": -3.6614825539234883,
+            "scored_cells": 214,
+            "too_cold_fraction": 0.02250877604504232,
+            "too_warm_fraction": 0.12035231199745998
+          },
+          "50:60": {
+            "accuracy": 0.8943293784343825,
+            "model_mean_c": -14.669550918878578,
+            "scored_cells": 261,
+            "too_cold_fraction": 0.09088541399174356,
+            "too_warm_fraction": 0.014785207573874097
+          },
+          "60:70": {
+            "accuracy": 0.9547073185961354,
+            "model_mean_c": -21.431745319278736,
+            "scored_cells": 346,
+            "too_cold_fraction": 0.02202604440673379,
+            "too_warm_fraction": 0.023266636997130656
+          },
+          "70:80": {
+            "accuracy": 1.0,
+            "model_mean_c": -30.814241154988586,
+            "scored_cells": 24,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.0
+          }
+        },
+        "model_mean_c": 6.321428307097246,
+        "scored_cells": 1631,
+        "too_cold_fraction": 0.05037445512850063,
+        "too_warm_fraction": 0.050050328715527524
+      },
+      "grid": {
+        "height": 64,
+        "width": 128
+      },
+      "warmest_month": {
+        "accuracy": 0.6773874207630958,
+        "by_reference_group": {
+          "C": {
+            "accuracy": 0.7545037913616648,
+            "model_mean_c": 24.940209106443202,
+            "scored_cells": 330,
+            "too_cold_fraction": 0.024821729791595602,
+            "too_warm_fraction": 0.22067447884673955
+          },
+          "D": {
+            "accuracy": 0.8980858318790823,
+            "model_mean_c": 16.601810436793095,
+            "scored_cells": 715,
+            "too_cold_fraction": 0.01745560733499368,
+            "too_warm_fraction": 0.08445856078592423
+          },
+          "E": {
+            "accuracy": 0.3473302756999144,
+            "model_mean_c": 6.169002982399481,
+            "scored_cells": 1314,
+            "too_cold_fraction": 0.05859599234860416,
+            "too_warm_fraction": 0.5940737319514815
+          }
+        },
+        "by_zone": {
+          "-10:0": {
+            "accuracy": 0.0,
+            "model_mean_c": 29.375268554687523,
+            "scored_cells": 1,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 1.0
+          },
+          "-20:-10": {
+            "accuracy": 0.0,
+            "model_mean_c": 29.084773228218964,
+            "scored_cells": 4,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 1.0
+          },
+          "-30:-20": {
+            "accuracy": 0.9023108771192551,
+            "model_mean_c": 29.564561321739948,
+            "scored_cells": 21,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.09768912288074501
+          },
+          "-40:-30": {
+            "accuracy": 0.39186004672841485,
+            "model_mean_c": 27.433411686751345,
+            "scored_cells": 39,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.608139953271585
+          },
+          "-50:-40": {
+            "accuracy": 0.0,
+            "model_mean_c": 24.21102532580951,
+            "scored_cells": 23,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 1.0
+          },
+          "-60:-50": {
+            "accuracy": 0.28432118515284494,
+            "model_mean_c": 18.566231582501736,
+            "scored_cells": 11,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.715678814847155
+          },
+          "-70:-60": {
+            "accuracy": 0.0,
+            "model_mean_c": 10.106829842381547,
+            "scored_cells": 101,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 1.0
+          },
+          "-80:-70": {
+            "accuracy": 0.18633347823589408,
+            "model_mean_c": 3.4742712773488273,
+            "scored_cells": 295,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.8136665217641059
+          },
+          "-90:-80": {
+            "accuracy": 0.8211419005283115,
+            "model_mean_c": -3.384555691151839,
+            "scored_cells": 501,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.17885809947168865
+          },
+          "0:10": {
+            "accuracy": 0.0,
+            "model_mean_c": 28.955163574218773,
+            "scored_cells": 1,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 1.0
+          },
+          "10:20": {
+            "accuracy": 0.0,
+            "model_mean_c": 29.117395019531273,
+            "scored_cells": 1,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 1.0
+          },
+          "20:30": {
+            "accuracy": 0.7726658374202252,
+            "model_mean_c": 27.880919063829076,
+            "scored_cells": 39,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.22733416257977473
+          },
+          "30:40": {
+            "accuracy": 0.6881632099557033,
+            "model_mean_c": 25.439204235152022,
+            "scored_cells": 116,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.3118367900442966
+          },
+          "40:50": {
+            "accuracy": 0.6529968981459126,
+            "model_mean_c": 22.10166756608575,
+            "scored_cells": 220,
+            "too_cold_fraction": 0.07063099221785454,
+            "too_warm_fraction": 0.2763721096362329
+          },
+          "50:60": {
+            "accuracy": 0.9571013773811745,
+            "model_mean_c": 17.65258324193788,
+            "scored_cells": 269,
+            "too_cold_fraction": 0.011910209401101452,
+            "too_warm_fraction": 0.030988413217723984
+          },
+          "60:70": {
+            "accuracy": 0.8758253823491595,
+            "model_mean_c": 12.091484586647777,
+            "scored_cells": 430,
+            "too_cold_fraction": 0.0,
+            "too_warm_fraction": 0.12417461765084041
+          },
+          "70:80": {
+            "accuracy": 0.7665237272947141,
+            "model_mean_c": 2.39210866982251,
+            "scored_cells": 203,
+            "too_cold_fraction": 0.16292473923082346,
+            "too_warm_fraction": 0.07055153347446246
+          },
+          "80:90": {
+            "accuracy": 0.3008104038315874,
+            "model_mean_c": -9.709667633604463,
+            "scored_cells": 84,
+            "too_cold_fraction": 0.6991895961684129,
+            "too_warm_fraction": 0.0
+          }
+        },
+        "model_mean_c": 15.386439309494778,
+        "scored_cells": 2359,
+        "too_cold_fraction": 0.03304059405812229,
+        "too_warm_fraction": 0.28957198517878197
+      }
+    },
+    "land_seasonal_cycle": {
+      "bands": {
+        "25-35N": {
+          "amplitude_k": 16.06611146096187,
+          "coldest_bias_c": 13.280467023889514,
+          "coldest_c": 11.280467023889514,
+          "mean_bias_c": 9.11776165306284,
+          "mean_c": 21.11776165306284,
+          "plateau_excess_months": 1.4855524989736195,
+          "plateau_months": 3.4848573540049315,
+          "squareness_months": 7.120001107180673,
+          "warmest_bias_c": 1.3465784848513849,
+          "warmest_c": 27.346578484851385
+        },
+        "25-35S": {
+          "amplitude_k": 16.894827113118414,
+          "coldest_bias_c": 3.870523655435175,
+          "coldest_c": 11.870523655435175,
+          "mean_bias_c": 6.0134441526226645,
+          "mean_c": 22.013444152622665,
+          "plateau_excess_months": 1.732768850904435,
+          "plateau_months": 3.625652861030716,
+          "squareness_months": 6.944846477962366,
+          "warmest_bias_c": 4.7653507685535885,
+          "warmest_c": 28.76535076855359
+        },
+        "35-45N": {
+          "amplitude_k": 21.48749729969041,
+          "coldest_bias_c": 6.556799319775096,
+          "coldest_c": 2.556799319775096,
+          "mean_bias_c": 5.51496555819193,
+          "mean_c": 15.51496555819193,
+          "plateau_excess_months": 1.2910548593632556,
+          "plateau_months": 3.007410426037604,
+          "squareness_months": 6.968612790212494,
+          "warmest_bias_c": 0.04429661946550567,
+          "warmest_c": 24.044296619465506
+        },
+        "45-55N": {
+          "amplitude_k": 30.16335746212641,
+          "coldest_bias_c": -2.6777027112035405,
+          "coldest_c": -10.67770271120354,
+          "mean_bias_c": 0.11953413130579005,
+          "mean_c": 7.11953413130579,
+          "plateau_excess_months": 0.9398803681088138,
+          "plateau_months": 2.3787467157107187,
+          "squareness_months": 6.746986768026183,
+          "warmest_bias_c": -1.514345249077131,
+          "warmest_c": 19.48565475092287
+        }
+      },
+      "cycle_error_score": 5.268564825457399
+    },
+    "monthly_climatology": {
+      "grid": {
+        "height": 64,
+        "width": 128
+      },
+      "period": "1991-2020",
+      "precipitation_mm_day": {
+        "annual_log_correlation": 0.4991443139860694,
+        "annual_log_rmse": 1.0634939812132738,
+        "monthly_bias": -0.10948335055616386,
+        "monthly_correlation": 0.36142614078702795,
+        "monthly_log_correlation": 0.4626197423860769,
+        "monthly_log_rmse": 1.4057300643796218,
+        "monthly_rmse": 2.6549205360829995
+      },
+      "scored_area_fraction": 0.258056640625,
+      "source": "CRU TS v4.10, Climatic Research Unit, University of East Anglia",
+      "temperature_c": {
+        "monthly_bias": 2.979522658567582,
+        "monthly_correlation": 0.9300321366915202,
+        "monthly_rmse": 6.2785396493418215
+      }
+    },
+    "orographic_contrast": {},
+    "precip_rescale": {
+      "capacity_limited_fraction": 0.859375,
+      "closure": {
+        "final_precip_mm_day": 3.0626812119222344,
+        "raw_column_rainout_fraction": 0.20764246221429655,
+        "raw_precip_mm_day": 5.651622862949182,
+        "raw_to_final_ratio": 1.8453186838215025,
+        "target_adjustment_mm_day": -2.5889416510269476
+      },
+      "max": 17.870920181274414,
+      "mean": 2.6874048316385597,
+      "mean_target_achieved_fraction": 0.7789063365198672,
+      "mean_unmet_mm_day": 0.3566902131715324,
+      "row_target_rescale_applied": true,
+      "saturated_fraction": 0.0,
+      "strategy": "moisture_budget"
+    },
+    "reference_error_score": 0.2116477243817489,
+    "regional_land_temperature": {
+      "Atacama": {
+        "annual_bias_c": 13.834013852951708,
+        "model_seasonal_range_c": 13.447845458984375,
+        "monthly_rmse_c": 14.028587844538848,
+        "reference_seasonal_range_c": 7.133680044415712
+      },
+      "Canadian Prairies": {
+        "annual_bias_c": 5.044431254878769,
+        "model_seasonal_range_c": 28.650009155273438,
+        "monthly_rmse_c": 5.735477221298579,
+        "reference_seasonal_range_c": 34.68168167787053
+      },
+      "Central Europe": {
+        "annual_bias_c": 0.5882876236289718,
+        "model_seasonal_range_c": 22.07429199218751,
+        "monthly_rmse_c": 1.6508424804354993,
+        "reference_seasonal_range_c": 18.915019057873963
+      },
+      "East China": {
+        "annual_bias_c": 3.651263833603044,
+        "model_seasonal_range_c": 19.154225667317746,
+        "monthly_rmse_c": 4.371844849755653,
+        "reference_seasonal_range_c": 18.999724128798903
+      },
+      "Kalahari": {
+        "annual_bias_c": 3.630287577166181,
+        "model_seasonal_range_c": 12.740572611490848,
+        "monthly_rmse_c": 3.7751265184866045,
+        "reference_seasonal_range_c": 11.3722958737971
+      },
+      "S Japan": {
+        "annual_bias_c": 8.735520013129602,
+        "model_seasonal_range_c": 18.303558349609375,
+        "monthly_rmse_c": 9.069868709596351,
+        "reference_seasonal_range_c": 16.136230561236403
+      },
+      "SE US": {
+        "annual_bias_c": 6.081166752768827,
+        "model_seasonal_range_c": 14.35813598632808,
+        "monthly_rmse_c": 6.172414069401872,
+        "reference_seasonal_range_c": 15.76307984592944
+      },
+      "Sahara": {
+        "annual_bias_c": -1.4813946129230733,
+        "model_seasonal_range_c": 10.414068942599783,
+        "monthly_rmse_c": 2.652719694054053,
+        "reference_seasonal_range_c": 16.287646403865097
+      },
+      "US Midwest": {
+        "annual_bias_c": 5.331673306078447,
+        "model_seasonal_range_c": 22.546009063720703,
+        "monthly_rmse_c": 6.074423038231876,
+        "reference_seasonal_range_c": 29.575744085739984
+      }
+    },
+    "regional_precip_mm_year": {
+      "Atacama": 64.21773209256861,
+      "Canadian Prairies": 479.6681811561105,
+      "Central Europe": 923.4687986917912,
+      "East China": 663.2185634875692,
+      "Kalahari": 138.5175783889878,
+      "S Japan": 960.1286077881829,
+      "SE US": 986.0049170543043,
+      "Sahara": 172.76511490256678,
+      "US Midwest": 936.8584823856802
+    },
+    "regional_soil_moisture": {
+      "Atacama": 0.5570233480797875,
+      "Canadian Prairies": 0.5215999931097032,
+      "Central Europe": 0.5174500462909541,
+      "East China": 0.5103025523324808,
+      "Kalahari": 0.5610810994274088,
+      "S Japan": 0.4876621303459009,
+      "SE US": 0.44500603573396813,
+      "Sahara": 0.5636143096067289,
+      "US Midwest": 0.5422429808725915
+    },
+    "regional_target_error_fraction": {
+      "Atacama": 0.2843546418513722,
+      "Canadian Prairies": 0.0,
+      "Central Europe": 0.23129173158905497,
+      "East China": 0.35376746472912823,
+      "Kalahari": 0.0,
+      "S Japan": 0.2908506328235532,
+      "SE US": 0.07599672196379713,
+      "Sahara": 0.0,
+      "US Midwest": 0.0
+    },
+    "zonal": {
+      "0-10N": {
+        "precip_mm_year": 1892.9375960302743,
+        "precip_ratio": 0.9464687980151372,
+        "temperature_bias_c": -0.42453817923853876,
+        "temperature_c": 26.07546182076146
+      },
+      "0-10S": {
+        "precip_mm_year": 1901.815597373103,
+        "precip_ratio": 1.2678770649154019,
+        "temperature_bias_c": 0.5455368965864977,
+        "temperature_c": 26.045536896586498
+      },
+      "10-20N": {
+        "precip_mm_year": 1431.876392844592,
+        "precip_ratio": 0.7954868849136622,
+        "temperature_bias_c": -0.4092358522944437,
+        "temperature_c": 25.090764147705556
+      },
+      "40-50N": {
+        "precip_mm_year": 975.5295337372644,
+        "precip_ratio": 1.625882556228774,
+        "temperature_bias_c": 5.791342706481714,
+        "temperature_c": 14.791342706481714
+      },
+      "40-50S": {
+        "precip_mm_year": 1020.0475870491055,
+        "precip_ratio": 1.2750594838113818,
+        "temperature_bias_c": 5.044739878177666,
+        "temperature_c": 17.044739878177666
+      },
+      "50-60N": {
+        "precip_mm_year": 672.8834958302207,
+        "precip_ratio": 1.3457669916604413,
+        "temperature_bias_c": 4.396318600575228,
+        "temperature_c": 8.396318600575228
+      }
+    }
+  },
+  "monthly_climatology_reference": {
+    "builder": "scripts/build_cru_ts_reference.py",
+    "grid": "0.5 degree regular global land grid; north-to-south rows",
+    "license": "Open Database License (ODbL) with Database Contents License (DbCL)",
+    "period": "1991-2020",
+    "precipitation_variable": "pre: monthly precipitation total (mm/month)",
+    "regridded_from": {
+      "height": 360,
+      "width": 720
+    },
+    "schema_version": 1,
+    "source": "CRU TS v4.10, Climatic Research Unit, University of East Anglia",
+    "source_urls": [
+      "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/cruts.2604091129.v4.10/tmp/cru_ts4.10.1991.2000.tmp.dat.nc.gz",
+      "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/cruts.2604091129.v4.10/tmp/cru_ts4.10.2001.2010.tmp.dat.nc.gz",
+      "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/cruts.2604091129.v4.10/tmp/cru_ts4.10.2011.2020.tmp.dat.nc.gz",
+      "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/cruts.2604091129.v4.10/pre/cru_ts4.10.1991.2000.pre.dat.nc.gz",
+      "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/cruts.2604091129.v4.10/pre/cru_ts4.10.2001.2010.pre.dat.nc.gz",
+      "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/cruts.2604091129.v4.10/pre/cru_ts4.10.2011.2020.pre.dat.nc.gz"
+    ],
+    "temperature_variable": "tmp: monthly average daily mean temperature (degC)"
+  },
+  "planet": {
+    "eccentricity": 0.0167,
+    "obliquity_deg": 23.44,
+    "orbital_period_days": 365.2422,
+    "solar_constant": 1361.0
+  },
+  "planet_params": {
+    "abyssal_overturning_coeff": 0.0,
+    "acc_bonus_far": 20.0,
+    "acc_bonus_near": 8.0,
+    "aerosol_optical_depth": 0.0,
+    "amoc_bonus_far": 9.0,
+    "amoc_bonus_near": 3.0,
+    "amoc_cutoff_lat": 80.0,
+    "betts_miller_midlevel_target_relative_humidity": 0.7,
+    "betts_miller_relaxation_hours": 2.0,
+    "betts_miller_target_relative_humidity": 0.85,
+    "betts_miller_upper_target_relative_humidity": 0.5,
+    "bg_ar_frac": 0.0093,
+    "bg_n2_frac": 0.7808,
+    "bg_o2_frac": 0.2095,
+    "ch4_baseline_ppb": 700.0,
+    "ch4_initial_ppb": 1900.0,
+    "cloud_greenhouse_factor": 0.12,
+    "cloud_optical_condensate_cap_q": 0.001,
+    "cloud_water_feedback": 0.0,
+    "co2_baseline_ppm": 280.0,
+    "co2_climate_feedback": 0.8,
+    "co2_initial_ppm": 415.0,
+    "co2_wind_averaging_days": 30.0,
+    "coastal_upwelling_fog_strength": 0.5,
+    "column_water_use_bulk_condensate_rainfall": false,
+    "condensate_autoconversion_timescale_days": 0.25,
+    "condensate_condensation_timescale_days": 0.5,
+    "condensate_fallout_timescale_days": 1.0,
+    "condensate_transport_scale": 1.0,
+    "cp_dry": 1004.0,
+    "deep_ocean_depth_m": 3700.0,
+    "deep_ocean_exchange_rate": 9.13e-05,
+    "deep_ocean_heat_capacity_ratio": 0.013513513513513514,
+    "drybelt_seasonal_equatorward_fraction": 0.0,
+    "drybelt_seasonal_response": 0.25,
+    "eccentricity": 0.0167,
+    "eddy_heat_flux_coeff": 0.006,
+    "ekman_strength": 0.3,
+    "enable_cloud_precipitating_condensate_partition": false,
+    "enable_energy_limited_evaporation": false,
+    "enable_force_restore_land": false,
+    "enable_humidity_dependent_downwelling_longwave": false,
+    "enable_hydrometeor_transport": false,
+    "enable_land_ice_dynamics": false,
+    "enable_land_surface_energy": false,
+    "enable_milankovitch_cycles": false,
+    "enable_native_balanced_diabatic_overturning": false,
+    "enable_native_balanced_moist_static_energy_overturning": false,
+    "enable_native_balanced_pressure_dynamics": false,
+    "enable_prognostic_column_water": false,
+    "enable_prognostic_condensate": false,
+    "enable_separate_precipitating_hydrometeors": false,
+    "enable_simplified_betts_miller_convection": false,
+    "enable_stability_aware_condensation": false,
+    "enable_surface_hydrology": false,
+    "enable_three_level_flux_form_exchange": false,
+    "enable_three_level_horizontal_mass_flux_closure": false,
+    "enable_three_level_pressure_column": false,
+    "enable_two_layer_convective_adjustment": false,
+    "enforce_three_level_mass_closure": false,
+    "epsilon_equator": 0.68,
+    "epsilon_pole": 0.7,
+    "evap_cooling_amplitude": 0.0,
+    "evap_cooling_coeff": 0.85,
+    "evap_cooling_season_width": 1.0,
+    "evap_cooling_strength": 1.0,
+    "evap_cooling_threshold_k": 290.0,
+    "evaporation_downwelling_longwave_w_m2": 0.0,
+    "evaporation_latent_energy_fraction": 0.75,
+    "evaporation_longwave_clear_sky_emissivity_floor": 0.7,
+    "evaporation_longwave_cloud_emissivity_weight": 0.5,
+    "evaporation_longwave_reference_emissivity": 0.8,
+    "evaporation_surface_shortwave_transmissivity": 0.5,
+    "ferrel_v_centre_deg": 44.0,
+    "ferrel_v_land_shift_deg": -4.0,
+    "gas_constant_dry": 287.0,
+    "has_liquid_water_ocean": true,
+    "humidity_advection_cfl": false,
+    "ice_albedo_strength": 0.3,
+    "ice_flow_diffusivity": 0.002,
+    "ice_melt_degree_day_mm": 6.0,
+    "itcz_seasonal_response": 0.4,
+    "itcz_seasonal_target_min_fraction": 0.1,
+    "itcz_seasonal_target_response": 2.0,
+    "itcz_zonal_smooth_deg": 8.0,
+    "jet_block_duration_range_days": [
+      10.0,
+      40.0
+    ],
+    "jet_block_pressure_amp_pa": 180.0,
+    "jet_block_radius_km": 3200.0,
+    "jet_block_trigger_rate_per_day": 0.015,
+    "jet_gradient_ref_k": 40.0,
+    "jet_lat_shift_per_index": 6.0,
+    "jet_meander_noise_amp": 0.35,
+    "jet_meander_tau_days": 10.0,
+    "jet_speed_scale_per_index": 0.25,
+    "jet_wave_amp_scale_per_index": 0.5,
+    "k_airsea": 0.001,
+    "lake_evap_mm_day": 4.0,
+    "land_cap_softness_k": 0.0,
+    "land_deep_heat_capacity_j_m2_k": 12000000.0,
+    "land_force_restore_days": 30.0,
+    "land_ice_max_thickness_m": 4000.0,
+    "land_seasonal_amplitude": 0.75,
+    "land_seasonal_amplitude_maritime": 0.45,
+    "land_surface_energy_strength": 1.0,
+    "land_surface_heat_capacity_j_m2_k": 1500000.0,
+    "land_surface_resistance_dry_s_m": 2000.0,
+    "land_surface_resistance_min_s_m": 70.0,
+    "land_thermal_inertia_days": 0.0,
+    "land_transport_deficit_gain": 1.0,
+    "land_transport_deficit_k": 0.0,
+    "land_transport_gain": 0.5,
+    "land_transport_maritime_decay": 1.0,
+    "land_transport_maritime_km": 1200.0,
+    "land_transport_seasonality": 0.0,
+    "land_transport_upwind_ratio": 32.0,
+    "lapse_rate_k_per_km": 6.5,
+    "max_elevation_km": 8.848,
+    "mean_molar_mass": 0.029,
+    "milankovitch_eccentricity_amplitude": 0.02,
+    "milankovitch_obliquity_amplitude_deg": 1.2,
+    "milankovitch_time_scale": 1.0,
+    "moisture_advection_scale": 0.0,
+    "moisture_budget_precip_rescale": true,
+    "moisture_budget_tropical_cap_boost": 0.0,
+    "monsoon_east_margin_exemption": 3.0,
+    "native_balanced_ageostrophic_timescale_hours": 0.0,
+    "native_balanced_diabatic_overturning_max_speed_m_s": 2.0,
+    "native_balanced_mid_pressure_pa": 65000.0,
+    "native_balanced_mse_overturning_max_speed_m_s": 2.0,
+    "native_balanced_mse_radiative_relaxation_days": 10.0,
+    "native_balanced_mse_use_toa_radiative_target": false,
+    "native_balanced_overturning_speed_m_s": 0.0,
+    "native_balanced_pressure_relaxation": 0.0,
+    "native_balanced_surface_pressure_pa": 90000.0,
+    "obliquity_deg": 23.44,
+    "ocean_fraction": 0.71,
+    "ocean_gyre_strength": 1.0,
+    "ocean_lag_days": 50.0,
+    "ocean_transport_coeff": 0.3,
+    "orbital_period_days": 365.2422,
+    "orographic_normalizer_land_only": true,
+    "orographic_spillover_km": 0.0,
+    "orographic_uplift_clip": 2.0,
+    "orographic_upwind_footprint_km": 0.0,
+    "perihelion_day": 3.0,
+    "pgf_continentality_amp": 0.0,
+    "polar_cooling_scale": 0.3,
+    "precip_land_shape_weight": 0.0,
+    "precip_orographic_shape_weight": 1.0,
+    "precip_orographic_weight": 0.2,
+    "precip_potential_ceiling": 3.0,
+    "precip_rain_out_ceiling": 0.85,
+    "precip_raw_conversion_gain": 4.5,
+    "precip_raw_shape_weight": 0.0,
+    "precip_substep_days": 0.0,
+    "radius_m": 6371000.0,
+    "river_routing_fraction": 0.55,
+    "river_routing_passes": 8,
+    "rotation_direction": 1,
+    "runoff_fraction": 0.35,
+    "runoff_soil_threshold": 0.3,
+    "salinity_amoc_scale": 1.0,
+    "salinity_reference_psu": 35.0,
+    "sidereal_day_hours": 23.9345,
+    "soil_deep_drain_rate": 0.002,
+    "soil_deep_evap_weight": 0.5,
+    "soil_deep_gain_rate": 0.0005,
+    "solar_constant": 1361.0,
+    "spherical_metric_clouds": true,
+    "spherical_metric_precip": true,
+    "sst_land_coupling_km": 600.0,
+    "sst_land_coupling_strength": 0.0,
+    "sst_land_target_weight": 0.0,
+    "stability_condensation_cape_scale_j_kg": 50.0,
+    "stability_condensation_critical_rh": 0.7,
+    "stability_condensation_reference_height_m": 3500.0,
+    "storm_pressure_amp_pa": 110.0,
+    "storm_track_seasonal_response": 0.0,
+    "subsidence_divergence_regime_gate": 1.0,
+    "surface_gravity": 9.81,
+    "surface_pressure_pa": 101325.0,
+    "surface_water_cap_mm": 50000.0,
+    "temperature_substep_days": 0.0,
+    "thermal_diffusivity": 0.04,
+    "three_level_balanced_thermal_wind_relaxation": 0.0,
+    "three_level_diabatic_ascent_scale": 0.0,
+    "three_level_divergence_filter_passes": 0,
+    "three_level_divergence_filter_strength": 0.0,
+    "three_level_horizontal_mass_flux_max_speed_m_s": 12.0,
+    "three_level_horizontal_mass_flux_strength": 1.0,
+    "three_level_horizontal_mass_flux_throughflow_max_speed_m_s": 80.0,
+    "three_level_mid_upper_pressure_depth_pa": 30000.0,
+    "three_level_mid_wind_damping": 0.08,
+    "three_level_mid_wind_pgf_fraction": 0.55,
+    "three_level_mid_wind_relaxation": 0.1,
+    "three_level_thermal_wind_upper_pressure_pa": 30000.0,
+    "three_level_upper_height_m": 8000.0,
+    "three_level_upper_humidity_fraction": 0.15,
+    "three_level_upper_wind_damping": 0.08,
+    "three_level_upper_wind_pgf_fraction": 1.0,
+    "trade_wave_pressure_amp_pa": 65.0,
+    "two_layer_cloud_radiative_weight": 0.5,
+    "two_layer_cloud_reference_q": 0.004,
+    "two_layer_entrainment_days": 2.0,
+    "two_layer_midlevel_relaxation_days": 10.0,
+    "two_layer_pressure_depth_pa": 35000.0,
+    "two_layer_upper_humidity_fraction": 0.25,
+    "two_layer_upper_mass_fraction": 0.25,
+    "two_layer_vertical_mixing_days": 5.0,
+    "two_layer_vertical_velocity_scale_pa_s": 0.05,
+    "vernal_equinox_day": 80.0,
+    "wind_prognostic_substep_days": 1.0,
+    "wind_terrain_pgf_scale": 1.0,
+    "wind_upper_damping": 0.05,
+    "wind_upper_hadley_edge_deg": 24.0,
+    "wind_upper_pgf_amp": 90.0,
+    "wv_greenhouse_factor": 0.1
+  },
+  "schema_version": 1,
+  "simulation": {
+    "evaluation_cycles": 12,
+    "final_total_days": 730.4843999999996,
+    "sampled_days": 365.24219999999997,
+    "spinup_cycles": 12,
+    "wall_seconds": 13.759347500046715
+  }
+}

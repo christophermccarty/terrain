@@ -1,0 +1,24 @@
+{
+  "baseline_untouched": {
+    "cross_equatorial_total_energy_transport_pw": -37.51093573966516,
+    "elapsed_seconds": 148.95476913452148,
+    "global_precip_mm_day": 2.9610758751248247,
+    "global_temp_c": null,
+    "koppen_class_accuracy": 0.42227783866320323,
+    "koppen_group_accuracy": 0.7088431191671922,
+    "peak_northward_energy_transport_pw": 193.96799623618978,
+    "peak_southward_energy_transport_pw": -330.75639013102364,
+    "reference_error_score": 0.1720360921091577
+  },
+  "candidate_frac0_damp0.08_toa": {
+    "cross_equatorial_total_energy_transport_pw": -3.441828721452495,
+    "elapsed_seconds": 6942.348884105682,
+    "global_precip_mm_day": 2.8097020596437368,
+    "global_temp_c": null,
+    "koppen_class_accuracy": 0.37799234752480365,
+    "koppen_group_accuracy": 0.7014896144125868,
+    "peak_northward_energy_transport_pw": 551.9697147823974,
+    "peak_southward_energy_transport_pw": -626.4525915293667,
+    "reference_error_score": 0.7324803403893263
+  }
+}

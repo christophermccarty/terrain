@@ -1,0 +1,72 @@
+--- ocean_spinup0.5 ---
+{
+  "koppen_group_accuracy": 0.6287449617063968,
+  "cross_equatorial_total_energy_transport_pw": 8.111528084861021
+}
+--- ocean_spinup0.75 ---
+{
+  "koppen_group_accuracy": 0.6348439023336688,
+  "cross_equatorial_total_energy_transport_pw": -22.29827410718554
+}
+--- ocean_spinup1.0 ---
+{
+  "koppen_group_accuracy": 0.6272871167263183,
+  "cross_equatorial_total_energy_transport_pw": -14.647868558190149
+}
+--- ocean_spinup1.25 ---
+{
+  "koppen_group_accuracy": 0.6357220926262849,
+  "cross_equatorial_total_energy_transport_pw": 23.11608475143816
+}
+--- ocean_spinup1.5 ---
+{
+  "koppen_group_accuracy": 0.6312356443892272,
+  "cross_equatorial_total_energy_transport_pw": 7.6409168111540495
+}
+--- ocean_spinup1.75 ---
+{
+  "koppen_group_accuracy": 0.6348484597963341,
+  "cross_equatorial_total_energy_transport_pw": -21.29991470036993
+}
+--- ocean_spinup2.0 ---
+{
+  "koppen_group_accuracy": 0.6473170892101385,
+  "cross_equatorial_total_energy_transport_pw": -29.314904906615837
+}
+--- toa_spinup0.5 ---
+{
+  "koppen_group_accuracy": 0.6350312751948824,
+  "cross_equatorial_total_energy_transport_pw": 20.477353434348146
+}
+--- toa_spinup0.75 ---
+{
+  "koppen_group_accuracy": 0.6320570397290904,
+  "cross_equatorial_total_energy_transport_pw": -11.152283545797395
+}
+--- toa_spinup1.0 ---
+{
+  "koppen_group_accuracy": 0.6394246505359553,
+  "cross_equatorial_total_energy_transport_pw": -9.363325776003506
+}
+--- toa_spinup1.25 ---
+{
+  "koppen_group_accuracy": 0.6387174481479658,
+  "cross_equatorial_total_energy_transport_pw": 21.888715515634253
+}
+--- toa_spinup1.5 ---
+{
+  "koppen_group_accuracy": 0.6480803325909915,
+  "cross_equatorial_total_energy_transport_pw": 21.810466724780014
+}
+--- toa_spinup1.75 ---
+{
+  "koppen_group_accuracy": 0.6400072266221544,
+  "cross_equatorial_total_energy_transport_pw": -19.027842022445682
+}
+--- toa_spinup2.0 ---
+{
+  "koppen_group_accuracy": 0.6409354820371042,
+  "cross_equatorial_total_energy_transport_pw": -22.703359432997825
+}
+
+Wrote D:\dev\planetsim\scripts\upper_wind_transport_noise_floor_result.json

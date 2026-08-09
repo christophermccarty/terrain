@@ -1598,3 +1598,191 @@ whether 5-10 PW of swing is intrinsic to a 32x64/1yr+1yr evaluation window
 regardless of which parameter moved. Results archived at
 `scripts/decoupled_upper_wind_fine_screen_result.json`; sweep script is
 `scripts/screen_decoupled_upper_wind_fine.py`.
+
+## 19. Resolved: the transport metric is phase-chaos-dominated at this protocol, full stop
+
+Section 18 left two options open: check transport only at the full
+128x256/5yr benchmark, or first characterize its noise floor directly. The
+model has no free global RNG seed to reseed independently of physics
+(`_storm_pressure_anomaly` and the blocking-ridge/trade-wave analogues are
+deterministic, stateless functions of `time_days` and a hashed
+(hemisphere, slot, generation) identity -- see their own comments in
+`simulate.py` -- not driven by any reseedable global RNG), so a literal
+"same config, different seed" test isn't available. `scripts/screen_upper_
+wind_transport_noise_floor.py` does the next best thing: holds `three_level_
+upper_wind_pgf_fraction=0.1`/`damping=0.08` (Section 17's candidate point)
+and **every** physics parameter completely fixed, and varies only
+`RealTerrainValidationConfig.spinup_years` (0.5/0.75/1.0/1.25/1.5/1.75/2.0)
+-- which shifts what day of the deterministic storm/Rossby/seasonal cycle
+the one-year evaluation window happens to start on, nothing else.
+
+**Result: transport swings more from this pure phase shift than it did
+across Section 18's entire physics-parameter grid, including flipping
+sign.** Ocean-target transport ranges -29.31 to +23.12 PW (52.4 PW
+peak-to-peak, stdev 18.3) and TOA-target -22.70 to +21.89 PW (44.6 PW
+peak-to-peak, stdev 18.8) -- both wider than Section 18's already-noisy
+20-point grids (7.6 / 5.9 PW pstdev) despite zero physics parameters
+changing. This settles the open question from Section 18 without
+qualification: cross-equatorial transport measured on the 32x64 one-year
+spin-up/one-year evaluation protocol is dominated by which phase of the
+deterministic storm/Rossby cycle the short evaluation window happens to
+sample, not by the physics being screened. **No conclusion about any
+`pgf_fraction`/damping value's effect on transport can be drawn from this
+protocol at all** -- not Section 17's -9.36 PW, not Section 18's grid, not
+any future compact screen run the same way. This is a protocol limitation,
+independent of the three-level/upper-wind work specifically, and likely
+applies to every transport number reported anywhere in Sections 11-18 (all
+used the same or a similar compact window).
+
+**Group accuracy is not affected the same way**: across the identical
+phase sweep, Köppen group accuracy stays within 0.627-0.647 (ocean, range
+0.020, stdev 0.006) and 0.632-0.648 (TOA, range 0.016, stdev 0.005) --
+roughly the same tight band it held across Section 18's physics-parameter
+grid. Group accuracy is robust to evaluation-window phase; transport is not.
+This is now a two-for-two confirmation (physics-parameter axis in Section
+18, phase axis here) that group accuracy is the trustworthy compact-screen
+signal and transport is not, for this class of experiment.
+
+**How to apply.** Stop trying to select `three_level_upper_wind_pgf_
+fraction`/`damping` (or tune anything else in the mass-flux-closure/
+overturning family) by watching transport move on a compact 32x64/short-year
+screen -- it cannot distinguish a real effect from evaluation-window timing.
+Two consequences: (1) any transport-based promotion decision for this whole
+experimental family (Sections 8-18) now requires the full 128x256 five-year
+CRU benchmark's much longer averaging window (or an even longer compact
+window, not yet tested, if one can be found where the metric stabilizes) --
+there is no shortcut; (2) for cheap iteration, use group accuracy as the
+screening signal instead, which the fine sweep's own data argues favors
+`pgf_fraction` at or below 0.05 (lower than anything tested so far) -- worth
+extending that axis downward (e.g. 0.0/0.01/0.025/0.05) the next time this
+thread is picked up, since accuracy hasn't yet been shown to plateau. No
+default changed. Results archived at `scripts/upper_wind_transport_noise_
+floor_result.json`; script is `scripts/screen_upper_wind_transport_noise_
+floor.py`.
+
+## 20. Extending the fraction axis: accuracy is not fully clean either, best point is 0.0
+
+Section 19's own "how to apply" flagged the fraction axis as worth extending
+below 0.05 by group accuracy. `scripts/screen_upper_wind_pgf_fraction_low_
+range.py` sweeps `three_level_upper_wind_pgf_fraction` in (0.0, 0.01, 0.025,
+0.05, 0.075, 0.1) at a single fixed damping (0.08, the established
+precedent) for both radiative targets, on the same 32x64 protocol.
+
+**Result 1: at fixed damping, group accuracy is not perfectly monotonic
+either -- Section 18's "clean monotonic" framing was a damping-averaging
+artifact.** Ocean-target accuracy: 0.6535 (0.0) / 0.6495 (0.01) / 0.6429
+(0.025) / 0.6478 (0.05) / **0.6131 (0.075)** / 0.6273 (0.1) -- a real dip at
+0.075 that breaks strict monotonicity. TOA follows the same pattern (0.6606
+/ 0.6567 / 0.6605 / 0.6563 / 0.6433 / 0.6394). So accuracy has real
+point-to-point noise too, not just a smooth curve. But the *scale* of that
+noise stays an order of magnitude below transport's: full range across all
+six points is 0.040 (ocean) / 0.021 (TOA) -- versus the same run's own
+transport column, which spans -3.79 to -21.65 PW (ocean) and -0.47 to
+-21.50 PW (TOA), the same order-of-magnitude chaos Section 19 already
+established. Group accuracy remains the comparatively trustworthy signal;
+it is just not noise-free.
+
+**Result 2: the best point at both targets is `pgf_fraction=0.0`** -- the
+floor of the tested range, not an interior optimum: 0.6535 ocean / 0.6606
+TOA, both the top score in their column. This means the decoupled upper
+wind's own direct PGF forcing term (the mechanism Section 17 built) is, by
+this metric, net negative relative to letting the state be driven solely by
+the four terms already redirected onto it (balanced-pressure blend,
+thermal-wind relaxation, `thermally_direct_overturning`'s branch, and the
+mass-flux closure's correction) plus damping. `pgf_fraction=0.0` does not
+disable any of Sections 8-17's mechanisms -- the three-level/closure/
+overturning gates all stay on; it only zeroes the one *additional* forcing
+term Section 17 introduced on top of them.
+
+**Result 3: the other two metrics do not agree with group accuracy's
+ranking**, reproducing Section 14's "metrics move independently" finding
+again. Composite `reference_error_score` favors 0.0 for ocean (0.833, its
+column minimum) but 0.025 for TOA (0.681, well below 0.0's 0.942).
+`koppen_class_accuracy` favors mid-range values instead of either end (0.1
+for ocean at 0.268, 0.05 for TOA at 0.286) -- the opposite end of the range
+from where group accuracy peaks. No single fraction value is a joint winner
+across all three metrics at both targets simultaneously; this is again a
+real multi-objective trade rather than a clean answer.
+
+**Decision.** Per Section 19's own conclusion -- group accuracy is the one
+metric shown robust to both the physics-parameter axis (this section) and
+the evaluation-window-phase axis (Section 19) -- and given this session's
+explicit brief to sweep and choose by it, `three_level_upper_wind_pgf_
+fraction=0.0` / `three_level_upper_wind_damping=0.08` / TOA radiative
+target (`native_balanced_mse_use_toa_radiative_target=True`, the higher of
+the two targets' scores at this point: 0.6606 vs 0.6535) is selected as the
+single candidate to carry into the mandatory full 128x256 five-year
+spin-up/five-year evaluation CRU benchmark that Section 19 established is
+the only test that can actually decide promotion for this family. This is a
+choice among several defensible ones (reference-error-score would have
+picked TOA/0.025 instead), made explicit here rather than left open, per
+this project's practice of flagging real judgment calls; it should not be
+read as a claim that 0.0 is uniquely correct, only that it is the best
+candidate under the metric this project has now twice shown to be reliable
+at compact scale. No default changed yet -- promotion is contingent on the
+full-resolution benchmark result. Results archived at `scripts/upper_wind_
+pgf_fraction_low_range_result.json`; script is `scripts/screen_upper_wind_
+pgf_fraction_low_range.py`.
+
+## 21. Full-resolution verdict: NOT PROMOTABLE -- best-ever transport, worse accuracy
+
+`scripts/run_full_benchmark_upper_wind_frac0.py` ran the mandatory check:
+the untouched baseline (every three-level/closure/overturning gate off) and
+Section 20's candidate (`pgf_fraction=0.0`/`damping=0.08`/TOA target, full
+SHARED pipeline), back to back, at the real 128x256 five-year spin-up/
+five-year evaluation protocol this whole family has deferred its promotion
+decision to since Section 14.
+
+| Metric | Baseline | Candidate | Change |
+|---|---|---|---|
+| Koppen group accuracy | 0.7088 | 0.7015 | -0.73pp |
+| Koppen class accuracy | 0.4223 | 0.3780 | -4.43pp |
+| Composite reference-error score (lower better) | 0.172 | 0.732 | 4.26x worse |
+| Cross-equatorial transport | -37.51 PW | -3.44 PW | 91% closer to Earth's ~5-6 PW |
+| Peak northward / southward transport | 194 / -331 PW | 552 / -626 PW | ~2.8x larger gross overturning |
+| Wall-clock runtime | 149 s | 6942 s (~1h56m) | 46.6x slower |
+
+**Transport is the best result this entire investigation (Sections 8-21)
+has produced** -- -3.44 PW is closer to Earth's real peak Hadley-cell energy
+transport than any prior configuration in this family, including Section
+17's -9.36 PW and Section 15's -14.10 PW (its previous best, at a 120 m/s
+mass-flux cap). The larger gross (peak) transport alongside a smaller net
+residual is physically sensible -- a stronger overturning circulation whose
+poleward and equatorward branches cancel more completely at the equator,
+closer to how a real Hadley cell works (Section 15's own point, now
+observed rather than just argued).
+
+**But it does not clear the bar.** Class accuracy drops 4.4 percentage
+points and the composite reference-error score -- the metric this project's
+promotion decisions actually turn on, not any individual compact-screen
+signal -- is **4.26x worse**. Group accuracy, the one metric Sections 19-20
+established as reliable at compact scale and the metric this candidate was
+explicitly selected by, barely moved and went the *wrong direction* at full
+resolution (-0.73pp). This is a real, additional finding beyond "transport
+is unreliable at compact scale": **even the compact metric shown robust to
+phase and physics-parameter noise did not predict its own direction of
+change at full resolution for this family.** The two protocols agree on
+magnitude of relevance but not sign, for this specific metric-and-config
+combination. Separately, the candidate's full pipeline is **46.6x slower**
+than the untouched baseline at this resolution/duration -- a real practical
+cost independent of the accuracy question, worth weighing before any future
+attempt at this family invests further iteration time.
+
+**Decision: do not promote.** `three_level_upper_wind_pgf_fraction` stays
+at its default `1.0` (irrelevant while the gate is off), and all three
+three-level/closure/overturning gates (`enable_three_level_pressure_column`,
+`enable_three_level_horizontal_mass_flux_closure`,
+`enable_native_balanced_moist_static_energy_overturning`) stay at their
+existing `False` defaults. This closes the Sections 8-21 investigative arc
+(mass-flux closure isolation -> cap sweep -> resolved-wind-magnitude
+diagnosis -> upper-wind decoupling -> fine parameter sweeps -> phase-noise
+characterization -> low-fraction extension -> this full benchmark) with a
+real verdict: the family's own best-selected configuration, reached by the
+project's own most careful methodology, produces outstanding transport but
+a worse-than-baseline overall climate fit. Any future attempt at this
+family should treat transport and accuracy as a genuine Pareto trade-off to
+navigate explicitly (e.g. is there a point that improves transport
+*without* an accuracy cost, rather than searching only along the axes swept
+here), not as a single-objective optimization, and should budget for the
+~47x runtime cost of full-pipeline evaluation. Results archived at
+`scripts/full_benchmark_upper_wind_frac0_result.json`.

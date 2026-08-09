@@ -89,24 +89,33 @@ forcing to act on except sea ice.
 
 The `experiments/` directory referenced in PLAN.md's deferred list still does not exist.
 
-### 4. A real reanalysis benchmark pack (ERA5/CRU at ~2°) with map-correlation scoring
-**Effort: medium. Touches: `testing/fixtures/`, `diagnostics.py`, `testing/test_reanalysis_validation.py`.**
+### 4. A real reanalysis benchmark pack (ERA5/CRU at ~2°) with map-correlation scoring -- **Mostly done; pytest gate landed 2026-08-09**
 
-Not glamorous, but look at the shape of the project's own history: an enormous fraction of past
-sessions were spent arguing about whether a number was right, chasing findings that were later
-retracted because they came from single-month snapshots, and re-measuring the same six named
-boxes over and over. `testing/test_reanalysis_validation.py` currently validates against six
-hand-typed zonal bands, and its own docstring says full map-correlation is "deferred to a later
-calibration pass."
+The infrastructure this item called for already existed by the time it was picked back up: a real
+CRU TS v4.10 0.5deg monthly land climatology (`testing/reference_data/cru_ts_v4.10_1991_2020.npz`,
+built via `scripts/build_cru_ts_reference.py`), area-conservative regridding and weighted
+bias/RMSE/correlation scoring (`monthly_climatology.py`), wired into
+`scripts/run_real_terrain_validation.py --monthly-climatology`, with baselines already recorded in
+`docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` at both 64x128/1yr and 128x256/5yr. This item's own text
+was stale -- it had not been updated after that work landed.
 
-A versioned gridded reference (T, P, wind at ~2°) plus spatial correlation and RMSE in
-`diagnostics.py` would:
-- Give every future physics session a single scalar to move instead of six box numbers that
-  disagree with each other.
-- Catch regional errors that zonal means average away — which is precisely the class of error
-  (desert cores, continental interiors) that Part 1 is still fighting.
-- Make the optimizer's scoring function meaningfully better, since `ClimateScore` is already
-  designed to take an arbitrary `ReferenceClimate`.
+The one real gap was that none of it was an enforced regression gate: `testing/
+test_reanalysis_validation.py` still only asserted against six hand-typed zonal bands on synthetic
+terrain, and its own docstring still said map-correlation was "deferred." Fixed 2026-08-09: three
+new tests (`test_cru_temperature_map_correlation_and_error`,
+`test_cru_precipitation_map_correlation_and_error`, `test_cru_scored_area_fraction_is_meaningful`)
+run the real bundled-Earth-DEM harness scored against the real CRU reference at 64x128/1yr+1yr and
+assert bias/RMSE/correlation stay within headroom of the measured baseline (temp +2.98C bias/6.28C
+RMSE/0.930 correlation; precip -0.109 mm/day bias/1.406 log-RMSE/0.463 log-correlation). They
+`skipif` cleanly when the gitignored local `.npz` hasn't been built, per this file's own licensing
+note. The old zonal-band tests were kept (cheap, terrain-independent general sanity checks) rather
+than replaced.
+
+**What's still open, if this is picked up again**: wind isn't scored (no wind reanalysis reference
+built yet, only T/P), and `diagnostics.py` itself was never touched -- the scoring logic lives
+entirely in `monthly_climatology.py` instead, which turned out to be a perfectly reasonable home
+for it and not worth moving. The optimizer's `ClimateScore`/`ReferenceClimate` integration
+mentioned below also remains undone.
 
 ### 5. Prognostic AMOC + freshwater hosing
 **Effort: medium. Touches: `simulate.py`, `PlanetParams`.**

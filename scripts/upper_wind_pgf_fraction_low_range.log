@@ -1,0 +1,98 @@
+--- ocean_frac0.0 ---
+{
+  "koppen_group_accuracy": 0.6535417078107758,
+  "koppen_class_accuracy": 0.2665996304931572,
+  "reference_error_score": 0.8332212395623453,
+  "global_precip_mm_day": 2.5528341766593727,
+  "cross_equatorial_total_energy_transport_pw": -13.737872342233132
+}
+--- ocean_frac0.01 ---
+{
+  "koppen_group_accuracy": 0.6495411833704006,
+  "koppen_class_accuracy": 0.26473397470627436,
+  "reference_error_score": 0.9686373360760268,
+  "global_precip_mm_day": 2.557268574938935,
+  "cross_equatorial_total_energy_transport_pw": -6.408536860399117
+}
+--- ocean_frac0.025 ---
+{
+  "koppen_group_accuracy": 0.6429254643027922,
+  "koppen_class_accuracy": 0.26006296430909953,
+  "reference_error_score": 0.8563397653371551,
+  "global_precip_mm_day": 2.5588374837843975,
+  "cross_equatorial_total_energy_transport_pw": -10.539717973239217
+}
+--- ocean_frac0.05 ---
+{
+  "koppen_group_accuracy": 0.6478363554577161,
+  "koppen_class_accuracy": 0.25808847275453295,
+  "reference_error_score": 0.9216376371658843,
+  "global_precip_mm_day": 2.556502950399544,
+  "cross_equatorial_total_energy_transport_pw": -3.7943147264601436
+}
+--- ocean_frac0.075 ---
+{
+  "koppen_group_accuracy": 0.6131293811148831,
+  "koppen_class_accuracy": 0.24038455335277384,
+  "reference_error_score": 0.9112335129397788,
+  "global_precip_mm_day": 2.5489710390505893,
+  "cross_equatorial_total_energy_transport_pw": -21.651449274600488
+}
+--- ocean_frac0.1 ---
+{
+  "koppen_group_accuracy": 0.6272871167263183,
+  "koppen_class_accuracy": 0.2676799513588313,
+  "reference_error_score": 0.9325307443853902,
+  "global_precip_mm_day": 2.5645864343403852,
+  "cross_equatorial_total_energy_transport_pw": -14.647868558190149
+}
+--- toa_frac0.0 ---
+{
+  "koppen_group_accuracy": 0.6605976888242245,
+  "koppen_class_accuracy": 0.2701593953506352,
+  "reference_error_score": 0.9423624648414382,
+  "global_precip_mm_day": 2.547984654968047,
+  "cross_equatorial_total_energy_transport_pw": -21.49758561632064
+}
+--- toa_frac0.01 ---
+{
+  "koppen_group_accuracy": 0.6566925989292826,
+  "koppen_class_accuracy": 0.2708760294730108,
+  "reference_error_score": 1.0931994305718675,
+  "global_precip_mm_day": 2.5468977371935466,
+  "cross_equatorial_total_energy_transport_pw": -3.593410644308543
+}
+--- toa_frac0.025 ---
+{
+  "koppen_group_accuracy": 0.6604518445905454,
+  "koppen_class_accuracy": 0.2797342645716975,
+  "reference_error_score": 0.6809154543915421,
+  "global_precip_mm_day": 2.560019967079294,
+  "cross_equatorial_total_energy_transport_pw": -19.30231669699917
+}
+--- toa_frac0.05 ---
+{
+  "koppen_group_accuracy": 0.6563249049380376,
+  "koppen_class_accuracy": 0.28597172224343964,
+  "reference_error_score": 1.2161212065141012,
+  "global_precip_mm_day": 2.5640862916117597,
+  "cross_equatorial_total_energy_transport_pw": -17.276491446009775
+}
+--- toa_frac0.075 ---
+{
+  "koppen_group_accuracy": 0.6432813247301538,
+  "koppen_class_accuracy": 0.2540653311027196,
+  "reference_error_score": 1.1196705692956008,
+  "global_precip_mm_day": 2.5623458131420302,
+  "cross_equatorial_total_energy_transport_pw": -0.4723331662185615
+}
+--- toa_frac0.1 ---
+{
+  "koppen_group_accuracy": 0.6394246505359553,
+  "koppen_class_accuracy": 0.28424772906289414,
+  "reference_error_score": 1.1105440219654377,
+  "global_precip_mm_day": 2.5706712712105033,
+  "cross_equatorial_total_energy_transport_pw": -9.363325776003506
+}
+
+Wrote D:\dev\planetsim\scripts\upper_wind_pgf_fraction_low_range_result.json
