@@ -251,7 +251,10 @@ before doing it, because it is a validated design for the exact tradeoff this pr
 
 ### 5. Per-cell T/P validation data (closes H10 gap #10)
 
-`scripts/build_cru_ts_reference.py` is already in progress (untracked). Notes for it:
+`scripts/build_cru_ts_reference.py` is built and committed, and CRU TS v4.10 scoring is now
+integrated into both `real_terrain_validation.py` and the optimizer (`monthly_climatology_path`
+on `run_simulation`) — see `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` and `FEATURES.md` §4. Notes
+below are kept for reference on the source data landscape:
 
 - **CHELSA** ([chelsa-climate.org](https://www.chelsa-climate.org/), 1 km monthly climatologies,
   1979–2013) is specifically documented as having **better orographic precipitation** than WorldClim

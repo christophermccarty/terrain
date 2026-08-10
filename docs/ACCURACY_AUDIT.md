@@ -2231,7 +2231,9 @@ geography (Sri Lanka, NE Brazil, Somalia, Vietnam, Hispaniola).
   their intended test).
 
 **Baseline on the tracked 64×128 benchmark**: group accuracy **0.688**, group κ **0.606**,
-class accuracy **0.388**, class κ **0.331**, group share MAE **2.06pp**.
+class accuracy **0.388**, class κ **0.331**, group share MAE **2.06pp**. *(Historical snapshot at
+build time, 2026-08-02; later recalibration shifted the tracked fixture — group accuracy is
+0.674 as of the current baseline, see `docs/CURRENT_BASELINE.md`. Class accuracy is unchanged.)*
 
 **It immediately earned its keep — the aggregate metrics were hiding real errors:**
 - **Group share MAE is 2.06pp while 31% of land is in the wrong group.** Shares are a closed budget,

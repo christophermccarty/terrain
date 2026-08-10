@@ -22,12 +22,22 @@ metrics.
   --height 128 --width 256 `
   --spinup-years 10 --evaluation-years 3 `
   --output testing\results\long-real-terrain.json
+
+# Score against real climatology references (CRU TS v4.10 temperature/precip,
+# NCEP/NCAR Reanalysis 1 wind) instead of only the built-in zonal-band targets
+.\.venv\Scripts\python.exe scripts\run_real_terrain_validation.py `
+  --monthly-climatology path\to\climatology.npz `
+  --wind-climatology path\to\ncep_ncar_wind_1991_2020.npz
 ```
 
 The default compact configuration is 64×128, one year of MONTHLY spinup, then
 one year of time-averaged evaluation. It is intentionally small enough for a
 repeatable regression test. Calibration decisions should also be checked with a
 longer and/or higher-resolution run.
+
+`--monthly-climatology` and `--wind-climatology` are optional and independent
+of each other — see `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` for how to build
+the reference files and what metrics each one populates.
 
 ## What is measured
 

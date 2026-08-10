@@ -136,6 +136,10 @@ PLANET_PARAM_CASES = [
     ("land_seasonal_amplitude_maritime", 0.0),  # default 0.45; 0.0 is the no-op
     ("land_transport_gain", 1.0),  # default 0.5; 1.0 is the exact no-op
     ("sst_land_target_weight", 1.5),  # default 0.0 (exact no-op)
+    ("temperature_amoc_scale", 5.0),  # default 0.0 (exact no-op); see test_amoc_density_coupling.py
+    ("mixed_layer_depth_tropical_m", 5.0),  # default 30.0
+    ("mixed_layer_depth_polar_m", 400.0),  # default 200.0
+    ("derive_ocean_seasonal_lag", True),  # default False; see test_mixed_layer_depth.py
     ("evap_cooling_threshold_k", 275.0),  # default 290.0; lower = wider reach
     ("evap_cooling_amplitude", 0.6),  # default 0.0 (exact no-op)
     # evap_cooling_coeff is deliberately absent, and like sst_land_coupling_strength

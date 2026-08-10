@@ -388,6 +388,56 @@ def _soft_min_cap(x: np.ndarray, cap: np.ndarray, width: float) -> np.ndarray:
     return (cap - width * np.logaddexp(0.0, z)).astype(np.float32, copy=False)
 
 
+def _ocean_seasonal_fraction(lat_deg: np.ndarray, pp) -> np.ndarray:
+    """Fraction of the radiative seasonal swing that reaches ocean SST.
+
+    Multiplies ``(T_lat_ocean_lagged - T_lat_annual_mean)`` in the ocean base
+    temperature calculation, i.e. how much of a lagged radiative-equilibrium
+    excursion the ocean's thermal inertia lets through.
+
+    Two modes, selected by ``pp.derive_ocean_seasonal_lag``:
+
+    - **Legacy (default, False)**: a hand-tuned per-latitude polynomial,
+      unchanged since the model's early days. Equator ~24%, mid-lat ~10%,
+      polar ~5% at Earth obliquity.
+    - **Derived (True)**: computed from an explicit latitude-dependent mixed
+      layer depth (``pp.mixed_layer_depth_tropical_m``/``_polar_m`` -- the
+      same field `_evolve_temperature`'s T_sst relaxation step uses) via the
+      standard slab-ocean thermal-relaxation response
+      ΔT/ΔT_rad = 1/sqrt(1 + (2πτ/P)²), τ = ρ·cp·h/λ. Ships behind a flag
+      (default off) because it has not yet been checked against the
+      real-terrain regression baseline -- see FEATURES.md item 6.
+
+    Both modes keep the same high-obliquity polar boost term: a real,
+    distinct effect (extreme axial tilt drives polar insolation swings large
+    enough to punch through even a deep mixed layer's damping), not curve-
+    fitting specific to the legacy formula.
+    """
+    obliq_ratio = float(pp.obliquity_deg) / 23.44
+    obliq_factor = np.clip(obliq_ratio, 0.6, 2.0) ** 0.5
+    polar_lat_boost = np.sin(np.deg2rad(lat_deg)) ** 2
+    high_obliq_boost = max(obliq_ratio - 1.0, 0.0)
+    seasonal_cap = float(min(0.45 * obliq_factor, 0.85))
+
+    if not pp.derive_ocean_seasonal_lag:
+        frac = (
+            (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg))) * obliq_factor
+            + 0.60 * high_obliq_boost * polar_lat_boost
+        )
+        return np.clip(frac, 0.03, seasonal_cap).astype(np.float32, copy=False)
+
+    mld_trop = float(pp.mixed_layer_depth_tropical_m)
+    mld_polar = float(pp.mixed_layer_depth_polar_m)
+    mld = mld_trop + (mld_polar - mld_trop) * (np.abs(lat_deg) / 90.0) ** 1.5
+    _WATER_HEAT_CAPACITY_J_M3_K = 4.186e6  # rho * cp for seawater
+    lam = max(float(pp.ocean_thermal_relaxation_coefficient), 1e-6)
+    tau_seconds = _WATER_HEAT_CAPACITY_J_M3_K * mld / lam
+    tau_over_period = tau_seconds / (float(pp.orbital_period_days) * 86400.0)
+    frac = 1.0 / np.sqrt(1.0 + (2.0 * np.pi * tau_over_period) ** 2)
+    frac = frac + 0.60 * high_obliq_boost * polar_lat_boost
+    return np.clip(frac, 0.03, seasonal_cap).astype(np.float32, copy=False)
+
+
 _MARITIME_CACHE: dict = {"key": None, "field": None}
 
 
@@ -1115,6 +1165,28 @@ def simulate_step(
             sal_anomaly = _na_sal - pp.salinity_reference_psu
             sal_amoc = float(np.clip(1.0 + 0.15 * sal_anomaly * pp.salinity_amoc_scale, 0.15, 1.5))
             amoc_factor = float(np.clip(amoc_factor * sal_amoc, 0.15, 1.0))
+
+    # Feature 3b: temperature (density) modulates AMOC strength -- the other
+    # half of the density-driven sinking, alongside the salinity term above.
+    # Warmer N.Atlantic surface water is less dense and further suppresses
+    # thermohaline sinking (compounds with freshening); colder water is denser
+    # and strengthens sinking. Same North Atlantic sinking region (50-75N),
+    # same phenomenological-gain convention as the salinity term -- not a full
+    # seawater equation of state. Ocean-only mean (unlike the salinity term,
+    # `state.temperature` carries real land values, so an unmasked band mean
+    # would be dominated by cold Canadian/Siberian winter land temperatures
+    # rather than the intended SST signal). See FEATURES.md item 5 /
+    # PlanetParams.temperature_amoc_scale for why this defaults to 0.0.
+    if state.temperature is not None and pp.has_liquid_water_ocean and pp.temperature_amoc_scale > 0.0:
+        _na_rows_temp = (_lat_ice >= 50.0) & (_lat_ice <= 75.0)
+        if np.any(_na_rows_temp):
+            _sea_mask_na, _ = get_masks(state.elevation)
+            _na_sea = _sea_mask_na[_na_rows_temp]
+            if np.any(_na_sea):
+                _na_temp = float(np.mean(state.temperature[_na_rows_temp][_na_sea]))
+                temp_anomaly = _na_temp - pp.temperature_amoc_reference_k
+                temp_amoc = float(np.clip(1.0 - 0.05 * temp_anomaly * pp.temperature_amoc_scale, 0.15, 1.5))
+                amoc_factor = float(np.clip(amoc_factor * temp_amoc, 0.15, 1.0))
 
     # Apply feedback flags — freeze individual feedback loops at neutral state for testing.
     # Planet-level disables (has_liquid_water_ocean=False) are merged in as flag overrides.
@@ -1857,21 +1929,10 @@ def simulate_step(
     _nh_transport_taper = np.where(lat > 0, _nh_transport_taper, 1.0)
     transport_warming = _transport_base * _sh_factor * _nh_transport_taper + _amoc_bonus + _acc_bonus
 
-    # Seasonal fraction: what fraction of the radiative swing the ocean actually feels
-    # Based on ΔT/ΔT_rad ≈ 1/sqrt(1 + (2π τ/P)²) where τ ~ 1-3 years, P = 1 year
-    # Equator (τ~0.7yr): ~24%, Mid-lat (τ~1.5yr): ~10%, Polar (τ~3yr): ~5%
-    obliq_ratio = float(pp.obliquity_deg) / 23.44
-    obliq_factor = np.clip(obliq_ratio, 0.6, 2.0) ** 0.5
-    polar_lat_boost = np.sin(np.deg2rad(lat_deg_1d)) ** 2
-    high_obliq_boost = max(obliq_ratio - 1.0, 0.0)
-    ocean_seasonal_frac = (
-        (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_1d))) * obliq_factor
-        + 0.60 * high_obliq_boost * polar_lat_boost
-    )
-    # High-obliquity planets have larger polar insolation swings; allow a proportionally
-    # higher seasonal fraction rather than capping at Earth's 0.45.
-    _seasonal_cap = float(min(0.45 * obliq_factor, 0.85))
-    ocean_seasonal_frac = np.clip(ocean_seasonal_frac, 0.03, _seasonal_cap)
+    # Seasonal fraction: what fraction of the radiative swing the ocean actually
+    # feels. See `_ocean_seasonal_fraction`'s docstring for the legacy-vs-derived
+    # (pp.derive_ocean_seasonal_lag) formulas.
+    ocean_seasonal_frac = _ocean_seasonal_fraction(lat_deg_1d, pp)
 
     # Final ocean base: annual mean + transport warming + small seasonal oscillation
     T_lat_ocean = (T_lat_annual_mean + transport_warming
@@ -2005,12 +2066,7 @@ def simulate_step(
             _transport_base_full * _sh_factor_full * _nh_transport_taper_full
             + _amoc_bonus_full + _acc_bonus_full
         )
-        polar_lat_boost_full = np.sin(np.deg2rad(lat_deg_full)) ** 2
-        ocean_seasonal_frac_full = (
-            (0.05 + 0.20 * np.cos(np.deg2rad(lat_deg_full))) * obliq_factor
-            + 0.60 * high_obliq_boost * polar_lat_boost_full
-        )
-        ocean_seasonal_frac_full = np.clip(ocean_seasonal_frac_full, 0.03, _seasonal_cap)
+        ocean_seasonal_frac_full = _ocean_seasonal_fraction(lat_deg_full, pp)
         T_lat_ocean_full = (T_lat_annual_mean_full + transport_warming_full
                             + ocean_seasonal_frac_full * (T_lat_ocean_full_lagged - T_lat_annual_mean_full))
         return np.repeat(T_lat_ocean_full[:, None], W, axis=1).astype(np.float32, copy=False) + co2_temp_offset
@@ -4190,7 +4246,9 @@ def _evolve_temperature(
     # Deeper mixed layers = more thermal inertia = slower response to forcing
     abs_lat_1d = np.abs(np.rad2deg(lat))  # lat computed at line 948
     abs_lat_2d_relax = np.repeat(abs_lat_1d[:, None], Wc, axis=1)
-    mld = 30.0 + 170.0 * (abs_lat_2d_relax / 90.0) ** 1.5  # 30m tropical, ~200m polar
+    _mld_trop = float(_pp.mixed_layer_depth_tropical_m)
+    _mld_polar = float(_pp.mixed_layer_depth_polar_m)
+    mld = _mld_trop + (_mld_polar - _mld_trop) * (abs_lat_2d_relax / 90.0) ** 1.5
     # Seasonal polar MLD reduction: Arctic/Antarctic meltwater halocline creates a
     # shallow warm layer (~20-30m) in summer, allowing rapid surface warming → ice melt.
     # Without this, the ~186m polar MLD gives a 93-day thermal time constant — too slow

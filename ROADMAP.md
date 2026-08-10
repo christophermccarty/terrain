@@ -178,13 +178,21 @@ relative to its climate influence.
   exists in atmosphere.py). Western boundary currents, subpolar gyres, and
   basin-shape sensitivity would emerge from topology instead of the
   land-west-of-ocean heuristic added 2026-07-03.
-- **Prognostic AMOC strength.** AMOC is currently a scale factor; make it
-  respond to high-latitude salinity/temperature (the salinity field already
-  exists), enabling freshwater-hosing experiments and ice-age dynamics.
-- **Mixed-layer depth map.** A single effective heat capacity everywhere
-  misses the shallow-tropics/deep-subpolar contrast that shapes seasonal SST
-  lag; a latitude-dependent mixed-layer depth is cheap and would let the
-  hand-tuned ocean seasonal-lag fractions be derived instead of prescribed.
+- ~~**Prognostic AMOC strength.**~~ **Temperature term shipped 2026-08-10, default off.**
+  AMOC now responds to both salinity (`salinity_amoc_scale`, on by default) and a real North
+  Atlantic temperature anomaly (`temperature_amoc_scale`, off by default pending a real-terrain
+  calibration pass -- ocean temperature has no restoring force pinning it near a reference, unlike
+  salinity). Enables freshwater-hosing/ice-age experiments once calibrated. See FEATURES.md item 5.
+  Still open: deriving `amoc_bonus_near`/`amoc_bonus_far` from an actual overturning-strength
+  calculation instead of prescribed constants (`docs/ACCURACY_AUDIT.md` D2) -- a substantially
+  larger undertaking, out of scope for the temperature-term pass.
+- ~~**Mixed-layer depth map.**~~ **Latitude-dependent depth shipped 2026-08-10, default reproduces
+  prior behavior exactly.** `PlanetParams.mixed_layer_depth_tropical_m`/`_polar_m` now expose what
+  was a hardcoded 30m/200m ramp in `_evolve_temperature`'s T_sst relaxation, and a second,
+  physically-derived `ocean_seasonal_frac` mode (`derive_ocean_seasonal_lag`, off by default) lets
+  that same mixed-layer depth drive the previously-independent hand-tuned seasonal-lag polynomial
+  in the `T_base_ocean` path. See FEATURES.md item 6. Map-based (non-latitude-only) depth is still
+  a future step.
 - ~~**Ocean CO2 uptake with proper piston velocity.**~~ **Done.** `carbon_cycle.ocean_co2_flux`
   now consumes `state.wind_speed_avg`, a rolling EMA over
   `PlanetParams.co2_wind_averaging_days` (default 30d) maintained in `simulate.py`, instead of
@@ -198,37 +206,19 @@ relative to its climate influence.
   hardcoded storm radius and `% 365` cache bugs (both fixed 2026-07-03) would
   have been caught automatically.
 - **Manual audit performed 2026-07-27** (canvas-review Phase 4 item), ranked
-  by fix priority — no code changed yet, this is the inventory that audit
-  test above should encode:
-  - **HIGH — max terrain elevation hardcoded at 8848m (Everest) in FOUR
-    separate places with at least three different formulas**:
-    `temperature.elevation_to_alt_km` (piecewise, both its loaded-heightmap
-    and procedural-terrain branches), `climate_averages.compute_biome_type`
-    (two sites, a *different*, simpler linear `elevation * 8848.0`, not the
-    same curve as `elevation_to_alt_km`), `main.py:1968` (a third,
-    power-curve formula), and `terrain.py` (comments/lookup assuming the same
-    ceiling). Mars's real max elevation (Olympus Mons, ~21.9km) is 2.5x
-    Earth's — loading Mars terrain today silently rescales it to Earth's
-    height range. Fixing this needs a `PlanetParams.max_elevation_km` (or
-    equivalent) field threaded through all four sites, plus ideally
-    unifying the two independently-drifted elevation-to-meters curves so
-    they can't diverge further. Not attempted this session: real, moderate
-    invasive-ness (4 files, several call sites, GUI included) and deserves
-    its own tested pass with Mars-terrain validation, not a side effect of
-    an audit.
-  - **HIGH — lapse rate hardcoded at 6.5 K/km in five call sites**:
-    `simulate._evolve_temperature` (x2), `temperature.generate_temperature_overlay`,
-    and `climate_averages.compute_biome_type` (x2, as `-6.5`). Earth's
-    environmental lapse rate is itself only a convenient approximation;
-    Mars's is meaningfully different (~2.5 K/km, driven by lower gravity and
-    the CO2 atmosphere's different heat capacity) and currently unreachable
-    — Mars terrain gets Earth's cooling-per-km applied verbatim. Needs a
-    `PlanetParams.lapse_rate_k_per_km: float = 6.5` field (Earth default is
-    an exact no-op) threaded through the same five sites. Smaller blast
-    radius than the elevation-ceiling item above (no GUI-only callers found)
-    but still spans three modules; also deferred this session for the same
-    reason — a real physics change deserving a dedicated real-terrain +
-    Mars-preset validation pass, not bundled with a documentation-only audit.
+  by fix priority at the time — this is the inventory that audit test above
+  should encode. The HIGH items have since been fixed (see below); only the
+  LOW item remains open:
+  - **DONE (fixed 2026-08-02, commit `d1c08b0`) — max terrain elevation and
+    lapse rate were hardcoded at Earth values (8848m Everest; 6.5 K/km) across
+    `temperature.elevation_to_alt_km`, `climate_averages.compute_biome_type`,
+    `main.py`, and `simulate._evolve_temperature`.** Added
+    `PlanetParams.max_elevation_km: float = 8.848` and
+    `PlanetParams.lapse_rate_k_per_km: float = 6.5` (`planet_params.py:95,110`,
+    Earth defaults are exact no-ops), threaded through all call sites above,
+    with `MARS` set to `max_elevation_km=21.9, lapse_rate_k_per_km=2.5`
+    (`planet_params.py:3677,3680`). Regression-guarded by
+    `testing/test_no_hardcoded_earth_constants.py`.
   - **LOW — `0.622` (Rd/Rv epsilon, water-vapor physics) hardcoded in four
     sites** (`atmosphere.py` x2, `simulate.py` x2). This ratio depends on
     atmosphere composition (M_water/M_dry_air); Mars's CO2 atmosphere gives
@@ -307,9 +297,12 @@ relative to its climate influence.
 
 ## Theme 6 — Validation & tooling
 
-- **Reanalysis benchmark pack.** Monthly ERA5/CRU climatology (T, P, wind at
-  ~2° resolution) as a versioned test fixture, with map-correlation scores in
-  the diagnostics — moving beyond zonal-mean and landmark-sample checks.
+- ~~**Reanalysis benchmark pack.**~~ **Done 2026-08-09.** CRU TS v4.10 (T, P) and
+  NCEP/NCAR Reanalysis 1 (wind) monthly climatologies, area-conservative regridding
+  and map-correlation scoring (`monthly_climatology.py`), wired into
+  `run_real_terrain_validation.py` (`--monthly-climatology`/`--wind-climatology`)
+  and the optimizer, with enforced pytest regression gates. See FEATURES.md item 4
+  and `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` for the full writeup.
 - ~~**Conservation dashboards.**~~ **Done 2026-07-04.** `diagnostics.py` gained
   `area_weighted_global_mean()` and `compute_radiation_balance()`;
   `testing/test_conservation.py` gained `test_radiation_budget_near_equilibrium`

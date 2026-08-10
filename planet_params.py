@@ -910,6 +910,39 @@ class PlanetParams:
     representing the heat capacity of the oceanic mixed layer.  Earth ≈ 50 days
     (phase lag of ~1.5 months).  Scaled by orbital period for non-Earth planets."""
 
+    # ------------------------------------------------------------------ #
+    # Latitude-dependent mixed-layer depth (Tier 1 item 6, FEATURES.md)
+    # ------------------------------------------------------------------ #
+    mixed_layer_depth_tropical_m: float = 30.0
+    """Ocean mixed-layer depth at the equator [m] -- shallow tropical
+    thermocline maintained by persistent trade-wind stratification. Also the
+    base value `_evolve_temperature`'s T_sst relaxation step uses for its
+    latitude-dependent thermal-inertia ramp; this field replaces what used to
+    be a hardcoded literal there, so the Earth default reproduces prior
+    behavior exactly."""
+
+    mixed_layer_depth_polar_m: float = 200.0
+    """Ocean mixed-layer depth at the poles [m] -- deep winter convective
+    mixing. Interpolated with `mixed_layer_depth_tropical_m` by
+    `(|lat|/90)**1.5`. Earth default reproduces the prior hardcoded ramp
+    (30 + 170*(|lat|/90)**1.5) exactly."""
+
+    derive_ocean_seasonal_lag: bool = False
+    """If True, `ocean_seasonal_frac` (how much of the radiative seasonal
+    swing reaches SST -- see simulate.py's `_ocean_seasonal_fraction`) is
+    computed from `mixed_layer_depth_*_m` via the standard slab-ocean thermal
+    relaxation response (ΔT/ΔT_rad = 1/sqrt(1+(2πτ/P)²), τ = ρ·cp·h/λ)
+    instead of the legacy hand-tuned per-latitude polynomial.  Default False:
+    the derived path is real and unit-tested but has not yet been checked
+    against the real-terrain regression baseline -- flip on for a calibration
+    pass, not by default, same convention as enable_surface_hydrology /
+    enable_land_ice_dynamics."""
+
+    ocean_thermal_relaxation_coefficient: float = 3.0
+    """Effective radiative-restoring coefficient λ [W/m²/K], used only when
+    `derive_ocean_seasonal_lag=True`. Order-of-magnitude Planck-response
+    value (4σT³ at T≈255K); free parameter for a future calibration pass."""
+
     ekman_strength: float = 0.3
     """Scaling factor for Ekman wind-driven ocean current advection [0–1].
     0 = Ekman transport disabled; 1 = full wind-to-current scaling (3% of wind speed).
@@ -3131,6 +3164,25 @@ class PlanetParams:
     """Sensitivity of amoc_factor to North Atlantic salinity anomaly [dimensionless].
     1.0 → +1 PSU anomaly multiplies amoc_factor by 1.15; −2 PSU by ~0.55.
     0.0 disables salinity–AMOC coupling."""
+
+    temperature_amoc_reference_k: float = 277.15
+    """Reference North Atlantic (50-75N, ocean cells) surface temperature [K]
+    used as the neutral point for the temperature-density AMOC term -- 4 degC,
+    the temperature of maximum density for fresh water, physically relevant to
+    deep convective sinking. Colder-than-reference water is denser and
+    strengthens AMOC; warmer water is less dense and weakens it -- same
+    phenomenological-gain convention as salinity_reference_psu/
+    salinity_amoc_scale above, not a full seawater equation of state."""
+
+    temperature_amoc_scale: float = 0.0
+    """Sensitivity of amoc_factor to North Atlantic surface temperature
+    anomaly [dimensionless]. 0.0 (default) disables the term. Unlike the
+    salinity anomaly -- pinned near its reference by evolve_salinity's
+    explicit 2-year restoring tendency -- ocean temperature has no equivalent
+    restoring force, so the anomaly's typical magnitude against a fixed
+    reference hasn't been checked against the real-terrain baseline yet. Real
+    and unit-tested; needs a calibration pass before defaulting on
+    (FEATURES.md item 5)."""
 
     # ------------------------------------------------------------------ #
     # CH4 / permafrost carbon (Feature 4)

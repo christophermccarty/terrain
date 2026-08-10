@@ -1,5 +1,14 @@
 # Plans: A9 spherical metric, and the US Midwest divergence bug
 
+> **STATUS (2026-08-09):** Both named plans (A9 spherical metric, US Midwest divergence) are
+> complete and superseded — see the "Phases 1-4 complete" / "Superseded" markers around line 959
+> and 1029/1306 below. Despite the title, this file grew into a newest-first execution log of
+> unrelated physics fixes through 2026-07-31 (land-ice, hydrology, storm systems, C1b, etc.) — it
+> has no entries past that date. Physics/accuracy work since then (C3 elevation/lapse-rate fix,
+> Köppen area-weighting, gyres, mass-flux/PGF sweeps, CRU/wind reanalysis scoring) is tracked in
+> `docs/ACCURACY_AUDIT.md` and `docs/PRIOR_ART_IMPLEMENTATION_PLAN.md` instead — check those first
+> for anything recent.
+
 ---
 ## EXECUTION LOG (2026-07-31, session 2) — moisture-budget rescale's "structural ceiling": investigated, negative result, documented
 

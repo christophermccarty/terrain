@@ -45,7 +45,7 @@ the GUI falls back to deterministic procedural terrain.
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 644 tests: 555 routine and 89 marked slow (verify
+The suite currently collects 751 tests: 658 routine and 93 marked slow (verify
 with `--collect-only -q`, since this count changes frequently). Slow tests
 cover multi-year climate response, multi-decadal drift, conservation,
 circulation, seasonal behavior, and reanalysis anchors.

@@ -2,6 +2,13 @@
 
 > Last updated: 2026-07-26
 > Branch: main
+> **STATUS (2026-08-09): HISTORICAL.** The "Current State Summary" and "Next Up" sections below
+> stopped being updated after 2026-07-04 and no longer reflect current state (e.g. the test count
+> below is stale by 300+ tests — see README.md for the current count). Live tracking of open
+> physics/accuracy work has moved to `docs/ACCURACY_AUDIT.md` and
+> `docs/PRIOR_ART_IMPLEMENTATION_PLAN.md`; current feature backlog lives in `FEATURES.md` and
+> `ROADMAP.md`. Kept for historical context on the reasoning behind early decisions, not as an
+> open task list.
 
 Two related planning docs exist alongside this one, both now historical/archived —
 kept for context but no longer tracking open work:
@@ -10,7 +17,8 @@ kept for context but no longer tracking open work:
 - **IMPLEMENTATION_PLAN.md** — a benchmark-recovery pass (circulation strength, thermal
   baseline, sea-ice balance, precipitation structure). Superseded — see status banner.
 
-This file (PLAN.md) is the live source of truth going forward.
+This file (PLAN.md) was the live source of truth through early July 2026; see the status banner
+above for where that role has moved to.
 
 ---
 

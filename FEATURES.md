@@ -156,30 +156,68 @@ this catches a real pipeline break, not enforces unreached realism) and
 bias, 2.73 m/s RMSE, 0.15 correlation. New dependency: `h5py` (NCEP's files are HDF5/NetCDF4;
 scipy's NetCDF3-only reader, already used for CRU, can't open them), added to `requirements.txt`.
 
-### 5. Prognostic AMOC + freshwater hosing
-**Effort: medium. Touches: `simulate.py`, `PlanetParams`.**
+### 5. Prognostic AMOC + freshwater hosing -- **Temperature-density term shipped 2026-08-10, default off**
 
-AMOC is now partially prognostic: `amoc_factor` responds to both NH sea-ice cover and a real
-North Atlantic salinity anomaly (`PlanetParams.salinity_amoc_scale`, a +1 PSU anomaly multiplies
-it by 1.15) — see `simulate.py:595-631`. What's still missing is a *temperature* density
-contribution (salinity-only today) and deriving the base `amoc_bonus_near`/`amoc_bonus_far`
-magnitudes from an actual overturning-strength calculation rather than prescribing them as
-constants; see `docs/ACCURACY_AUDIT.md` D2. Salinity itself is a real prognostic field, stable
-at ~35.3 PSU since the Jul 2026 coefficient fix. Finishing the temperature-density coupling
-would:
-- Unlock hosing experiments, AMOC bistability, and Younger-Dryas-style collapse scenarios.
-- Make the ocean module less of "the weakest module relative to its climate influence."
-- Compose with item 1 (river discharge is the natural freshwater forcing) and item 2
-  (meltwater pulses).
+AMOC is now partially prognostic: `amoc_factor` responds to NH sea-ice cover, a real North
+Atlantic salinity anomaly (`PlanetParams.salinity_amoc_scale`, a +1 PSU anomaly multiplies it by
+1.15), and now also a real North Atlantic *temperature* anomaly
+(`PlanetParams.temperature_amoc_scale`, `simulate.py`'s AMOC section, "Feature 3b") — warmer
+50-75N ocean water is less dense and weakens sinking, colder strengthens it, same
+phenomenological-gain convention and sinking region as the salinity term, but masked to ocean
+cells only (unlike the salinity field, `state.temperature` carries real land values, so an
+unmasked band mean would be dominated by continental winter cold rather than SST). New
+`PlanetParams.temperature_amoc_reference_k` (277.15 K, temperature of maximum density) is the
+neutral point. Directional correctness is unit-tested
+(`testing/test_amoc_density_coupling.py`): a warmed North Atlantic measurably cools the NH Arctic
+relative to an otherwise-identical run with the term off.
 
-### 6. Latitude-dependent mixed-layer depth
-**Effort: small. Touches: `ocean.py`, `simulate.py`, `PlanetParams`.**
+**Ships at `temperature_amoc_scale=0.0` (exact no-op)**, unlike the salinity term
+(`salinity_amoc_scale=1.0`, on by default): salinity is pinned near its reference by
+`evolve_salinity`'s explicit 2-year restoring tendency, so its anomaly stays small and bounded by
+construction. Ocean temperature has no equivalent restoring force, so the anomaly's typical
+magnitude against a fixed reference hasn't been checked against the real-terrain baseline yet --
+needs a calibration pass (real-terrain sweep of `temperature_amoc_scale`/`temperature_amoc_reference_k`)
+before defaulting on, same convention as `enable_surface_hydrology`/`enable_land_ice_dynamics`.
 
-A single effective ocean heat capacity everywhere misses the shallow-tropics /
-deep-subpolar contrast that sets seasonal SST lag. A latitude-dependent (later:
-map-based) mixed-layer depth is cheap and lets several hand-tuned ocean seasonal-lag
-fractions be *derived* rather than prescribed. It also targets the seasonal-amplitude
-discrepancies behind the MONTHLY-vs-DAILY divergence in Part 1.
+**Deliberately not done this pass**: deriving `amoc_bonus_near`/`amoc_bonus_far` from an actual
+overturning-strength calculation rather than prescribing them as constants (see
+`docs/ACCURACY_AUDIT.md` D2) is a substantially larger undertaking (essentially a Stommel-style
+box-model AMOC strength calculator) than this item's "Effort: medium" scope covers -- left as a
+separate, harder follow-up. Once calibrated, the temperature term unlocks hosing experiments, AMOC
+bistability, and Younger-Dryas-style collapse scenarios, and composes with item 1 (river discharge
+is the natural freshwater forcing) and item 2 (meltwater pulses).
+
+### 6. Latitude-dependent mixed-layer depth -- **Shipped 2026-08-10, derived-fraction mode default off**
+
+`_evolve_temperature`'s T_sst relaxation step already had a real latitude-dependent mixed-layer
+depth ramp (30m tropical -> 200m polar), but as two hardcoded literals. Now
+`PlanetParams.mixed_layer_depth_tropical_m`/`_polar_m` (Earth defaults reproduce the old ramp
+exactly -- planet-generalization win on their own, since a non-Earth ocean world previously had no
+way to change this). The separate `ocean_seasonal_frac` calculation (how much of the radiative
+seasonal swing reaches SST, used in the `T_base_ocean` path) was an *independent* hand-tuned
+per-latitude polynomial, unrelated to any physical depth -- the "several hand-tuned ocean
+seasonal-lag fractions" this item targeted.
+
+Unified into `simulate._ocean_seasonal_fraction`, a shared helper (deduplicating what used to be
+two copies of the same formula) with two modes:
+- **Legacy (default)**: the original hand-tuned polynomial, bit-identical to before.
+- **Derived (`PlanetParams.derive_ocean_seasonal_lag=True`)**: computed from the same
+  `mixed_layer_depth_*_m` fields via the standard slab-ocean thermal-relaxation response
+  (ΔT/ΔT_rad = 1/sqrt(1+(2πτ/P)²), τ = ρ·cp·h/λ, with λ = new
+  `PlanetParams.ocean_thermal_relaxation_coefficient`, an order-of-magnitude Planck-response
+  value). Produces the same order of magnitude as the legacy formula (tropical ~12% vs ~25%,
+  polar ~2% vs ~3% at Earth defaults) but is a genuinely different curve -- see
+  `testing/test_mixed_layer_depth.py`.
+
+**Ships off by default**, same reasoning as item 5: the derived path is real and tested but
+untested against the real-terrain regression baseline. `--compare` against the tracked baseline
+is unaffected by this change (both new items default to exactly reproducing prior behavior, and
+the real-terrain gate confirms it -- `scripts/run_real_terrain_validation.py --compare` still
+passes). A future calibration pass could tune `ocean_thermal_relaxation_coefficient` (or scale MLD
+depths toward a map-based field) and decide whether to flip the default. Not yet addressed: the
+MONTHLY-vs-DAILY seasonal-amplitude divergence in Part 1, and the phase lag (`ocean_lag_days`,
+currently a single global constant) staying latitude-independent -- deriving that too would need
+per-latitude phase shifting, a larger structural change than this item's "Effort: small" scope.
 
 ---
 
