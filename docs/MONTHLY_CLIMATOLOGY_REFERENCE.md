@@ -48,18 +48,22 @@ first CRU TS v4.10 comparison measured:
 - Land monthly precipitation: -0.109 mm/day bias, 2.65 mm/day RMSE, 0.361
   correlation; log-space RMSE 1.406 and correlation 0.463.
 
-This is a measurement baseline, not an acceptance threshold. It establishes a
-clear next priority: correct the warm land-temperature bias with the existing
-land surface-energy/thermal-inertia mechanisms before treating individual
-Koppen or rainfall-map symptoms. Re-run the command above after every
-intentional physics change and retain the generated JSON report with the run.
+This is a measurement baseline, not an acceptance threshold. The first
+calibrated land surface-energy promotion (Earth default
+`land_surface_energy_strength=0.001`) reduced the land temperature bias/RMSE
+to +2.974 C / 6.276 C while preserving precipitation skill and slightly
+improving both Köppen measures. It is intentionally conservative: stronger
+values cool the land further but regress Köppen classification. Re-run the
+command above after every intentional physics change and retain the generated
+JSON report with the run.
 
-At the first 128x256, five-year spin-up/five-year evaluation checkpoint, the
-baseline measured 5.73 C temperature RMSE, 1.61 C temperature bias, 1.460
+At 128x256 with a five-year spin-up/five-year evaluation, the promoted setting
+measures 5.726 C temperature RMSE, +1.606 C temperature bias, 1.460
 precipitation log-RMSE, and Köppen group/class accuracy of 0.709/0.422. The
-regional temperature report identifies Atacama, southern Japan, SE US, and
-continental interiors as the principal warm-bias targets; this is the promotion
-baseline for any future land-energy change.
+candidate improved temperature RMSE by 0.001 C and both Köppen measures
+relative to the prior baseline. The regional temperature report still identifies
+Atacama, southern Japan, SE US, and continental interiors as the principal
+warm-bias targets; this is the promotion baseline for future land-energy work.
 
 ## Gated condensate-closure experiment
 

@@ -554,21 +554,30 @@ class PlanetParams:
     differences the wind and precip substep gates address. See
     `testing/test_land_seasonal_cycle.py`, which pins both halves."""
 
-    enable_land_surface_energy: bool = False
-    """Enable the gated prognostic land surface-energy tendency.
+    enable_land_surface_energy: bool = True
+    """Enable the calibrated prognostic land surface-energy tendency.
 
     The existing land branch relaxes toward a prescribed seasonal baseline.
-    This optional closure additionally integrates net radiation minus bulk
-    sensible and latent heat fluxes through a finite land heat capacity. It is
-    off by default until CRU regional-temperature validation demonstrates a
-    joint improvement in temperature, rainfall, and Köppen skill.
+    This closure additionally integrates net radiation minus bulk sensible and
+    latent heat fluxes through a finite land heat capacity.  The deliberately
+    small Earth-default strength cleared the compact and 128x256 five-year CRU
+    gates: temperature RMSE improved while precipitation and both Köppen
+    accuracy measures were preserved.  Set this to ``False`` for a strict
+    legacy-path A/B comparison.
     """
 
     land_surface_heat_capacity_j_m2_k: float = 1_500_000.0
     """Effective active land-layer heat capacity [J m-2 K-1] when enabled."""
 
-    land_surface_energy_strength: float = 1.0
-    """Dimensionless multiplier for the gated land surface-energy tendency."""
+    land_surface_energy_strength: float = 0.001
+    """Dimensionless multiplier for the calibrated land-energy tendency.
+
+    0.001 is the largest compact-CRU-screened strength that improved
+    temperature RMSE without regressing either Köppen accuracy metric; it
+    also passed the 128x256 five-year promotion check.  Larger strengths cool
+    the land further but move cells across Köppen boundaries in the wrong
+    direction, so remain opt-in experiment values.
+    """
 
     enable_force_restore_land: bool = False
     """Use the gated two-reservoir force-restore land replacement path.
@@ -3774,6 +3783,10 @@ MARS = PlanetParams(
     # where carrying the Earth calibration over is affirmatively wrong rather
     # than merely unvalidated (contrast the note above).
     land_seasonal_amplitude=1.0,
+    # The default land-energy closure was calibrated only against Earth's CRU
+    # benchmark.  Mars has no liquid-water surface exchange, so retaining this
+    # Earth-specific tendency would be an unvalidated source of damping.
+    enable_land_surface_energy=False,
     # land_transport_gain is left inherited at 0.5: it scales atmospheric heat
     # transport into land, and a thin atmosphere transports less, so if anything
     # Earth's reduced value is closer for Mars than the old 1.0 was.

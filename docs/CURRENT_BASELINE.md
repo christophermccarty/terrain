@@ -11,7 +11,7 @@ Generated from the tracked deterministic real-terrain validation report. Histori
 ## Headline skill
 
 - Köppen group accuracy: 0.674
-- Köppen class accuracy: 0.388
+- Köppen class accuracy: 0.389
 - Coldest-month threshold accuracy: 0.900
 - Warmest-month threshold accuracy: 0.677
 

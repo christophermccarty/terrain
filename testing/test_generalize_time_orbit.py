@@ -149,10 +149,20 @@ def test_precipitation_substeps_advance_fractional_dates(monkeypatch):
     seen = []
 
     def fake_precip(H, W, elev, *, day_of_year, humidity, soil_moisture,
-                    soil_moisture_deep, **kwargs):
+                    soil_moisture_deep, condensate, precipitating_hydrometeors,
+                    midlevel_temperature, midlevel_humidity,
+                    upperlevel_temperature, upperlevel_humidity, **kwargs):
         seen.append(day_of_year)
         zeros = np.zeros((H, W), dtype=np.float32)
-        return zeros, humidity, soil_moisture, soil_moisture_deep
+        # Order matches generate_precipitation's real return contract when
+        # every return_* flag is set (see the unpack in
+        # _generate_precipitation_substepped's substep loop).
+        return (
+            zeros, humidity, soil_moisture, soil_moisture_deep, condensate,
+            midlevel_temperature, midlevel_humidity,
+            upperlevel_temperature, upperlevel_humidity,
+            precipitating_hydrometeors,
+        )
 
     monkeypatch.setattr(simulate, "generate_precipitation", fake_precip)
     field = np.zeros((1, 1), dtype=np.float32)
@@ -163,9 +173,19 @@ def test_precipitation_substeps_advance_fractional_dates(monkeypatch):
         temperature=field,
         wind_u=field,
         wind_v=field,
+        wind_u_aloft=field,
+        wind_v_aloft=field,
+        wind_u_midlevel=field,
+        wind_v_midlevel=field,
         humidity=field,
         soil_moisture=field,
         soil_moisture_deep=field,
+        condensate=field,
+        precipitating_hydrometeors=field,
+        midlevel_temperature=field,
+        midlevel_humidity=field,
+        upperlevel_temperature=field,
+        upperlevel_humidity=field,
         cloud_fraction=field,
         day_of_year=16.0,
         dt_days=6.0,
