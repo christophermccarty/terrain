@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import itertools
+import math
 import multiprocessing
 import sys
 import time
@@ -37,7 +38,7 @@ if str(ROOT) not in sys.path:
 
 from planet_params import PlanetParams, EARTH
 from simulate import TimeScaleMode
-from optimizer.scoring import ClimateScore, ClimateMetrics, EARTH_REFERENCE, ReferenceClimate
+from optimizer.scoring import ClimateScore, ClimateMetrics, EARTH_REFERENCE, WIND_SCREENING_REFERENCE, ReferenceClimate
 from optimizer.headless import run_simulation
 
 try:
@@ -319,3 +320,119 @@ def _write_csv(results: list[dict], path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=list(results[0].keys()), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(results)
+
+
+# ---------------------------------------------------------------------------
+# GPU-batched search (JAX) -- optional alternate backend
+# ---------------------------------------------------------------------------
+# Covers the batch-natural sweep strategies (random / latin-hypercube) only;
+# Optuna's Bayesian search stays on the CPU backend (sequential ask/tell
+# doesn't batch the same way -- see the GPU-sweep-screening plan). Requires
+# jax[cuda12] and a GPU; imported lazily so this module stays importable
+# without either. Scored by optimizer/jax_screening.py's model, NOT the real
+# CPU physics -- see that module's docstring for exactly what it does and
+# does not reproduce. Validated on optimizer/configs/sweep_wind.json's
+# parameter family: overall-score Spearman 0.708 against EARTH_REFERENCE
+# (added once the model gained a wind-speed-driven evaporative-cooling term
+# -- see jax_screening.py's docstring) on 20 latin-hypercube-sampled
+# configs, checked against real CPU headless.run_simulation output. That's
+# now the default reference -- WIND_SCREENING_REFERENCE (optimizer/
+# scoring.py) was an earlier, weaker fallback (0.338) from before that fix
+# and is kept only as a documented alternative, not because it performs
+# better.
+
+def gpu_random_search(
+    param_space: ParamSpace,
+    n_samples: int = 50,
+    *,
+    output_csv: str | Path | None = None,
+    reference: ReferenceClimate = EARTH_REFERENCE,
+    seed: int = 0,
+    use_lhs: bool = True,
+    max_batch_size: int = 256,
+) -> "list[dict] | pd.DataFrame":
+    """GPU-batched equivalent of random_search, using jax_screening's model.
+
+    Same ParamSpace input and the same result-row shape (trial_id, score,
+    elapsed_s, param_*, metric_*, contrib_*) as random_search's CPU backend,
+    so output CSVs from the two are directly comparable/appendable. Only
+    supports the swept parameters jax_screening.py's model actually
+    understands (``jax_screening.SUPPORTED_PARAMS``) -- anything else in
+    param_space raises rather than being silently ignored.
+
+    Defaults to ``EARTH_REFERENCE``: validated at Spearman 0.708 against the
+    real CPU model on a 20-config sample (see the module comment above and
+    project memory gpu-sweep-screening-phase4-anticorrelated-2026-08-10).
+    Individual temperature-gradient metrics (gradient_nh/sh) remain
+    anti-correlated on their own -- the composite score correlates well
+    despite that, not because every ingredient does -- so don't assume this
+    generalizes perfectly to configs far outside the validated range.
+
+    Unlike random_search, there is no n_jobs / run_kwargs / planet_params
+    override: resolution and the spinup/eval horizon are fixed inside
+    jax_screening.py, and only the swept fields in
+    ``jax_screening.SUPPORTED_PARAMS`` vary.
+
+    max_batch_size:
+        Split n_samples into chunks of at most this size before calling
+        ``jax_screening.run_batch``, to bound GPU memory use for very large
+        sweeps. Each chunk is one batched GPU call rather than N separate
+        CPU processes -- that's the entire point of this backend.
+    """
+    from optimizer import jax_screening  # noqa: PLC0415 -- optional GPU dep, import lazily
+
+    unsupported = set(param_space) - jax_screening.SUPPORTED_PARAMS
+    if unsupported:
+        raise ValueError(
+            f"gpu_random_search does not support sweeping {sorted(unsupported)} -- "
+            f"jax_screening.py's model only understands "
+            f"{sorted(jax_screening.SUPPORTED_PARAMS)}. Use random_search (CPU) for "
+            "sweeps over other parameters."
+        )
+
+    if use_lhs:
+        configs = latin_hypercube_sample(param_space, n_samples, seed=seed)
+    else:
+        configs = random_uniform_sample(param_space, n_samples, seed=seed)
+
+    score_fn = ClimateScore(reference)
+    results: list[dict] = []
+
+    for chunk_start in range(0, n_samples, max_batch_size):
+        chunk = configs[chunk_start:chunk_start + max_batch_size]
+        params = {
+            name: np.array(
+                [cfg.get(name, jax_screening.DEFAULT_PARAMS[name]) for cfg in chunk],
+                dtype=np.float32,
+            )
+            for name in jax_screening.SUPPORTED_PARAMS
+        }
+        t0 = time.perf_counter()
+        gpu_metrics = jax_screening.run_batch(params)
+        elapsed = time.perf_counter() - t0
+        elapsed_per_config = elapsed / max(len(chunk), 1)
+
+        for i, cfg in enumerate(chunk):
+            trial_id = chunk_start + i
+            field_values = {name: float(gpu_metrics[name][i]) for name in jax_screening.METRICS_FIELDS}
+            has_nan = any(math.isnan(v) for v in field_values.values())
+            has_inf = any(math.isinf(v) for v in field_values.values())
+            metrics = ClimateMetrics(**field_values, has_nan=has_nan, has_inf=has_inf)
+
+            score = score_fn.score(metrics)
+            bd = score_fn.breakdown(metrics)
+
+            result = {"trial_id": trial_id, "score": score, "elapsed_s": elapsed_per_config}
+            result.update({f"param_{k}": v for k, v in cfg.items()})
+            result.update({f"metric_{k}": getattr(metrics, k) for k in vars(metrics)})
+            result.update({f"contrib_{k}": v for k, v in bd.items() if k != "total"})
+            results.append(result)
+
+    if output_csv is not None:
+        _write_csv(results, Path(output_csv))
+
+    results.sort(key=lambda r: float(r.get("score", -1.0)), reverse=True)
+    if _PANDAS:
+        import pandas as pd  # noqa: PLC0415
+        return pd.DataFrame(results)
+    return results

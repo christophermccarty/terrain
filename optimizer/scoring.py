@@ -160,6 +160,70 @@ class ReferenceClimate:
 EARTH_REFERENCE = ReferenceClimate()
 """Earth-calibrated reference targets (default values of ReferenceClimate)."""
 
+WIND_SCREENING_REFERENCE = ReferenceClimate(
+    global_mean_t=(286.0, 290.0, 0.0),
+    gradient_nh=(40.0, 65.0, 0.0),
+    gradient_sh=(38.0, 62.0, 0.0),
+    ice_frac_nh=(0.02, 0.10, 0.0),
+    ice_frac_sh=(0.03, 0.12, 0.0),
+    mean_precip=(2.2, 3.2, 0.0),
+    wind_trade_mean=(2.519, 3.987, 1.0),
+    wind_midlat_mean=(3.196, 5.753, 1.0),
+    wind_itcz_conv=(-0.001, 0.070, 1.0),
+    seasonal_amplitude_nh=(28.0, 55.0, 0.0),
+)
+"""EARTH_REFERENCE, restricted and rebanded for optimizer/jax_screening.py's
+GPU screening model -- NOT a general-purpose reference, and CPU-backend
+sweeps have no need for it.
+
+SUPERSEDED as gpu_random_search's default: once the screening model gained
+a wind-speed-driven evaporative-cooling term (see jax_screening.py's
+docstring), scoring against the plain EARTH_REFERENCE reached Spearman
+0.708 against the real CPU model -- well above this reference's own 0.338
+on the same 20-config validation set. gpu_random_search now defaults to
+EARTH_REFERENCE. This reference is kept only as a documented alternative
+(e.g. if a future change regresses the temperature coupling and the
+full-reference score stops correlating well again), not because it
+performs better today. History below, for that scenario:
+
+Two problems needed fixing, found in that order:
+
+1. Temperature/ice metrics carry a validated-WRONG signal. The screening
+   model's wind mechanism matches the real CPU model well (Spearman
+   0.985-0.995 on wind_trade_mean, optimizer/configs/sweep_wind.json's
+   parameter family), but its temperature response to wind does not
+   (global_mean_t -0.37, gradient_nh/sh -0.73/-0.74) -- so
+   global_mean_t/gradient_nh/gradient_sh/ice_frac_nh/ice_frac_sh/
+   seasonal_amplitude_nh are zeroed, same as this project's existing
+   default-0.0-weight convention for the inert CRU/NCEP fields above.
+2. EARTH_REFERENCE's [lo, hi] bands were sized for a 10-component score
+   where ties get broken by the other 6 metrics; restricted to the 4
+   wind/precip metrics left after (1), those wide bands gave a FLAT 1.0 to
+   a large, correlated fraction of configs simultaneously (6 of 20
+   validation configs landed on an exact tied ceiling of 100.0), which
+   destroyed rank information even though the underlying raw metrics still
+   correlated fine. Two fixes: mean_precip's weight is zeroed too -- its
+   real-model values for this parameter family cluster in a ~0.05-wide
+   band (2.99-3.04 mm/day) regardless of the swept params, i.e. it carries
+   no discriminating signal here, unlike gradient/ice_frac's problem of
+   carrying a wrong signal. wind_trade_mean/wind_midlat_mean/
+   wind_itcz_conv's bands are narrowed to the interquartile range (25th-
+   75th percentile) of the real CPU model's own output on 20 latin-
+   hypercube-sampled sweep_wind.json configs -- a standard, non-tuned-to-
+   maximize-one-metric statistical choice (narrower percentile windows
+   scored marginally higher on that same 20-config sample, up to ~0.44,
+   but turned the score increasingly binary/step-like doing it -- a sign
+   of overfitting to a 20-point sample rather than a real improvement).
+
+Net result on that 20-config validation set: overall-score Spearman
+correlation against the CPU model went from -0.117 (worse than not
+restricting the reference at all) to +0.337 -- a real fix for the outright
+-broken ceiling-tie bug, but still short of a validated bar for pointing a
+real sweep at this backend (wind_trade_mean alone independently reaches
+0.985-0.995; the composite score doesn't get close to that). See project
+memory gpu-sweep-screening-phase4-anticorrelated-2026-08-10 for the full
+investigation and everything already tried."""
+
 
 # ---------------------------------------------------------------------------
 # ClimateScore

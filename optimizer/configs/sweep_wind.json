@@ -1,8 +1,9 @@
 {
   "_comment": "Wind parameter sweep — tune atmospheric circulation strength and structure.",
+  "_wind_baroclinic_jet_amp_note": "Range corrected 2026-08-11: the previous [200000, 3000000] predated the 2026-07-04 1.5-layer-atmosphere rescale (see testing/test_param_wiring.py:71), when this parameter still scaled a |dT/dy| proxy directly. It's now a dimensionless coupling-strength multiplier (current simulate_step default: 1.0), so [200000, 3000000] would drive wind_baroclinic_mix's k = amp/(mix*86400) mixing rate ~6 orders of magnitude too fast. [0.3, 3.0] is centered on the current default and was validated (no blowup) against real CPU headless.run_simulation runs -- see optimizer/jax_screening.py and project memory gpu-sweep-screening-phase4-anticorrelated-2026-08-10.",
   "param_space": {
     "wind_damping":           [0.25, 0.75],
-    "wind_baroclinic_jet_amp":[200000.0, 3000000.0],
+    "wind_baroclinic_jet_amp":[0.3, 3.0],
     "wind_baroclinic_mix":    [1.0, 4.0],
     "wind_pgf_temp_scale":    [200.0, 800.0],
     "wind_cell_relax_days":   [1.5, 6.0]
