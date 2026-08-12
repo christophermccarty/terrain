@@ -54,7 +54,11 @@ the reference files and what metrics each one populates.
   unmet target, and legacy-ceiling saturation;
 - seasonal named-region precipitation-pathway diagnostics: final and raw
   rainout, the post-raw allocator adjustment, local evaporation, humidity,
-  convergence/ascent/convection drivers, and orographic/rain-shadow drivers;
+  physical specific-humidity-flux convergence, lower wind, ascent/convection
+  and storm-track drivers, plus named adjacent-ocean source temperature,
+  humidity, cloud/inversion, evaporation, and source-to-land wind proxies for
+  Atacama, East China, South Japan, and Central Europe, and the model's
+  upwind SST anomaly even while SST coupling is default-off;
 - seasonal lower- and upper-level jet core latitude, strength, migration span,
   and NH/SH asymmetry;
 - a composite reference-error score.
@@ -69,6 +73,16 @@ specific-humidity-flux driver. Neither should be reported as a physical
 moisture-flux convergence in SI units. `post_raw_precip_adjustment_mm_day`
 separates the calibrated row-target allocator from raw rain production, so a
 regional improvement cannot be mistaken for new local moisture supply.
+
+`metrics.seasonal_regional_moisture_budget` groups the same native-grid probes
+into astronomical DJF/MAM/JJA/SON seasons relative to the configured vernal
+equinox. It adds a true spherical divergence of the lower specific-humidity
+flux (`physical_moisture_flux_convergence_q_s`) for diagnosis; this is a
+snapshot tendency proxy, not a claimed prognostic column-water budget. The
+four named ocean controls are context for the coastal/monsoon and Atlantic
+pathways, not additional target regions. A positive
+`source_to_region_lower_wind_m_s` means the regional mean lower wind points
+from that ocean control toward the land box.
 
 `metrics.seasonal_jet` samples each evaluation state and reports the
 zonal-mean westerly core in both hemispheres. It is appropriate for diagnosing

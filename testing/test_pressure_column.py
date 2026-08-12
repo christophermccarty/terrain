@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from pressure_column import evolve_three_level_column
+from pressure_column import (
+    evolve_closed_three_level_thermodynamic_column,
+    evolve_three_level_column,
+)
 
 
 def test_three_level_pressure_column_conserves_total_vapor_for_opposing_interfaces():
@@ -67,3 +70,110 @@ def test_mass_closure_uses_upper_divergence_to_close_column_residual():
     # Upper divergence is -(0.4*1 + 0.35*2)/0.25 = -4.4 micro-s^-1,
     # therefore omega(mid, upper)=0.5*30000*(2 - -4.4) micro-Pa/s.
     np.testing.assert_allclose(step.omega_mid_upper_pa_s, 0.096, atol=1e-7)
+
+
+def _closed_column_inputs(shape=(2, 3)):
+    return dict(
+        lower_humidity=np.full(shape, 0.014),
+        midlevel_humidity=np.full(shape, 0.007),
+        upperlevel_humidity=np.full(shape, 0.002),
+        lower_temperature_k=np.full(shape, 299.0),
+        midlevel_temperature_k=np.full(shape, 273.0),
+        upperlevel_temperature_k=np.full(shape, 243.0),
+        omega_lower_mid_pa_s=np.array([[-0.020, 0.015, -0.010], [0.012, -0.018, 0.009]]),
+        omega_mid_upper_pa_s=np.array([[0.012, -0.016, 0.008], [-0.010, 0.014, -0.006]]),
+        dt_seconds=3600.0,
+    )
+
+
+def test_closed_thermodynamic_column_conserves_mass_weighted_water_and_energy():
+    step = evolve_closed_three_level_thermodynamic_column(**_closed_column_inputs())
+
+    assert abs(step.water_residual_kg_m2) < 1e-8
+    assert abs(step.moist_static_energy_residual_j_m2) < 1e-4
+    assert np.all(step.lower_humidity >= 0.0)
+    assert np.all(step.midlevel_humidity >= 0.0)
+    assert np.all(step.upperlevel_humidity >= 0.0)
+    assert np.all(step.lower_mid_mass_flux_kg_m2_s > 0.0)
+    assert np.all(step.mid_upper_mass_flux_kg_m2_s > 0.0)
+
+
+def test_closed_thermodynamic_column_releases_latent_heat_without_creating_energy():
+    shape = (2, 3)
+    condensed = np.full(shape, 0.001)
+    common = dict(
+        lower_humidity=np.full(shape, 0.010),
+        midlevel_humidity=np.full(shape, 0.005),
+        upperlevel_humidity=np.full(shape, 0.002),
+        lower_temperature_k=np.full(shape, 290.0),
+        midlevel_temperature_k=np.full(shape, 270.0),
+        upperlevel_temperature_k=np.full(shape, 245.0),
+        omega_lower_mid_pa_s=np.zeros(shape),
+        omega_mid_upper_pa_s=np.zeros(shape),
+        dt_seconds=3600.0,
+    )
+    step = evolve_closed_three_level_thermodynamic_column(
+        **common,
+        condensed_specific_humidity=(condensed, np.zeros(shape), np.zeros(shape)),
+    )
+
+    np.testing.assert_allclose(
+        step.lower_temperature - common["lower_temperature_k"],
+        2.5e6 / 1004.0 * condensed,
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(step.lower_humidity, common["lower_humidity"] - condensed)
+    assert abs(step.water_residual_kg_m2) < 1e-8
+    assert abs(step.moist_static_energy_residual_j_m2) < 1e-4
+
+
+def test_closed_thermodynamic_column_radiation_is_an_explicit_energy_source_and_timestep_stable():
+    shape = (2, 3)
+    common = _closed_column_inputs(shape)
+    common["omega_lower_mid_pa_s"] = np.zeros(shape)
+    common["omega_mid_upper_pa_s"] = np.zeros(shape)
+    radiation = (
+        np.full(shape, 10.0),
+        np.full(shape, -4.0),
+        np.full(shape, 2.0),
+    )
+    full = evolve_closed_three_level_thermodynamic_column(
+        **common, radiative_flux_w_m2=radiation
+    )
+    half = dict(common, dt_seconds=1800.0)
+    first_half = evolve_closed_three_level_thermodynamic_column(
+        **half, radiative_flux_w_m2=radiation
+    )
+    second_half = evolve_closed_three_level_thermodynamic_column(
+        lower_humidity=first_half.lower_humidity,
+        midlevel_humidity=first_half.midlevel_humidity,
+        upperlevel_humidity=first_half.upperlevel_humidity,
+        lower_temperature_k=first_half.lower_temperature,
+        midlevel_temperature_k=first_half.midlevel_temperature,
+        upperlevel_temperature_k=first_half.upperlevel_temperature,
+        omega_lower_mid_pa_s=np.zeros(shape),
+        omega_mid_upper_pa_s=np.zeros(shape),
+        dt_seconds=1800.0,
+        radiative_flux_w_m2=radiation,
+    )
+
+    assert abs(full.moist_static_energy_residual_j_m2) < 1e-4
+    assert full.radiative_energy_input_j_m2 == 8.0 * 3600.0 * np.prod(shape)
+    np.testing.assert_allclose(second_half.lower_temperature, full.lower_temperature, atol=3e-5)
+    np.testing.assert_allclose(second_half.midlevel_temperature, full.midlevel_temperature, atol=3e-5)
+    np.testing.assert_allclose(second_half.upperlevel_temperature, full.upperlevel_temperature, atol=3e-5)
+
+
+def test_closed_thermodynamic_column_rejects_unclosed_or_invalid_sources():
+    common = _closed_column_inputs()
+    with np.testing.assert_raises_regex(ValueError, "summing to one"):
+        evolve_closed_three_level_thermodynamic_column(
+            **common, layer_mass_fractions=(0.4, 0.3, 0.2)
+        )
+    with np.testing.assert_raises_regex(ValueError, "cannot exceed"):
+        evolve_closed_three_level_thermodynamic_column(
+            **common,
+            condensed_specific_humidity=(
+                np.full((2, 3), 0.020), np.zeros((2, 3)), np.zeros((2, 3)),
+            ),
+        )

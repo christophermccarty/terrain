@@ -45,7 +45,7 @@ the GUI falls back to deterministic procedural terrain.
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 784 tests: 612 routine and 172 marked slow (verify
+The suite currently collects 796 tests: 624 routine and 172 marked slow (verify
 with `--collect-only -q`, since this count changes frequently). Slow tests
 cover multi-year climate response, multi-decadal drift, conservation,
 circulation, seasonal behavior, and reanalysis anchors.
@@ -126,6 +126,7 @@ before it can change a default.
 - `docs/REAL_TERRAIN_VALIDATION.md` — regional/zonal benchmark workflow
 
 - `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md` — supported-product boundary, experimental gates, unresolved priorities, and promotion criteria
+- `docs/REMAINING_WORK_PLAN.md` — dependency-ordered remaining architecture and validation work
 
 - `docs/CURRENT_BASELINE.md` — generated compact current regression contract
 - `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` — optional gridded monthly T/P reference format

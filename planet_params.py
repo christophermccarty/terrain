@@ -1478,6 +1478,29 @@ class PlanetParams:
     enable_three_level_pressure_column: bool = False
     """Enable the experimental native lower/mid/upper pressure-column state."""
 
+    enable_closed_three_level_thermodynamics: bool = False
+    """Use the finite-volume three-level water/thermodynamic closure.
+
+    Requires the existing prognostic-column, stability-convection, two-layer,
+    and three-level pressure-column gates.  It replaces that path's unweighted
+    humidity exchange and lapse-profile temperature relaxation with a
+    mass-weighted moist-static-energy update.  The host temperature solver is
+    the explicit resolved radiative/surface step; this operator applies only
+    vertical exchange and phase conversion afterwards.  Experimental and off
+    by default pending a compact climate gate.
+    """
+
+    enable_diabatic_interface_mass_flux: bool = False
+    """Derive closed-column interface omega from prior raw-column latent heating.
+
+    Nested inside ``enable_closed_three_level_thermodynamics``.  This uses the
+    zonal-mean, allocator-free precipitation heating and resolved layer static
+    stability to derive a mass-consistent large-scale pressure circulation,
+    replacing the invalid omega diagnosed from independently evolved raw wind
+    divergences.  It has no amplitude scalar: a vertical-Courant violation is
+    an admission failure, not a value to clip.
+    """
+
     enforce_three_level_mass_closure: bool = False
     """Close mass-weighted lower/mid/upper divergence before diagnosing omega."""
 

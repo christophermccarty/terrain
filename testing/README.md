@@ -2,7 +2,7 @@
 
 This folder is a standard pytest suite (`pytest.ini` + `conftest.py` fixtures at the repo
 root/`testing/`), not a collection of standalone scripts. As of 2026-08-11, it holds
-92 `test_*.py` modules and collects 784 tests (612 routine, 172 slow). Use pytest collection as the
+93 `test_*.py` modules and collects 796 tests (624 routine, 172 slow). Use pytest collection as the
 authoritative count because the suite changes frequently:
 
 ```powershell

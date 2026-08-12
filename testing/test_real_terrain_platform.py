@@ -162,6 +162,9 @@ def test_compact_real_terrain_report_contains_regional_moisture_budget():
     assert set(budget) == {region.name for region in EARTH_PRECIP_REGIONS}
     assert budget["Atacama"]["precipitation_final_mm_day"] is not None
     assert budget["Atacama"]["post_raw_precip_adjustment_mm_day"] is not None
+    seasonal_budget = report["metrics"]["seasonal_regional_moisture_budget"]
+    assert seasonal_budget["season_order"] == ["DJF", "MAM", "JJA", "SON"]
+    assert seasonal_budget["seasons"]["MAM"]["regions"]["Atacama"]["lower_wind_speed_m_s"] is not None
     seasonal_jet = report["metrics"]["seasonal_jet"]
     assert seasonal_jet["sample_count"] == 3
     assert seasonal_jet["upper"]["nh"]["mean_core_speed_m_s"] > 0.0

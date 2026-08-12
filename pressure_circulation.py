@@ -25,6 +25,120 @@ class HorizontalMassClosure(NamedTuple):
     equatorial_throughflow_after_m_s: float
 
 
+class DiabaticInterfaceMassFlux(NamedTuple):
+    """Zonal-mean, mass-consistent pressure-interface circulation diagnosis."""
+
+    omega_lower_mid_pa_s: np.ndarray
+    omega_mid_upper_pa_s: np.ndarray
+    lower_divergence_s: np.ndarray
+    midlevel_divergence_s: np.ndarray
+    upperlevel_divergence_s: np.ndarray
+    latent_heating_w_m2: np.ndarray
+    lower_mid_vertical_courant_max: float
+    mid_upper_vertical_courant_max: float
+
+
+def diabatic_interface_mass_flux(
+    precipitation_mm_day: np.ndarray | None,
+    lower_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    *,
+    dt_seconds: float,
+    surface_pressure_pa: float,
+    lower_mid_pressure_depth_pa: float,
+    mid_upper_pressure_depth_pa: float,
+    gravity_m_s2: float = 9.80665,
+    cp_dry_j_kg_k: float = 1004.0,
+    latent_heat_j_kg: float = 2.5e6,
+    layer_mass_fractions: tuple[float, float, float] = (0.40, 0.35, 0.25),
+) -> DiabaticInterfaceMassFlux:
+    """Diagnose a vertically closed large-scale omega from diabatic heating.
+
+    The existing raw independent layer winds contain divergent modes that imply
+    pressure-interface mass transfer of tens of complete layers per day.  This
+    operator deliberately does not cap those omegas.  It bypasses them and
+    derives the large-scale overturning from the preceding raw-column
+    precipitation: ``Lv * P`` is deposited uniformly per unit free-troposphere
+    mass, then balanced against each interface's resolved static stability.
+
+    Precipitation and temperatures are zonally averaged before the diagnosis.
+    That is intentional: a three-level climate column represents the Hadley/
+    seasonal mean overturning, whereas individual grid-cell convective plumes
+    belong to the condensate closure.  The returned layer divergences solve the
+    same centred continuity relations as the production omega calculation and
+    have zero 0.40/0.35/0.25 mass-weighted column divergence at every cell.
+    """
+    if dt_seconds <= 0.0 or surface_pressure_pa <= 0.0:
+        raise ValueError("dt_seconds and surface_pressure_pa must be positive")
+    if lower_mid_pressure_depth_pa <= 0.0 or mid_upper_pressure_depth_pa <= 0.0:
+        raise ValueError("pressure depths must be positive")
+    if gravity_m_s2 <= 0.0 or cp_dry_j_kg_k <= 0.0 or latent_heat_j_kg <= 0.0:
+        raise ValueError("physical constants must be positive")
+    fractions = np.asarray(layer_mass_fractions, dtype=np.float64)
+    if fractions.shape != (3,) or np.any(fractions <= 0.0) or not np.isclose(np.sum(fractions), 1.0):
+        raise ValueError("layer mass fractions must be three positive values summing to one")
+    lower = np.asarray(lower_temperature_k, dtype=np.float64)
+    middle = np.asarray(midlevel_temperature_k, dtype=np.float64)
+    upper = np.asarray(upperlevel_temperature_k, dtype=np.float64)
+    if lower.ndim != 2 or lower.shape[1] != 2 * lower.shape[0] or middle.shape != lower.shape or upper.shape != lower.shape:
+        raise ValueError("temperature layers must share a two-dimensional 2:1 grid")
+    if precipitation_mm_day is None:
+        precipitation = np.zeros_like(lower)
+    else:
+        precipitation = np.asarray(precipitation_mm_day, dtype=np.float64)
+        if precipitation.shape != lower.shape:
+            raise ValueError("precipitation must match the temperature grid")
+        if not np.all(np.isfinite(precipitation)):
+            raise ValueError("precipitation must be finite")
+
+    # kg m-2 day-1 is numerically equal to mm day-1.  Only the zonal-mean,
+    # non-negative latent release drives the large-scale branch.
+    latent_flux = float(latent_heat_j_kg) * np.maximum(
+        np.mean(precipitation, axis=1, keepdims=True), 0.0
+    ) / 86400.0
+    column_mass = float(surface_pressure_pa) / float(gravity_m_s2)
+    free_troposphere_mass = column_mass * (fractions[1] + fractions[2])
+    heating_k_s = latent_flux / (float(cp_dry_j_kg_k) * free_troposphere_mass)
+    lower_zonal = np.mean(lower, axis=1, keepdims=True)
+    middle_zonal = np.mean(middle, axis=1, keepdims=True)
+    upper_zonal = np.mean(upper, axis=1, keepdims=True)
+    lower_mid_stability = (lower_zonal - middle_zonal) / float(lower_mid_pressure_depth_pa)
+    mid_upper_stability = (middle_zonal - upper_zonal) / float(mid_upper_pressure_depth_pa)
+    # An unstably stratified interface is a microphysical convective-adjustment
+    # problem, not a hydrostatic large-scale omega diagnostic.  Leave that
+    # branch at zero instead of hiding an arbitrary stability floor here.
+    omega_lower_mid = np.divide(
+        -heating_k_s, lower_mid_stability,
+        out=np.zeros_like(heating_k_s), where=lower_mid_stability > 0.0,
+    )
+    omega_mid_upper = np.divide(
+        -heating_k_s, mid_upper_stability,
+        out=np.zeros_like(heating_k_s), where=mid_upper_stability > 0.0,
+    )
+    omega_lower_mid = np.broadcast_to(omega_lower_mid, lower.shape).copy()
+    omega_mid_upper = np.broadcast_to(omega_mid_upper, lower.shape).copy()
+
+    # Invert the centred continuity relations used by the pressure column:
+    # omega_lm=0.5*dp_lm*(d_lower-d_mid), omega_mu=0.5*dp_mu*(d_mid-d_upper),
+    # plus weighted column divergence exactly equal to zero.
+    lower_mid_difference = 2.0 * omega_lower_mid / float(lower_mid_pressure_depth_pa)
+    mid_upper_difference = 2.0 * omega_mid_upper / float(mid_upper_pressure_depth_pa)
+    mid_divergence = -fractions[0] * lower_mid_difference + fractions[2] * mid_upper_difference
+    lower_divergence = mid_divergence + lower_mid_difference
+    upper_divergence = mid_divergence - mid_upper_difference
+    return DiabaticInterfaceMassFlux(
+        omega_lower_mid.astype(np.float32),
+        omega_mid_upper.astype(np.float32),
+        lower_divergence.astype(np.float32),
+        mid_divergence.astype(np.float32),
+        upper_divergence.astype(np.float32),
+        np.broadcast_to(latent_flux, lower.shape).astype(np.float32),
+        float(np.max(np.abs(omega_lower_mid)) * dt_seconds / float(lower_mid_pressure_depth_pa)),
+        float(np.max(np.abs(omega_mid_upper)) * dt_seconds / float(mid_upper_pressure_depth_pa)),
+    )
+
+
 def spherical_divergence(u: np.ndarray, v: np.ndarray, radius_m: float) -> np.ndarray:
     """Production-compatible signed divergence on a north-to-south 2:1 grid.
 

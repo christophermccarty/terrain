@@ -6,6 +6,17 @@ wind generation: it evolves three vapor reservoirs using two pressure-
 coordinate interface velocities supplied by the circulation code.  Keeping
 the vertical exchange in a small pure kernel makes its water budget testable
 before it is coupled to cloud microphysics or radiation.
+
+``evolve_closed_three_level_thermodynamic_column`` is deliberately a separate
+kernel from the older experimental path below.  The older path represents its
+three humidity values as pieces of one scalar and restores temperature toward
+a prescribed lapse profile; it is useful for backwards-compatible experiments,
+but it is not a finite-volume thermodynamic closure.  The new kernel instead
+uses mixing ratios in explicit pressure-mass layers and transports moist static
+energy with the same pressure-coordinate mass flux as water.  Radiation is an
+explicit source and condensation is an internal vapour-to-thermal conversion.
+Keeping that contract pure and small lets the integration layer be tested
+before it is allowed to affect the calibrated climate path.
 """
 from __future__ import annotations
 
@@ -25,6 +36,231 @@ class PressureColumnStep(NamedTuple):
     omega_lower_mid_pa_s: np.ndarray
     omega_mid_upper_pa_s: np.ndarray
     relative_water_residual: float
+
+
+class ClosedThermodynamicColumnStep(NamedTuple):
+    """One finite-volume lower/mid/upper thermodynamic column update.
+
+    Humidity values are layer mixing ratios [kg kg-1].  Temperatures are
+    recovered from conserved moist static energy [J kg-1].  The residuals are
+    column-integrated quantities: water in kg m-2 and energy in J m-2.
+    """
+
+    lower_humidity: np.ndarray
+    midlevel_humidity: np.ndarray
+    upperlevel_humidity: np.ndarray
+    lower_temperature: np.ndarray
+    midlevel_temperature: np.ndarray
+    upperlevel_temperature: np.ndarray
+    lower_mid_mass_flux_kg_m2_s: np.ndarray
+    mid_upper_mass_flux_kg_m2_s: np.ndarray
+    water_residual_kg_m2: float
+    moist_static_energy_residual_j_m2: float
+    radiative_energy_input_j_m2: float
+
+
+_GRAVITY_M_S2 = 9.80665
+_DRY_AIR_HEAT_CAPACITY_J_KG_K = 1004.0
+_LATENT_HEAT_VAPORIZATION_J_KG = 2.5e6
+
+
+def _as_column_field(
+    value: np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    *,
+    shape: tuple[int, ...],
+    name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return three finite fields, accepting ``None`` as a zero source."""
+    if value is None:
+        zero = np.zeros(shape, dtype=np.float64)
+        return zero, zero.copy(), zero.copy()
+    if not isinstance(value, tuple) or len(value) != 3:
+        raise ValueError(f"{name} must be a three-element tuple of layer fields")
+    fields = tuple(np.asarray(item, dtype=np.float64) for item in value)
+    if any(item.shape != shape for item in fields):
+        raise ValueError(f"{name} fields must match the column shape")
+    if any(not np.all(np.isfinite(item)) for item in fields):
+        raise ValueError(f"{name} fields must be finite")
+    return fields
+
+
+def _transfer_layer_content(
+    humidity: list[np.ndarray],
+    moist_static_energy: list[np.ndarray],
+    layer_mass_kg_m2: np.ndarray,
+    *,
+    donor: int,
+    receiver: int,
+    transfer_mass_kg_m2: np.ndarray,
+) -> None:
+    """Move donor air composition across one interface without a hidden source."""
+    # Layer dry-air masses are held fixed by the supplied horizontal mass
+    # convergence.  The moving parcel changes tracer and energy concentrations,
+    # rather than changing a layer's diagnosed pressure thickness.
+    fraction = np.clip(transfer_mass_kg_m2 / layer_mass_kg_m2[donor], 0.0, 1.0)
+    humidity_flux = humidity[donor] * fraction
+    energy_flux = moist_static_energy[donor] * fraction
+    humidity[donor] = humidity[donor] - humidity_flux
+    moist_static_energy[donor] = moist_static_energy[donor] - energy_flux
+    receive_ratio = layer_mass_kg_m2[donor] / layer_mass_kg_m2[receiver]
+    humidity[receiver] = humidity[receiver] + humidity_flux * receive_ratio
+    moist_static_energy[receiver] = (
+        moist_static_energy[receiver] + energy_flux * receive_ratio
+    )
+
+
+def evolve_closed_three_level_thermodynamic_column(
+    lower_humidity: np.ndarray,
+    midlevel_humidity: np.ndarray,
+    upperlevel_humidity: np.ndarray,
+    lower_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    omega_lower_mid_pa_s: np.ndarray,
+    omega_mid_upper_pa_s: np.ndarray,
+    *,
+    dt_seconds: float,
+    layer_mass_fractions: tuple[float, float, float] = (0.40, 0.35, 0.25),
+    surface_pressure_pa: float = 101_325.0,
+    layer_heights_m: tuple[float, float, float] = (0.0, 3500.0, 8000.0),
+    radiative_flux_w_m2: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    condensed_specific_humidity: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> ClosedThermodynamicColumnStep:
+    """Advance a closed finite-volume vertical column.
+
+    Positive ``omega`` is downward.  Each interface transfers the donor air's
+    humidity and moist static energy with mass flux ``abs(omega) / g``.  The
+    diagnosed pressure-layer masses remain fixed: their compensating horizontal
+    convergence is outside this one-column operator and must be closed by the
+    circulation component.  ``radiative_flux_w_m2`` is the *only* external
+    energy source.  ``condensed_specific_humidity`` removes vapour while
+    retaining moist static energy, so latent heat is released exactly once.
+
+    This function intentionally has no lapse-profile relaxation, temperature
+    clipping, precipitation sink, or empirical tuning term.  Callers must
+    account for any exported condensate or rainfall in the water/energy budget
+    they couple to it.
+    """
+    if dt_seconds <= 0.0 or not np.isfinite(dt_seconds):
+        raise ValueError("dt_seconds must be finite and positive")
+    if surface_pressure_pa <= 0.0 or not np.isfinite(surface_pressure_pa):
+        raise ValueError("surface_pressure_pa must be finite and positive")
+    fractions = np.asarray(layer_mass_fractions, dtype=np.float64)
+    if fractions.shape != (3,) or np.any(fractions <= 0.0) or not np.isclose(
+        float(np.sum(fractions)), 1.0, atol=1e-12
+    ):
+        raise ValueError("layer_mass_fractions must be three positive values summing to one")
+    heights = np.asarray(layer_heights_m, dtype=np.float64)
+    if heights.shape != (3,) or not np.all(np.isfinite(heights)) or np.any(np.diff(heights) < 0.0):
+        raise ValueError("layer_heights_m must be finite and non-decreasing")
+
+    raw_fields = (
+        lower_humidity, midlevel_humidity, upperlevel_humidity,
+        lower_temperature_k, midlevel_temperature_k, upperlevel_temperature_k,
+        omega_lower_mid_pa_s, omega_mid_upper_pa_s,
+    )
+    fields = tuple(np.asarray(item, dtype=np.float64) for item in raw_fields)
+    shape = fields[0].shape
+    if not shape or any(item.shape != shape for item in fields):
+        raise ValueError("all closed-column fields must share a non-scalar shape")
+    if any(not np.all(np.isfinite(item)) for item in fields):
+        raise ValueError("closed-column fields must be finite")
+    if any(np.any(item < 0.0) for item in fields[:3]):
+        raise ValueError("layer humidities must be non-negative")
+
+    radiation = _as_column_field(
+        radiative_flux_w_m2, shape=shape, name="radiative_flux_w_m2"
+    )
+    condensed = _as_column_field(
+        condensed_specific_humidity, shape=shape, name="condensed_specific_humidity"
+    )
+    humidity = [item.copy() for item in fields[:3]]
+    temperature = fields[3:6]
+    if any(np.any(condensed[index] > humidity[index]) for index in range(3)):
+        raise ValueError("condensed_specific_humidity cannot exceed layer vapour")
+
+    layer_mass = fractions * (float(surface_pressure_pa) / _GRAVITY_M_S2)
+    geopotential = _GRAVITY_M_S2 * heights
+    moist_static_energy = [
+        _DRY_AIR_HEAT_CAPACITY_J_KG_K * temperature[index]
+        + geopotential[index]
+        + _LATENT_HEAT_VAPORIZATION_J_KG * humidity[index]
+        for index in range(3)
+    ]
+    water_before = sum(
+        float(np.sum(layer_mass[index] * humidity[index], dtype=np.float64))
+        for index in range(3)
+    )
+    energy_before = sum(
+        float(np.sum(layer_mass[index] * moist_static_energy[index], dtype=np.float64))
+        for index in range(3)
+    )
+
+    omega_lower_mid, omega_mid_upper = fields[6:8]
+    lower_mid_flux = np.abs(omega_lower_mid) / _GRAVITY_M_S2
+    mid_upper_flux = np.abs(omega_mid_upper) / _GRAVITY_M_S2
+    lower_mid_transfer = lower_mid_flux * dt_seconds
+    mid_upper_transfer = mid_upper_flux * dt_seconds
+    # Apply interfaces sequentially.  The second interface sees the middle
+    # layer after the first transfer, exactly as a finite-volume update does.
+    up_lower_mid = omega_lower_mid < 0.0
+    if np.any(up_lower_mid):
+        _transfer_layer_content(
+            humidity, moist_static_energy, layer_mass, donor=0, receiver=1,
+            transfer_mass_kg_m2=np.where(up_lower_mid, lower_mid_transfer, 0.0),
+        )
+    if np.any(~up_lower_mid):
+        _transfer_layer_content(
+            humidity, moist_static_energy, layer_mass, donor=1, receiver=0,
+            transfer_mass_kg_m2=np.where(~up_lower_mid, lower_mid_transfer, 0.0),
+        )
+    up_mid_upper = omega_mid_upper < 0.0
+    if np.any(up_mid_upper):
+        _transfer_layer_content(
+            humidity, moist_static_energy, layer_mass, donor=1, receiver=2,
+            transfer_mass_kg_m2=np.where(up_mid_upper, mid_upper_transfer, 0.0),
+        )
+    if np.any(~up_mid_upper):
+        _transfer_layer_content(
+            humidity, moist_static_energy, layer_mass, donor=2, receiver=1,
+            transfer_mass_kg_m2=np.where(~up_mid_upper, mid_upper_transfer, 0.0),
+        )
+
+    radiative_input = 0.0
+    for index in range(3):
+        moist_static_energy[index] = moist_static_energy[index] + (
+            radiation[index] * dt_seconds / layer_mass[index]
+        )
+        radiative_input += float(np.sum(radiation[index] * dt_seconds, dtype=np.float64))
+        # With moist static energy held fixed, this vapour decrease appears as
+        # the corresponding latent warming.  Condensate remains in the column
+        # for the reported water budget; a later fallout operator must export it
+        # explicitly rather than silently treating it as lost here.
+        humidity[index] = humidity[index] - condensed[index]
+
+    output_temperature = [
+        (moist_static_energy[index] - geopotential[index]
+         - _LATENT_HEAT_VAPORIZATION_J_KG * humidity[index])
+        / _DRY_AIR_HEAT_CAPACITY_J_KG_K
+        for index in range(3)
+    ]
+    water_after = sum(
+        float(np.sum(layer_mass[index] * (humidity[index] + condensed[index]), dtype=np.float64))
+        for index in range(3)
+    )
+    energy_after = sum(
+        float(np.sum(layer_mass[index] * moist_static_energy[index], dtype=np.float64))
+        for index in range(3)
+    )
+    return ClosedThermodynamicColumnStep(
+        *(item.astype(np.float32) for item in humidity),
+        *(item.astype(np.float32) for item in output_temperature),
+        lower_mid_flux.astype(np.float32),
+        mid_upper_flux.astype(np.float32),
+        water_after - water_before,
+        energy_after - energy_before - radiative_input,
+        radiative_input,
+    )
 
 
 def _partition_total_humidity(

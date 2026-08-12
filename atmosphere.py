@@ -23,7 +23,11 @@ from condensate import (
     stability_aware_condensation,
 )
 from column_water import evolve_column_water
-from pressure_column import evolve_three_level_column
+from pressure_column import (
+    evolve_closed_three_level_thermodynamic_column,
+    evolve_three_level_column,
+)
+from pressure_circulation import diabatic_interface_mass_flux
 from pressure_circulation import smooth_spherical_scalar
 
 # Numba JIT compilation for performance
@@ -2947,6 +2951,8 @@ def generate_precipitation(
     midlevel_humidity: np.ndarray | None = None,
     upperlevel_temperature: np.ndarray | None = None,
     upperlevel_humidity: np.ndarray | None = None,
+    column_lower_temperature: np.ndarray | None = None,
+    previous_precipitation_mm_day: np.ndarray | None = None,
     day_of_year: float = 80.0,
     dt_days: float = 1.0,
     evap_coeff: float = 1.0,
@@ -3190,7 +3196,11 @@ def generate_precipitation(
     _sst_strength = float(getattr(pp, "sst_land_coupling_strength", 0.0))
     _sst_target_w = float(getattr(pp, "sst_land_target_weight", 0.0))
     _sst_anom_field = None
-    if (_sst_strength != 0.0 or _sst_target_w != 0.0) and np.any(sea_mask) and np.any(land_mask):
+    if (
+        _sst_strength != 0.0
+        or _sst_target_w != 0.0
+        or debug_fields is not None
+    ) and np.any(sea_mask) and np.any(land_mask):
         if _sc is not None and "sst_anom" in _sc:
             _sst_anom_field = _sc["sst_anom"]
         else:
@@ -3461,9 +3471,23 @@ def generate_precipitation(
         and bool(pp.enable_two_layer_convective_adjustment)
     )
     three_level_active = two_layer_active and bool(pp.enable_three_level_pressure_column)
+    closed_three_level_active = (
+        three_level_active and bool(pp.enable_closed_three_level_thermodynamics)
+    )
+    closed_lower_temperature_next: np.ndarray | None = None
+    closed_column_water_residual = 0.0
+    closed_column_energy_residual = 0.0
+    diabatic_interface_mass_flux_step = None
     if two_layer_active:
+        # The legacy experiment stores one total-humidity proxy and partitions
+        # it afresh.  The closed path instead persists a lower-layer mixing
+        # ratio plus two independent layer values.  On its first call, migrate
+        # the legacy total into the documented 0.40/0.35/0.25 pressure masses.
+        _closed_first_step = closed_three_level_active and (
+            midlevel_humidity is None or upperlevel_humidity is None
+        )
         upper_q_in = (
-            base_q * float(pp.two_layer_upper_humidity_fraction)
+            base_q * (0.35 if _closed_first_step else float(pp.two_layer_upper_humidity_fraction))
             if midlevel_humidity is None
             else np.asarray(midlevel_humidity, dtype=np.float32)
         )
@@ -3471,7 +3495,7 @@ def generate_precipitation(
             raise ValueError("midlevel_humidity must match precipitation grid")
         upper_q_in = np.clip(upper_q_in, 0.0, base_q)
         upperlevel_q_in = (
-            base_q * float(pp.three_level_upper_humidity_fraction)
+            base_q * (0.25 if _closed_first_step else float(pp.three_level_upper_humidity_fraction))
             if three_level_active and upperlevel_humidity is None
             else np.zeros_like(base_q)
             if not three_level_active
@@ -3480,7 +3504,11 @@ def generate_precipitation(
         if upperlevel_q_in.shape != base_q.shape:
             raise ValueError("upperlevel_humidity must match precipitation grid")
         upperlevel_q_in = np.clip(upperlevel_q_in, 0.0, base_q - upper_q_in)
-        lower_base_q = base_q - upper_q_in - upperlevel_q_in
+        lower_base_q = (
+            base_q * 0.40 if _closed_first_step
+            else base_q if closed_three_level_active
+            else base_q - upper_q_in - upperlevel_q_in
+        )
     else:
         upper_q_in = np.zeros_like(base_q)
         upperlevel_q_in = np.zeros_like(base_q)
@@ -3967,36 +3995,112 @@ def generate_precipitation(
                     strength=_divergence_filter_strength,
                     passes=_divergence_filter_passes,
                 )
-            three_level_step = evolve_three_level_column(
-                q + midlevel_humidity_next + upperlevel_humidity_next,
-                temperature,
-                lower_divergence_si,
-                mid_divergence_si,
-                upper_divergence_si,
-                midlevel_humidity=midlevel_humidity_next,
-                upperlevel_humidity=upperlevel_humidity_next,
-                midlevel_temperature_k=midlevel_temperature,
-                upperlevel_temperature_k=upperlevel_temperature,
-                dt_days=dt,
-                lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
-                mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
-                vertical_velocity_scale_pa_s=omega_scale,
-                exchange_days=float(pp.two_layer_entrainment_days),
-                midlevel_fraction=float(pp.two_layer_upper_humidity_fraction),
-                upperlevel_fraction=float(pp.three_level_upper_humidity_fraction),
-                midlevel_height_m=float(pp.stability_condensation_reference_height_m),
-                upperlevel_height_m=float(pp.three_level_upper_height_m),
-                thermal_relaxation_days=float(pp.two_layer_midlevel_relaxation_days),
-                use_flux_form_exchange=bool(pp.enable_three_level_flux_form_exchange),
-                enforce_column_mass_closure=bool(pp.enforce_three_level_mass_closure),
-            )
-            q = three_level_step.lower_humidity
-            midlevel_humidity_next = three_level_step.midlevel_humidity
-            upperlevel_humidity_next = three_level_step.upperlevel_humidity
-            three_level_mid_temperature_next = three_level_step.midlevel_temperature
-            upperlevel_temperature_next = three_level_step.upperlevel_temperature
-            omega_midlevel_pa_s = three_level_step.omega_lower_mid_pa_s
-            omega_upperlevel_pa_s = three_level_step.omega_mid_upper_pa_s
+            if closed_three_level_active:
+                # The new closure owns its pressure-mass continuity rather
+                # than accepting the older experiment's optional algebraic
+                # switch.  This makes its layer masses and omegas one contract.
+                lower_temperature_for_column = (
+                    np.asarray(temperature, dtype=np.float64)
+                    if column_lower_temperature is None
+                    else np.asarray(column_lower_temperature, dtype=np.float64)
+                )
+                if lower_temperature_for_column.shape != q.shape:
+                    raise ValueError("column_lower_temperature must match precipitation grid")
+                mid_temperature_for_column = (
+                    lower_temperature_for_column - 6.5e-3 * float(pp.stability_condensation_reference_height_m)
+                    if midlevel_temperature is None
+                    else np.asarray(midlevel_temperature, dtype=np.float64)
+                )
+                upper_temperature_for_column = (
+                    lower_temperature_for_column - 6.5e-3 * float(pp.three_level_upper_height_m)
+                    if upperlevel_temperature is None
+                    else np.asarray(upperlevel_temperature, dtype=np.float64)
+                )
+                if bool(pp.enable_diabatic_interface_mass_flux):
+                    diabatic_interface_mass_flux_step = diabatic_interface_mass_flux(
+                        previous_precipitation_mm_day,
+                        lower_temperature_for_column, mid_temperature_for_column,
+                        upper_temperature_for_column,
+                        dt_seconds=dt * 86400.0,
+                        surface_pressure_pa=float(surface_pressure_hpa) * 100.0,
+                        lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                        mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
+                        gravity_m_s2=float(pp.surface_gravity),
+                        cp_dry_j_kg_k=float(pp.cp_dry),
+                    )
+                    omega_midlevel_pa_s = diabatic_interface_mass_flux_step.omega_lower_mid_pa_s
+                    omega_upperlevel_pa_s = diabatic_interface_mass_flux_step.omega_mid_upper_pa_s
+                else:
+                    upper_divergence_si = -(
+                        0.40 * lower_divergence_si + 0.35 * mid_divergence_si
+                    ) / 0.25
+                    omega_midlevel_pa_s = 0.5 * float(pp.two_layer_pressure_depth_pa) * (
+                        lower_divergence_si - mid_divergence_si
+                    )
+                    omega_upperlevel_pa_s = 0.5 * float(pp.three_level_mid_upper_pressure_depth_pa) * (
+                        mid_divergence_si - upper_divergence_si
+                    )
+                _vertical_substeps = 1
+                if diabatic_interface_mass_flux_step is not None:
+                    # The flux is preserved exactly; only its finite-volume
+                    # integration is divided until no interface transports
+                    # more than one quarter layer in one inner update.
+                    _vertical_substeps = max(1, int(np.ceil(max(
+                        diabatic_interface_mass_flux_step.lower_mid_vertical_courant_max,
+                        diabatic_interface_mass_flux_step.mid_upper_vertical_courant_max,
+                    ) / 0.25)))
+                _vertical_dt_seconds = dt * 86400.0 / _vertical_substeps
+                for _ in range(_vertical_substeps):
+                    closed_step = evolve_closed_three_level_thermodynamic_column(
+                        q, midlevel_humidity_next, upperlevel_humidity_next,
+                        lower_temperature_for_column, mid_temperature_for_column,
+                        upper_temperature_for_column, omega_midlevel_pa_s,
+                        omega_upperlevel_pa_s, dt_seconds=_vertical_dt_seconds,
+                        surface_pressure_pa=float(surface_pressure_hpa) * 100.0,
+                        layer_heights_m=(0.0, float(pp.stability_condensation_reference_height_m), float(pp.three_level_upper_height_m)),
+                    )
+                    q = closed_step.lower_humidity
+                    midlevel_humidity_next = closed_step.midlevel_humidity
+                    upperlevel_humidity_next = closed_step.upperlevel_humidity
+                    lower_temperature_for_column = closed_step.lower_temperature
+                    mid_temperature_for_column = closed_step.midlevel_temperature
+                    upper_temperature_for_column = closed_step.upperlevel_temperature
+                    closed_column_water_residual += closed_step.water_residual_kg_m2
+                    closed_column_energy_residual += closed_step.moist_static_energy_residual_j_m2
+                closed_lower_temperature_next = lower_temperature_for_column
+                three_level_mid_temperature_next = mid_temperature_for_column
+                upperlevel_temperature_next = upper_temperature_for_column
+            else:
+                three_level_step = evolve_three_level_column(
+                    q + midlevel_humidity_next + upperlevel_humidity_next,
+                    temperature,
+                    lower_divergence_si,
+                    mid_divergence_si,
+                    upper_divergence_si,
+                    midlevel_humidity=midlevel_humidity_next,
+                    upperlevel_humidity=upperlevel_humidity_next,
+                    midlevel_temperature_k=midlevel_temperature,
+                    upperlevel_temperature_k=upperlevel_temperature,
+                    dt_days=dt,
+                    lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                    mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
+                    vertical_velocity_scale_pa_s=omega_scale,
+                    exchange_days=float(pp.two_layer_entrainment_days),
+                    midlevel_fraction=float(pp.two_layer_upper_humidity_fraction),
+                    upperlevel_fraction=float(pp.three_level_upper_humidity_fraction),
+                    midlevel_height_m=float(pp.stability_condensation_reference_height_m),
+                    upperlevel_height_m=float(pp.three_level_upper_height_m),
+                    thermal_relaxation_days=float(pp.two_layer_midlevel_relaxation_days),
+                    use_flux_form_exchange=bool(pp.enable_three_level_flux_form_exchange),
+                    enforce_column_mass_closure=bool(pp.enforce_three_level_mass_closure),
+                )
+                q = three_level_step.lower_humidity
+                midlevel_humidity_next = three_level_step.midlevel_humidity
+                upperlevel_humidity_next = three_level_step.upperlevel_humidity
+                three_level_mid_temperature_next = three_level_step.midlevel_temperature
+                upperlevel_temperature_next = three_level_step.upperlevel_temperature
+                omega_midlevel_pa_s = three_level_step.omega_lower_mid_pa_s
+                omega_upperlevel_pa_s = three_level_step.omega_mid_upper_pa_s
             upward_motion = np.clip(-omega_midlevel_pa_s / omega_scale, 0.0, 6.0)
             downward_motion = np.clip(omega_midlevel_pa_s / omega_scale, 0.0, 6.0)
             upperlevel_upward_motion = np.clip(
@@ -4044,6 +4148,19 @@ def generate_precipitation(
             if three_level_active:
                 debug_fields["upperlevel_omega_pa_s"] = omega_upperlevel_pa_s.astype(np.float32)
                 debug_fields["upperlevel_upward_motion"] = upperlevel_upward_motion.astype(np.float32)
+                if diabatic_interface_mass_flux_step is not None:
+                    debug_fields["diabatic_interface_latent_heating_w_m2"] = (
+                        diabatic_interface_mass_flux_step.latent_heating_w_m2
+                    )
+                    debug_fields["diabatic_interface_lower_mid_courant_max"] = float(
+                        diabatic_interface_mass_flux_step.lower_mid_vertical_courant_max
+                    )
+                    debug_fields["diabatic_interface_mid_upper_courant_max"] = float(
+                        diabatic_interface_mass_flux_step.mid_upper_vertical_courant_max
+                    )
+                    debug_fields["diabatic_interface_vertical_substeps"] = int(
+                        _vertical_substeps
+                    )
 
     # Orographic uplift signal.
     # gy must be the physical NORTHWARD slope (row index increases southward),
@@ -4142,6 +4259,43 @@ def generate_precipitation(
     upperlevel_temperature_next = (
         upperlevel_temperature_next if three_level_active else upperlevel_temperature
     )
+
+    def _apply_closed_phase_conversion(
+        lower_condensed_q: np.ndarray,
+        mid_condensed_q: np.ndarray,
+        upper_condensed_q: np.ndarray,
+    ) -> None:
+        """Apply an already-diagnosed phase change without a second heat term."""
+        nonlocal q, midlevel_humidity_next, upperlevel_humidity_next
+        nonlocal closed_lower_temperature_next, midlevel_temperature_next
+        nonlocal upperlevel_temperature_next, closed_column_water_residual
+        nonlocal closed_column_energy_residual
+        if not closed_three_level_active:
+            return
+        assert closed_lower_temperature_next is not None
+        assert midlevel_temperature_next is not None
+        assert upperlevel_temperature_next is not None
+        zero_omega = np.zeros_like(q, dtype=np.float64)
+        phase_step = evolve_closed_three_level_thermodynamic_column(
+            q, midlevel_humidity_next, upperlevel_humidity_next,
+            closed_lower_temperature_next, midlevel_temperature_next,
+            upperlevel_temperature_next, zero_omega, zero_omega,
+            dt_seconds=dt * 86400.0,
+            surface_pressure_pa=float(surface_pressure_hpa) * 100.0,
+            layer_heights_m=(0.0, float(pp.stability_condensation_reference_height_m), float(pp.three_level_upper_height_m)),
+            condensed_specific_humidity=(
+                lower_condensed_q, mid_condensed_q, upper_condensed_q,
+            ),
+        )
+        q = phase_step.lower_humidity
+        midlevel_humidity_next = phase_step.midlevel_humidity
+        upperlevel_humidity_next = phase_step.upperlevel_humidity
+        closed_lower_temperature_next = phase_step.lower_temperature
+        midlevel_temperature_next = phase_step.midlevel_temperature
+        upperlevel_temperature_next = phase_step.upperlevel_temperature
+        closed_column_water_residual += phase_step.water_residual_kg_m2
+        closed_column_energy_residual += phase_step.moist_static_energy_residual_j_m2
+
     condensate_precipitation = np.zeros_like(q, dtype=np.float32)
     lowerlevel_condensate_precipitation = np.zeros_like(q, dtype=np.float32)
     midlevel_condensate_precipitation = np.zeros_like(q, dtype=np.float32)
@@ -4323,7 +4477,7 @@ def generate_precipitation(
                     reference_height_m=float(pp.stability_condensation_reference_height_m),
                     cape_scale_j_kg=float(pp.stability_condensation_cape_scale_j_kg),
                 )
-            if use_two_layer_adjustment:
+            if use_two_layer_adjustment and not closed_three_level_active:
                 relax_fraction = 1.0 - np.exp(
                     -dt / float(pp.two_layer_midlevel_relaxation_days)
                 )
@@ -4341,6 +4495,17 @@ def generate_precipitation(
                     150.0,
                     350.0,
                 ).astype(np.float32)
+            if closed_three_level_active:
+                lower_condensed_q = np.maximum(q_before_condensation - q, 0.0)
+                # The condensation routine has already removed vapour. Restore
+                # its input briefly so the closed operator makes the identical
+                # removal while converting Lv*dq into layer temperature.
+                q = q_before_condensation
+                _apply_closed_phase_conversion(
+                    lower_condensed_q,
+                    np.zeros_like(q),
+                    np.zeros_like(q),
+                )
             if two_layer_active:
                 # The upper partition is an active layer, not merely a storage
                 # bin.  Diagnose saturation at its reference pressure and let
@@ -4371,19 +4536,25 @@ def generate_precipitation(
                 upper_rainout_q = upper_condensed_q * (
                     1.0 - np.exp(-dt / float(pp.condensate_fallout_timescale_days))
                 )
-                midlevel_humidity_next = midlevel_humidity_next - upper_condensed_q
+                if not closed_three_level_active:
+                    midlevel_humidity_next = midlevel_humidity_next - upper_condensed_q
                 condensate_next = np.asarray(condensate_next, dtype=np.float64) + (
                     upper_condensed_q - upper_rainout_q
                 )
                 # Latent heat from both layers remains in the persistent upper
                 # temperature reservoir, which is exchanged with resolved air
                 # by simulate_step on the next temperature advance.
-                midlevel_temperature_next = np.clip(
-                    np.asarray(midlevel_temperature_next, dtype=np.float64)
-                    + 0.40 * (2.5e6 / 1004.0) * upper_condensed_q,
-                    150.0,
-                    350.0,
-                ).astype(np.float32)
+                if closed_three_level_active:
+                    _apply_closed_phase_conversion(
+                        np.zeros_like(q), upper_condensed_q, np.zeros_like(q)
+                    )
+                else:
+                    midlevel_temperature_next = np.clip(
+                        np.asarray(midlevel_temperature_next, dtype=np.float64)
+                        + 0.40 * (2.5e6 / 1004.0) * upper_condensed_q,
+                        150.0,
+                        350.0,
+                    ).astype(np.float32)
             if three_level_active:
                 # The third reservoir has its own, colder pressure level and
                 # interface ascent.  It shares the suspended condensate pool
@@ -4418,18 +4589,24 @@ def generate_precipitation(
                 upperlevel_rainout_q = upperlevel_condensed_q * (
                     1.0 - np.exp(-dt / float(pp.condensate_fallout_timescale_days))
                 )
-                upperlevel_humidity_next = (
-                    upperlevel_humidity_next - upperlevel_condensed_q
-                )
+                if not closed_three_level_active:
+                    upperlevel_humidity_next = (
+                        upperlevel_humidity_next - upperlevel_condensed_q
+                    )
                 condensate_next = np.asarray(condensate_next, dtype=np.float64) + (
                     upperlevel_condensed_q - upperlevel_rainout_q
                 )
-                upperlevel_temperature_next = np.clip(
-                    upperlevel_temperature
-                    + 0.40 * (2.5e6 / 1004.0) * upperlevel_condensed_q,
-                    150.0,
-                    350.0,
-                ).astype(np.float32)
+                if closed_three_level_active:
+                    _apply_closed_phase_conversion(
+                        np.zeros_like(q), np.zeros_like(q), upperlevel_condensed_q
+                    )
+                else:
+                    upperlevel_temperature_next = np.clip(
+                        upperlevel_temperature
+                        + 0.40 * (2.5e6 / 1004.0) * upperlevel_condensed_q,
+                        150.0,
+                        350.0,
+                    ).astype(np.float32)
         else:
             q, condensate_next, condensate_rainout = evolve_bulk_condensate(
                 q,
@@ -5294,7 +5471,9 @@ def generate_precipitation(
         if three_level_active:
             upperlevel_humidity_next = np.clip(upperlevel_humidity_next, 0.0, 0.035)
             humidity_next = (
-                lower_humidity_next + midlevel_humidity_next + upperlevel_humidity_next
+                lower_humidity_next
+                if closed_three_level_active
+                else lower_humidity_next + midlevel_humidity_next + upperlevel_humidity_next
             )
         else:
             humidity_next = lower_humidity_next + midlevel_humidity_next
@@ -5332,6 +5511,17 @@ def generate_precipitation(
         debug_fields["column_water_evaporation_source_mm"] = (
             (ocean_evap + land_evap) * dt_evap * column_mm_per_q
         ).astype(np.float32)
+        if closed_three_level_active:
+            debug_fields["closed_column_lower_temperature_k"] = (
+                closed_lower_temperature_next.astype(np.float32)
+            )
+            debug_fields["closed_column_water_residual_kg_m2"] = float(
+                closed_column_water_residual
+            )
+            debug_fields["closed_column_mse_residual_j_m2"] = float(
+                closed_column_energy_residual
+            )
+            debug_fields["closed_column_radiative_source"] = "resolved_host_temperature_step"
         if pp.enable_prognostic_column_water:
             # Whole-call closure for the experimental system.  Transport may
             # redistribute individual cells, so this is intentionally

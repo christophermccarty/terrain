@@ -8,6 +8,7 @@ from planet_params import EARTH
 from pressure_circulation import (
     balanced_thermal_wind_u,
     close_upper_mass_flux,
+    diabatic_interface_mass_flux,
     smooth_spherical_scalar,
     spherical_divergence,
 )
@@ -86,6 +87,82 @@ def test_balanced_thermal_wind_puts_westerly_shear_outside_hadley_cell():
     zonal = np.mean(target, axis=1)
     assert float(np.max(zonal[np.abs(latitude) >= 30.0])) > 5.0
     assert float(np.max(np.abs(zonal[np.abs(latitude) <= 5.0]))) < 0.5
+
+
+def test_diabatic_interface_mass_flux_is_zonal_mean_mass_closed_and_cfl_reported():
+    h, w = 24, 48
+    latitude = 90.0 - (np.arange(h) + 0.5) * 180.0 / h
+    lower = np.broadcast_to(300.0 - 0.20 * np.abs(latitude)[:, None], (h, w))
+    middle = lower - 22.0
+    upper = middle - 24.0
+    precipitation = np.broadcast_to(
+        (2.0 + 3.0 * np.exp(-(latitude / 18.0) ** 2))[:, None], (h, w)
+    )
+    result = diabatic_interface_mass_flux(
+        precipitation, lower, middle, upper,
+        dt_seconds=86400.0, surface_pressure_pa=101325.0,
+        lower_mid_pressure_depth_pa=35000.0, mid_upper_pressure_depth_pa=30000.0,
+    )
+    weighted_divergence = (
+        0.40 * result.lower_divergence_s
+        + 0.35 * result.midlevel_divergence_s
+        + 0.25 * result.upperlevel_divergence_s
+    )
+    np.testing.assert_allclose(weighted_divergence, 0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        result.omega_lower_mid_pa_s,
+        0.5 * 35000.0 * (result.lower_divergence_s - result.midlevel_divergence_s),
+        rtol=2e-6, atol=2e-8,
+    )
+    assert np.all(result.omega_lower_mid_pa_s < 0.0)
+    assert np.all(result.omega_mid_upper_pa_s < 0.0)
+    assert result.lower_mid_vertical_courant_max < 0.25
+    assert result.mid_upper_vertical_courant_max < 0.25
+
+
+def test_diabatic_interface_mass_flux_uses_no_hidden_stability_floor():
+    shape = (8, 16)
+    lower = np.full(shape, 280.0)
+    # A convectively unstable lower-mid interface must be left for the
+    # convective closure, not turned into a large arbitrary pressure velocity.
+    middle = np.full(shape, 282.0)
+    upper = np.full(shape, 250.0)
+    result = diabatic_interface_mass_flux(
+        np.full(shape, 5.0), lower, middle, upper,
+        dt_seconds=86400.0, surface_pressure_pa=101325.0,
+        lower_mid_pressure_depth_pa=35000.0, mid_upper_pressure_depth_pa=30000.0,
+    )
+    np.testing.assert_array_equal(result.omega_lower_mid_pa_s, np.zeros(shape, dtype=np.float32))
+    assert np.all(result.omega_mid_upper_pa_s < 0.0)
+
+
+def test_diabatic_interface_runtime_substeps_instead_of_capping_courant():
+    shape = (12, 24)
+    planet = dataclasses.replace(
+        EARTH,
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+        enable_diabatic_interface_mass_flux=True,
+    )
+    state = create_initial_state(np.zeros(shape, dtype=np.float32), planet_params=planet)
+    state = state._replace(precipitation=np.full(shape, 50.0, dtype=np.float32))
+    debug: dict = {}
+    evolved, _ = simulate_step(
+        state, days=1.0, planet_params=planet, precipitation_debug=debug
+    )
+
+    assert evolved.omega_lower_mid_pa_s is not None
+    assert debug["diabatic_interface_vertical_substeps"] > 1
+    cfl = max(
+        float(debug["diabatic_interface_lower_mid_courant_max"]),
+        float(debug["diabatic_interface_mid_upper_courant_max"]),
+    )
+    assert cfl / int(debug["diabatic_interface_vertical_substeps"]) <= 0.25 + 1e-12
 
 
 def test_pressure_column_gate_plumbs_closure_into_persisted_upper_wind():

@@ -922,6 +922,89 @@ def test_three_level_upper_reservoir_condenses_and_closes_water_budget():
     assert abs(float(debug["column_water_total_budget_relative_residual"])) < 1e-5
 
 
+def test_closed_three_level_runtime_adapter_is_explicit_and_default_off():
+    shape = (6, 12)
+    common = dict(
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+    )
+    closed = dataclasses.replace(
+        EARTH, **common, enable_closed_three_level_thermodynamics=True
+    )
+    legacy = dataclasses.replace(EARTH, **common)
+    fields = dict(
+        temperature=np.full(shape, 300.0, dtype=np.float32),
+        column_lower_temperature=np.full(shape, 295.0, dtype=np.float32),
+        humidity=np.full(shape, 0.020, dtype=np.float32),
+        midlevel_humidity=np.full(shape, 0.006, dtype=np.float32),
+        upperlevel_humidity=np.full(shape, 0.003, dtype=np.float32),
+        midlevel_temperature=np.full(shape, 270.0, dtype=np.float32),
+        upperlevel_temperature=np.full(shape, 245.0, dtype=np.float32),
+        wind_u=np.zeros(shape, dtype=np.float32),
+        wind_v=np.zeros(shape, dtype=np.float32),
+        dt_days=0.1,
+        return_condensate=True,
+        return_midlevel_temperature=True,
+        return_midlevel_humidity=True,
+        return_upperlevel_state=True,
+    )
+    closed_debug: dict = {}
+    closed_result = generate_precipitation(
+        *shape, np.zeros(shape, dtype=np.float32), planet_params=closed,
+        debug_fields=closed_debug, **fields,
+    )
+    legacy_debug: dict = {}
+    generate_precipitation(
+        *shape, np.zeros(shape, dtype=np.float32), planet_params=legacy,
+        debug_fields=legacy_debug, **fields,
+    )
+
+    assert len(closed_result) == 9
+    assert "closed_column_lower_temperature_k" in closed_debug
+    assert closed_debug["closed_column_radiative_source"] == "resolved_host_temperature_step"
+    assert abs(float(closed_debug["closed_column_water_residual_kg_m2"])) < 1e-7
+    assert abs(float(closed_debug["closed_column_mse_residual_j_m2"])) < 1e-3
+    assert "closed_column_lower_temperature_k" not in legacy_debug
+    # The returned humidity is the persistent lower-layer mixing ratio; the
+    # other two reservoirs remain separate outputs rather than an unweighted
+    # sum embedded in the legacy field.
+    assert np.all(np.isfinite(closed_result[1]))
+    assert np.all(np.isfinite(closed_result[6]))
+    assert np.all(np.isfinite(closed_result[8]))
+
+
+def test_closed_three_level_runtime_adapter_routes_lower_temperature_to_state():
+    elevation = np.zeros((12, 24), dtype=np.float32)
+    planet = dataclasses.replace(
+        EARTH,
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+    )
+    initial = create_initial_state(elevation, planet_params=planet)
+    debug: dict = {}
+    evolved, _ = simulate_step(
+        initial, days=1.0, planet_params=planet, precipitation_debug=debug
+    )
+
+    assert evolved.midlevel_temperature is not None
+    assert evolved.upperlevel_temperature is not None
+    assert "closed_column_lower_temperature_k" in debug
+    np.testing.assert_allclose(
+        evolved.air_temperature, debug["closed_column_lower_temperature_k"], atol=1e-6
+    )
+    assert abs(float(debug["closed_column_water_residual_kg_m2"])) < 1e-7
+    assert abs(float(debug["closed_column_mse_residual_j_m2"])) < 1e-3
+
+
 def test_three_level_upper_temperature_anomaly_feeds_back_to_resolved_air():
     elevation = np.zeros((12, 24), dtype=np.float32)
     planet = dataclasses.replace(

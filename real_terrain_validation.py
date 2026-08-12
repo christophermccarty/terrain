@@ -25,6 +25,8 @@ from monthly_climatology import (
 from planet_params import EARTH, PlanetParams
 from regional_moisture_budget import (
     regional_moisture_budget_snapshot,
+    season_for_day,
+    seasonal_regional_moisture_budget,
     time_average_regional_moisture_budget,
 )
 from regional_validation import (
@@ -953,7 +955,18 @@ def _regional_moisture_budget_snapshot(
         planet_params=planet_params,
         debug_fields=debug,
     )
-    return regional_moisture_budget_snapshot(state.elevation, debug)
+    return regional_moisture_budget_snapshot(
+        state.elevation,
+        debug,
+        pathway_fields={
+            "lower_wind_u_m_s": state.wind_u,
+            "lower_wind_v_m_s": state.wind_v,
+            "surface_temperature_k": state.temperature,
+            "air_temperature_k": temperature,
+            "cloud_fraction": state.cloud_cover,
+        },
+        radius_m=float(planet_params.radius_m),
+    )
 
 
 def run_real_terrain_validation(
@@ -1039,12 +1052,25 @@ def run_real_terrain_validation(
     regional_moisture_snapshots: list[
         tuple[float, dict[str, dict[str, float | None]]]
     ] = []
+    seasonal_regional_moisture_snapshots: list[
+        tuple[str, float, dict[str, dict[str, float | None]]]
+    ] = []
     sampled_days = 0.0
     cycle_duration = cycle_days(mode, planet_params)
     for _ in range(evaluation_cycles):
         state = _advance_cycle(state, mode, planet_params, config)
-        regional_moisture_snapshots.append(
-            (cycle_duration, _regional_moisture_budget_snapshot(state, planet_params))
+        regional_snapshot = _regional_moisture_budget_snapshot(state, planet_params)
+        regional_moisture_snapshots.append((cycle_duration, regional_snapshot))
+        seasonal_regional_moisture_snapshots.append(
+            (
+                season_for_day(
+                    state.day_of_year,
+                    orbital_period_days=float(planet_params.orbital_period_days),
+                    vernal_equinox_day=float(planet_params.vernal_equinox_day),
+                ),
+                cycle_duration,
+                regional_snapshot,
+            )
         )
         temperature = (
             state.air_temperature if state.air_temperature is not None else state.temperature
@@ -1121,6 +1147,9 @@ def run_real_terrain_validation(
     )
     metrics["regional_moisture_budget"] = time_average_regional_moisture_budget(
         regional_moisture_snapshots
+    )
+    metrics["seasonal_regional_moisture_budget"] = seasonal_regional_moisture_budget(
+        seasonal_regional_moisture_snapshots
     )
     if lower_u_samples:
         metrics["seasonal_jet"] = seasonal_jet_scorecard(

@@ -74,8 +74,29 @@ default behavior.
 | Surface hydrology | `enable_surface_hydrology` | Do not promote. D8 routing works, but no channel capacity/velocity permits unphysical basin pooling. Redesign around capacity and lateral spill before recalibration. |
 | Condensate and convection | `enable_prognostic_condensate`, `enable_stability_aware_condensation`, `enable_two_layer_convective_adjustment`, `enable_cloud_precipitating_condensate_partition`, `enable_separate_precipitating_hydrometeors`, `enable_hydrometeor_transport`, `enable_simplified_betts_miller_convection` | Keep as one experimental closure family. It cannot replace the default rainfall path until it closes water/energy budgets and improves real-terrain precipitation and cloud skill together. |
 | Conserved column water | `enable_prognostic_column_water`, `enable_energy_limited_evaporation`, `enable_humidity_dependent_downwelling_longwave`, `column_water_use_bulk_condensate_rainfall` | Keep experimental. These gates bypass or replace empirical rainfall correction, so promotion requires a complete validated moisture closure, not a local metric improvement. |
-| Diagnosed overturning | `enable_two_level_thermally_direct_overturning`, `two_level_thermally_direct_overturning_speed_m_s`, `enable_three_level_pressure_column`, `enforce_three_level_mass_closure`, `enable_three_level_horizontal_mass_flux_closure`, `enable_native_balanced_pressure_dynamics`, `enable_native_balanced_diabatic_overturning`, `enable_native_balanced_moist_static_energy_overturning`, `native_balanced_mse_use_toa_radiative_target`, `enable_three_level_flux_form_exchange` | Keep experimental. The new two-level path reuses the existing mass-conserving thermal structure with the normal surface/upper wind states; it needs process and real-terrain validation. The best three-level configuration improved transport but made the full climate score worse and cost about 47x more. |
+| Diagnosed overturning | `enable_two_level_thermally_direct_overturning`, `two_level_thermally_direct_overturning_speed_m_s`, `enable_three_level_pressure_column`, `enable_closed_three_level_thermodynamics`, `enable_diabatic_interface_mass_flux`, `enforce_three_level_mass_closure`, `enable_three_level_horizontal_mass_flux_closure`, `enable_native_balanced_pressure_dynamics`, `enable_native_balanced_diabatic_overturning`, `enable_native_balanced_moist_static_energy_overturning`, `native_balanced_mse_use_toa_radiative_target`, `enable_three_level_flux_form_exchange` | **Redesign required; keep experimental.** The raw closed-column screen collapsed (164.36 K; omega RMS 14.58/29.99 Pa/s). The nested diabatic-interface branch repairs only that vertical source: 64x128 omega RMS is 0.0248/0.0229 Pa/s and temperature remains bounded, but rain is 1.34 mm/day, KÃ¶ppen group/class 0.571/0.317, reference error 0.545, and cross-equatorial transport 2177 PW. The remaining fault is the incompatible horizontal wind/energy carrier. Derive winds, divergence, omega, and energy transport from one shared pressure-coordinate solve; do not tune omega caps, exchange, heating, or damping scalars. |
 | Land ice | `enable_land_ice_dynamics` | Do not promote. Terrain-slope flow, albedo, calving/freshwater, coastline feedback, and multi-century calibration are incomplete. |
+
+## Current experimental-family dispositions
+
+This is the explicit outcome of the priority-4 review. "Retain" means the
+experiment remains a valid, bounded research capability and needs the stated
+validation work. "Redesign" means further scalar tuning is not informative:
+the missing behavior is architectural. No family is retired in this pass; each
+still represents a useful, testable physical direction or compatibility-safe
+research capability.
+
+| Family | Disposition | Rationale and next admissible work |
+|---|---|---|
+| Orbital forcing | **Retain experimental** | The forcing is wired. Build a dedicated multi-millennial harness and validate ice/ocean stability before making an Earth-accuracy claim. |
+| Force-restore land | **Redesign** | The local two-reservoir/Penman--Monteith closure is valid, but it lacks diagnosed atmospheric heat convergence and decisively fails the CRU/Koppen gate. Do not re-sweep local parameters. |
+| Derived ocean seasonal lag | **Retain experimental** | The derivation is unit-tested but needs an independent matched real-terrain climate comparison. |
+| CFL humidity transport | **Retain experimental** | Its numerical premise is valid, but it needs grid-size and time-scale comparison with the calibrated fixed-divisor path. |
+| Surface hydrology | **Redesign** | D8 routing lacks channel capacity/velocity and lateral spill, allowing unphysical basin pooling. Add those physical constraints before recalibration. |
+| Condensate/convection closure | **Redesign** | The individual gates are not independently promotable; the closure must jointly close water/energy budgets and improve real-terrain precipitation and clouds. |
+| Conserved column water | **Redesign** | It replaces the empirical rainfall correction, so a local skill gain cannot validate it. The complete moisture closure must pass the normal real-terrain gate. |
+| Two-/three-level overturning | **Redesign** | The normal path lacks upper thermodynamic/radiative closure for a diagnosed overturning strength. The best three-level result also worsened whole-climate skill at roughly 47x cost. |
+| Land ice | **Redesign** | Flow, albedo, calving/freshwater, coastline feedback, and multi-century calibration are incomplete. |
 
 ## Inert numeric trials
 
@@ -99,7 +120,7 @@ than candidate Earth defaults.
 | Area | Controls | Current disposition |
 |---|---|---|
 | Scenario forcing | `aerosol_optical_depth` | Valid clear-sky Earth baseline (`0.0`). A positive value is an explicit volcanic/aerosol scenario, not a missing baseline feature. |
-| Land-seasonal refinements | `land_transport_deficit_k`, `land_thermal_inertia_days`, `land_transport_seasonality`, `land_cap_softness_k`, `evap_cooling_amplitude` | Keep inert. These have individually shown useful directional behavior but no configuration has cleared the cross-resolution climate gates. Revisit together only after the supported precipitation and land-temperature priorities. |
+| Land-seasonal refinements | `land_transport_deficit_k`, `land_thermal_inertia_days`, `land_transport_seasonality`, `land_cap_softness_k`, `evap_cooling_amplitude` | Keep inert. These have individually shown useful directional behavior but no configuration has cleared the cross-resolution climate gates. Do not revisit them as independent scalar sweeps; priority 3 established that the credible follow-up is a redesigned force-restore path with atmospheric heat convergence. |
 | Moisture transport | `moisture_advection_scale` | Keep inert. The added long-range transport is implemented and tested, but has no net validated Earth improvement over the calibrated path. |
 | Three-level tuning companions | `three_level_divergence_filter_strength`, `three_level_divergence_filter_passes`, `three_level_balanced_thermal_wind_relaxation`, `native_balanced_pressure_relaxation`, `native_balanced_ageostrophic_timescale_hours`, `native_balanced_overturning_speed_m_s`, `three_level_diabatic_ascent_scale` | Inactive because their parent three-level gates are off. They are not independent user controls and must not be tuned outside that family’s promotion protocol. |
 | Column-water tuning companion | `evaporation_downwelling_longwave_w_m2` | Inactive because `enable_energy_limited_evaporation` is off; evaluate only with the complete conserved-column-water family. |
@@ -117,6 +138,8 @@ an unresolved higher-priority accuracy issue. Work proceeds in this order:
 
 This document is the concise current policy; `PLAN.md`,
 `IMPLEMENTATION_PLAN.md`, and `PLAN_PHYSICS.md` remain historical records.
+The dependency-ordered remaining implementation work is maintained in
+`docs/REMAINING_WORK_PLAN.md`.
 
 ## Current priority-1 disposition
 
@@ -170,6 +193,33 @@ compensating overturning branch. A physically diagnosed two-layer overturning
 requires an upper thermodynamic reservoir and radiative tendency/closure;
 adding another speed parameter would just repeat the rejected tuning path.
 
+The 2026-08-12 seasonal regional pathway dossier confirms that no remaining
+priority-1 scalar is admissible. Atacama has offshore southeast-Pacific source
+flow (-0.69 m/s), negative lower moisture-flux convergence (-1.34e-8 q/s), no
+ascent, and only a -0.057 K upwind SST anomaly; the existing cold-SST target
+path was already rejected. East China and South Japan have negative physical
+moisture-flux convergence in every sampled season and source-to-land flow of
+the wrong sign through most of the year; their allocator corrections are
+therefore not a monsoon mechanism. Central Europe instead has positive
+convergence but 7.65 mm/day raw rain (10.70 in JJA) followed by a -5.03
+(-8.45 in JJA) allocator correction from the static storm-track/ascent path.
+The sole existing seasonal storm-track control at 0.3 increased that JJA raw
+rain to 10.80 mm/day, worsened precipitation log-RMSE by 0.00209, and regressed
+Atacama and S Japan target errors. It is rejected.
+
+No priority-1 target, SST-weight, or storm-window scalar should be retuned.
+The eastern-margin/coastal requirements hand off to the vertical
+thermodynamic/circulation architecture, and Central Europe needs a diagnosed
+transient rain-production path that uses those states rather than a latitude
+window. The supported baseline remains unchanged.
+
+The Phase-2 closed thermodynamic-column kernel is now implemented in
+`pressure_column.py`, with its explicit state/budget contract in
+`VERTICAL_THERMODYNAMIC_CLOSURE.md`. It is a pure, unconnected experimental
+kernel rather than an enabled feature: runtime coupling awaits an auditable
+radiative/surface/precipitation source adapter, so the supported baseline and
+every default-off experimental switch remain unchanged.
+
 ## Current priority-2 disposition
 
 Seasonal jet diagnostics are now emitted by the real-terrain report rather
@@ -190,3 +240,39 @@ the known 1.5-layer thermal-gradient/momentum-structure limitation, not a
 missing width value. Do not tune the upper PGF or Hadley-edge scalars further;
 the supported baseline remains unchanged and the next priority is land
 seasonal temperature bias and its ceiling.
+
+## Current priority-3 disposition
+
+The supported land-temperature path remains the calibrated seasonal-amplitude,
+continentality, transport, and small surface-energy closure. It is not a
+complete surface-energy model: its latitude-only ceiling is still a numerical
+surrogate for unresolved land and atmospheric heat transport. The active
+configuration is nevertheless materially better than the legacy undamped path
+on the regression-gated temperature and Koppen measures, so removing or
+retuning the ceiling by itself is not justified.
+
+The physically motivated replacement is present as the default-off
+`enable_force_restore_land` path. It replaces, rather than stacks on, the
+legacy seasonal blend and ceiling with a two-reservoir force-restore surface
+and moisture-dependent Penman--Monteith partition. Its local annual-cycle
+shape is more physical, but it does not yet represent the atmospheric
+eddy/storm-track heat convergence that the supported path currently supplies.
+
+A representative current CRU A/B at 64x128 (one year spin-up plus one year
+evaluation, 30-day restore time, 12 MJ m-2 K-1 deep capacity, and 2000 s m-1
+dry resistance) remains decisively outside the promotion gate: temperature
+RMSE is 6.279 -> 7.679 C, Koppen group accuracy 0.674 -> 0.603, and class
+accuracy 0.388 -> 0.248. Precipitation log-RMSE improves 1.406 -> 1.363, but
+that single gain cannot compensate for the temperature and biome regressions.
+The wider published-range screen is recorded in
+`docs/PRIOR_ART_IMPLEMENTATION_PLAN.md`.
+
+Priority 3 is therefore complete as a supported-baseline decision: retain the
+current default and keep force-restore experimental. Do not perform another
+local parameter sweep or introduce a softer/global ceiling. A future promotion
+attempt needs a separately designed, diagnosed atmospheric heat-convergence
+term in the replacement architecture, with a physically defined forcing and
+the same CRU/Koppen gates; copying the legacy latitude trapezoids would only
+move the old surrogate into the new branch. The next work priority is the
+explicit promote/redesign/retire decision for each remaining experimental
+family.

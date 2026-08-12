@@ -115,6 +115,8 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
                                         midlevel_humidity,
                                         upperlevel_temperature,
                                         upperlevel_humidity,
+                                        column_lower_temperature=None,
+                                        previous_precipitation_mm_day=None,
                                         cloud_fraction,
                                         day_of_year, dt_days,
                                         surface_pressure_hpa=1013.25,
@@ -136,6 +138,8 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             midlevel_humidity=midlevel_humidity,
             upperlevel_temperature=upperlevel_temperature,
             upperlevel_humidity=upperlevel_humidity,
+            column_lower_temperature=column_lower_temperature,
+            previous_precipitation_mm_day=previous_precipitation_mm_day,
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
             return_condensate=True, return_midlevel_temperature=True,
@@ -177,6 +181,8 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             midlevel_humidity=mid_q,
             upperlevel_temperature=upper_t,
             upperlevel_humidity=upper_q,
+            column_lower_temperature=column_lower_temperature,
+            previous_precipitation_mm_day=previous_precipitation_mm_day,
             cloud_fraction=cloud_fraction,
             day_of_year=sub_day, dt_days=sub_dt,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
@@ -200,7 +206,10 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
                         if _name not in _debug_accumulators
                         else _debug_accumulators[_name] + _weighted
                     )
-                elif _name in {"midlevel_omega_pa_s", "upperlevel_omega_pa_s"}:
+                elif _name in {
+                    "midlevel_omega_pa_s", "upperlevel_omega_pa_s",
+                    "closed_column_lower_temperature_k",
+                }:
                     # These are wind-derived instantaneous diagnostics.  They
                     # are unchanged through the moisture-only substeps, so one
                     # copy is the meaningful state diagnostic for this step.
@@ -3121,6 +3130,7 @@ def simulate_step(
             _group_p_in: dict[str, np.ndarray] = {
                 "T": T_full, "u": u_full, "v": v_full,
                 "u2": _precip_wind_u_aloft, "v2": _precip_wind_v_aloft,
+                "T_air": T_air_full,
             }
             if _three_level_midwind_active:
                 _group_p_in["u_mid"] = midlevel_wind_u_full
@@ -3137,6 +3147,8 @@ def simulate_step(
                 _group_p_in["condensate"] = state.atmospheric_condensate
             if state.precipitating_hydrometeors is not None:
                 _group_p_in["hydrometeors"] = state.precipitating_hydrometeors
+            if state.precipitation is not None:
+                _group_p_in["previous_precipitation"] = state.precipitation
             if midlevel_temperature_for_precip is not None:
                 _group_p_in["midlevel_temperature"] = midlevel_temperature_for_precip
             if state.midlevel_humidity is not None:
@@ -3151,6 +3163,7 @@ def simulate_step(
             _v_p = _group_p_out["v"]
             _u2_p = _group_p_out["u2"]
             _v2_p = _group_p_out["v2"]
+            _T_air_p = _group_p_out["T_air"]
             _umid_p = _group_p_out.get("u_mid")
             _vmid_p = _group_p_out.get("v_mid")
             _hum_p = _group_p_out.get("hum")
@@ -3159,6 +3172,7 @@ def simulate_step(
             _cloud_p = _group_p_out.get("cloud")
             _condensate_p = _group_p_out.get("condensate")
             _hydrometeors_p = _group_p_out.get("hydrometeors")
+            _previous_precipitation_p = _group_p_out.get("previous_precipitation")
             _midlevel_temperature_p = _group_p_out.get("midlevel_temperature")
             _midlevel_humidity_p = _group_p_out.get("midlevel_humidity")
             _upperlevel_temperature_p = _group_p_out.get("upperlevel_temperature")
@@ -3175,6 +3189,8 @@ def simulate_step(
                 midlevel_humidity=_midlevel_humidity_p,
                 upperlevel_temperature=_upperlevel_temperature_p,
                 upperlevel_humidity=_upperlevel_humidity_p,
+                column_lower_temperature=_T_air_p,
+                previous_precipitation_mm_day=_previous_precipitation_p,
                 cloud_fraction=_cloud_p,
                 day_of_year=new_day, dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
@@ -3213,6 +3229,8 @@ def simulate_step(
                 midlevel_humidity=state.midlevel_humidity,
                 upperlevel_temperature=upperlevel_temperature_for_precip,
                 upperlevel_humidity=state.upperlevel_humidity,
+                column_lower_temperature=T_air_full,
+                previous_precipitation_mm_day=state.precipitation,
                 cloud_fraction=cloud_full,
                 day_of_year=new_day, dt_days=float(days),
                 surface_pressure_hpa=pp.surface_pressure_pa / 100.0,
@@ -3239,12 +3257,17 @@ def simulate_step(
         None if _precipitation_diagnostics is None
         else _precipitation_diagnostics.get("upperlevel_omega_pa_s")
     )
+    closed_lower_temperature_full = (
+        None if _precipitation_diagnostics is None
+        else _precipitation_diagnostics.get("closed_column_lower_temperature_k")
+    )
     if state.elevation is not None and _pbs > 1:
         _omega_fields = {
             name: np.asarray(value)
             for name, value in {
                 "lower": omega_lower_mid_full,
                 "upper": omega_mid_upper_full,
+                "closed_lower_temperature": closed_lower_temperature_full,
             }.items()
             if value is not None and np.asarray(value).shape == (_Hcp, _Wcp)
         }
@@ -3252,9 +3275,22 @@ def simulate_step(
             _omega_full = _upsample_bilinear_many(_omega_fields, H, W, _pbs)
             omega_lower_mid_full = _omega_full.get("lower", omega_lower_mid_full)
             omega_mid_upper_full = _omega_full.get("upper", omega_mid_upper_full)
+            closed_lower_temperature_full = _omega_full.get(
+                "closed_lower_temperature", closed_lower_temperature_full
+            )
     if not _three_level_midwind_active:
         omega_lower_mid_full = None
         omega_mid_upper_full = None
+        closed_lower_temperature_full = None
+    if (
+        bool(pp.enable_closed_three_level_thermodynamics)
+        and closed_lower_temperature_full is not None
+        and np.asarray(closed_lower_temperature_full).shape == T_air_full.shape
+    ):
+        # `_evolve_temperature` is the resolved radiative/surface split step;
+        # the pressure-column operator applies its conservative vertical and
+        # phase adjustment afterwards. No radiative tendency is applied twice.
+        T_air_full = np.asarray(closed_lower_temperature_full, dtype=np.float32)
 
     # Preserve the historical state representation exactly while the new
     # closure is gated off; a zero array is not equivalent to an absent
