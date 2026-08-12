@@ -4,6 +4,11 @@ This document converts `EXTERNAL_PRIOR_ART.md` into staged, promotion-gated
 work.  A published formulation is a source of physics and validation, not an
 automatic default for PlanetSim.
 
+> **Historical implementation record.** Completed, rejected, and in-progress
+> entries retain their original experimental evidence. The supported baseline
+> and current experiment disposition are maintained in
+> `docs/CURRENT_BASELINE.md` and `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md`.
+
 ## 1. Orographic precipitation: Smith--Barstad linear theory
 
 **Status: implemented offline; not coupled.** `orographic_linear.py` provides

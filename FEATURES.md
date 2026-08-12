@@ -1,12 +1,13 @@
 # PlanetSim — Feature Backlog (Part 2)
 
 > Created: 2026-07-25
-> Companion to `ROADMAP.md` (long-horizon idea backlog) and `PLAN.md` (live task tracking).
+> Companion to `ROADMAP.md` (long-horizon idea backlog) and the historical `PLAN.md`.
 >
 > This file is specifically the **"what's missing that we should build"** list, as distinct
 > from the **"what's broken that we should fix"** list tracked in the memory notes and
-> summarized in ROADMAP.md. Work here begins **after** the Part 1 findings (open physics
-> gaps, inert-gate decisions, test debt) are resolved.
+> summarized in ROADMAP.md. These are candidate capabilities, not committed implementation;
+> the supported-product boundary and active experiment disposition are in
+> `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md`.
 >
 > Ordered by recommendation strength. Effort estimates are rough and assume familiarity
 > with the module being touched.

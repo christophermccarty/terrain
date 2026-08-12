@@ -10,6 +10,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from real_terrain_validation import DEFAULT_BASELINE_PATH, load_validation_report  # noqa: E402
+from regional_validation import EARTH_PRECIP_REGIONS  # noqa: E402
+
+
+def _format_precipitation_target(minimum: float, maximum: float) -> str:
+    """Format a bounded annual precipitation target for a status table."""
+    if minimum <= 0.0:
+        return f"< {maximum:.0f}"
+    return f"{minimum:.0f}–{maximum:.0f}"
 
 
 def render_current_baseline(report: dict) -> str:
@@ -20,6 +28,8 @@ def render_current_baseline(report: dict) -> str:
     skill = metrics.get("koppen_map_skill") or {}
     thresholds = metrics.get("koppen_temperature_thresholds") or {}
     closure = (metrics.get("precip_rescale") or {}).get("closure") or {}
+    regional_precip = metrics.get("regional_precip_mm_year") or {}
+    regional_error = metrics.get("regional_target_error_fraction") or {}
     lines = [
         "# Current Earth baseline",
         "",
@@ -46,6 +56,32 @@ def render_current_baseline(report: dict) -> str:
         f"- Global precipitation: {float(global_metrics['precip_mm_day']):.3f} mm/day",
         f"- Cloud fraction: {float(global_metrics['cloud_fraction']):.3f}",
     ]
+    if regional_precip or regional_error:
+        lines.extend(
+            [
+                "",
+                "## Regional precipitation targets",
+                "",
+                "Annual regional means from the validation fixture. These are broad "
+                "climatological guardrails, not station-level targets.",
+                "",
+                "| Region | Model (mm/year) | Target (mm/year) | Status |",
+                "| --- | ---: | ---: | --- |",
+            ]
+        )
+        for region in EARTH_PRECIP_REGIONS:
+            value = regional_precip.get(region.name)
+            error = regional_error.get(region.name)
+            if value is None or error is None:
+                rendered_value = "—"
+                status = "not scored"
+            else:
+                rendered_value = f"{float(value):.0f}"
+                status = "within target" if abs(float(error)) <= 1e-12 else "outside target"
+            target = _format_precipitation_target(
+                region.precip_min_mm_year, region.precip_max_mm_year
+            )
+            lines.append(f"| {region.name} | {rendered_value} | {target} | {status} |")
     if closure:
         lines.extend(
             [

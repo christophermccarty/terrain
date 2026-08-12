@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+pytestmark = pytest.mark.slow
+
 
 def _ecs_run(co2_ppm: float, years: int = 15, spinup_years: float = 1.0,
              H: int = 32, W: int = 64):

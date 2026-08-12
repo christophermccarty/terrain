@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+pytestmark = pytest.mark.slow
+
 
 def _run_spinup(planet_params, H: int = 32, W: int = 64, n_days: int = 365,
                 block_size: int = 8) -> object:

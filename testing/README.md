@@ -1,8 +1,8 @@
 ## Testing Layout
 
 This folder is a standard pytest suite (`pytest.ini` + `conftest.py` fixtures at the repo
-root/`testing/`), not a collection of standalone scripts. As of 2026-08-01, it holds
-roughly 57 `test_*.py` modules and collects 446 tests. Use pytest collection as the
+root/`testing/`), not a collection of standalone scripts. As of 2026-08-11, it holds
+90 `test_*.py` modules and collects 778 tests (607 routine, 171 slow). Use pytest collection as the
 authoritative count because the suite changes frequently:
 
 ```powershell
@@ -22,6 +22,12 @@ python -m venv .venv
 
 Long-running benchmark/integration tests are marked `@pytest.mark.slow` (see `pytest.ini`) and
 excluded by `-m "not slow"`.
+
+Pytest's `--basetemp` is set to `testing/.pytest-tmp/` in `pytest.ini`. This
+avoids user-profile temp-directory permissions on Windows and keeps temporary
+test files inside the ignored workspace location. Do not run concurrent pytest
+processes using the default configuration: they would share that temporary
+directory. Supply a distinct `--basetemp` for each parallel process.
 
 ### Notable non-pytest files
 

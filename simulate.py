@@ -7,6 +7,7 @@ with configurable time scales. Default unit is one day.
 from __future__ import annotations
 
 import logging
+import warnings
 import numpy as np
 from simulation_state import PlanetState, TimeScaleMode
 from simulation_runner import initialize_state, run_multiple_steps
@@ -1025,11 +1026,12 @@ def simulate_step(
     # so the default was recalibrated rather than reused.
     wind_baroclinic_jet_amp: float = 1.0,
     wind_baroclinic_mix: float = 2.0,
-    # Increased to 3.0 days to prevent oscillations from over-relaxation
-    wind_cell_relax_days: float = 3.0,
+    # None uses PlanetParams.wind_cell_relax_days (historical default: 3.0).
+    # An explicit value remains supported for compatibility with existing callers.
+    wind_cell_relax_days: float | None = None,
     ocean_transport_coeff: float | None = None,  # None → pp.ocean_transport_coeff
-    # Deprecated no-ops (kept for config compatibility): these were never read
-    # by ocean.calculate_ocean_heat_transport.
+    # Deprecated compatibility arguments. They are not active model controls
+    # and must not appear in new configs; non-default legacy values warn below.
     ocean_exchange_floor: float = 0.65,
     ocean_exchange_span: float = 0.35,
     # Ocean-atmosphere restoring rate [K/day]. Default matches the value that
@@ -1047,7 +1049,7 @@ def simulate_step(
     ice_melt_rate: float = 0.19,
     ice_albedo_strength: float | None = None,  # None → pp.ice_albedo_strength
     thermal_diffusion: float | None = None,    # None → pp.thermal_diffusivity
-    latent_cooling_coeff: float = 0.015,  # Deprecated no-op (found by test_param_wiring.py, 2026-07-04): accepted but never read anywhere in the codebase; kept for config compatibility
+    latent_cooling_coeff: float = 0.015,
     enable_carbon_cycle: bool = True,
     apply_greenhouse_forcing: bool = True,
     co2_climate_feedback: float | None = None,  # None → pp.co2_climate_feedback
@@ -1058,6 +1060,25 @@ def simulate_step(
     time_scale: TimeScaleMode = TimeScaleMode.DAILY,
     feedback_flags: dict[str, bool] | None = None,
 ) -> tuple[PlanetState, dict]:
+    deprecated_values = {
+        "ocean_exchange_floor": (ocean_exchange_floor, 0.65),
+        "ocean_exchange_span": (ocean_exchange_span, 0.35),
+        "latent_cooling_coeff": (latent_cooling_coeff, 0.015),
+    }
+    supplied_deprecated = [
+        name for name, (value, default) in deprecated_values.items()
+        if value != default
+    ]
+    if supplied_deprecated:
+        warnings.warn(
+            "Deprecated no-op simulate_step argument(s): "
+            + ", ".join(supplied_deprecated)
+            + ". They are accepted only for legacy configuration compatibility "
+            "and have no effect; remove them from new callers.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     # Supported flags (all default True when absent):
     #   'ice_albedo'        — sea ice effect on surface albedo + latent heat
     #   'snow_albedo'       — snow pack effect on surface albedo
@@ -1098,6 +1119,11 @@ def simulate_step(
         pp = orbital_params_at_time(base_pp, state.total_days)
     else:
         pp = base_pp
+    _wind_cell_relax_days_arg = (
+        float(pp.wind_cell_relax_days)
+        if wind_cell_relax_days is None
+        else float(wind_cell_relax_days)
+    )
     if precip_block_size not in (None, 1, 2):
         raise ValueError("precip_block_size must be None, 1, or 2")
     # Retain pressure-vertical velocity when its three-level source exists,
@@ -2356,7 +2382,7 @@ def simulate_step(
         and _two_layer_thermo_active
     )
     _wind_cell_relax_days = (
-        0.0 if _native_balanced_momentum_active else float(wind_cell_relax_days)
+        0.0 if _native_balanced_momentum_active else _wind_cell_relax_days_arg
     )
 
     # Opt-in (PlanetParams.wind_prognostic_substep_days, default 0.0/off): when
@@ -2519,6 +2545,26 @@ def simulate_step(
             a = float(np.clip(wind_relax, 0.0, 1.0))
             u_full = (1.0 - a) * u_full + a * u_diag
             v_full = (1.0 - a) * v_full + a * v_diag
+
+    # Optional two-level extraction of the existing thermally-direct,
+    # mass-conserving overturning primitive.  The same lower/return structure
+    # used by the three-level experiment applies directly to the normal surface
+    # and upper-wind state, avoiding a second circulation formulation.
+    if bool(pp.enable_two_level_thermally_direct_overturning):
+        _two_level_speed = max(float(pp.two_level_thermally_direct_overturning_speed_m_s), 0.0)
+        if _two_level_speed > 0.0:
+            _two_level_temperature = (
+                state.air_temperature
+                if state.air_temperature is not None and state.air_temperature.shape == u_full.shape
+                else (state.temperature if state.temperature is not None else _compute_T_base_ocean_full())
+            )
+            _two_level_overturning = thermally_direct_overturning(
+                _two_level_temperature,
+                hadley_edge_deg=float(pp.wind_upper_hadley_edge_deg),
+                lower_branch_speed_m_s=_two_level_speed,
+            )
+            v_full = (v_full + _two_level_overturning.lower_v).astype(np.float32, copy=False)
+            v2_full = (v2_full + _two_level_overturning.upper_v).astype(np.float32, copy=False)
 
     # Native three-level pressure-coordinate momentum.  The middle pressure
     # level has an independent prognostic circulation, not a diagnostic mean
@@ -2976,8 +3022,6 @@ def simulate_step(
         ice_cover=ice_prev_coarse,
         thermal_diffusion=thermal_diffusion,
         ocean_transport_coeff=ocean_transport_coeff,
-        ocean_exchange_floor=ocean_exchange_floor,
-        ocean_exchange_span=ocean_exchange_span,
         ocean_exchange_coeff=ocean_exchange_coeff,
         ocean_exchange_inertia=ocean_exchange_inertia,
         epsilon_equator=eps_eq,
@@ -3770,8 +3814,6 @@ def _evolve_temperature(
     T_base_land: np.ndarray | None = None,
     ice_cover: np.ndarray | None = None,
     ocean_transport_coeff: float = 0.5,
-    ocean_exchange_floor: float = 0.65,   # deprecated no-op (never read downstream)
-    ocean_exchange_span: float = 0.35,    # deprecated no-op (never read downstream)
     ocean_exchange_coeff: float = 0.03,
     ocean_exchange_inertia: float = 0.0,
     epsilon_equator: float = 0.72,

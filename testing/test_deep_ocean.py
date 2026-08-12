@@ -5,6 +5,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+pytestmark = pytest.mark.slow
+
 
 def test_deep_ocean_initialized(mixed_initial_state):
     """T_deep_ocean should be initialized on first step for a wet planet."""

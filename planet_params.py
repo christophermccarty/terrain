@@ -3481,6 +3481,32 @@ class PlanetParams:
     (wind_drag_base/wind_drag_elev_scale), since the upper troposphere is
     nearly frictionless compared to the boundary layer."""
 
+    wind_cell_relax_days: float = 3.0
+    """Timescale [days] of the surface 3-cell circulation scaffold.
+
+    ``atmosphere.evolve_wind`` combines resolved pressure-gradient, Coriolis,
+    friction, and upper-layer momentum tendencies with a weak relaxation toward
+    an Earth-like Hadley/Ferrel/polar surface pattern. A one-layer surface
+    model cannot generate that complete overturning pattern by itself, so this
+    is an explicit calibrated scaffold rather than an emergent circulation.
+
+    The historical ``simulate_step`` default was 3.0 days. Keeping it here
+    makes the value part of reproducible ``PlanetParams`` validation and allows
+    real-terrain screens to override it without a hidden integrator argument.
+    Smaller values strengthen the scaffold and must clear circulation,
+    precipitation, drift, and cadence gates before any default change.
+    """
+
+    enable_two_level_thermally_direct_overturning: bool = False
+    """Apply the existing thermally centred overturning primitive to the
+    normal 1.5-layer wind state. The surface lower branch is paired with the
+    compensating upper return branch, so the two represented layers have zero
+    mass-weighted meridional flow. Experimental; default-off."""
+
+    two_level_thermally_direct_overturning_speed_m_s: float = 0.0
+    """Lower-branch speed [m/s] for the opt-in two-level overturning path.
+    Zero keeps the gate inert even when enabled."""
+
     wind_prognostic_substep_days: float = 1.0
     """Run the real prognostic `evolve_wind`/`evolve_wind_aloft` integration
     (in inner chunks of this many days) instead of the cached diagnostic

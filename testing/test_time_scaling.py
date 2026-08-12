@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+pytestmark = pytest.mark.slow
+
 
 def _run(scale_name: str, spinup_years: float = 0.5, H: int = 32, W: int = 64, planet_params=None):
     from optimizer.headless import run_simulation

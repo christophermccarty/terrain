@@ -5,6 +5,11 @@ local, generated, or overnight experiments. Raw logs and large result artifacts
 remain intentionally ignored. Detailed measurement tables for the most recent
 wind work are tracked in `PLAN_PHYSICS_FIXES.md`.
 
+> **Historical findings record.** It explains prior decisions, but is not a
+> current status page. Use `docs/CURRENT_BASELINE.md` for the active regression
+> contract and `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md` for the current scope,
+> unresolved work, and default-off decisions.
+
 Last updated: 2026-08-01.
 
 ## Rules learned from prior investigations

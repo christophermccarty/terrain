@@ -34,6 +34,21 @@ def test_precipitation_gate_rejects_koppen_tradeoff():
     assert not decision["gates"]["koppen_group_preserved"]
 
 
+def test_precipitation_gate_rejects_hidden_regional_regression():
+    baseline = _report(precip_rmse=1.4)
+    candidate = _report(precip_rmse=1.3, precip_corr=0.461, group=0.671, klass=0.391)
+    baseline["metrics"].update(
+        {"reference_error_score": 0.10, "regional_target_error_fraction": {"Atacama": 0.2}}
+    )
+    candidate["metrics"].update(
+        {"reference_error_score": 0.11, "regional_target_error_fraction": {"Atacama": 0.3}}
+    )
+    decision = evaluate_precipitation_candidate(candidate, baseline)
+    assert not decision["accepted"]
+    assert not decision["gates"]["regional_target_errors_nonregressing"]
+    assert not decision["gates"]["reference_error_score_nonregressing"]
+
+
 def test_scorecard_requires_monthly_reference_metrics():
     try:
         scorecard({"metrics": {}})

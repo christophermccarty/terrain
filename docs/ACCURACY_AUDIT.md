@@ -12,14 +12,21 @@
 > and `PLAN_PHYSICS_FIXES.md` remain the detailed session-by-session logs; this is the rolled-up
 > index. **Re-verify against current code before trusting any specific number below** — this
 > project's own history shows numbers drift session to session; grep the cited file/param first.
+>
+> **Status policy (2026-08-11): historical investigation record.** The generated
+> `docs/CURRENT_BASELINE.md` is the sole current regression contract and
+> `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md` defines the supported product and experiment
+> disposition. Treat the measurements and “current” wording below as dated evidence unless
+> they explicitly match the generated baseline; they are not release criteria by themselves.
 
 **Severity legend**: 🔴 open, actively wrong · 🟡 partially fixed, real residual gap · 🟢 investigated
 and correctly left as-is (not a bug) · ⬛ missing system entirely, no code exists
 
-**Baseline numbers cited below** are from `testing/fixtures/real_terrain_validation_baseline.json`
-(64×128 compact fixture, MONTHLY, 1yr spinup + 1yr eval) unless noted "real-terrain" (512×1024
-Earth DEM, longer runs, less reproducible but higher-fidelity). Targets are from
-`regional_validation.py`'s `EARTH_PRECIP_REGIONS`.
+**Historical baseline numbers cited below** generally came from
+`testing/fixtures/real_terrain_validation_baseline.json` (64×128 compact fixture, MONTHLY,
+1yr spinup + 1yr eval) unless noted "real-terrain" (512×1024 Earth DEM, longer runs, less
+reproducible but higher-fidelity). Check `CURRENT_BASELINE.md` for the current fixture values;
+targets are from `regional_validation.py`'s `EARTH_PRECIP_REGIONS`.
 
 ---
 

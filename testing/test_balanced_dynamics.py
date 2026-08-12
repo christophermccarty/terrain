@@ -210,6 +210,25 @@ def test_moist_static_energy_overturning_gate_is_default_off():
     assert EARTH.enable_native_balanced_moist_static_energy_overturning is False
 
 
+def test_two_level_thermally_direct_overturning_is_default_off_and_wired():
+    assert EARTH.enable_two_level_thermally_direct_overturning is False
+    state = create_initial_state(np.zeros((12, 24), dtype=np.float32), planet_params=EARTH)
+    control, _ = simulate_step(state, days=1.0, planet_params=EARTH)
+    active = dataclasses.replace(
+        EARTH, enable_two_level_thermally_direct_overturning=True,
+        two_level_thermally_direct_overturning_speed_m_s=0.5,
+    )
+    changed, _ = simulate_step(state, days=1.0, planet_params=active)
+    assert float(np.mean(np.abs(changed.wind_v - control.wind_v))) > 0.0
+    assert float(np.mean(np.abs(changed.wind_v_aloft - control.wind_v_aloft))) > 0.0
+    lower_anomaly = changed.wind_v - control.wind_v
+    upper_anomaly = changed.wind_v_aloft - control.wind_v_aloft
+    # The extracted primitive uses the same 0.40 lower / 0.60 return-layer
+    # mass split as its three-level source. Its *increment* must therefore
+    # add no meridional column mass flux.
+    assert np.max(np.abs(0.40 * lower_anomaly + 0.60 * upper_anomaly)) < 1e-6
+
+
 def test_moist_static_energy_overturning_gate_changes_native_balanced_winds():
     shape = (12, 24)
     common = dict(

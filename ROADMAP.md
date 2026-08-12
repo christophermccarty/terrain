@@ -1,9 +1,11 @@
 # PlanetSim — Roadmap
 
 > Created: 2026-07-03
-> Companion to PLAN.md (live task tracking). This document is the long-horizon
-> idea backlog: where the simulation can go next, roughly ordered by
-> leverage within each theme. Nothing here is committed work.
+> This document is the long-horizon idea backlog: where the simulation can go
+> next, roughly ordered by leverage within each theme. Nothing here is
+> committed work. `PLAN.md` is historical; use
+> `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md` for the supported scope and current
+> experimental decisions.
 
 ---
 

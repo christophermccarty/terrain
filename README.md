@@ -45,10 +45,14 @@ the GUI falls back to deterministic procedural terrain.
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 751 tests: 658 routine and 93 marked slow (verify
+The suite currently collects 778 tests: 607 routine and 171 marked slow (verify
 with `--collect-only -q`, since this count changes frequently). Slow tests
 cover multi-year climate response, multi-decadal drift, conservation,
 circulation, seasonal behavior, and reanalysis anchors.
+
+Pytest writes temporary files under `testing/.pytest-tmp/`, configured in
+`pytest.ini`, so routine runs do not depend on a user-profile temp directory.
+The directory is ignored and recreated for each run.
 
 ## Climate-calibration workflow
 
@@ -76,6 +80,21 @@ and are substantially slower than the long-run target. MONTHLY and ANNUAL are
 the practical modes for long spinups, but intentionally approximate some fast
 weather processes.
 
+### Optional GPU wind screening
+
+`optimizer.jax_screening` provides an optional JAX-based, latitude-only
+screening surrogate for batched *wind-parameter* searches. It is not the
+PlanetSim simulation and is not a substitute for CPU validation. JAX is
+intentionally not a required dependency; install a JAX build appropriate to
+the target CPU/GPU only when using this workflow. Its tests skip when JAX is
+absent.
+
+`optimizer.sweep.gpu_random_search()` uses `EARTH_REFERENCE` by default. The
+specialized `WIND_SCREENING_REFERENCE` is an alternative for the validated
+wind-screening experiment, not a new production climate target. Every
+candidate remains subject to the normal CPU, real-terrain, and promotion gates
+before it can change a default.
+
 ## Architecture
 
 - `simulate.py` — state definition, time-step orchestration, persistence
@@ -99,12 +118,14 @@ weather processes.
 ## Project documentation
 
 - `PLAN.md` — historical development log
-- `ROADMAP.md` — long-horizon physics and engineering ideas
-- `FEATURES.md` — prioritized experience and system features
-- `PLAN_PHYSICS_FIXES.md` — recent measured physics decisions
-- `docs/FINDINGS_SUMMARY.md` — durable findings promoted from local experiments
+- `ROADMAP.md` — non-committed long-horizon physics and engineering ideas
+- `FEATURES.md` — non-committed experience and system feature candidates
+- `PLAN_PHYSICS_FIXES.md` — historical measured physics decisions
+- `docs/FINDINGS_SUMMARY.md` — historical durable findings from local experiments
 - `docs/ARCHITECTURE.md` — module boundaries and compatibility contracts
 - `docs/REAL_TERRAIN_VALIDATION.md` — regional/zonal benchmark workflow
+
+- `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md` — supported-product boundary, experimental gates, unresolved priorities, and promotion criteria
 
 - `docs/CURRENT_BASELINE.md` — generated compact current regression contract
 - `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` — optional gridded monthly T/P reference format

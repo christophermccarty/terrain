@@ -102,10 +102,14 @@ class SimulationThread(SimulationWorker):
         )
 
 
-def main() -> None:
+def main(*, root_factory=None) -> None:
     """Tiny Tk UI to toggle globe/map and rotate with keys.
 
     Keys: arrows=yaw/pitch, A/D=roll, R=reset, Esc=quit. Radio: globe vs map.
+
+    ``root_factory`` is an internal test seam. Normal application startup
+    creates a standard ``tk.Tk`` root; tests can supply a real root configured
+    to close itself after the window has been assembled.
     """
     # 262,144 cells = 512 x 512
     size = 512
@@ -159,7 +163,7 @@ def main() -> None:
         name: scenario.planet_params for name, scenario in SCENARIO_BY_NAME.items()
     }
 
-    root = tk.Tk()
+    root = (root_factory or tk.Tk)()
     root.title(f"Sphere {size}x{size} (262,144 cells)")
     root.resizable(True, True)
 

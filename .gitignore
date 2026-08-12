@@ -2,6 +2,8 @@
 /.venv
 /__pycache__
 /testing/__pycache__/
+/testing/.pytest-*/
+/testing/.pytest-tmp/
 /testing/results/
 /testing/results/**/*.json
 /testing/reference_data/
@@ -22,3 +24,4 @@ settings.json
 *.pyc
 /overnight/
 /_planetsim_wt_blend/
+/.claude/

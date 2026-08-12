@@ -79,6 +79,31 @@ STEP_KWARG_CASES = [
 ]
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ocean_exchange_floor", 0.1),
+        ("ocean_exchange_span", 0.9),
+        ("latent_cooling_coeff", 0.5),
+    ],
+)
+def test_deprecated_noop_kwargs_remain_compatible_but_warn(name, value):
+    """Old configs stay readable without presenting no-ops as active controls."""
+    elev = _make_default_elevation(H, W)
+    state = create_initial_state(elev, planet_params=EARTH)
+    with pytest.warns(DeprecationWarning, match=name):
+        simulate_step(state, days=1.0, planet_params=EARTH, **{name: value})
+
+
+def test_current_earth_optimizer_config_excludes_deprecated_noop_kwargs():
+    import json
+
+    config_path = ROOT / "optimizer" / "configs" / "earth_params.json"
+    fixed_params = json.loads(config_path.read_text(encoding="utf-8"))["fixed_params"]
+    deprecated = {"ocean_exchange_floor", "ocean_exchange_span", "latent_cooling_coeff"}
+    assert not (deprecated & fixed_params.keys())
+
+
 @pytest.mark.parametrize("name,perturbed", STEP_KWARG_CASES)
 def test_simulate_step_kwarg_is_wired(name, perturbed):
     baseline = _run(EARTH)
@@ -97,6 +122,7 @@ PLANET_PARAM_CASES = [
     ("eddy_heat_flux_coeff", 0.05),
     ("storm_pressure_amp_pa", 0.0),
     ("trade_wave_pressure_amp_pa", 0.0),
+    ("wind_cell_relax_days", 1.5),
     ("ekman_strength", 0.0),
     ("cloud_greenhouse_factor", 0.0),
     ("wv_greenhouse_factor", 0.0),
