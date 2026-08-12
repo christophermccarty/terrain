@@ -52,7 +52,30 @@ the reference files and what metrics each one populates.
 - Köppen land fractions;
 - precipitation strategy, effective correction, moisture-capacity limitation,
   unmet target, and legacy-ceiling saturation;
+- seasonal named-region precipitation-pathway diagnostics: final and raw
+  rainout, the post-raw allocator adjustment, local evaporation, humidity,
+  convergence/ascent/convection drivers, and orographic/rain-shadow drivers;
+- seasonal lower- and upper-level jet core latitude, strength, migration span,
+  and NH/SH asymmetry;
 - a composite reference-error score.
+
+`metrics.regional_moisture_budget` is a diagnostic decomposition, not a claim
+that the default path closes a resolved horizontal column-water budget. It is
+the duration-weighted mean of one-day, native-grid precipitation probes made at
+each evaluation state; the probes do not alter simulation state. In particular,
+`lower_wind_convergence_proxy` is the rainfall scheme's grid-scale wind
+divergence signal, while `moisture_flux_convergence_driver` is its normalized
+specific-humidity-flux driver. Neither should be reported as a physical
+moisture-flux convergence in SI units. `post_raw_precip_adjustment_mm_day`
+separates the calibrated row-target allocator from raw rain production, so a
+regional improvement cannot be mistaken for new local moisture supply.
+
+`metrics.seasonal_jet` samples each evaluation state and reports the
+zonal-mean westerly core in both hemispheres. It is appropriate for diagnosing
+the model's own upper-wind placement and seasonal movement. NCEP/NCAR's local
+reference is near-surface wind speed only, so it remains a global speed-map
+sanity check and must not be misused as an upper-tropospheric jet-latitude
+target.
 
 ## Baseline versus realism
 

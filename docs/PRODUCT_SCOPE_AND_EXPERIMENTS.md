@@ -133,6 +133,25 @@ Atacama’s dry-coast residual, the eastern-margin monsoon deficits, and any
 coarse-grid Central Europe discrepancy need separate, physically scoped work;
 they must not be combined into another global dry-belt exemption.
 
+The 2026-08-11 regional moisture-budget decomposition confirms that these are
+not one shared missing transport term. In the compact seasonal baseline,
+Atacama produces 0.076 mm/day of raw rain and ends at 0.176 mm/day because the
+allocator adds 0.100 mm/day; East China produces 0.855 and ends at 1.823
+because the allocator adds 0.967; S Japan is 2.307 to 2.620 (+0.313); and
+Central Europe is the opposite case, 7.648 to 2.623 (-5.025). The first three
+need distinct coastal/monsoon moisture pathways, while Central Europe needs a
+mid-latitude rain-production/track diagnosis. There is no honest shared scalar
+repair.
+
+The existing cold-side SST target-share pathway was re-screened at its recorded
+physical strength (`sst_land_target_weight=1.5`) against the current 64x128,
+one-year CRU gate. It was rejected before long validation: precipitation
+log-RMSE worsened by 0.00007, Köppen class accuracy fell by 0.07 points, and
+the Atacama, Central Europe, East China, and S Japan target errors all
+increased. It remains implemented but inert. The diagnosis priority is thereby
+complete: retain the baseline, do not add a regional exemption, and proceed to
+the separate jet-placement and hemispheric-asymmetry priority.
+
 The extracted two-level thermally direct overturning experiment was compact-
 screened on 2026-08-11 at 0.1–1.0 m/s. It is real, two-layer mass-conserving,
 and improves CRU precipitation skill modestly, but its best regional composite
@@ -140,3 +159,34 @@ result (0.5 m/s) still lowers Köppen class accuracy by 0.009 points and worsens
 the Central Europe, S Japan, and SE US target errors. It remains default-off;
 do not advance it to long-run validation until a physically diagnosed strength
 or structure resolves that trade-off.
+
+The read-only baseline diagnostic added after that screen establishes why a
+diagnosed strength is not yet justified in the normal 1.5-layer path: its
+seasonal mean has tropical latent heating of about 124 W/m² and both wind
+layers, but no upper-layer temperature/humidity or radiative-tendency state.
+Its assumed 40% lower / 60% upper meridional mass-flux residual is about
+23 m/s RMS. The existing upper wind is therefore a jet layer, not a diagnosed
+compensating overturning branch. A physically diagnosed two-layer overturning
+requires an upper thermodynamic reservoir and radiative tendency/closure;
+adding another speed parameter would just repeat the rejected tuning path.
+
+## Current priority-2 disposition
+
+Seasonal jet diagnostics are now emitted by the real-terrain report rather
+than reading one final-state snapshot. At the supported 64x128, one-year
+baseline, lower cores average 43.8 degrees N / 45.2 degrees S at 6.72 / 6.75
+m/s, so there is no material lower-level hemispheric strength asymmetry at
+that resolution. Upper cores are persistently equatorward at 26.7 degrees N /
+28.6 degrees S, with 22.4 / 24.0 m/s cores; the modest 7.4% stronger SH core
+is not evidence for a separate asymmetry repair.
+
+The one directly relevant active-shape screen, widening
+`wind_upper_hadley_edge_deg` from 24 to 30 degrees, did not move either
+seasonal upper-jet latitude and reduced their core strengths. Despite a tiny
+precipitation log-RMSE gain (0.00022), it reduced both Köppen group and class
+accuracy and regressed Central Europe and East China target errors. It is
+rejected before long validation. The persistent placement error is therefore
+the known 1.5-layer thermal-gradient/momentum-structure limitation, not a
+missing width value. Do not tune the upper PGF or Hadley-edge scalars further;
+the supported baseline remains unchanged and the next priority is land
+seasonal temperature bias and its ceiling.

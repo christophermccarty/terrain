@@ -46,6 +46,8 @@ def test_climate_summary_contains_global_regional_and_zonal_metrics():
     precipitation = np.full(shape, 1.0, dtype=np.float32)
     cloud = np.full(shape, 0.5, dtype=np.float32)
     soil = np.full(shape, 0.4, dtype=np.float32)
+    lower_v = np.full(shape, 1.5, dtype=np.float32)
+    upper_v = np.full(shape, -1.0, dtype=np.float32)
 
     metrics = summarize_real_terrain_climate(
         state,
@@ -54,6 +56,9 @@ def test_climate_summary_contains_global_regional_and_zonal_metrics():
         mean_cloud_fraction=cloud,
         mean_soil_moisture=soil,
         planet_params=EARTH,
+        mean_surface_temperature_k=temperature + 1.0,
+        mean_lower_meridional_wind_m_s=lower_v,
+        mean_upper_meridional_wind_m_s=upper_v,
     )
 
     assert metrics["global"]["temperature_k"] == pytest.approx(288.0)
@@ -66,6 +71,8 @@ def test_climate_summary_contains_global_regional_and_zonal_metrics():
     )
     assert "40-50N" in metrics["zonal"]
     assert np.isfinite(metrics["reference_error_score"])
+    assert metrics["two_layer_overturning"]["diagnosed_mse_strength_available"] is False
+    assert metrics["two_layer_overturning"]["two_layer_mass_flux_available"] is True
 
 
 def test_climate_summary_scores_optional_monthly_climatology():
@@ -144,6 +151,20 @@ def test_tracked_real_terrain_baseline_is_valid():
         "wind_block_size": 4,
     }
     assert np.isfinite(report["metrics"]["reference_error_score"])
+
+
+@pytest.mark.slow
+def test_compact_real_terrain_report_contains_regional_moisture_budget():
+    _, report = run_real_terrain_validation(
+        RealTerrainValidationConfig(spinup_years=0.0, evaluation_years=0.25)
+    )
+    budget = report["metrics"]["regional_moisture_budget"]
+    assert set(budget) == {region.name for region in EARTH_PRECIP_REGIONS}
+    assert budget["Atacama"]["precipitation_final_mm_day"] is not None
+    assert budget["Atacama"]["post_raw_precip_adjustment_mm_day"] is not None
+    seasonal_jet = report["metrics"]["seasonal_jet"]
+    assert seasonal_jet["sample_count"] == 3
+    assert seasonal_jet["upper"]["nh"]["mean_core_speed_m_s"] > 0.0
 
 
 @pytest.mark.slow

@@ -12,9 +12,10 @@ from PIL import Image
 
 from atmosphere import generate_precipitation
 from balanced_dynamics import pressure_level_geopotential
-from circulation_diagnostics import circulation_scorecard
+from circulation_diagnostics import circulation_scorecard, seasonal_jet_scorecard
 from masks import get_masks
 from temperature import elevation_to_alt_km
+from two_layer_overturning_diagnostics import diagnose_two_layer_overturning_state
 from monthly_climatology import (
     MonthlyClimatology,
     load_monthly_climatology,
@@ -22,6 +23,10 @@ from monthly_climatology import (
     score_monthly_climatology,
 )
 from planet_params import EARTH, PlanetParams
+from regional_moisture_budget import (
+    regional_moisture_budget_snapshot,
+    time_average_regional_moisture_budget,
+)
 from regional_validation import (
     EARTH_PRECIP_REGIONS,
     OROGRAPHIC_PAIRS,
@@ -682,6 +687,9 @@ def summarize_real_terrain_climate(
     planet_params: PlanetParams,
     monthly_climatology: MonthlyClimatology | None = None,
     mean_wind_speed_ms: np.ndarray | None = None,
+    mean_surface_temperature_k: np.ndarray | None = None,
+    mean_lower_meridional_wind_m_s: np.ndarray | None = None,
+    mean_upper_meridional_wind_m_s: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Compute stable global, zonal, and named-region validation metrics."""
     sea_mask, land_mask = get_masks(state.elevation, use_cache=False)
@@ -814,6 +822,17 @@ def summarize_real_terrain_climate(
     ]
     score_terms = finite_region_errors + temperature_errors + precipitation_errors
     reference_error_score = float(np.mean(score_terms)) if score_terms else float("nan")
+    two_layer_overturning = {}
+    if mean_surface_temperature_k is not None:
+        two_layer_overturning = diagnose_two_layer_overturning_state(
+            mean_surface_temperature_k,
+            mean_temperature_k,
+            mean_precipitation_mm_day,
+            mean_lower_meridional_wind_m_s,
+            mean_upper_meridional_wind_m_s,
+            hadley_edge_deg=float(planet_params.wind_upper_hadley_edge_deg),
+            upper_temperature_k=state.upperlevel_temperature,
+        )
 
     return {
         "global": {
@@ -858,6 +877,7 @@ def summarize_real_terrain_climate(
         ),
         "precip_rescale": _precip_rescale_metrics(state, planet_params),
         "circulation": circulation,
+        "two_layer_overturning": two_layer_overturning,
         "reference_error_score": reference_error_score,
     }
 
@@ -887,6 +907,53 @@ def _advance_cycle(
             track_components=False,
         )
     return state
+
+
+def _regional_moisture_budget_snapshot(
+    state: PlanetState,
+    planet_params: PlanetParams,
+) -> dict[str, dict[str, float | None]]:
+    """Re-evaluate precipitation diagnostics without changing validation state.
+
+    This deliberately uses a one-day native-grid call on each sampled climate
+    state. It exposes the precipitation scheme's current drivers and allocator
+    response, while keeping validation evolution bit-for-bit unchanged.
+    """
+    if state.elevation is None or state.wind_u is None or state.wind_v is None:
+        raise RuntimeError("regional moisture diagnostic requires elevation and lower wind")
+    temperature = state.air_temperature if state.air_temperature is not None else state.temperature
+    if temperature is None or state.humidity is None:
+        raise RuntimeError("regional moisture diagnostic requires temperature and humidity")
+    H, W = state.elevation.shape
+    debug: dict = {}
+    generate_precipitation(
+        H,
+        W,
+        state.elevation,
+        temperature=temperature,
+        wind_u=state.wind_u,
+        wind_v=state.wind_v,
+        wind_u_aloft=state.wind_u_aloft,
+        wind_v_aloft=state.wind_v_aloft,
+        wind_u_midlevel=state.midlevel_wind_u,
+        wind_v_midlevel=state.midlevel_wind_v,
+        humidity=state.humidity,
+        soil_moisture=state.soil_moisture,
+        soil_moisture_deep=state.soil_moisture_deep,
+        condensate=state.atmospheric_condensate,
+        precipitating_hydrometeors=state.precipitating_hydrometeors,
+        midlevel_temperature=state.midlevel_temperature,
+        midlevel_humidity=state.midlevel_humidity,
+        upperlevel_temperature=state.upperlevel_temperature,
+        upperlevel_humidity=state.upperlevel_humidity,
+        cloud_fraction=state.cloud_cover,
+        day_of_year=state.day_of_year,
+        dt_days=1.0,
+        surface_pressure_hpa=float(planet_params.surface_pressure_pa) / 100.0,
+        planet_params=planet_params,
+        debug_fields=debug,
+    )
+    return regional_moisture_budget_snapshot(state.elevation, debug)
 
 
 def run_real_terrain_validation(
@@ -959,20 +1026,32 @@ def run_real_terrain_validation(
 
     accumulators: dict[str, np.ndarray | None] = {
         "temperature": None,
+        "surface_temperature": None,
         "precipitation": None,
         "cloud": None,
         "soil": None,
     }
     wind_speed_accumulator: np.ndarray | None = None
+    lower_v_accumulator: np.ndarray | None = None
+    upper_v_accumulator: np.ndarray | None = None
+    lower_u_samples: list[np.ndarray] = []
+    upper_u_samples: list[np.ndarray] = []
+    regional_moisture_snapshots: list[
+        tuple[float, dict[str, dict[str, float | None]]]
+    ] = []
     sampled_days = 0.0
     cycle_duration = cycle_days(mode, planet_params)
     for _ in range(evaluation_cycles):
         state = _advance_cycle(state, mode, planet_params, config)
+        regional_moisture_snapshots.append(
+            (cycle_duration, _regional_moisture_budget_snapshot(state, planet_params))
+        )
         temperature = (
             state.air_temperature if state.air_temperature is not None else state.temperature
         )
         fields = {
             "temperature": temperature,
+            "surface_temperature": state.temperature,
             "precipitation": state.precipitation,
             "cloud": state.cloud_cover,
             "soil": state.soil_moisture,
@@ -989,6 +1068,7 @@ def run_real_terrain_validation(
         # raising -- mean_wind_speed_ms is simply None (no CRU wind score)
         # if wind was never present.
         if state.wind_u is not None and state.wind_v is not None:
+            lower_u_samples.append(np.asarray(state.wind_u, dtype=np.float64))
             speed = np.sqrt(
                 np.asarray(state.wind_u, dtype=np.float64) ** 2
                 + np.asarray(state.wind_v, dtype=np.float64) ** 2
@@ -997,6 +1077,20 @@ def run_real_terrain_validation(
             wind_speed_accumulator = (
                 weighted_speed if wind_speed_accumulator is None
                 else wind_speed_accumulator + weighted_speed
+            )
+            weighted_lower_v = np.asarray(state.wind_v, dtype=np.float64) * cycle_duration
+            lower_v_accumulator = (
+                weighted_lower_v if lower_v_accumulator is None
+                else lower_v_accumulator + weighted_lower_v
+            )
+        if state.wind_v_aloft is not None:
+            if state.wind_u_aloft is None:
+                raise RuntimeError("upper meridional wind present without upper zonal wind")
+            upper_u_samples.append(np.asarray(state.wind_u_aloft, dtype=np.float64))
+            weighted_upper_v = np.asarray(state.wind_v_aloft, dtype=np.float64) * cycle_duration
+            upper_v_accumulator = (
+                weighted_upper_v if upper_v_accumulator is None
+                else upper_v_accumulator + weighted_upper_v
             )
         sampled_days += cycle_duration
 
@@ -1010,6 +1104,8 @@ def run_real_terrain_validation(
     mean_wind_speed_ms = (
         wind_speed_accumulator / sampled_days if wind_speed_accumulator is not None else None
     )
+    mean_lower_v = lower_v_accumulator / sampled_days if lower_v_accumulator is not None else None
+    mean_upper_v = upper_v_accumulator / sampled_days if upper_v_accumulator is not None else None
     metrics = summarize_real_terrain_climate(
         state,
         mean_temperature_k=means["temperature"],
@@ -1019,7 +1115,20 @@ def run_real_terrain_validation(
         planet_params=planet_params,
         monthly_climatology=monthly_climatology,
         mean_wind_speed_ms=mean_wind_speed_ms,
+        mean_surface_temperature_k=means["surface_temperature"],
+        mean_lower_meridional_wind_m_s=mean_lower_v,
+        mean_upper_meridional_wind_m_s=mean_upper_v,
     )
+    metrics["regional_moisture_budget"] = time_average_regional_moisture_budget(
+        regional_moisture_snapshots
+    )
+    if lower_u_samples:
+        metrics["seasonal_jet"] = seasonal_jet_scorecard(
+            lower_u_samples,
+            upper_zonal_wind_samples=(
+                upper_u_samples if len(upper_u_samples) == len(lower_u_samples) else None
+            ),
+        )
     report = {
         "schema_version": VALIDATION_SCHEMA_VERSION,
         "config": asdict(config),

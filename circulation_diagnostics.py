@@ -1,6 +1,7 @@
 """Grid-aware diagnostics for PlanetSim's layer-aware circulation path."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,85 @@ def jet_latitudes_deg(zonal_wind_m_s: np.ndarray, *, tropical_edge_deg: float = 
         return float(lat[rows[np.argmax(mean_u[rows])]])
 
     return {"nh_deg": peak(lat >= tropical_edge_deg), "sh_deg": peak(lat <= -tropical_edge_deg)}
+
+
+def jet_core_properties(
+    zonal_wind_m_s: np.ndarray, *, tropical_edge_deg: float = 15.0
+) -> dict[str, dict[str, float]]:
+    """Return each hemisphere's zonal-mean westerly jet position and strength."""
+    wind = np.asarray(zonal_wind_m_s, dtype=np.float64)
+    if wind.ndim != 2 or wind.shape[1] != 2 * wind.shape[0]:
+        raise ValueError("zonal wind must use a 2:1 global grid")
+    lat = latitude_centres_deg(wind.shape[0])
+    mean_u = np.mean(wind, axis=1)
+
+    def core(mask: np.ndarray) -> dict[str, float]:
+        if not np.any(mask):
+            return {"latitude_deg": float("nan"), "speed_m_s": float("nan")}
+        rows = np.flatnonzero(mask)
+        row = rows[np.argmax(mean_u[rows])]
+        return {"latitude_deg": float(lat[row]), "speed_m_s": float(mean_u[row])}
+
+    return {
+        "nh": core(lat >= tropical_edge_deg),
+        "sh": core(lat <= -tropical_edge_deg),
+    }
+
+
+def seasonal_jet_scorecard(
+    lower_zonal_wind_samples: Sequence[np.ndarray],
+    *,
+    upper_zonal_wind_samples: Sequence[np.ndarray] | None = None,
+    tropical_edge_deg: float = 15.0,
+) -> dict[str, Any]:
+    """Summarize seasonal jet migration and NH/SH core asymmetry.
+
+    Samples are successive model states from one evaluation period.  This is a
+    model-internal placement diagnostic, not a comparison to near-surface NCEP
+    wind speed: that product cannot identify an upper-tropospheric jet core.
+    """
+    if not lower_zonal_wind_samples:
+        raise ValueError("at least one lower-wind sample is required")
+
+    def summarize(samples: Sequence[np.ndarray]) -> dict[str, Any]:
+        cores = [jet_core_properties(sample, tropical_edge_deg=tropical_edge_deg) for sample in samples]
+
+        def hemisphere(name: str) -> dict[str, float]:
+            latitude = np.asarray([entry[name]["latitude_deg"] for entry in cores])
+            speed = np.asarray([entry[name]["speed_m_s"] for entry in cores])
+            return {
+                "mean_latitude_deg": float(np.mean(latitude)),
+                "seasonal_latitude_span_deg": float(np.max(latitude) - np.min(latitude)),
+                "mean_core_speed_m_s": float(np.mean(speed)),
+            }
+
+        nh = hemisphere("nh")
+        sh = hemisphere("sh")
+        return {
+            "nh": nh,
+            "sh": sh,
+            "hemispheric": {
+                "absolute_latitude_difference_deg": float(
+                    abs(abs(nh["mean_latitude_deg"]) - abs(sh["mean_latitude_deg"]))
+                ),
+                "core_speed_ratio_sh_to_nh": float(
+                    sh["mean_core_speed_m_s"] / (nh["mean_core_speed_m_s"] + 1e-12)
+                ),
+                "core_speed_difference_nh_minus_sh_m_s": float(
+                    nh["mean_core_speed_m_s"] - sh["mean_core_speed_m_s"]
+                ),
+            },
+        }
+
+    result: dict[str, Any] = {
+        "sample_count": len(lower_zonal_wind_samples),
+        "lower": summarize(lower_zonal_wind_samples),
+    }
+    if upper_zonal_wind_samples is not None:
+        if len(upper_zonal_wind_samples) != len(lower_zonal_wind_samples):
+            raise ValueError("upper-wind samples must match lower-wind sample count")
+        result["upper"] = summarize(upper_zonal_wind_samples)
+    return result
 
 
 def hadley_edges_deg(meridional_wind_m_s: np.ndarray, *, tropical_edge_deg: float = 5.0) -> dict[str, float]:

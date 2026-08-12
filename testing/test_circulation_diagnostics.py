@@ -1,14 +1,33 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from circulation_diagnostics import (
     circulation_scorecard,
     hadley_edges_deg,
     jet_latitudes_deg,
+    seasonal_jet_scorecard,
     latitude_centres_deg,
     meridional_transport_diagnostics,
 )
+
+
+def test_seasonal_jet_scorecard_reports_migration_and_strength_asymmetry():
+    h, w = 18, 36
+    first = np.zeros((h, w), dtype=np.float64)
+    second = np.zeros((h, w), dtype=np.float64)
+    # 45N/55S in the first sample, then 35N/45S. The SH core
+    # remains deliberately weaker to make the asymmetry observable exact.
+    first[4] = 20.0
+    first[14] = 10.0
+    second[5] = 20.0
+    second[13] = 10.0
+    score = seasonal_jet_scorecard((first, second))
+    assert score["sample_count"] == 2
+    assert score["lower"]["nh"]["seasonal_latitude_span_deg"] == 10.0
+    assert score["lower"]["hemispheric"]["core_speed_ratio_sh_to_nh"] == pytest.approx(0.5)
+    assert score["lower"]["hemispheric"]["absolute_latitude_difference_deg"] == 10.0
 
 
 def test_jet_latitudes_find_each_hemisphere_peak():

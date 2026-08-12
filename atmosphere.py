@@ -3627,6 +3627,15 @@ def generate_precipitation(
         debug_fields["soil_evap_factor"] = soil_evap_factor
         debug_fields["land_evap"] = land_evap
         debug_fields["ocean_evap"] = ocean_evap
+        # Explicit rates make the regional moisture-budget report independent
+        # of the caller's precipitation timestep. The legacy q/day source
+        # fields above are retained for existing low-level diagnostics.
+        debug_fields["land_evaporation_mm_day"] = (
+            land_evap * 2000.0
+        ).astype(np.float32, copy=False)
+        debug_fields["ocean_evaporation_mm_day"] = (
+            ocean_evap * 2000.0
+        ).astype(np.float32, copy=False)
         if _latent_cap_mm_day is not None:
             debug_fields["energy_limited_evaporation_cap_mm_day"] = (
                 _latent_cap_mm_day.astype(np.float32)
