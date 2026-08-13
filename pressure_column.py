@@ -24,6 +24,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from column_water import evolve_column_water
+
 
 class PressureColumnStep(NamedTuple):
     """One conservative three-level column update."""
@@ -59,9 +61,125 @@ class ClosedThermodynamicColumnStep(NamedTuple):
     radiative_energy_input_j_m2: float
 
 
+class ClosedColumnHorizontalMSEStep(NamedTuple):
+    """Three-layer temperatures after conservative horizontal MSE transport."""
+
+    lower_temperature: np.ndarray
+    midlevel_temperature: np.ndarray
+    upperlevel_temperature: np.ndarray
+    energy_residual_j: float
+    relative_energy_residual: float
+
+
 _GRAVITY_M_S2 = 9.80665
 _DRY_AIR_HEAT_CAPACITY_J_KG_K = 1004.0
 _LATENT_HEAT_VAPORIZATION_J_KG = 2.5e6
+
+
+def transport_closed_three_level_mse(
+    lower_humidity_before: np.ndarray,
+    midlevel_humidity_before: np.ndarray,
+    upperlevel_humidity_before: np.ndarray,
+    lower_humidity_after: np.ndarray,
+    midlevel_humidity_after: np.ndarray,
+    upperlevel_humidity_after: np.ndarray,
+    lower_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    lower_wind_u_m_s: np.ndarray,
+    lower_wind_v_m_s: np.ndarray,
+    midlevel_wind_u_m_s: np.ndarray,
+    midlevel_wind_v_m_s: np.ndarray,
+    upperlevel_wind_u_m_s: np.ndarray,
+    upperlevel_wind_v_m_s: np.ndarray,
+    *,
+    lower_vapour_source_kg_kg_day: np.ndarray,
+    dt_days: float,
+    dx_m: np.ndarray | float,
+    dy_m: float,
+    cell_area_m2: np.ndarray | float,
+    x_face_length_m: np.ndarray | float,
+    y_face_length_m: np.ndarray | float,
+    layer_mass_fractions: tuple[float, float, float] = (0.40, 0.35, 0.25),
+    surface_pressure_pa: float = 101_325.0,
+    layer_heights_m: tuple[float, float, float] = (0.0, 3500.0, 8000.0),
+) -> ClosedColumnHorizontalMSEStep:
+    """Transport pressure-layer MSE on the same faces as its vapour.
+
+    The pressure-coordinate moisture closure already transports each layer's
+    vapour with the diagnosed shared winds. This companion operation carries
+    layer MSE contents on the identical finite-volume faces, then recovers
+    temperatures using those transported humidities. Surface evaporation
+    imports its latent energy into the lower atmospheric layer; no relaxation,
+    amplitude scale, or energy clipping is introduced.
+    """
+    fractions = np.asarray(layer_mass_fractions, dtype=np.float64)
+    if fractions.shape != (3,) or np.any(fractions <= 0.0) or not np.isclose(
+        float(np.sum(fractions)), 1.0, atol=1e-12
+    ):
+        raise ValueError("layer_mass_fractions must be three positive values summing to one")
+    if surface_pressure_pa <= 0.0 or dt_days <= 0.0:
+        raise ValueError("surface_pressure_pa and dt_days must be positive")
+    heights = np.asarray(layer_heights_m, dtype=np.float64)
+    if heights.shape != (3,) or not np.all(np.isfinite(heights)):
+        raise ValueError("layer_heights_m must be three finite values")
+    raw = (
+        lower_humidity_before, midlevel_humidity_before, upperlevel_humidity_before,
+        lower_humidity_after, midlevel_humidity_after, upperlevel_humidity_after,
+        lower_temperature_k, midlevel_temperature_k, upperlevel_temperature_k,
+        lower_wind_u_m_s, lower_wind_v_m_s, midlevel_wind_u_m_s,
+        midlevel_wind_v_m_s, upperlevel_wind_u_m_s, upperlevel_wind_v_m_s,
+        lower_vapour_source_kg_kg_day,
+    )
+    fields = tuple(np.asarray(value, dtype=np.float64) for value in raw)
+    shape = fields[0].shape
+    if len(shape) != 2 or any(value.shape != shape for value in fields):
+        raise ValueError("MSE transport fields must share a two-dimensional shape")
+    if any(not np.all(np.isfinite(value)) for value in fields):
+        raise ValueError("MSE transport fields must be finite")
+    if any(np.any(value < 0.0) for value in fields[:6]) or np.any(fields[-1] < 0.0):
+        raise ValueError("MSE transport humidities and vapour source must be non-negative")
+
+    humidity_before = fields[:3]
+    humidity_after = fields[3:6]
+    temperatures = fields[6:9]
+    winds = ((fields[9], fields[10]), (fields[11], fields[12]), (fields[13], fields[14]))
+    layer_mass = fractions * (float(surface_pressure_pa) / _GRAVITY_M_S2)
+    energy_residual = 0.0
+    expected_energy = 0.0
+    transported_energy: list[np.ndarray] = []
+    for index in range(3):
+        mse = (
+            _DRY_AIR_HEAT_CAPACITY_J_KG_K * temperatures[index]
+            + _GRAVITY_M_S2 * heights[index]
+            + _LATENT_HEAT_VAPORIZATION_J_KG * humidity_before[index]
+        )
+        energy_content = layer_mass[index] * mse
+        source = (
+            layer_mass[index] * _LATENT_HEAT_VAPORIZATION_J_KG * fields[-1]
+            if index == 0 else np.zeros_like(energy_content)
+        )
+        step = evolve_column_water(
+            energy_content, source, np.zeros_like(energy_content), *winds[index],
+            dx_m=dx_m, dy_m=dy_m, dt_days=dt_days, cell_area_m2=cell_area_m2,
+            x_face_length_m=x_face_length_m, y_face_length_m=y_face_length_m,
+        )
+        transported_energy.append(np.asarray(step.water_mm, dtype=np.float64))
+        energy_residual += float(step.residual_mm)
+        expected_energy += float(np.sum((energy_content + dt_days * source) * np.asarray(cell_area_m2)))
+
+    output_temperature = tuple(
+        (transported_energy[index] / layer_mass[index]
+         - _GRAVITY_M_S2 * heights[index]
+         - _LATENT_HEAT_VAPORIZATION_J_KG * humidity_after[index])
+        / _DRY_AIR_HEAT_CAPACITY_J_KG_K
+        for index in range(3)
+    )
+    return ClosedColumnHorizontalMSEStep(
+        *(value.astype(np.float32) for value in output_temperature),
+        energy_residual,
+        energy_residual / max(abs(expected_energy), 1.0),
+    )
 
 
 def _as_column_field(

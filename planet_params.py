@@ -1501,6 +1501,52 @@ class PlanetParams:
     an admission failure, not a value to clip.
     """
 
+    enable_shared_pressure_coordinate_circulation: bool = False
+    """Use one diabatic pressure-coordinate solve for winds and interface mass flux.
+
+    Requires ``enable_diabatic_interface_mass_flux``. The longitude-mean
+    zonal wind and the meridional wind reconstructed from the same closed layer
+    divergences become the precipitation/transport circulation. This is the
+    next experimental replacement for independent raw layer winds carrying
+    incompatible mass and energy transport; it has no strength or damping
+    scalar and remains default-off pending compact climate validation.
+    """
+
+    enable_pressure_coordinate_moisture_closure: bool = False
+    """Use a pressure-mass water budget with the shared circulation experiment.
+
+    Requires the closed three-level thermodynamics and shared pressure-coordinate
+    circulation gates.  Surface evaporation enters the lower layer in kg m-2;
+    each layer's actual interface ascent can convert vapour to a suspended-cloud
+    reservoir [kg m-2], and explicit fallout is the only non-numerical
+    precipitation sink.  With ``enable_separate_precipitating_hydrometeors``,
+    cloud water autoconverts into a second pressure-mass hydrometeor reservoir;
+    only that reservoir sediments. It replaces the older mixed-q bulk
+    condensate accounting only inside this nested experimental family.  No
+    precipitation target, geographic exception, strength, or damping control is
+    introduced.  ``False`` preserves the prior experimental path exactly.
+    """
+
+    enable_prognostic_overturning_heat_reservoir: bool = False
+    """Buffer condensation heating before it diagnoses shared overturning.
+
+    Requires the pressure-coordinate moisture closure.  It stores the
+    cosine-area-balanced, zonal latent-heating anomaly and relaxes it on the
+    free-tropospheric radiative timescale derived from heat capacity and
+    ``4 sigma T^3``.  The stored anomaly, rather than one step's condensation,
+    drives the mass-consistent omega solve.  This adds no user tuning scalar.
+    """
+
+    enable_pressure_coordinate_mse_transport: bool = False
+    """Transport three-layer moist static energy with shared pressure winds.
+
+    Requires the pressure-coordinate moisture closure. Each layer's MSE is
+    carried on the same conservative faces as its vapour, and lower-layer
+    evaporation imports its latent energy. This closes the otherwise missing
+    large-scale energy-export path without a circulation or damping scalar.
+    Experimental and off by default pending compact climate validation.
+    """
+
     enforce_three_level_mass_closure: bool = False
     """Close mass-weighted lower/mid/upper divergence before diagnosing omega."""
 
@@ -1701,7 +1747,12 @@ class PlanetParams:
     """Cloud-water-to-precipitating-hydrometeor conversion time in the separated-reservoir path."""
 
     enable_separate_precipitating_hydrometeors: bool = False
-    """Persist a distinct precipitating-hydrometeor reservoir in the experimental column closure."""
+    """Persist a distinct precipitating-hydrometeor reservoir in experimental closures.
+
+    In the pressure-coordinate closure both this reservoir and suspended cloud
+    water are pressure masses [kg m-2].  Cloud water autoconverts above the
+    retained optical-cloud amount; only hydrometeors sediment.
+    """
 
     enable_hydrometeor_transport: bool = False
     """Advect persisted precipitating hydrometeors with the resolved cloud-layer wind before sedimentation."""

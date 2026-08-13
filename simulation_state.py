@@ -84,3 +84,5 @@ class PlanetState(NamedTuple):
     omega_mid_upper_pa_s: np.ndarray | None = None
     upperlevel_wind_u: np.ndarray | None = None
     upperlevel_wind_v: np.ndarray | None = None
+    pressure_moisture_condensation_mm_day: np.ndarray | None = None
+    pressure_overturning_heating_w_m2: np.ndarray | None = None

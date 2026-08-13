@@ -16,6 +16,9 @@ from typing import NamedTuple
 import numpy as np
 
 
+_STEFAN_BOLTZMANN_W_M2_K4 = 5.670374419e-8
+
+
 class HorizontalMassClosure(NamedTuple):
     upper_u_correction: np.ndarray
     upper_v_correction: np.ndarray
@@ -36,6 +39,25 @@ class DiabaticInterfaceMassFlux(NamedTuple):
     latent_heating_w_m2: np.ndarray
     lower_mid_vertical_courant_max: float
     mid_upper_vertical_courant_max: float
+
+
+class PressureCoordinateCirculation(NamedTuple):
+    """One mass-consistent three-level horizontal/vertical circulation state."""
+
+    lower_u: np.ndarray
+    lower_v: np.ndarray
+    midlevel_u: np.ndarray
+    midlevel_v: np.ndarray
+    upperlevel_u: np.ndarray
+    upperlevel_v: np.ndarray
+    interface_mass_flux: DiabaticInterfaceMassFlux
+
+
+class LargeScaleHeatingStep(NamedTuple):
+    """Radiatively adjusted latent-heating anomaly for diagnosed overturning."""
+
+    heating_w_m2: np.ndarray
+    radiative_adjustment_time_s: np.ndarray
 
 
 def diabatic_interface_mass_flux(
@@ -92,19 +114,82 @@ def diabatic_interface_mass_flux(
         if not np.all(np.isfinite(precipitation)):
             raise ValueError("precipitation must be finite")
 
-    # kg m-2 day-1 is numerically equal to mm day-1.  Only the zonal-mean,
-    # non-negative latent release drives the large-scale branch.
-    latent_flux = float(latent_heat_j_kg) * np.maximum(
-        np.mean(precipitation, axis=1, keepdims=True), 0.0
+    # kg m-2 day-1 is numerically equal to mm day-1.  The planetwide mean
+    # latent release is balanced by the host radiation/surface step; only its
+    # cosine-area-weighted anomaly can drive a closed large-scale overturning.
+    # Without that removal every latitude ascends, which cannot be represented
+    # by a horizontal circulation and leads to arbitrary polar return flow.
+    zonal_precipitation = np.maximum(np.mean(precipitation, axis=1, keepdims=True), 0.0)
+    cos_lat = np.cos(np.radians(90.0 - (np.arange(lower.shape[0]) + 0.5) * 180.0 / lower.shape[0]))[:, None]
+    mean_precipitation = np.sum(zonal_precipitation * cos_lat) / np.sum(cos_lat)
+    latent_flux = float(latent_heat_j_kg) * (
+        zonal_precipitation - mean_precipitation
     ) / 86400.0
+    return diabatic_interface_mass_flux_from_heating(
+        np.broadcast_to(latent_flux, lower.shape), lower, middle, upper,
+        dt_seconds=dt_seconds, surface_pressure_pa=surface_pressure_pa,
+        lower_mid_pressure_depth_pa=lower_mid_pressure_depth_pa,
+        mid_upper_pressure_depth_pa=mid_upper_pressure_depth_pa,
+        gravity_m_s2=gravity_m_s2, cp_dry_j_kg_k=cp_dry_j_kg_k,
+        layer_mass_fractions=layer_mass_fractions,
+    )
+
+
+def diabatic_interface_mass_flux_from_heating(
+    large_scale_heating_w_m2: np.ndarray,
+    lower_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    *,
+    dt_seconds: float,
+    surface_pressure_pa: float,
+    lower_mid_pressure_depth_pa: float,
+    mid_upper_pressure_depth_pa: float,
+    gravity_m_s2: float = 9.80665,
+    cp_dry_j_kg_k: float = 1004.0,
+    layer_mass_fractions: tuple[float, float, float] = (0.40, 0.35, 0.25),
+) -> DiabaticInterfaceMassFlux:
+    """Diagnose closed interface mass flux from a signed heating anomaly."""
+    lower = np.asarray(lower_temperature_k, dtype=np.float64)
+    middle = np.asarray(midlevel_temperature_k, dtype=np.float64)
+    upper = np.asarray(upperlevel_temperature_k, dtype=np.float64)
+    heating = np.asarray(large_scale_heating_w_m2, dtype=np.float64)
+    if lower.ndim != 2 or lower.shape[1] != 2 * lower.shape[0] or middle.shape != lower.shape or upper.shape != lower.shape:
+        raise ValueError("temperature layers must share a two-dimensional 2:1 grid")
+    if heating.shape != lower.shape or not np.all(np.isfinite(heating)):
+        raise ValueError("large-scale heating must be finite and match the temperature grid")
+    if dt_seconds <= 0.0 or surface_pressure_pa <= 0.0 or lower_mid_pressure_depth_pa <= 0.0 or mid_upper_pressure_depth_pa <= 0.0:
+        raise ValueError("time, pressure, and pressure depths must be positive")
+    fractions = np.asarray(layer_mass_fractions, dtype=np.float64)
+    if fractions.shape != (3,) or np.any(fractions <= 0.0) or not np.isclose(np.sum(fractions), 1.0):
+        raise ValueError("layer mass fractions must be three positive values summing to one")
+    # The forcing is a large-scale zonal anomaly.  Re-average here so callers
+    # cannot accidentally turn local plume noise into a global circulation.
+    latent_flux = np.broadcast_to(np.mean(heating, axis=1, keepdims=True), lower.shape).copy()
     column_mass = float(surface_pressure_pa) / float(gravity_m_s2)
     free_troposphere_mass = column_mass * (fractions[1] + fractions[2])
     heating_k_s = latent_flux / (float(cp_dry_j_kg_k) * free_troposphere_mass)
     lower_zonal = np.mean(lower, axis=1, keepdims=True)
     middle_zonal = np.mean(middle, axis=1, keepdims=True)
     upper_zonal = np.mean(upper, axis=1, keepdims=True)
-    lower_mid_stability = (lower_zonal - middle_zonal) / float(lower_mid_pressure_depth_pa)
-    mid_upper_stability = (middle_zonal - upper_zonal) / float(mid_upper_pressure_depth_pa)
+    # Static stability is the vertical *potential-temperature* gradient, not
+    # a raw temperature difference. A normally stratified troposphere cools
+    # with height, so raw T differences can approach zero even while theta
+    # increases strongly upward. Using raw T produced a singular omega during
+    # phase-heating events. Layer-centre pressures follow the documented
+    # 0.40/0.35/0.25 pressure-mass partition; no stability floor or omega cap
+    # is introduced.
+    layer_edges = float(surface_pressure_pa) * np.array(
+        (1.0, 1.0 - fractions[0], fractions[2], 0.0), dtype=np.float64
+    )
+    layer_pressures = 0.5 * (layer_edges[:-1] + layer_edges[1:])
+    kappa = 287.05 / float(cp_dry_j_kg_k)
+    reference_pressure = float(surface_pressure_pa)
+    lower_theta = lower_zonal * (reference_pressure / layer_pressures[0]) ** kappa
+    middle_theta = middle_zonal * (reference_pressure / layer_pressures[1]) ** kappa
+    upper_theta = upper_zonal * (reference_pressure / layer_pressures[2]) ** kappa
+    lower_mid_stability = (middle_theta - lower_theta) / float(lower_mid_pressure_depth_pa)
+    mid_upper_stability = (upper_theta - middle_theta) / float(mid_upper_pressure_depth_pa)
     # An unstably stratified interface is a microphysical convective-adjustment
     # problem, not a hydrostatic large-scale omega diagnostic.  Leave that
     # branch at zero instead of hiding an arbitrary stability floor here.
@@ -136,6 +221,121 @@ def diabatic_interface_mass_flux(
         np.broadcast_to(latent_flux, lower.shape).astype(np.float32),
         float(np.max(np.abs(omega_lower_mid)) * dt_seconds / float(lower_mid_pressure_depth_pa)),
         float(np.max(np.abs(omega_mid_upper)) * dt_seconds / float(mid_upper_pressure_depth_pa)),
+    )
+
+
+def evolve_large_scale_heating_reservoir(
+    previous_heating_w_m2: np.ndarray | None,
+    condensation_mm_day: np.ndarray,
+    lower_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    *,
+    dt_seconds: float,
+    surface_pressure_pa: float,
+    gravity_m_s2: float = 9.80665,
+    cp_dry_j_kg_k: float = 1004.0,
+    latent_heat_j_kg: float = 2.5e6,
+) -> LargeScaleHeatingStep:
+    """Low-pass large-scale latent heating using a derived radiative timescale.
+
+    The reservoir stores only cosine-area-balanced zonal anomalies.  Its
+    e-folding time is free-tropospheric heat capacity divided by linearized
+    thermal emission (``4 sigma T^3``), so it introduces no configurable
+    damping or circulation-strength coefficient.
+    """
+    lower, middle, upper, condensation = (
+        np.asarray(value, dtype=np.float64)
+        for value in (lower_temperature_k, midlevel_temperature_k, upperlevel_temperature_k, condensation_mm_day)
+    )
+    if lower.ndim != 2 or lower.shape[1] != 2 * lower.shape[0] or any(value.shape != lower.shape for value in (middle, upper, condensation)):
+        raise ValueError("heating-reservoir fields must share a two-dimensional 2:1 grid")
+    if dt_seconds <= 0.0 or surface_pressure_pa <= 0.0 or gravity_m_s2 <= 0.0 or cp_dry_j_kg_k <= 0.0:
+        raise ValueError("heating-reservoir constants must be positive")
+    previous = np.zeros_like(lower) if previous_heating_w_m2 is None else np.asarray(previous_heating_w_m2, dtype=np.float64)
+    if previous.shape != lower.shape or not np.all(np.isfinite(previous)):
+        raise ValueError("previous heating must be finite and match the temperature grid")
+    zonal_condensation = np.maximum(np.mean(condensation, axis=1, keepdims=True), 0.0)
+    cos_lat = np.cos(np.radians(90.0 - (np.arange(lower.shape[0]) + 0.5) * 180.0 / lower.shape[0]))[:, None]
+    mean_condensation = np.sum(zonal_condensation * cos_lat) / np.sum(cos_lat)
+    forcing = float(latent_heat_j_kg) * (zonal_condensation - mean_condensation) / 86400.0
+    free_temperature = 0.35 * np.mean(middle, axis=1, keepdims=True) + 0.25 * np.mean(upper, axis=1, keepdims=True)
+    free_mass = float(surface_pressure_pa) / float(gravity_m_s2) * 0.60
+    radiative_stiffness = 4.0 * _STEFAN_BOLTZMANN_W_M2_K4 * np.maximum(free_temperature, 180.0) ** 3
+    adjustment_time = free_mass * float(cp_dry_j_kg_k) / radiative_stiffness
+    decay = np.exp(-float(dt_seconds) / adjustment_time)
+    updated = decay * np.mean(previous, axis=1, keepdims=True) + (1.0 - decay) * forcing
+    return LargeScaleHeatingStep(
+        np.broadcast_to(updated, lower.shape).astype(np.float32),
+        np.broadcast_to(adjustment_time, lower.shape).astype(np.float32),
+    )
+
+
+def shared_pressure_coordinate_circulation(
+    precipitation_mm_day: np.ndarray | None,
+    lower_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    lower_zonal_wind_m_s: np.ndarray,
+    midlevel_zonal_wind_m_s: np.ndarray,
+    upperlevel_zonal_wind_m_s: np.ndarray,
+    *,
+    dt_seconds: float,
+    radius_m: float,
+    surface_pressure_pa: float,
+    lower_mid_pressure_depth_pa: float,
+    mid_upper_pressure_depth_pa: float,
+    gravity_m_s2: float = 9.80665,
+    cp_dry_j_kg_k: float = 1004.0,
+    large_scale_heating_w_m2: np.ndarray | None = None,
+) -> PressureCoordinateCirculation:
+    """Return winds and omega from one pressure-coordinate continuity solve.
+
+    The zonal component keeps only each raw wind's longitude mean, which is a
+    non-divergent zonal flow on this grid.  Meridional winds are then the
+    minimum-norm fields whose production spherical divergence matches the
+    diabatic interface solve exactly.  Thus the horizontal energy carrier and
+    the vertical water/energy exchange are no longer two incompatible systems.
+    """
+    if radius_m <= 0.0:
+        raise ValueError("radius_m must be positive")
+    fields = tuple(np.asarray(value, dtype=np.float64) for value in (
+        lower_temperature_k, midlevel_temperature_k, upperlevel_temperature_k,
+        lower_zonal_wind_m_s, midlevel_zonal_wind_m_s, upperlevel_zonal_wind_m_s,
+    ))
+    shape = fields[0].shape
+    if any(value.shape != shape for value in fields) or len(shape) != 2 or shape[1] != 2 * shape[0]:
+        raise ValueError("all pressure-coordinate fields must share a two-dimensional 2:1 grid")
+    if large_scale_heating_w_m2 is None:
+        interface = diabatic_interface_mass_flux(
+            precipitation_mm_day, fields[0], fields[1], fields[2],
+            dt_seconds=dt_seconds, surface_pressure_pa=surface_pressure_pa,
+            lower_mid_pressure_depth_pa=lower_mid_pressure_depth_pa,
+            mid_upper_pressure_depth_pa=mid_upper_pressure_depth_pa,
+            gravity_m_s2=gravity_m_s2, cp_dry_j_kg_k=cp_dry_j_kg_k,
+        )
+    else:
+        interface = diabatic_interface_mass_flux_from_heating(
+            large_scale_heating_w_m2, fields[0], fields[1], fields[2],
+            dt_seconds=dt_seconds, surface_pressure_pa=surface_pressure_pa,
+            lower_mid_pressure_depth_pa=lower_mid_pressure_depth_pa,
+            mid_upper_pressure_depth_pa=mid_upper_pressure_depth_pa,
+            gravity_m_s2=gravity_m_s2, cp_dry_j_kg_k=cp_dry_j_kg_k,
+        )
+    latitude = np.radians(90.0 - (np.arange(shape[0]) + 0.5) * 180.0 / shape[0])
+    cos_lat = np.cos(latitude)
+
+    def layer(zonal_wind: np.ndarray, divergence: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        u = np.broadcast_to(np.mean(zonal_wind, axis=1, keepdims=True), shape).copy()
+        v_1d = _zonal_mean_meridional_wind(divergence[:, 0], radius_m, cos_lat)
+        v = np.broadcast_to(v_1d[:, None], shape).copy()
+        return u.astype(np.float32), v.astype(np.float32)
+
+    lower_u, lower_v = layer(fields[3], interface.lower_divergence_s)
+    mid_u, mid_v = layer(fields[4], interface.midlevel_divergence_s)
+    upper_u, upper_v = layer(fields[5], interface.upperlevel_divergence_s)
+    return PressureCoordinateCirculation(
+        lower_u, lower_v, mid_u, mid_v, upper_u, upper_v, interface,
     )
 
 

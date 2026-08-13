@@ -5,6 +5,7 @@ import numpy as np
 from pressure_column import (
     evolve_closed_three_level_thermodynamic_column,
     evolve_three_level_column,
+    transport_closed_three_level_mse,
 )
 
 
@@ -162,6 +163,36 @@ def test_closed_thermodynamic_column_radiation_is_an_explicit_energy_source_and_
     np.testing.assert_allclose(second_half.lower_temperature, full.lower_temperature, atol=3e-5)
     np.testing.assert_allclose(second_half.midlevel_temperature, full.midlevel_temperature, atol=3e-5)
     np.testing.assert_allclose(second_half.upperlevel_temperature, full.upperlevel_temperature, atol=3e-5)
+
+
+def test_closed_column_mse_transport_follows_vapour_and_closes_energy():
+    shape = (4, 8)
+    lower_before = np.full(shape, 0.010)
+    lower_before[2, 2] = 0.020
+    winds = np.full(shape, 150.0)
+    zeros = np.zeros(shape)
+    from column_water import evolve_column_water
+
+    lower_mass = 101325.0 / 9.80665 * 0.40
+    transported_lower = evolve_column_water(
+        lower_before * lower_mass, zeros, zeros, winds, zeros,
+        dx_m=100_000.0, dy_m=100_000.0, dt_days=0.1,
+    ).water_mm / lower_mass
+    step = transport_closed_three_level_mse(
+        lower_before, np.full(shape, 0.004), np.full(shape, 0.001),
+        transported_lower, np.full(shape, 0.004), np.full(shape, 0.001),
+        np.full(shape, 290.0), np.full(shape, 270.0), np.full(shape, 245.0),
+        winds, zeros, zeros, zeros, zeros, zeros,
+        lower_vapour_source_kg_kg_day=zeros, dt_days=0.1,
+        dx_m=100_000.0, dy_m=100_000.0, cell_area_m2=1.0e10,
+        x_face_length_m=100_000.0, y_face_length_m=np.full((5, 8), 100_000.0),
+    )
+
+    assert abs(step.energy_residual_j) < 1e-2
+    assert abs(step.relative_energy_residual) < 1e-12
+    # The vapour anomaly carries latent MSE eastward; recovering temperature
+    # from transported MSE leaves a uniform-temperature tracer unchanged.
+    np.testing.assert_allclose(step.lower_temperature, 290.0, atol=3e-5)
 
 
 def test_closed_thermodynamic_column_rejects_unclosed_or_invalid_sources():

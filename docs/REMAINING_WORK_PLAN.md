@@ -201,6 +201,67 @@ layer divergence, omega, and horizontal moist-static-energy transport from one
 continuity-constrained state, then clear unit conservation/CFL tests before it
 returns to a compact CRU screen.
 
+That shared solve is now implemented as
+`enable_shared_pressure_coordinate_circulation`. At 64x128 it is the first
+candidate to make the wind/omega/energy contract coherent: omega RMS is
+0.00198/0.000688 Pa/s, cross-equatorial energy transport is -9.66 PW, peak
+transport +62.9/-74.6 PW, and runtime 42.3 seconds. It is nevertheless
+rejected as a complete climate candidate because global precipitation is only
+0.954 mm/day, KÃ¶ppen group/class is 0.501/0.287, and reference error 0.696.
+
+**Next Phase-2 architecture:** retain the shared circulation; do not raise
+its speed or reintroduce raw divergent winds. Build an explicit
+circulation-coupled moisture-source/condensate/rainfall pathway that restores
+raw production through a physical surface-evaporation, ascent, and fallout
+budget. Validate its water/MSE export terms against this shared circulation
+before another compact CRU run; geographic targets and allocator repair remain
+out of scope.
+
+The pressure-mass source/condensate/fallout branch now closes water to 1.34e-7
+relative residual at 64x128, but is rejected as a coupled climate candidate:
+30 days produces 54.6 mm/day rain peaks and 1.27 Pa/s lower-interface omega.
+Its direct condensation-to-next-step omega handoff lacks a large-scale
+adjustment timescale.
+
+**Revised next Phase-2 architecture:** retain the shared circulation and
+pressure-mass water budget, but add a prognostic large-scale overturning/heat
+reservoir with explicit adjustment and compensating energy export. Do not tune
+fallout, RH, or circulation strength to suppress the oscillation.
+
+That reservoir is now implemented with a derived ~54.4-day radiative
+free-troposphere adjustment time. The required phase audit corrected an
+important unit boundary: pressure-mass cloud water had been interpreted by
+radiation as a mixing ratio. The corrected 64x128 one-year spin-up/one-year
+evaluation is stable but rejects the candidate (0.530 mm/day global rain,
+0.965 polar rain, 0.434 cloud fraction, 0.870 reference error; omega RMS
+0.00161/0.00175 Pa/s). Do not restore the unit error or tune cloud/rain
+coefficients. The separate pressure-mass suspended-cloud and
+precipitating-hydrometeor reservoirs are implemented, nested default-off:
+cloud excess autoconverts into an independently transported, falling mass
+reservoir, so direct cloud fallout is no longer used in that branch. Its mass
+and distinct-footprint regressions pass, but the unchanged 64x128 candidate
+initially hit a raw-temperature static-stability singularity on evaluation day
+15 (905,002 W m-2 stored heating; 26.9 s/day). Replacing that nonphysical raw-T
+denominator with the derived potential-temperature gradient makes the compact
+screen stable, but the full 64x128 one-year spin-up/one-year evaluation still
+fails: 1.336 mm/day global rain, 4.670 polar rain, 0.539 cloud, 0.955 reference
+error, and omega RMS 0.0411/0.0234 Pa/s. Do not tune conversion or fallout
+values. The next structural redesign is an explicit large-scale heating export
+closure; its purpose is to constrain the response to stored condensation
+without an arbitrary heating or omega cap.
+
+The first default-off energy-export attempt,
+`enable_pressure_coordinate_mse_transport`, now carries each pressure layer's
+MSE on the identical finite-volume faces as its vapour and accounts for lower
+evaporation's latent-energy input. Its conservation regression passes, but its
+64x128 one-year spin-up/one-year evaluation rejects direct use with the
+existing shared winds: 0.481 mm/day global precipitation, 0.207 polar
+precipitation, 0.549 cloud, 0.898 reference error, and +28.6/-94.7 PW peak
+northward/southward energy transport. Retain the kernel default-off; do not
+tune it. The required Phase-2 redesign is now narrower: an MSE-constrained
+circulation solve must diagnose transport and overturning together, rather
+than applying MSE export to winds diagnosed solely from latent heating.
+
 ## Phase 3 — land temperature replacement with diagnosed heat convergence
 
 **Dependency:** Phase 2 must first provide a diagnosed atmospheric heat-

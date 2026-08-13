@@ -1024,3 +1024,197 @@ def test_three_level_upper_temperature_anomaly_feeds_back_to_resolved_air():
     base_next, _ = simulate_step(base, days=1.0, planet_params=planet)
     warm_next, _ = simulate_step(warm_upper, days=1.0, planet_params=planet)
     assert float(np.mean(warm_next.air_temperature - base_next.air_temperature)) > 0.0
+
+
+def test_pressure_coordinate_moisture_closure_uses_mass_source_and_fallout_budget():
+    shape = (6, 12)
+    debug: dict = {}
+    planet = dataclasses.replace(
+        EARTH,
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+        enable_diabatic_interface_mass_flux=True,
+        enable_shared_pressure_coordinate_circulation=True,
+        enable_pressure_coordinate_moisture_closure=True,
+    )
+    result = generate_precipitation(
+        *shape,
+        np.zeros(shape, dtype=np.float32),
+        temperature=np.full(shape, 300.0, dtype=np.float32),
+        humidity=np.full(shape, 0.020, dtype=np.float32),
+        midlevel_temperature=np.full(shape, 275.0, dtype=np.float32),
+        midlevel_humidity=np.full(shape, 0.008, dtype=np.float32),
+        upperlevel_temperature=np.full(shape, 245.0, dtype=np.float32),
+        upperlevel_humidity=np.full(shape, 0.004, dtype=np.float32),
+        wind_u=np.zeros(shape, dtype=np.float32), wind_v=np.zeros(shape, dtype=np.float32),
+        wind_u_aloft=np.zeros(shape, dtype=np.float32), wind_v_aloft=np.zeros(shape, dtype=np.float32),
+        wind_u_midlevel=np.zeros(shape, dtype=np.float32), wind_v_midlevel=np.zeros(shape, dtype=np.float32),
+        previous_precipitation_mm_day=np.zeros(shape, dtype=np.float32),
+        dt_days=1.0, planet_params=planet, debug_fields=debug,
+        return_condensate=True, return_midlevel_temperature=True,
+        return_midlevel_humidity=True, return_upperlevel_state=True,
+    )
+    precipitation, _, _, _, condensate, _, _, _, _ = result
+    assert debug["condensate_closure"] == "pressure_coordinate"
+    assert np.all(debug["pressure_moisture_surface_source_mm"] >= 0.0)
+    assert np.any(debug["pressure_moisture_cloud_created_mm"] > 0.0)
+    assert float(np.mean(precipitation)) > 0.0
+    assert np.all(condensate >= 0.0)
+    assert abs(float(debug["column_water_total_budget_relative_residual"])) < 1e-6
+
+
+def test_pressure_mass_cloud_reservoir_is_converted_before_radiative_cloud_use():
+    shape = (12, 24)
+    planet = dataclasses.replace(
+        EARTH,
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+        enable_diabatic_interface_mass_flux=True,
+        enable_shared_pressure_coordinate_circulation=True,
+        enable_pressure_coordinate_moisture_closure=True,
+        enable_prognostic_overturning_heat_reservoir=True,
+    )
+    initial = create_initial_state(np.zeros(shape, dtype=np.float32), planet_params=planet)
+    # 4 kg m-2 is substantial cloud mass, but only about 0.0011 kg kg-1 in
+    # the 0.35-pressure-mass layer. Passing 4.0 directly as a mixing ratio
+    # would make every cell instantly opaque.
+    cloudy = initial._replace(
+        atmospheric_condensate=np.full(shape, 4.0, dtype=np.float32)
+    )
+    evolved, _ = simulate_step(cloudy, days=1.0, planet_params=planet)
+    assert float(np.mean(evolved.cloud_cover)) < 0.5
+
+
+def test_pressure_mass_cloud_and_hydrometeors_have_separate_residence_paths():
+    """Only falling pressure-mass hydrometeors may become surface rainfall."""
+    shape = (6, 12)
+    debug: dict = {}
+    planet = dataclasses.replace(
+        EARTH,
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+        enable_diabatic_interface_mass_flux=True,
+        enable_shared_pressure_coordinate_circulation=True,
+        enable_pressure_coordinate_moisture_closure=True,
+        enable_separate_precipitating_hydrometeors=True,
+        cloud_optical_condensate_cap_q=0.0,
+        condensate_autoconversion_timescale_days=0.25,
+        condensate_fallout_timescale_days=0.5,
+    )
+    zero = np.zeros(shape, dtype=np.float32)
+    result = generate_precipitation(
+        *shape, zero,
+        temperature=np.full(shape, 250.0, dtype=np.float32),
+        humidity=zero,
+        midlevel_temperature=np.full(shape, 245.0, dtype=np.float32),
+        midlevel_humidity=zero,
+        upperlevel_temperature=np.full(shape, 230.0, dtype=np.float32),
+        upperlevel_humidity=zero,
+        wind_u=zero, wind_v=zero, wind_u_aloft=zero, wind_v_aloft=zero,
+        wind_u_midlevel=zero, wind_v_midlevel=zero,
+        condensate=np.full(shape, 4.0, dtype=np.float32),
+        precipitating_hydrometeors=np.full(shape, 2.0, dtype=np.float32),
+        previous_precipitation_mm_day=zero,
+        dt_days=1.0, evap_coeff=0.0, planet_params=planet, debug_fields=debug,
+        return_condensate=True, return_midlevel_temperature=True,
+        return_midlevel_humidity=True, return_upperlevel_state=True,
+        return_precipitating_hydrometeors=True,
+    )
+    precipitation, _, _, _, cloud, _, _, _, _, hydrometeors = result
+    np.testing.assert_allclose(
+        cloud,
+        4.0 * np.exp(-1.0 / planet.condensate_autoconversion_timescale_days),
+        rtol=0.0,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        cloud + precipitation + hydrometeors,
+        6.0,
+        rtol=0.0,
+        atol=2e-5,
+    )
+    np.testing.assert_allclose(
+        precipitation,
+        debug["pressure_moisture_hydrometeor_fallout_mm"],
+        rtol=0.0,
+        atol=2e-5,
+    )
+    assert np.all(debug["pressure_moisture_cloud_autoconversion_mm"] > 0.0)
+
+
+def test_pressure_mass_cloud_and_hydrometeor_transport_have_distinct_footprints():
+    """Clouds travel for the climate step; rain only travels while aloft."""
+    shape = (32, 64)
+    planet = dataclasses.replace(
+        EARTH,
+        enable_prognostic_column_water=True,
+        enable_prognostic_condensate=True,
+        column_water_use_bulk_condensate_rainfall=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+        enable_diabatic_interface_mass_flux=True,
+        enable_shared_pressure_coordinate_circulation=True,
+        enable_pressure_coordinate_moisture_closure=True,
+        enable_separate_precipitating_hydrometeors=True,
+        enable_hydrometeor_transport=True,
+        # Keep cloud water suspended while giving falling water a quarter-day
+        # residence.  These are controlled test conditions, not calibration.
+        cloud_optical_condensate_cap_q=0.03,
+        condensate_fallout_timescale_days=0.25,
+    )
+    zero = np.zeros(shape, dtype=np.float32)
+    wind_u = np.full(shape, 300.0, dtype=np.float32)
+    source = np.zeros(shape, dtype=np.float32)
+    source[shape[0] // 2, 16] = 4.0
+
+    def _advance(*, cloud: np.ndarray, hydrometeors: np.ndarray):
+        result = generate_precipitation(
+            *shape, zero,
+            temperature=np.full(shape, 250.0, dtype=np.float32),
+            humidity=zero,
+            midlevel_temperature=np.full(shape, 245.0, dtype=np.float32),
+            midlevel_humidity=zero,
+            upperlevel_temperature=np.full(shape, 230.0, dtype=np.float32),
+            upperlevel_humidity=zero,
+            wind_u=wind_u, wind_v=zero,
+            wind_u_aloft=wind_u, wind_v_aloft=zero,
+            wind_u_midlevel=wind_u, wind_v_midlevel=zero,
+            condensate=cloud, precipitating_hydrometeors=hydrometeors,
+            previous_precipitation_mm_day=zero,
+            dt_days=1.0, evap_coeff=0.0, planet_params=planet,
+            return_condensate=True, return_midlevel_temperature=True,
+            return_midlevel_humidity=True, return_upperlevel_state=True,
+            return_precipitating_hydrometeors=True,
+        )
+        return result[4], result[9]
+
+    cloud_next, _ = _advance(cloud=source, hydrometeors=zero)
+    _, hydrometeors_next = _advance(cloud=zero, hydrometeors=source)
+
+    columns = np.arange(shape[1], dtype=np.float64)
+    cloud_center = float(np.sum(cloud_next * columns[None, :]) / np.sum(cloud_next))
+    rain_center = float(
+        np.sum(hydrometeors_next * columns[None, :]) / np.sum(hydrometeors_next)
+    )
+    cloud_displacement = abs(cloud_center - 16.0)
+    hydrometeor_displacement = abs(rain_center - 16.0)
+    assert cloud_displacement > hydrometeor_displacement + 0.25
+    np.testing.assert_allclose(np.sum(cloud_next), np.sum(source), rtol=0.0, atol=2e-5)
+    assert float(np.sum(hydrometeors_next)) < float(np.sum(source))
