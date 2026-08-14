@@ -86,3 +86,12 @@ class PlanetState(NamedTuple):
     upperlevel_wind_v: np.ndarray | None = None
     pressure_moisture_condensation_mm_day: np.ndarray | None = None
     pressure_overturning_heating_w_m2: np.ndarray | None = None
+    lower_pressure_depth_pa: np.ndarray | None = None
+    midlevel_pressure_depth_pa: np.ndarray | None = None
+    upperlevel_pressure_depth_pa: np.ndarray | None = None
+    lower_pressure_cloud_condensate: np.ndarray | None = None
+    midlevel_pressure_cloud_condensate: np.ndarray | None = None
+    upperlevel_pressure_cloud_condensate: np.ndarray | None = None
+    lower_pressure_hydrometeors: np.ndarray | None = None
+    midlevel_pressure_hydrometeors: np.ndarray | None = None
+    upperlevel_pressure_hydrometeors: np.ndarray | None = None

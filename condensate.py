@@ -9,7 +9,32 @@ rainout`` to floating-point precision.
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
+
+
+class PressureCondensateReservoirStep(NamedTuple):
+    """Pressure-column cloud and hydrometeor reservoirs after one transition.
+
+    All fields are column masses in kg m-2 (numerically mm).  Keeping this
+    transition separate from the vapour phase change lets a coupled circulation
+    solve use the same reservoir mass source/sink as the runtime adapter.
+    """
+
+    cloud_condensate_kg_m2: np.ndarray
+    precipitating_hydrometeors_kg_m2: np.ndarray
+    fallout_kg_m2: np.ndarray
+    autoconverted_kg_m2: np.ndarray
+
+
+class PressureCondensateTransportStep(NamedTuple):
+    """Cloud and hydrometeor reservoirs after their horizontal transport leg."""
+
+    cloud_condensate_kg_m2: np.ndarray
+    precipitating_hydrometeors_kg_m2: np.ndarray
+    cloud_relative_residual: float
+    hydrometeor_relative_residual: float | None
 
 
 def evolve_bulk_condensate(
@@ -251,3 +276,167 @@ def separate_cloud_and_hydrometeor_reservoirs(
     rain = rain + converted
     fallout = rain * (1.0 - np.exp(-dt_days / fallout_timescale_days))
     return cloud, rain - fallout, fallout
+
+
+def evolve_pressure_condensate_reservoirs(
+    cloud_condensate_kg_m2: np.ndarray,
+    precipitating_hydrometeors_kg_m2: np.ndarray,
+    newly_condensed_kg_m2: np.ndarray,
+    *,
+    dt_days: float,
+    autoconversion_timescale_days: float,
+    fallout_timescale_days: float,
+    cloud_retention_kg_m2: float,
+) -> PressureCondensateReservoirStep:
+    """Advance pressure-column cloud and falling-water reservoirs exactly once.
+
+    This is the pressure-coordinate analogue of the older generic reservoir
+    helper, but reports autoconversion explicitly and keeps the units in
+    physical column mass.  It deliberately has no phase or circulation
+    diagnosis: its inputs are the contemporaneous vapour-to-cloud conversion,
+    so its only external water sink is the returned fallout.
+    """
+    if dt_days <= 0.0 or autoconversion_timescale_days <= 0.0 or fallout_timescale_days <= 0.0:
+        raise ValueError("time scales and dt_days must be positive")
+    if cloud_retention_kg_m2 < 0.0:
+        raise ValueError("cloud_retention_kg_m2 must be non-negative")
+    cloud, hydrometeors, new = (
+        np.asarray(value, dtype=np.float64)
+        for value in (
+            cloud_condensate_kg_m2,
+            precipitating_hydrometeors_kg_m2,
+            newly_condensed_kg_m2,
+        )
+    )
+    if cloud.shape != hydrometeors.shape or cloud.shape != new.shape:
+        raise ValueError("pressure condensate reservoirs must share a shape")
+    if not all(np.all(np.isfinite(value)) and np.all(value >= 0.0) for value in (cloud, hydrometeors, new)):
+        raise ValueError("pressure condensate reservoirs must be finite and non-negative")
+    cloud_total = cloud + new
+    cloud_excess = np.maximum(cloud_total - float(cloud_retention_kg_m2), 0.0)
+    autoconverted = cloud_excess * (
+        1.0 - np.exp(-float(dt_days) / float(autoconversion_timescale_days))
+    )
+    cloud_next = cloud_total - autoconverted
+    hydrometeor_total = hydrometeors + autoconverted
+    fallout = hydrometeor_total * (
+        1.0 - np.exp(-float(dt_days) / float(fallout_timescale_days))
+    )
+    return PressureCondensateReservoirStep(
+        cloud_next.astype(np.float32), (hydrometeor_total - fallout).astype(np.float32),
+        fallout.astype(np.float32), autoconverted.astype(np.float32),
+    )
+
+
+def transport_pressure_condensate_reservoirs(
+    cloud_condensate_kg_m2: np.ndarray,
+    precipitating_hydrometeors_kg_m2: np.ndarray,
+    wind_u_m_s: np.ndarray,
+    wind_v_m_s: np.ndarray,
+    *,
+    dt_days: float,
+    fallout_timescale_days: float,
+    cloud_transport_scale: float,
+    transport_hydrometeors: bool,
+    dx_m: np.ndarray | float,
+    dy_m: float,
+    cell_area_m2: np.ndarray | float,
+    x_face_length_m: np.ndarray | float,
+    y_face_length_m: np.ndarray | float,
+) -> PressureCondensateTransportStep:
+    """Transport pressure condensate reservoirs without changing their mass."""
+    if dt_days <= 0.0 or fallout_timescale_days <= 0.0:
+        raise ValueError("dt_days and fallout_timescale_days must be positive")
+    cloud, hydrometeors, u, v = (
+        np.asarray(value, dtype=np.float64)
+        for value in (cloud_condensate_kg_m2, precipitating_hydrometeors_kg_m2, wind_u_m_s, wind_v_m_s)
+    )
+    if not (cloud.shape == hydrometeors.shape == u.shape == v.shape):
+        raise ValueError("pressure condensate transport fields must share a shape")
+    if not all(np.all(np.isfinite(value)) and np.all(value >= 0.0) for value in (cloud, hydrometeors)):
+        raise ValueError("pressure condensate reservoirs must be finite and non-negative")
+    from column_water import evolve_column_water
+
+    scale = float(np.clip(cloud_transport_scale, 0.0, 1.0))
+    if scale > 0.0:
+        cloud_step = evolve_column_water(
+            cloud, np.zeros_like(cloud), np.zeros_like(cloud), u, v,
+            dx_m=dx_m, dy_m=dy_m, dt_days=dt_days, cell_area_m2=cell_area_m2,
+            x_face_length_m=x_face_length_m, y_face_length_m=y_face_length_m,
+        )
+        cloud_next = (1.0 - scale) * cloud + scale * cloud_step.water_mm
+        cloud_residual = float(cloud_step.relative_residual)
+    else:
+        cloud_next = cloud
+        cloud_residual = 0.0
+    hydro_residual: float | None = None
+    hydro_next = hydrometeors
+    if transport_hydrometeors and np.any(hydrometeors):
+        hydro_step = evolve_column_water(
+            hydrometeors, np.zeros_like(hydrometeors), np.zeros_like(hydrometeors), u, v,
+            dx_m=dx_m, dy_m=dy_m, dt_days=min(dt_days, fallout_timescale_days),
+            cell_area_m2=cell_area_m2, x_face_length_m=x_face_length_m,
+            y_face_length_m=y_face_length_m,
+        )
+        hydro_next = hydro_step.water_mm
+        hydro_residual = float(hydro_step.relative_residual)
+    return PressureCondensateTransportStep(
+        cloud_next.astype(np.float32), hydro_next.astype(np.float32),
+        cloud_residual, hydro_residual,
+    )
+
+
+def column_water_forcing_from_boundary_fluxes(
+    surface_source_kg_m2: np.ndarray,
+    fallout_kg_m2: np.ndarray,
+    *,
+    dt_seconds: float,
+) -> np.ndarray:
+    """Return the total-atmospheric-water forcing for the circulation solve.
+
+    Vapour-to-cloud conversion is internal to the atmospheric column and must
+    not appear here.  The only external terms are surface supply and fallout;
+    expressing both as step-integrated physical masses makes the returned
+    kg m-2 s-1 forcing unambiguous at the pressure-circulation boundary.
+    """
+    if dt_seconds <= 0.0:
+        raise ValueError("dt_seconds must be positive")
+    source = np.asarray(surface_source_kg_m2, dtype=np.float64)
+    fallout = np.asarray(fallout_kg_m2, dtype=np.float64)
+    if source.shape != fallout.shape:
+        raise ValueError("surface source and fallout must share a shape")
+    if not all(np.all(np.isfinite(value)) and np.all(value >= 0.0) for value in (source, fallout)):
+        raise ValueError("surface source and fallout must be finite and non-negative")
+    return ((source - fallout) / float(dt_seconds)).astype(np.float32)
+
+
+def column_water_forcing_from_budget(
+    surface_source_kg_m2: np.ndarray,
+    fallout_kg_m2: np.ndarray,
+    water_before_kg_m2: np.ndarray,
+    water_after_kg_m2: np.ndarray,
+    *,
+    dt_seconds: float,
+) -> np.ndarray:
+    """Return horizontal water convergence implied by a transient column budget.
+
+    ``surface source - fallout`` alone is valid only for a steady atmospheric
+    water store.  A prognostic pressure column instead obeys
+
+    ``horizontal convergence = source - fallout - d(storage)/dt``.
+
+    The storage includes vapour and both condensate reservoirs.  This is the
+    term a simultaneous circulation solve must constrain; phase conversion is
+    internal because it cancels between vapour and cloud storage.
+    """
+    if dt_seconds <= 0.0:
+        raise ValueError("dt_seconds must be positive")
+    source, fallout, before, after = (
+        np.asarray(value, dtype=np.float64)
+        for value in (surface_source_kg_m2, fallout_kg_m2, water_before_kg_m2, water_after_kg_m2)
+    )
+    if not (source.shape == fallout.shape == before.shape == after.shape):
+        raise ValueError("column-water budget fields must share a shape")
+    if not all(np.all(np.isfinite(value)) and np.all(value >= 0.0) for value in (source, fallout, before, after)):
+        raise ValueError("column-water budget fields must be finite and non-negative")
+    return ((source - fallout - (after - before)) / float(dt_seconds)).astype(np.float32)

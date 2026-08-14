@@ -58,6 +58,15 @@ def test_safe_npz_roundtrip_preserves_extended_state(tmp_path):
         surface_water_mm=np.full((8, 16), 3.0, dtype=np.float32),
         river_discharge_mm_day=np.full((8, 16), 0.5, dtype=np.float32),
         runoff_to_ocean_mm_day=np.full((8, 16), 0.1, dtype=np.float32),
+        lower_pressure_depth_pa=np.full((8, 16), 40_000.0, dtype=np.float32),
+        midlevel_pressure_depth_pa=np.full((8, 16), 35_000.0, dtype=np.float32),
+        upperlevel_pressure_depth_pa=np.full((8, 16), 25_000.0, dtype=np.float32),
+        lower_pressure_cloud_condensate=np.full((8, 16), 0.2, dtype=np.float32),
+        midlevel_pressure_cloud_condensate=np.full((8, 16), 0.3, dtype=np.float32),
+        upperlevel_pressure_cloud_condensate=np.full((8, 16), 0.1, dtype=np.float32),
+        lower_pressure_hydrometeors=np.full((8, 16), 0.05, dtype=np.float32),
+        midlevel_pressure_hydrometeors=np.full((8, 16), 0.07, dtype=np.float32),
+        upperlevel_pressure_hydrometeors=np.full((8, 16), 0.03, dtype=np.float32),
     )
     path = tmp_path / "test.npz"
     save_state(state, path)

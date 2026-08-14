@@ -1547,6 +1547,56 @@ class PlanetParams:
     Experimental and off by default pending compact climate validation.
     """
 
+    enable_mse_constrained_pressure_circulation: bool = False
+    """Diagnose pressure-column overturning from the MSE export budget.
+
+    Requires the prognostic overturning-heating reservoir and pressure-MSE
+    transport. A mass-closed lower/upper branch carries the zonal,
+    area-balanced diabatic forcing, with its mass flux fixed by resolved MSE
+    contrast. No wind-strength, damping, or omega-cap control is present.
+    Experimental and off by default pending compact climate validation.
+    """
+
+    enable_three_branch_mse_pressure_circulation: bool = False
+    """Use all three pressure branches in the MSE-constrained circulation.
+
+    Requires ``enable_mse_constrained_pressure_circulation``. The unique
+    minimum-mass-flux solution uses each layer's MSE departure from the
+    mass-weighted column mean, while diagnosed interface fluxes close its
+    layerwise MSE deposition. The deposition is diagnostic until phase heating
+    can use it without double counting. Experimental and off by default.
+    """
+
+    enable_momentum_constrained_three_branch_mse_circulation: bool = False
+    """Constrain the three-branch MSE solution with zonal momentum transport.
+
+    Requires ``enable_three_branch_mse_pressure_circulation``. It replaces the
+    minimum-mass-flux branch choice with zero mass-weighted transport of the
+    resolved vertically sheared zonal momentum. The planetary angular-momentum
+    term cancels under exact local mass closure. Experimental and off by
+    default pending compact climate validation.
+    """
+
+    enable_prognostic_pressure_coordinate_momentum: bool = False
+    """Evolve the pressure-level wind shear before MSE branch selection.
+
+    Requires the momentum-constrained three-branch MSE closure. Hydrostatic
+    layer pressure gradients, exact Coriolis rotation, and conservative prior-
+    step interface momentum exchange evolve all three pressure winds. This
+    supplies a prognostic shear state rather than using raw wind diagnostics.
+    Experimental and off by default pending compact climate validation.
+    """
+
+    enable_hydrostatic_sigma_pressure_coordinate_transport: bool = False
+    """Enable the complete experimental hydrostatic sigma-column transition.
+
+    Requires the closed three-level pressure-column family.  The deeply nested
+    gate replaces its pressure mass, vapour/MSE, layer-resolved cloud and
+    hydrometeor reservoirs, continuity-derived interface flux, and
+    pressure-level momentum as one state transition.  It is default-off until
+    gate-off, persistence, compact, and long admission checks pass.
+    """
+
     enforce_three_level_mass_closure: bool = False
     """Close mass-weighted lower/mid/upper divergence before diagnosing omega."""
 

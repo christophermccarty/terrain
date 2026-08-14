@@ -17,6 +17,7 @@ from temperature import temperature_kelvin_for_lat
 from planet_params import PlanetParams, EARTH
 from masks import get_masks, get_continentality
 from condensate import (
+    evolve_pressure_condensate_reservoirs,
     evolve_bulk_condensate,
     separate_cloud_and_hydrometeor_reservoirs,
     simplified_betts_miller_condensation,
@@ -31,6 +32,8 @@ from pressure_column import (
 from pressure_circulation import (
     diabatic_interface_mass_flux,
     diabatic_interface_mass_flux_from_heating,
+    evolve_joint_mse_momentum_pressure_column_runtime,
+    evolve_hydrostatic_sigma_phase_reservoir_transport,
 )
 from pressure_circulation import smooth_spherical_scalar
 
@@ -2973,6 +2976,15 @@ def generate_precipitation(
     return_midlevel_humidity: bool = False,
     return_upperlevel_state: bool = False,
     return_precipitating_hydrometeors: bool = False,
+    lower_pressure_depth_pa: np.ndarray | None = None,
+    midlevel_pressure_depth_pa: np.ndarray | None = None,
+    upperlevel_pressure_depth_pa: np.ndarray | None = None,
+    lower_pressure_cloud_condensate: np.ndarray | None = None,
+    midlevel_pressure_cloud_condensate: np.ndarray | None = None,
+    upperlevel_pressure_cloud_condensate: np.ndarray | None = None,
+    lower_pressure_hydrometeors: np.ndarray | None = None,
+    midlevel_pressure_hydrometeors: np.ndarray | None = None,
+    upperlevel_pressure_hydrometeors: np.ndarray | None = None,
     _static_cache: dict | None = None,
 ) -> tuple:
     """Return precipitation, vapor, and soil reservoirs (plus condensate on request).
@@ -3489,10 +3501,19 @@ def generate_precipitation(
         pressure_moisture_closure_active
         and bool(pp.enable_pressure_coordinate_mse_transport)
     )
+    joint_pressure_column_runtime_active = (
+        pressure_coordinate_mse_transport_active
+        and bool(pp.enable_prognostic_overturning_heat_reservoir)
+        and bool(pp.enable_mse_constrained_pressure_circulation)
+        and bool(pp.enable_three_branch_mse_pressure_circulation)
+        and bool(pp.enable_momentum_constrained_three_branch_mse_circulation)
+        and bool(pp.enable_prognostic_pressure_coordinate_momentum)
+    )
     closed_lower_temperature_next: np.ndarray | None = None
     closed_column_water_residual = 0.0
     closed_column_energy_residual = 0.0
     diabatic_interface_mass_flux_step = None
+    joint_pressure_column_runtime_step = None
     if two_layer_active:
         # The legacy experiment stores one total-humidity proxy and partitions
         # it afresh.  The closed path instead persists a lower-layer mixing
@@ -3699,6 +3720,76 @@ def generate_precipitation(
             debug_fields["energy_limited_downwelling_longwave_w_m2"] = (
                 _longwave_increment_w_m2.astype(np.float32)
             )
+
+    hydrostatic_sigma_runtime_active = (
+        closed_three_level_active
+        and bool(pp.enable_hydrostatic_sigma_pressure_coordinate_transport)
+    )
+    if hydrostatic_sigma_runtime_active:
+        # Atomic owner: surface evaporation above is the shared lower boundary,
+        # while no legacy advection, pressure-column phase, reservoir, target,
+        # or rainout code below is allowed to run under this gate.
+        shape = lower_base_q.shape
+        pressure_total = float(surface_pressure_hpa) * 100.0
+        zero = np.zeros(shape, dtype=np.float32)
+        pressure = tuple(
+            np.full(shape, fraction * pressure_total, dtype=np.float32) if value is None else np.asarray(value, dtype=np.float32)
+            for fraction, value in zip((0.40, 0.35, 0.25), (lower_pressure_depth_pa, midlevel_pressure_depth_pa, upperlevel_pressure_depth_pa), strict=True)
+        )
+        cloud = tuple(zero if value is None else np.asarray(value, dtype=np.float32) for value in (lower_pressure_cloud_condensate, midlevel_pressure_cloud_condensate, upperlevel_pressure_cloud_condensate))
+        hydro = tuple(zero if value is None else np.asarray(value, dtype=np.float32) for value in (lower_pressure_hydrometeors, midlevel_pressure_hydrometeors, upperlevel_pressure_hydrometeors))
+        lower_t = np.asarray(temperature if column_lower_temperature is None else column_lower_temperature, dtype=np.float32)
+        middle_t = np.asarray(lower_t - 6.5e-3 * float(pp.stability_condensation_reference_height_m) if midlevel_temperature is None else midlevel_temperature, dtype=np.float32)
+        upper_t = np.asarray(lower_t - 6.5e-3 * float(pp.three_level_upper_height_m) if upperlevel_temperature is None else upperlevel_temperature, dtype=np.float32)
+        mid_u = np.asarray(wind_u if wind_u_midlevel is None else wind_u_midlevel, dtype=np.float32)
+        mid_v = np.asarray(wind_v if wind_v_midlevel is None else wind_v_midlevel, dtype=np.float32)
+        top_u = np.asarray(wind_u if wind_u_aloft is None else wind_u_aloft, dtype=np.float32)
+        top_v = np.asarray(wind_v if wind_v_aloft is None else wind_v_aloft, dtype=np.float32)
+        area_m2, x_face_length_m, y_face_length_m = _column_water_spherical_geometry(H, W, float(pp.radius_m))
+        sigma_step = evolve_hydrostatic_sigma_phase_reservoir_transport(
+            *pressure, lower_base_q, upper_q_in, upperlevel_q_in, lower_t, middle_t, upper_t,
+            np.asarray(wind_u, dtype=np.float32), np.asarray(wind_v, dtype=np.float32), mid_u, mid_v, top_u, top_v,
+            *cloud, *hydro, lower_surface_vapour_source_kg_m2_s=(ocean_evap + land_evap) * 2000.0 / 86400.0,
+            dt_seconds=dt * 86400.0, gravity_m_s2=float(pp.surface_gravity), radius_m=float(pp.radius_m), sidereal_day_hours=float(pp.sidereal_day_hours),
+            critical_relative_humidity=float(pp.stability_condensation_critical_rh), autoconversion_timescale_days=float(pp.condensate_autoconversion_timescale_days), fallout_timescale_days=float(pp.condensate_fallout_timescale_days), cloud_retention_kg_m2=1.0,
+            cp_dry_j_kg_k=float(pp.cp_dry), layer_heights_m=(0.0, float(pp.stability_condensation_reference_height_m), float(pp.three_level_upper_height_m)),
+            dx_m=dx_grid, dy_m=float(dy_grid), cell_area_m2=area_m2, x_face_length_m=x_face_length_m, y_face_length_m=y_face_length_m,
+        )
+        sigma = sigma_step.transport.transport
+        P = sigma_step.fallout_kg_m2 / max(dt, 1e-12)
+        soil += (P * land_f) * 0.00015 * dt - (land_evap * dt_evap) * 0.4
+        soil_deep += (P * land_f) * float(pp.soil_deep_gain_rate) * dt
+        soil_deep -= float(pp.soil_deep_drain_rate) * soil_deep * dt
+        soil = np.where(land_mask, np.clip(soil, 0.05, 1.0), 0.0).astype(np.float32)
+        soil_deep = np.where(land_mask, np.clip(soil_deep, 0.0, 1.0), 0.0).astype(np.float32)
+        if debug_fields is not None:
+            debug_fields.update({
+                "hydrostatic_sigma_runtime": True,
+                "hydrostatic_sigma_lower_pressure_depth_pa": sigma.lower_pressure_depth_pa,
+                "hydrostatic_sigma_midlevel_pressure_depth_pa": sigma.midlevel_pressure_depth_pa,
+                "hydrostatic_sigma_upperlevel_pressure_depth_pa": sigma.upperlevel_pressure_depth_pa,
+                "hydrostatic_sigma_lower_cloud": sigma_step.lower_cloud_condensate_kg_m2,
+                "hydrostatic_sigma_midlevel_cloud": sigma_step.midlevel_cloud_condensate_kg_m2,
+                "hydrostatic_sigma_upperlevel_cloud": sigma_step.upperlevel_cloud_condensate_kg_m2,
+                "hydrostatic_sigma_lower_hydrometeors": sigma_step.lower_hydrometeors_kg_m2,
+                "hydrostatic_sigma_midlevel_hydrometeors": sigma_step.midlevel_hydrometeors_kg_m2,
+                "hydrostatic_sigma_upperlevel_hydrometeors": sigma_step.upperlevel_hydrometeors_kg_m2,
+                "hydrostatic_sigma_lower_temperature": sigma.lower_temperature,
+                "hydrostatic_sigma_midlevel_temperature": sigma.midlevel_temperature,
+                "hydrostatic_sigma_upperlevel_temperature": sigma.upperlevel_temperature,
+                "hydrostatic_sigma_lower_wind_u": sigma_step.momentum.lower_u,
+                "hydrostatic_sigma_lower_wind_v": sigma_step.momentum.lower_v,
+                "hydrostatic_sigma_midlevel_wind_u": sigma_step.momentum.midlevel_u,
+                "hydrostatic_sigma_midlevel_wind_v": sigma_step.momentum.midlevel_v,
+                "hydrostatic_sigma_upperlevel_wind_u": sigma_step.momentum.upperlevel_u,
+                "hydrostatic_sigma_upperlevel_wind_v": sigma_step.momentum.upperlevel_v,
+            })
+        result = (P.astype(np.float32), sigma.lower_humidity, soil, soil_deep)
+        if not return_condensate:
+            return result
+        cloud_total = sigma_step.lower_cloud_condensate_kg_m2 + sigma_step.midlevel_cloud_condensate_kg_m2 + sigma_step.upperlevel_cloud_condensate_kg_m2
+        hydro_total = sigma_step.lower_hydrometeors_kg_m2 + sigma_step.midlevel_hydrometeors_kg_m2 + sigma_step.upperlevel_hydrometeors_kg_m2
+        return (*result, cloud_total.astype(np.float32), sigma.midlevel_temperature, sigma.midlevel_humidity, sigma.upperlevel_temperature, sigma.upperlevel_humidity, hydro_total.astype(np.float32))
 
     # Moisture advection: hybrid of the old short-range donor-cell blend
     # (kept as the base term) plus an additional longer-range transport
@@ -4023,7 +4114,91 @@ def generate_precipitation(
                     strength=_divergence_filter_strength,
                     passes=_divergence_filter_passes,
                 )
-            if closed_three_level_active:
+            if closed_three_level_active and joint_pressure_column_runtime_active:
+                # This nested runtime gate is the single owner of the
+                # horizontal MSE leg, adaptive vertical exchange, momentum,
+                # and latent phase deposition.  Do not fall through to the
+                # older split operations below: that would apply both the
+                # vertical exchange and phase heat twice.
+                lower_temperature_for_column = (
+                    np.asarray(temperature, dtype=np.float64)
+                    if column_lower_temperature is None
+                    else np.asarray(column_lower_temperature, dtype=np.float64)
+                )
+                if lower_temperature_for_column.shape != q.shape:
+                    raise ValueError("column_lower_temperature must match precipitation grid")
+                mid_temperature_for_column = (
+                    lower_temperature_for_column - 6.5e-3 * float(pp.stability_condensation_reference_height_m)
+                    if midlevel_temperature is None
+                    else np.asarray(midlevel_temperature, dtype=np.float64)
+                )
+                upper_temperature_for_column = (
+                    lower_temperature_for_column - 6.5e-3 * float(pp.three_level_upper_height_m)
+                    if upperlevel_temperature is None
+                    else np.asarray(upperlevel_temperature, dtype=np.float64)
+                )
+                _joint_runtime_common = dict(
+                    dt_seconds=dt * 86400.0, radius_m=float(pp.radius_m),
+                    sidereal_day_hours=float(pp.sidereal_day_hours),
+                    surface_pressure_pa=float(surface_pressure_hpa) * 100.0,
+                    lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                    mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
+                    dx_m=dx_grid, dy_m=float(dy_grid), cell_area_m2=area_m2,
+                    x_face_length_m=x_face_length_m, y_face_length_m=y_face_length_m,
+                    critical_relative_humidity=float(pp.stability_condensation_critical_rh),
+                    gravity_m_s2=float(pp.surface_gravity), cp_dry_j_kg_k=float(pp.cp_dry),
+                    gas_constant_dry_j_kg_k=float(pp.gas_constant_dry),
+                    layer_heights_m=(
+                        0.0, float(pp.stability_condensation_reference_height_m),
+                        float(pp.three_level_upper_height_m),
+                    ),
+                )
+                _previous_heating = (
+                    np.zeros_like(q, dtype=np.float64)
+                    if previous_large_scale_heating_w_m2 is None
+                    else np.asarray(previous_large_scale_heating_w_m2, dtype=np.float64)
+                )
+                joint_pressure_column_runtime_step = evolve_joint_mse_momentum_pressure_column_runtime(
+                    _previous_heating,
+                    lower_base_q, upper_q_in, upperlevel_q_in,
+                    q, midlevel_humidity_next, upperlevel_humidity_next,
+                    lower_temperature_for_column, mid_temperature_for_column,
+                    upper_temperature_for_column,
+                    u, v, mid_u, mid_v, upper_u, upper_v,
+                    lower_vapour_source_kg_kg_day=effective_evaporation_q_day,
+                    **_joint_runtime_common,
+                )
+                joint_step = joint_pressure_column_runtime_step.joint
+                q = joint_step.lower_humidity
+                midlevel_humidity_next = joint_step.midlevel_humidity
+                upperlevel_humidity_next = joint_step.upperlevel_humidity
+                closed_lower_temperature_next = joint_step.lower_temperature
+                three_level_mid_temperature_next = joint_step.midlevel_temperature
+                upperlevel_temperature_next = joint_step.upperlevel_temperature
+                u, v = joint_step.lower_u, joint_step.lower_v
+                mid_u, mid_v = joint_step.midlevel_u, joint_step.midlevel_v
+                upper_u, upper_v = joint_step.upperlevel_u, joint_step.upperlevel_v
+                diabatic_interface_mass_flux_step = joint_step.interface_mass_flux
+                omega_midlevel_pa_s = diabatic_interface_mass_flux_step.omega_lower_mid_pa_s
+                omega_upperlevel_pa_s = diabatic_interface_mass_flux_step.omega_mid_upper_pa_s
+                _vertical_substeps = joint_step.substeps
+                closed_column_water_residual += joint_step.water_residual_kg_m2
+                closed_column_energy_residual += joint_step.moist_static_energy_residual_j_m2
+                closed_column_energy_residual += joint_pressure_column_runtime_step.horizontal_mse_energy_residual_j
+                if debug_fields is not None:
+                    debug_fields["joint_pressure_column_runtime"] = True
+                    debug_fields["joint_pressure_column_substeps"] = joint_step.substeps
+                    debug_fields["joint_pressure_column_vertical_courant_max"] = joint_step.vertical_courant_max
+                    debug_fields["pressure_coordinate_mse_transport_relative_residual"] = (
+                        joint_pressure_column_runtime_step.horizontal_mse_relative_energy_residual
+                    )
+                    debug_fields["joint_pressure_column_lower_wind_u"] = joint_step.lower_u
+                    debug_fields["joint_pressure_column_lower_wind_v"] = joint_step.lower_v
+                    debug_fields["joint_pressure_column_midlevel_wind_u"] = joint_step.midlevel_u
+                    debug_fields["joint_pressure_column_midlevel_wind_v"] = joint_step.midlevel_v
+                    debug_fields["joint_pressure_column_upperlevel_wind_u"] = joint_step.upperlevel_u
+                    debug_fields["joint_pressure_column_upperlevel_wind_v"] = joint_step.upperlevel_v
+            elif closed_three_level_active:
                 # The new closure owns its pressure-mass continuity rather
                 # than accepting the older experiment's optional algebraic
                 # switch.  This makes its layer masses and omegas one contract.
@@ -4471,38 +4646,46 @@ def generate_precipitation(
 
         mid_qsat_pressure = _layer_qsat(midlevel_temperature_next, mid_pressure_hpa)
         upper_qsat_pressure = _layer_qsat(upperlevel_temperature_next, upper_pressure_hpa)
-        critical_rh = float(pp.stability_condensation_critical_rh)
-        lower_activation = 1.0 - np.exp(
-            -np.maximum(-omega_midlevel_pa_s, 0.0) * dt * 86400.0
-            / float(pp.two_layer_pressure_depth_pa)
-        )
-        mid_activation = 1.0 - np.exp(
-            -np.maximum.reduce((
-                np.maximum(-omega_midlevel_pa_s, 0.0) / float(pp.two_layer_pressure_depth_pa),
-                np.maximum(-omega_upperlevel_pa_s, 0.0) / float(pp.three_level_mid_upper_pressure_depth_pa),
-            )) * dt * 86400.0
-        )
-        upper_activation = 1.0 - np.exp(
-            -np.maximum(-omega_upperlevel_pa_s, 0.0) * dt * 86400.0
-            / float(pp.three_level_mid_upper_pressure_depth_pa)
-        )
-        lower_condensed_q = np.minimum(
-            q, np.maximum(q - critical_rh * qsat, 0.0) * lower_activation
-            + np.maximum(q - qsat, 0.0),
-        )
-        upper_condensed_q = np.minimum(
-            midlevel_humidity_next,
-            np.maximum(midlevel_humidity_next - critical_rh * mid_qsat_pressure, 0.0)
-            * mid_activation + np.maximum(midlevel_humidity_next - mid_qsat_pressure, 0.0),
-        )
-        upperlevel_condensed_q = np.minimum(
-            upperlevel_humidity_next,
-            np.maximum(upperlevel_humidity_next - critical_rh * upper_qsat_pressure, 0.0)
-            * upper_activation + np.maximum(upperlevel_humidity_next - upper_qsat_pressure, 0.0),
-        )
-        _apply_closed_phase_conversion(
-            lower_condensed_q, upper_condensed_q, upperlevel_condensed_q
-        )
+        if joint_pressure_column_runtime_step is not None:
+            # The runtime transition already made exactly this vapour-to-heat
+            # conversion after its joint CFL integration.  The reservoir code
+            # below only retains/cloud-rains the returned condensate mass.
+            lower_condensed_q = joint_pressure_column_runtime_step.lower_condensed_specific_humidity
+            upper_condensed_q = joint_pressure_column_runtime_step.midlevel_condensed_specific_humidity
+            upperlevel_condensed_q = joint_pressure_column_runtime_step.upperlevel_condensed_specific_humidity
+        else:
+            critical_rh = float(pp.stability_condensation_critical_rh)
+            lower_activation = 1.0 - np.exp(
+                -np.maximum(-omega_midlevel_pa_s, 0.0) * dt * 86400.0
+                / float(pp.two_layer_pressure_depth_pa)
+            )
+            mid_activation = 1.0 - np.exp(
+                -np.maximum.reduce((
+                    np.maximum(-omega_midlevel_pa_s, 0.0) / float(pp.two_layer_pressure_depth_pa),
+                    np.maximum(-omega_upperlevel_pa_s, 0.0) / float(pp.three_level_mid_upper_pressure_depth_pa),
+                )) * dt * 86400.0
+            )
+            upper_activation = 1.0 - np.exp(
+                -np.maximum(-omega_upperlevel_pa_s, 0.0) * dt * 86400.0
+                / float(pp.three_level_mid_upper_pressure_depth_pa)
+            )
+            lower_condensed_q = np.minimum(
+                q, np.maximum(q - critical_rh * qsat, 0.0) * lower_activation
+                + np.maximum(q - qsat, 0.0),
+            )
+            upper_condensed_q = np.minimum(
+                midlevel_humidity_next,
+                np.maximum(midlevel_humidity_next - critical_rh * mid_qsat_pressure, 0.0)
+                * mid_activation + np.maximum(midlevel_humidity_next - mid_qsat_pressure, 0.0),
+            )
+            upperlevel_condensed_q = np.minimum(
+                upperlevel_humidity_next,
+                np.maximum(upperlevel_humidity_next - critical_rh * upper_qsat_pressure, 0.0)
+                * upper_activation + np.maximum(upperlevel_humidity_next - upper_qsat_pressure, 0.0),
+            )
+            _apply_closed_phase_conversion(
+                lower_condensed_q, upper_condensed_q, upperlevel_condensed_q
+            )
         cloud_created_mm = (
             lower_condensed_q * lower_layer_mass_kg_m2
             + upper_condensed_q * mid_layer_mass_kg_m2
@@ -4520,18 +4703,20 @@ def generate_precipitation(
                 max(float(pp.cloud_optical_condensate_cap_q), 0.0)
                 * mid_layer_mass_kg_m2
             )
-            cloud_excess_mm = np.maximum(cloud_total_mm - cloud_retention_mm, 0.0)
-            autoconversion_fraction = 1.0 - np.exp(
-                -dt / float(pp.condensate_autoconversion_timescale_days)
+            reservoir_step = evolve_pressure_condensate_reservoirs(
+                condensate_in_mm, hydrometeors_in_mm, cloud_created_mm,
+                dt_days=dt,
+                autoconversion_timescale_days=float(pp.condensate_autoconversion_timescale_days),
+                fallout_timescale_days=float(pp.condensate_fallout_timescale_days),
+                cloud_retention_kg_m2=cloud_retention_mm,
             )
-            autoconverted_mm = cloud_excess_mm * autoconversion_fraction
-            condensate_next = (cloud_total_mm - autoconverted_mm).astype(np.float32)
-            hydrometeor_total_mm = hydrometeors_in_mm + autoconverted_mm
+            condensate_next = reservoir_step.cloud_condensate_kg_m2
+            hydrometeors_next = reservoir_step.precipitating_hydrometeors_kg_m2
+            fallout_mm = reservoir_step.fallout_kg_m2
+            autoconverted_mm = reservoir_step.autoconverted_kg_m2
             fallout_fraction = 1.0 - np.exp(
                 -dt / float(pp.condensate_fallout_timescale_days)
             )
-            fallout_mm = hydrometeor_total_mm * fallout_fraction
-            hydrometeors_next = (hydrometeor_total_mm - fallout_mm).astype(np.float32)
             if debug_fields is not None:
                 debug_fields["pressure_moisture_cloud_autoconversion_mm"] = (
                     autoconverted_mm.astype(np.float32)

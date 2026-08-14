@@ -16,6 +16,8 @@ class ColumnWaterStep(NamedTuple):
     transport_tendency_mm_day: np.ndarray
     residual_mm: float
     relative_residual: float
+    substeps: int
+    maximum_outgoing_courant: float
 
 
 def evolve_column_water(
@@ -125,5 +127,6 @@ def evolve_column_water(
     residual = final_mass - float(expected_mass)
     relative_residual = residual / max(abs(final_mass), abs(float(expected_mass)), 1.0)
     return ColumnWaterStep(
-        water_next.astype(np.float32), transport.astype(np.float32), residual, relative_residual
+        water_next.astype(np.float32), transport.astype(np.float32), residual, relative_residual,
+        n_substeps, float(np.max(outbound_rate) * dt_days * 86400.0 / n_substeps),
     )

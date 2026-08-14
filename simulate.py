@@ -57,6 +57,10 @@ from pressure_circulation import balanced_thermal_wind_u, close_upper_mass_flux
 from pressure_circulation import (
     shared_pressure_coordinate_circulation,
     evolve_large_scale_heating_reservoir,
+    mse_constrained_pressure_coordinate_circulation,
+    three_branch_mse_constrained_pressure_coordinate_circulation,
+    momentum_constrained_three_branch_mse_pressure_coordinate_circulation,
+    evolve_three_level_zonal_momentum,
 )
 from balanced_dynamics import (
     balanced_pressure_wind,
@@ -122,15 +126,46 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
                                         column_lower_temperature=None,
                                         previous_precipitation_mm_day=None,
                                         previous_large_scale_heating_w_m2=None,
+                                        lower_pressure_depth_pa=None,
+                                        midlevel_pressure_depth_pa=None,
+                                        upperlevel_pressure_depth_pa=None,
+                                        lower_pressure_cloud_condensate=None,
+                                        midlevel_pressure_cloud_condensate=None,
+                                        upperlevel_pressure_cloud_condensate=None,
+                                        lower_pressure_hydrometeors=None,
+                                        midlevel_pressure_hydrometeors=None,
+                                        upperlevel_pressure_hydrometeors=None,
                                         cloud_fraction,
                                         day_of_year, dt_days,
                                         surface_pressure_hpa=1013.25,
                                         planet_params=None,
                                         debug_fields=None):
     dt_days = float(dt_days)
+    # The deepest pressure-column experiment is itself a complete adaptive
+    # state transition.  Calling it once per legacy daily microphysics chunk
+    # would silently impose that old prescribed cadence on its joint
+    # momentum/MSE/CFL solve.  At this nested gate, use the host climate step
+    # as the one runtime call; its interface CFL policy supplies every needed
+    # physical substep internally.
+    _joint_pressure_column_runtime_active = planet_params is not None and all((
+        bool(planet_params.enable_prognostic_column_water),
+        bool(planet_params.enable_stability_aware_condensation),
+        bool(planet_params.enable_two_layer_convective_adjustment),
+        bool(planet_params.enable_three_level_pressure_column),
+        bool(planet_params.enable_closed_three_level_thermodynamics),
+        bool(planet_params.enable_diabatic_interface_mass_flux),
+        bool(planet_params.enable_shared_pressure_coordinate_circulation),
+        bool(planet_params.enable_pressure_coordinate_moisture_closure),
+        bool(planet_params.enable_prognostic_overturning_heat_reservoir),
+        bool(planet_params.enable_pressure_coordinate_mse_transport),
+        bool(planet_params.enable_mse_constrained_pressure_circulation),
+        bool(planet_params.enable_three_branch_mse_pressure_circulation),
+        bool(planet_params.enable_momentum_constrained_three_branch_mse_circulation),
+        bool(planet_params.enable_prognostic_pressure_coordinate_momentum),
+    ))
     _pp_substep = float(planet_params.precip_substep_days) if planet_params is not None else 0.0
     substep_days = _pp_substep if _pp_substep > 0.0 else _PRECIP_SUBSTEP_DAYS
-    if dt_days <= substep_days:
+    if dt_days <= substep_days or _joint_pressure_column_runtime_active:
         return generate_precipitation(
             H, W, elev, temperature=temperature, wind_u=wind_u, wind_v=wind_v,
             wind_u_aloft=wind_u_aloft, wind_v_aloft=wind_v_aloft,
@@ -146,6 +181,15 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             column_lower_temperature=column_lower_temperature,
             previous_precipitation_mm_day=previous_precipitation_mm_day,
             previous_large_scale_heating_w_m2=previous_large_scale_heating_w_m2,
+            lower_pressure_depth_pa=lower_pressure_depth_pa,
+            midlevel_pressure_depth_pa=midlevel_pressure_depth_pa,
+            upperlevel_pressure_depth_pa=upperlevel_pressure_depth_pa,
+            lower_pressure_cloud_condensate=lower_pressure_cloud_condensate,
+            midlevel_pressure_cloud_condensate=midlevel_pressure_cloud_condensate,
+            upperlevel_pressure_cloud_condensate=upperlevel_pressure_cloud_condensate,
+            lower_pressure_hydrometeors=lower_pressure_hydrometeors,
+            midlevel_pressure_hydrometeors=midlevel_pressure_hydrometeors,
+            upperlevel_pressure_hydrometeors=upperlevel_pressure_hydrometeors,
             cloud_fraction=cloud_fraction, day_of_year=day_of_year, dt_days=dt_days,
             surface_pressure_hpa=surface_pressure_hpa, planet_params=planet_params,
             return_condensate=True, return_midlevel_temperature=True,
@@ -226,11 +270,32 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
                 elif _name in {
                     "midlevel_omega_pa_s", "upperlevel_omega_pa_s",
                     "closed_column_lower_temperature_k",
+                    "joint_pressure_column_lower_wind_u",
+                    "joint_pressure_column_lower_wind_v",
+                    "joint_pressure_column_midlevel_wind_u",
+                    "joint_pressure_column_midlevel_wind_v",
+                    "joint_pressure_column_upperlevel_wind_u",
+                    "joint_pressure_column_upperlevel_wind_v",
                 }:
                     # These are wind-derived instantaneous diagnostics.  They
                     # are unchanged through the moisture-only substeps, so one
                     # copy is the meaningful state diagnostic for this step.
                     _debug_accumulators[_name] = np.asarray(_value)
+            if _sub_debug.get("joint_pressure_column_runtime"):
+                # This gate evolves winds and the lower thermodynamic layer
+                # inside the one-call pressure-column transition.  Carry that
+                # state into the next monthly precipitation substep instead of
+                # restarting its momentum evolution from the outer-step wind.
+                wind_u = _sub_debug["joint_pressure_column_lower_wind_u"]
+                wind_v = _sub_debug["joint_pressure_column_lower_wind_v"]
+                wind_u_midlevel = _sub_debug["joint_pressure_column_midlevel_wind_u"]
+                wind_v_midlevel = _sub_debug["joint_pressure_column_midlevel_wind_v"]
+                wind_u_aloft = _sub_debug["joint_pressure_column_upperlevel_wind_u"]
+                wind_v_aloft = _sub_debug["joint_pressure_column_upperlevel_wind_v"]
+                column_lower_temperature = _sub_debug["closed_column_lower_temperature_k"]
+                # Cached wind/temperature-derived precipitation drivers no
+                # longer apply after the joint state transition.
+                _static_cache = {}
         P_accum = P_i.astype(np.float32) if P_accum is None else P_accum + P_i
     if debug_fields is not None:
         debug_fields.update(_debug_accumulators)
@@ -3147,7 +3212,29 @@ def simulate_step(
         and bool(pp.enable_pressure_coordinate_moisture_closure)
         and bool(pp.enable_prognostic_overturning_heat_reservoir)
     )
-    if _shared_pressure_coordinate_active:
+    _mse_constrained_pressure_circulation_active = (
+        _prognostic_overturning_heat_active
+        and bool(pp.enable_pressure_coordinate_mse_transport)
+        and bool(pp.enable_mse_constrained_pressure_circulation)
+    )
+    _three_branch_mse_pressure_circulation_active = (
+        _mse_constrained_pressure_circulation_active
+        and bool(pp.enable_three_branch_mse_pressure_circulation)
+    )
+    _momentum_constrained_three_branch_mse_active = (
+        _three_branch_mse_pressure_circulation_active
+        and bool(pp.enable_momentum_constrained_three_branch_mse_circulation)
+    )
+    _prognostic_pressure_momentum_active = (
+        _momentum_constrained_three_branch_mse_active
+        and bool(pp.enable_prognostic_pressure_coordinate_momentum)
+    )
+    _joint_pressure_column_runtime_active = _prognostic_pressure_momentum_active
+    _hydrostatic_sigma_runtime_active = (
+        _joint_pressure_column_runtime_active
+        and bool(pp.enable_hydrostatic_sigma_pressure_coordinate_transport)
+    )
+    if _shared_pressure_coordinate_active and not _joint_pressure_column_runtime_active:
         # One large-scale circulation now supplies the divergent mass carrier,
         # the pressure interfaces, and the meridional energy transport.  The
         # longitude-mean raw u field is retained only as a non-divergent jet
@@ -3171,26 +3258,99 @@ def simulate_step(
             and state.pressure_moisture_condensation_mm_day is not None
             else state.precipitation
         )
-        _shared_circulation = shared_pressure_coordinate_circulation(
-            _shared_latent_heating,
-            T_air_full, _shared_mid_temperature, _shared_upper_temperature,
-            u_full, midlevel_wind_u_full, upperlevel_wind_u_full,
-            dt_seconds=float(days) * 86400.0,
-            radius_m=float(pp.radius_m),
-            surface_pressure_pa=float(pp.surface_pressure_pa),
-            lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
-            mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
-            gravity_m_s2=float(pp.surface_gravity),
-            cp_dry_j_kg_k=float(pp.cp_dry),
-            large_scale_heating_w_m2=(
-                np.zeros_like(T_air_full, dtype=np.float32)
-                if _prognostic_overturning_heat_active
-                and state.pressure_overturning_heating_w_m2 is None
-                else state.pressure_overturning_heating_w_m2
-                if _prognostic_overturning_heat_active
-                else None
-            ),
+        _shared_heating = (
+            np.zeros_like(T_air_full, dtype=np.float32)
+            if _prognostic_overturning_heat_active
+            and state.pressure_overturning_heating_w_m2 is None
+            else state.pressure_overturning_heating_w_m2
+            if _prognostic_overturning_heat_active
+            else None
         )
+        if _prognostic_pressure_momentum_active:
+            _previous_omega_lower = (
+                np.asarray(state.omega_lower_mid_pa_s, dtype=np.float64)
+                if state.omega_lower_mid_pa_s is not None
+                and state.omega_lower_mid_pa_s.shape == T_air_full.shape
+                else np.zeros_like(T_air_full, dtype=np.float64)
+            )
+            _previous_omega_upper = (
+                np.asarray(state.omega_mid_upper_pa_s, dtype=np.float64)
+                if state.omega_mid_upper_pa_s is not None
+                and state.omega_mid_upper_pa_s.shape == T_air_full.shape
+                else np.zeros_like(T_air_full, dtype=np.float64)
+            )
+            _momentum_step = evolve_three_level_zonal_momentum(
+                u_full, v_full, midlevel_wind_u_full, midlevel_wind_v_full,
+                upperlevel_wind_u_full, upperlevel_wind_v_full,
+                T_air_full, _shared_mid_temperature, _shared_upper_temperature,
+                _previous_omega_lower, _previous_omega_upper,
+                dt_seconds=float(days) * 86400.0, radius_m=float(pp.radius_m),
+                sidereal_day_hours=float(pp.sidereal_day_hours),
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                gravity_m_s2=float(pp.surface_gravity),
+                gas_constant_dry_j_kg_k=float(pp.gas_constant_dry),
+            )
+            u_full, v_full = _momentum_step.lower_u, _momentum_step.lower_v
+            midlevel_wind_u_full, midlevel_wind_v_full = (
+                _momentum_step.midlevel_u, _momentum_step.midlevel_v
+            )
+            upperlevel_wind_u_full, upperlevel_wind_v_full = (
+                _momentum_step.upperlevel_u, _momentum_step.upperlevel_v
+            )
+        if _mse_constrained_pressure_circulation_active:
+            _lower_q = (
+                np.asarray(state.humidity, dtype=np.float64)
+                if state.humidity is not None and state.humidity.shape == T_air_full.shape
+                else np.full_like(T_air_full, 0.010, dtype=np.float64)
+            )
+            _mid_q = (
+                np.asarray(state.midlevel_humidity, dtype=np.float64)
+                if state.midlevel_humidity is not None and state.midlevel_humidity.shape == T_air_full.shape
+                else 0.25 * _lower_q
+            )
+            _upper_q = (
+                np.asarray(state.upperlevel_humidity, dtype=np.float64)
+                if state.upperlevel_humidity is not None and state.upperlevel_humidity.shape == T_air_full.shape
+                else 0.15 * _lower_q
+            )
+            _mse_circulation_kwargs = dict(
+                dt_seconds=float(days) * 86400.0, radius_m=float(pp.radius_m),
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
+                gravity_m_s2=float(pp.surface_gravity), cp_dry_j_kg_k=float(pp.cp_dry),
+                layer_heights_m=(
+                    0.0, float(pp.stability_condensation_reference_height_m),
+                    float(pp.three_level_upper_height_m),
+                ),
+            )
+            _mse_circulation_function = (
+                momentum_constrained_three_branch_mse_pressure_coordinate_circulation
+                if _momentum_constrained_three_branch_mse_active
+                else three_branch_mse_constrained_pressure_coordinate_circulation
+                if _three_branch_mse_pressure_circulation_active
+                else mse_constrained_pressure_coordinate_circulation
+            )
+            _mse_circulation = _mse_circulation_function(
+                _shared_heating, T_air_full, _shared_mid_temperature,
+                _shared_upper_temperature, _lower_q, _mid_q, _upper_q,
+                u_full, midlevel_wind_u_full, upperlevel_wind_u_full,
+                **_mse_circulation_kwargs,
+            )
+            _shared_circulation = _mse_circulation.circulation
+        else:
+            _shared_circulation = shared_pressure_coordinate_circulation(
+                _shared_latent_heating,
+                T_air_full, _shared_mid_temperature, _shared_upper_temperature,
+                u_full, midlevel_wind_u_full, upperlevel_wind_u_full,
+                dt_seconds=float(days) * 86400.0,
+                radius_m=float(pp.radius_m),
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                lower_mid_pressure_depth_pa=float(pp.two_layer_pressure_depth_pa),
+                mid_upper_pressure_depth_pa=float(pp.three_level_mid_upper_pressure_depth_pa),
+                gravity_m_s2=float(pp.surface_gravity),
+                cp_dry_j_kg_k=float(pp.cp_dry), large_scale_heating_w_m2=_shared_heating,
+            )
         u_full, v_full = _shared_circulation.lower_u, _shared_circulation.lower_v
         midlevel_wind_u_full, midlevel_wind_v_full = (
             _shared_circulation.midlevel_u, _shared_circulation.midlevel_v
@@ -3207,6 +3367,26 @@ def simulate_step(
             _precipitation_diagnostics["shared_pressure_mid_upper_courant_max"] = float(
                 _shared_interface.mid_upper_vertical_courant_max
             )
+            if _mse_constrained_pressure_circulation_active:
+                _precipitation_diagnostics["mse_constrained_pressure_circulation"] = True
+                _precipitation_diagnostics["mse_constrained_energy_closure_residual_w"] = float(
+                    _mse_circulation.energy_closure_residual_w
+                )
+                _precipitation_diagnostics["mse_constrained_peak_transport_w_m"] = float(
+                    np.max(np.abs(_mse_circulation.meridional_mse_transport_w_m))
+                )
+                if _three_branch_mse_pressure_circulation_active:
+                    _precipitation_diagnostics["three_branch_mse_pressure_circulation"] = True
+                    _precipitation_diagnostics["three_branch_mse_midlevel_deposition_w_m2"] = (
+                        _mse_circulation.midlevel_diabatic_deposition_w_m2
+                    )
+                if _momentum_constrained_three_branch_mse_active:
+                    _precipitation_diagnostics["momentum_constrained_three_branch_mse_circulation"] = True
+                if _prognostic_pressure_momentum_active:
+                    _precipitation_diagnostics["prognostic_pressure_coordinate_momentum"] = True
+                    _precipitation_diagnostics["pressure_momentum_vertical_courant_max"] = float(
+                        _momentum_step.vertical_courant_max
+                    )
 
     # Section 17: the "upper" wind fed into precipitation's pressure-column
     # physics (upper-reservoir vapor transport, the mid-upper interface omega)
@@ -3224,7 +3404,9 @@ def simulate_step(
         # the half-resolution cell size (~0.7°) still resolves the subtropical dry belt
         # adequately. For small grids (H < 256) the subtropical band spans too few rows
         # at half resolution, so full-resolution precipitation is used instead.
-        _pbs = (2 if H >= 256 else 1) if precip_block_size is None else precip_block_size
+        _pbs = 1 if _hydrostatic_sigma_runtime_active else (
+            (2 if H >= 256 else 1) if precip_block_size is None else precip_block_size
+        )
         _Hcp = max(1, H // _pbs)
         _Wcp = max(1, W // _pbs)
         if _pbs > 1 and H >= 4 and W >= 4:
@@ -3342,6 +3524,15 @@ def simulate_step(
                 soil_moisture_deep=state.soil_moisture_deep,
                 condensate=state.atmospheric_condensate,
                 precipitating_hydrometeors=state.precipitating_hydrometeors,
+                lower_pressure_depth_pa=state.lower_pressure_depth_pa,
+                midlevel_pressure_depth_pa=state.midlevel_pressure_depth_pa,
+                upperlevel_pressure_depth_pa=state.upperlevel_pressure_depth_pa,
+                lower_pressure_cloud_condensate=state.lower_pressure_cloud_condensate,
+                midlevel_pressure_cloud_condensate=state.midlevel_pressure_cloud_condensate,
+                upperlevel_pressure_cloud_condensate=state.upperlevel_pressure_cloud_condensate,
+                lower_pressure_hydrometeors=state.lower_pressure_hydrometeors,
+                midlevel_pressure_hydrometeors=state.midlevel_pressure_hydrometeors,
+                upperlevel_pressure_hydrometeors=state.upperlevel_pressure_hydrometeors,
                 midlevel_temperature=midlevel_temperature_for_precip,
                 midlevel_humidity=state.midlevel_humidity,
                 upperlevel_temperature=upperlevel_temperature_for_precip,
@@ -3387,10 +3578,64 @@ def simulate_step(
         None if _precipitation_diagnostics is None
         else _precipitation_diagnostics.get("upperlevel_omega_pa_s")
     )
+    _sigma_state_next = {
+        "lower_pressure_depth_pa": state.lower_pressure_depth_pa,
+        "midlevel_pressure_depth_pa": state.midlevel_pressure_depth_pa,
+        "upperlevel_pressure_depth_pa": state.upperlevel_pressure_depth_pa,
+        "lower_pressure_cloud_condensate": state.lower_pressure_cloud_condensate,
+        "midlevel_pressure_cloud_condensate": state.midlevel_pressure_cloud_condensate,
+        "upperlevel_pressure_cloud_condensate": state.upperlevel_pressure_cloud_condensate,
+        "lower_pressure_hydrometeors": state.lower_pressure_hydrometeors,
+        "midlevel_pressure_hydrometeors": state.midlevel_pressure_hydrometeors,
+        "upperlevel_pressure_hydrometeors": state.upperlevel_pressure_hydrometeors,
+    }
     closed_lower_temperature_full = (
         None if _precipitation_diagnostics is None
         else _precipitation_diagnostics.get("closed_column_lower_temperature_k")
     )
+    if _hydrostatic_sigma_runtime_active:
+        if _precipitation_diagnostics is None or not _precipitation_diagnostics.get("hydrostatic_sigma_runtime"):
+            raise RuntimeError("hydrostatic sigma gate did not receive its atomic precipitation transition")
+        _sigma_state_next.update({
+            name: _precipitation_diagnostics[key]
+            for name, key in {
+                "lower_pressure_depth_pa": "hydrostatic_sigma_lower_pressure_depth_pa",
+                "midlevel_pressure_depth_pa": "hydrostatic_sigma_midlevel_pressure_depth_pa",
+                "upperlevel_pressure_depth_pa": "hydrostatic_sigma_upperlevel_pressure_depth_pa",
+                "lower_pressure_cloud_condensate": "hydrostatic_sigma_lower_cloud",
+                "midlevel_pressure_cloud_condensate": "hydrostatic_sigma_midlevel_cloud",
+                "upperlevel_pressure_cloud_condensate": "hydrostatic_sigma_upperlevel_cloud",
+                "lower_pressure_hydrometeors": "hydrostatic_sigma_lower_hydrometeors",
+                "midlevel_pressure_hydrometeors": "hydrostatic_sigma_midlevel_hydrometeors",
+                "upperlevel_pressure_hydrometeors": "hydrostatic_sigma_upperlevel_hydrometeors",
+            }.items()
+        })
+        closed_lower_temperature_full = _precipitation_diagnostics["hydrostatic_sigma_lower_temperature"]
+        midlevel_temperature_next = _precipitation_diagnostics["hydrostatic_sigma_midlevel_temperature"]
+        upperlevel_temperature_next = _precipitation_diagnostics["hydrostatic_sigma_upperlevel_temperature"]
+    _joint_runtime_winds = {
+        name: None if _precipitation_diagnostics is None else _precipitation_diagnostics.get(key)
+        for name, key in {
+            "lower_u": "joint_pressure_column_lower_wind_u",
+            "lower_v": "joint_pressure_column_lower_wind_v",
+            "mid_u": "joint_pressure_column_midlevel_wind_u",
+            "mid_v": "joint_pressure_column_midlevel_wind_v",
+            "upper_u": "joint_pressure_column_upperlevel_wind_u",
+            "upper_v": "joint_pressure_column_upperlevel_wind_v",
+        }.items()
+    }
+    if _hydrostatic_sigma_runtime_active:
+        _joint_runtime_winds = {
+            name: _precipitation_diagnostics[key]
+            for name, key in {
+                "lower_u": "hydrostatic_sigma_lower_wind_u",
+                "lower_v": "hydrostatic_sigma_lower_wind_v",
+                "mid_u": "hydrostatic_sigma_midlevel_wind_u",
+                "mid_v": "hydrostatic_sigma_midlevel_wind_v",
+                "upper_u": "hydrostatic_sigma_upperlevel_wind_u",
+                "upper_v": "hydrostatic_sigma_upperlevel_wind_v",
+            }.items()
+        }
     if state.elevation is not None and _pbs > 1:
         _omega_fields = {
             name: np.asarray(value)
@@ -3408,6 +3653,15 @@ def simulate_step(
             closed_lower_temperature_full = _omega_full.get(
                 "closed_lower_temperature", closed_lower_temperature_full
             )
+        _joint_coarse_winds = {
+            name: np.asarray(value)
+            for name, value in _joint_runtime_winds.items()
+            if value is not None and np.asarray(value).shape == (_Hcp, _Wcp)
+        }
+        if _joint_coarse_winds:
+            _joint_runtime_winds.update(
+                _upsample_bilinear_many(_joint_coarse_winds, H, W, _pbs)
+            )
     if not _three_level_midwind_active:
         omega_lower_mid_full = None
         omega_mid_upper_full = None
@@ -3421,6 +3675,17 @@ def simulate_step(
         # the pressure-column operator applies its conservative vertical and
         # phase adjustment afterwards. No radiative tendency is applied twice.
         T_air_full = np.asarray(closed_lower_temperature_full, dtype=np.float32)
+    if _joint_pressure_column_runtime_active and all(
+        value is not None and np.asarray(value).shape == T_air_full.shape
+        for value in _joint_runtime_winds.values()
+    ):
+        u_full, v_full = _joint_runtime_winds["lower_u"], _joint_runtime_winds["lower_v"]
+        midlevel_wind_u_full, midlevel_wind_v_full = (
+            _joint_runtime_winds["mid_u"], _joint_runtime_winds["mid_v"]
+        )
+        upperlevel_wind_u_full, upperlevel_wind_v_full = (
+            _joint_runtime_winds["upper_u"], _joint_runtime_winds["upper_v"]
+        )
 
     # Preserve the historical state representation exactly while the new
     # closure is gated off; a zero array is not equivalent to an absent
@@ -3440,39 +3705,62 @@ def simulate_step(
         upperlevel_wind_v_full = state.upperlevel_wind_v
 
     pressure_overturning_heating_next = state.pressure_overturning_heating_w_m2
-    if _prognostic_overturning_heat_active:
-        _condensation_mm = (
+    if _prognostic_overturning_heat_active and not _hydrostatic_sigma_runtime_active:
+        _simultaneous_heating = (
             None if _precipitation_diagnostics is None
-            else _precipitation_diagnostics.get("pressure_moisture_cloud_created_mm")
+            else _precipitation_diagnostics.get("simultaneous_pressure_column_heating_w_m2")
         )
-        if _condensation_mm is None:
-            raise RuntimeError("prognostic overturning heat requires pressure-mass condensation diagnostics")
-        _condensation_mm = np.asarray(_condensation_mm, dtype=np.float32)
-        if _condensation_mm.shape != T_air_full.shape:
-            if _condensation_mm.shape == (_Hcp, _Wcp) and _pbs > 1:
-                _condensation_mm = _upsample_bilinear_many(
-                    {"condensation": _condensation_mm}, H, W, _pbs
-                )["condensation"]
-            else:
-                raise ValueError("pressure-mass condensation diagnostic has an unexpected grid")
-        if midlevel_temperature_next is None or upperlevel_temperature_next is None:
-            raise RuntimeError("prognostic overturning heat requires all thermodynamic layers")
-        _heating_step = evolve_large_scale_heating_reservoir(
-            state.pressure_overturning_heating_w_m2,
-            _condensation_mm / float(days), T_air_full,
-            midlevel_temperature_next, upperlevel_temperature_next,
-            dt_seconds=float(days) * 86400.0,
-            surface_pressure_pa=float(pp.surface_pressure_pa),
-            gravity_m_s2=float(pp.surface_gravity), cp_dry_j_kg_k=float(pp.cp_dry),
-        )
-        pressure_overturning_heating_next = _heating_step.heating_w_m2
-        if _precipitation_diagnostics is not None:
-            _precipitation_diagnostics["prognostic_overturning_heating_w_m2"] = (
-                pressure_overturning_heating_next
+        if _simultaneous_heating is not None:
+            _simultaneous_heating = np.asarray(_simultaneous_heating, dtype=np.float32)
+            if _simultaneous_heating.shape != T_air_full.shape:
+                if _simultaneous_heating.shape == (_Hcp, _Wcp) and _pbs > 1:
+                    _simultaneous_heating = _upsample_bilinear_many(
+                        {"heating": _simultaneous_heating}, H, W, _pbs
+                    )["heating"]
+                else:
+                    raise ValueError("simultaneous pressure-column heating has an unexpected grid")
+            # The nested simultaneous adapter already solved this heating
+            # state with its current phase and reservoir transition.  Running
+            # the historical next-step reservoir update here would make it a
+            # second, lagged owner of the same latent heating.
+            pressure_overturning_heating_next = _simultaneous_heating
+            if _precipitation_diagnostics is not None:
+                _precipitation_diagnostics["prognostic_overturning_heating_w_m2"] = (
+                    pressure_overturning_heating_next
+                )
+        else:
+            _condensation_mm = (
+                None if _precipitation_diagnostics is None
+                else _precipitation_diagnostics.get("pressure_moisture_cloud_created_mm")
             )
-            _precipitation_diagnostics["prognostic_overturning_adjustment_time_days"] = (
-                _heating_step.radiative_adjustment_time_s / 86400.0
+            if _condensation_mm is None:
+                raise RuntimeError("prognostic overturning heat requires pressure-mass condensation diagnostics")
+            _condensation_mm = np.asarray(_condensation_mm, dtype=np.float32)
+            if _condensation_mm.shape != T_air_full.shape:
+                if _condensation_mm.shape == (_Hcp, _Wcp) and _pbs > 1:
+                    _condensation_mm = _upsample_bilinear_many(
+                        {"condensation": _condensation_mm}, H, W, _pbs
+                    )["condensation"]
+                else:
+                    raise ValueError("pressure-mass condensation diagnostic has an unexpected grid")
+            if midlevel_temperature_next is None or upperlevel_temperature_next is None:
+                raise RuntimeError("prognostic overturning heat requires all thermodynamic layers")
+            _heating_step = evolve_large_scale_heating_reservoir(
+                state.pressure_overturning_heating_w_m2,
+                _condensation_mm / float(days), T_air_full,
+                midlevel_temperature_next, upperlevel_temperature_next,
+                dt_seconds=float(days) * 86400.0,
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                gravity_m_s2=float(pp.surface_gravity), cp_dry_j_kg_k=float(pp.cp_dry),
             )
+            pressure_overturning_heating_next = _heating_step.heating_w_m2
+            if _precipitation_diagnostics is not None:
+                _precipitation_diagnostics["prognostic_overturning_heating_w_m2"] = (
+                    pressure_overturning_heating_next
+                )
+                _precipitation_diagnostics["prognostic_overturning_adjustment_time_days"] = (
+                    _heating_step.radiative_adjustment_time_s / 86400.0
+                )
 
     if pp.enable_surface_hydrology and P_full is not None and soil_next is not None:
         from hydrology import route_surface_water
@@ -3943,6 +4231,10 @@ def simulate_step(
             ) / max(float(days), 1e-12)
         ),
         pressure_overturning_heating_w_m2=pressure_overturning_heating_next,
+        # The hydrostatic-sigma state is inert until its deepest experimental
+        # gate owns a complete transition. Preserve it verbatim meanwhile so
+        # save/load and gate-off stepping cannot silently discard it.
+        **_sigma_state_next,
         # Preserve the scenario baseline; `pp` may be a time-varying effective
         # Milankovitch snapshot and must not become the next cycle's baseline.
         planet_params=base_pp,

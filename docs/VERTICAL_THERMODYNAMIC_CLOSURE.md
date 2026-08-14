@@ -1,7 +1,7 @@
 # Vertical circulation and thermodynamic-closure contract
 
-Status: **experimental kernel complete; runtime coupling not yet admitted**
-(2026-08-12).
+Status: **experimental atomic runtime gate implemented; compact admission
+rejected, redesign required** (2026-08-13).
 
 This document is the contract for Phase 2 of `REMAINING_WORK_PLAN.md`. It
 separates the physical closure that must exist from the older three-level
@@ -279,3 +279,269 @@ but reject its direct coupling to the existing diagnosed winds. Do not tune
 wind, radiative, autoconversion, or fallout coefficients. The next closure
 must diagnose the circulation from the simultaneously conserved MSE transport
 and diabatic forcing, so the transport itself constrains overturning strength.
+
+## MSE-constrained pressure circulation screen (2026-08-13): kernel retained, two-branch candidate rejected
+
+`enable_mse_constrained_pressure_circulation` is the first joint solve. It
+balances the zonal, cosine-area-balanced diabatic forcing by a meridional MSE
+transport at every latitude circle. A lower/upper pressure branch carries
+equal and opposite dry-air mass, and its *resolved signed* MSE contrast fixes
+the branch mass flux; its divergent winds, pressure-interface omega, and MSE
+transport therefore follow from one calculation. The middle layer remains a
+non-divergent branch in this deliberately limited first formulation. There is
+no speed coefficient, relaxation, omega cap, or MSE-contrast floor. A truly
+vanishing branch contrast is rejected as having no finite two-branch solution.
+
+Analytic regressions verify: uniform diabatic forcing produces no circulation;
+an equatorial heating anomaly produces poleward MSE export in each hemisphere;
+the layer-weighted mass divergence is zero; and a vanishing MSE contrast is
+rejected. The 64x128 one-year spin-up/one-year evaluation is stable (44.5 s)
+and removes the previous +28.6/-94.7 PW transport pathology, reaching
++9.42/-6.00 PW. It nevertheless rejects the climate candidate: global
+precipitation is 0.688 mm/day, polar precipitation 0.208 mm/day, cloud
+fraction 0.567, reference error 0.663, KÃ¶ppen group/class accuracy
+0.486/0.271, and lower/mid-upper omega RMS 0.000454/0.00410 Pa/s.
+**Decision:** retain the pure joint-budget solver as default-off
+infrastructure, but do not promote or tune the two-branch runtime coupling.
+The next redesign is a three-branch MSE/vertical-exchange solve: it must derive
+the middle-layer MSE flux and phase-heating deposition with the two interface
+mass fluxes, rather than treating the middle layer as horizontally passive.
+
+## Three-branch MSE/vertical-exchange screen (2026-08-13): closure retained, minimum-norm branch selection rejected
+
+`enable_three_branch_mse_pressure_circulation` extends the joint MSE solve to
+all three pressure layers. At each latitude it selects the unique
+minimum-mass-flux velocity vector that has zero column mass flux and carries
+the required MSE export. It then diagnoses both interface mass fluxes and the
+layerwise diabatic deposition needed to balance horizontal MSE export plus
+vertical MSE exchange. The phase-deposition fields remain diagnostic: applying
+them to the existing phase-conversion temperature update now would double-count
+latent heat.
+
+The pure regressions verify three-layer mass closure, exact recovery of the
+column diabatic forcing from the three deposition fields, a nonzero middle
+branch, and rejection of a vertically uniform MSE state. The 64x128 one-year
+spin-up/one-year evaluation is stable (38.9 s), but rejects the runtime
+candidate: global precipitation is 0.428 mm/day, polar precipitation 0.071
+mm/day, cloud fraction 0.571, reference error 0.754, KÃ¶ppen group/class
+accuracy 0.483/0.274, and lower/mid-upper omega RMS 0.00102/0.0108 Pa/s. Peak
+northward/southward energy transports fall to +0.745/-0.160 PW, showing that
+minimum mass flux is not a physically sufficient branch-selection principle.
+**Decision:** retain the three-branch budget/deposition diagnostics as
+default-off infrastructure, but reject the coupled candidate. Do not tune a
+branch weight or restore the two-branch solution. The next required constraint
+is a momentum/thermal-wind relation that selects the vertical branch structure
+while the MSE and mass budgets remain exact.
+
+## Momentum-constrained three-branch screen (2026-08-13): algebra retained, resolved-wind constraint rejected
+
+`enable_momentum_constrained_three_branch_mse_circulation` replaces the
+minimum-norm branch choice with zero mass-weighted transport of resolved
+pressure-level zonal momentum. At a fixed latitude the planetary
+angular-momentum term cancels under exact column mass closure, leaving this
+third linear constraint alongside mass and MSE export. Its analytic regression
+closes all three budgets and rejects barotropic (vertically unsheared) winds.
+
+The 64x128 one-year spin-up/one-year evaluation is computationally stable
+(41.6 s) but rejects the candidate: global precipitation is 0.497 mm/day,
+polar precipitation 0.075 mm/day, cloud fraction 0.578, reference error
+0.883, KÃ¶ppen group/class accuracy 0.465/0.260, and lower/mid-upper omega RMS
+0.00179/0.01499 Pa/s. The northern peak energy transport explodes to 69.4 PW
+(southern peak -2.75 PW). **Decision:** retain the algebraic budget test as
+default-off infrastructure, but reject runtime use of the present resolved
+zonal winds as a momentum constraint. They are not themselves a prognostic,
+pressure-coordinate thermal-wind/momentum balance. Do not cap transport or
+tune a branch weight. The next architecture must evolve pressure-level zonal
+momentum with explicit pressure-gradient, Coriolis, and vertical momentum
+exchange terms before its shear can constrain the MSE circulation.
+
+## Prognostic pressure-momentum integration (2026-08-13): kernel retained, monthly coupling inadmissible
+
+`enable_prognostic_pressure_coordinate_momentum` advances all three pressure
+wind levels before branch selection. The pure operator obtains each layer's
+meridional pressure-gradient acceleration from hydrostatic pressure thickness,
+integrates Coriolis rotation analytically (including the finite equatorial
+limit), and transfers both horizontal momentum components conservatively across
+the prior-step pressure interfaces. Its regressions verify exact split-step
+agreement under fixed forcing and mass-weighted horizontal-momentum conservation
+under vertical exchange.
+
+The daily small-grid path is finite, but the required 64x128 MONTHLY compact
+integration is not admissible. Its first two monthly cycles take 9.03 and 8.43
+seconds; after cycle two, lower/mid-upper interface omega already reaches
+0.00319/0.00987 Pa/s. The third cycle enters the existing conservative
+closed-column substep path and does not complete within the two-minute runner
+limit. This is a true coarse-cadence/CFL failure, not a candidate climate
+result. **Decision:** retain the pure momentum operator default-off, but reject
+its current split runtime coupling before climate scoring. Do not cap omega or
+relax the winds. The remaining missing design is a jointly time-discretized
+pressure-column momentum/MSE/vertical-transport solve, with one shared CFL
+policy, rather than sequential monthly momentum and thermodynamic operators.
+
+## Joint pressure-column time-integration kernel (2026-08-13): pure contract complete
+
+`pressure_circulation.evolve_joint_mse_momentum_pressure_column` now provides
+one adaptive state transition for the three-branch MSE/momentum diagnosis,
+conservative vertical MSE exchange, and pressure-level momentum update. Each
+substep re-diagnoses circulation from its current state, applies half momentum,
+one full vertical MSE exchange, and the remaining half momentum using the same
+interface flux. The substep duration is derived from that interface's shared
+vertical Courant number; it neither clips omega nor prescribes an inner
+timestep. Regressions verify its zero-state identity, finite coupled response,
+water/MSE closure, and the shared CFL bound.
+
+The runtime adapter now moves horizontal MSE transport, joint CFL integration,
+and phase deposition into one transition under the deepest momentum/MSE gate;
+the legacy pressure-column split is bypassed there. Its focused regressions
+pass, including runtime wind persistence and the absence of the old separate
+momentum step.
+
+The legacy daily wrapper is also bypassed at this gate, so the host monthly
+step calls the adapter once and its interface-CFL policy is the only inner
+discretization. The first mass-closure report exposed that the previous
+normalized 3x3 branch solve accumulated a tiny continuity residual. The solve
+now eliminates its third branch algebraically, so pressure-mass continuity is
+structural and its discrete-divergence regression passes.
+
+The 64x128 compact path still fails admission in its second 6.09-day monthly
+substep, but for the physically relevant reason: the simultaneous MSE and
+zonal-momentum constraints become near-degenerate (condition number
+2.64e9), demanding a 3.30e9 m s-1 branch speed and 8.77e3 s-1 divergence.
+The reported absolute mass residual (1.36e-12 s-1) is only floating-point
+roundoff relative to that divergence; it is not the cause. This produces no
+climate metric and remains rejected. Retain the adapter default-off; do not
+add an omega cap, damping term, fallback branch, or prescribed joint inner
+timestep. A subsequent redesign must supply a physically independent third
+branch constraint rather than forcing exact momentum transport through a
+nearly barotropic MSE state.
+
+## Column-water-constrained three-branch diagnostic (2026-08-13)
+
+`water_constrained_three_branch_mse_pressure_coordinate_circulation` now
+supplies that independent pure constraint: after structural pressure-mass
+closure, it solves the required MSE and column-vapour transports together.
+Its water transport is diagnosed from the cosine-area-balanced atmospheric
+column source/sink, rather than from a resolved zonal-wind shear. The focused
+regression verifies discrete mass closure, finite interface omega, and a
+nonzero middle branch.
+
+An attempted partial runtime coupling used surface vapour supply minus prior
+precipitation as that source/sink. It is inadmissible: surface supply can be
+nonzero while the simultaneously prescribed MSE export is zero, which forces
+large compensating branches. The next implementation must therefore put
+surface evaporation, ascent/condensation, cloud storage, and fallout in the
+same state transition before this water constraint is allowed into the monthly
+path. Do not use lagged precipitation, a branch weight, a cap, or damping to
+manufacture that closure.
+
+The diagnostic's layerwise MSE deposition now solves its same two constraints
+at pressure-latitude faces, using face-interpolated MSE and vapour states.
+Interpolating the already-solved cell-centre branch transports can cancel at a
+face even when the finite-volume MSE budget requires a nonzero transport. The
+face solve preserves both exact transports and has a regression for nonzero
+MSE transport with zero column-water transport; it does not introduce a
+normalising branch share.
+
+An undamped pure-runtime fixed-point probe was also rejected, not wired: with
+the existing 80 W m-2 analytic heating case, its first diagnosed phase sink
+was 6.85e-4 kg m-2 s-1 and the next water-constrained solve required a 94.6
+m s-1 middle branch. Thus merely iterating the current condensation activation
+does not make the transition simultaneous; it amplifies a vapour-only sink
+that excludes contemporaneous cloud storage, hydrometeor conversion/fallout,
+and the matching large-scale latent-heating update. The next closure must
+solve those prognostic reservoirs and heating together, rather than applying
+this fixed point or a relaxation to it.
+
+`evolve_pressure_condensate_reservoirs` is now the sole pressure-path
+cloud/hydrometeor conversion and fallout transition, and
+`column_water_forcing_from_boundary_fluxes` defines its circulation input as
+``(surface source - fallout) / elapsed seconds`` in kg m-2 s-1. Phase change
+does not enter that forcing because it is internal to total atmospheric water.
+These pure contracts are tested and are intentionally not yet passed into the
+runtime water branch until their fallout and latent-heating diagnostics are
+solved with the same circulation state.
+
+`diagnose_joint_pressure_column_coupling_residual` now evaluates precisely
+that candidate transition and returns both residuals. The comparison projects
+both candidate and diagnosed fields onto the cosine-area-balanced zonal
+anomaly, because a closed meridional circulation cannot determine their global
+mean or longitude-dependent component. A regression verifies that adding a
+uniform heating or water boundary term leaves the residual unchanged. A scaled
+8x16 nonlinear least-squares probe (heating scale 100 W m-2; water scale
+1e-4 kg m-2 s-1) terminates with maximum scaled residual 0.89 rather than a
+root. Bounded attempts with standard hybrid, Levenberg--Marquardt, and Broyden
+root methods likewise do not establish a finite root (the Broyden update
+becomes singular). It is therefore not a usable solver or runtime gate: the
+current phase-activation/reservoir equations do not yet supply a simultaneous
+closure.
+
+The missing transient storage term is now included: the water constraint is
+``surface source - fallout - d(vapour + cloud + hydrometeors)/dt``, not a
+steady ``source - fallout`` approximation. With that correction, the exact
+undamped candidate map converges in the analytic case to float32-consistent
+water/heating residuals. The solver canonicalises its unknowns to balanced
+zonal anomalies, updates by the full diagnosed state (never a relaxed blend),
+and raises rather than returning a partial iterate. The resulting
+`evolve_simultaneous_joint_pressure_column_runtime` also owns the established
+cloud and hydrometeor horizontal transport leg before reservoir conversion.
+Its pure regressions pass; it is still deliberately outside the monthly
+atmosphere gate pending the required 64x128 admission screen.
+
+The first atomic admission attempt was rejected at the smaller 12x24,
+one-day runtime screen, before a 64x128 climate run was warranted. A nonlinear
+candidate reached a water/MSE constraint condition number of 2.91e17 and
+demanded a 9.73e9 m s-1 branch, producing 1.71e4 s-1 divergence. This is a
+genuine degeneracy of the simultaneous transport constraints, not a shared-CFL
+failure or an accepted partially converged state. The default-off atmosphere
+gate was removed; the pure adapter, transient storage budget, reservoir
+transport contract, and strict failure diagnostics remain retained. No cap,
+damping, fallback branch, or prescribed inner timestep was introduced.
+
+The analogous missing MSE-storage term is now factored as
+`column_mse_storage_tendency_w_m2`: pressure-layer dry-static, geopotential,
+and vapour latent storage divided by elapsed time. The next residual must keep
+the heating reservoir as its own diagnosed state and use ``heating - storage``
+for the MSE transport constraint. It must be evaluated as a pure exact map
+before any runtime admission attempt.
+
+That exact-map experiment is now rejected: on the analytic 8x16 case it enters
+the active rank-deficient MSE/water constraint before convergence and produces
+nonphysical thermodynamic and forcing excursions. The integration was removed,
+while the storage diagnostic remains tested. This confirms that neither a
+steady nor a transient diagnostic MSE/water branch system has an admissible
+simultaneous runtime solution; the next required replacement is prognostic
+pressure-coordinate transport, not another diagnostic branch selection.
+
+## Hydrostatic-sigma runtime admission (2026-08-13): redesign required
+
+`enable_hydrostatic_sigma_pressure_coordinate_transport` now owns a default-off
+atomic transition through the precipitation adapter. It persists the three
+layer pressure depths plus cloud and hydrometeor reservoirs, returns the
+closure's temperature and momentum state, and bypasses the legacy lagged
+overturning-heating update. Gate-off state identity, persistence, pure-kernel
+conservation/CFL checks, and a finite one-day 8x16 enabled transition are
+covered by focused regressions.
+
+The required 64x128 one-year spin-up/one-year evaluation MONTHLY screen was
+started with the full prerequisite family enabled and rejected during its first
+spin-up cycle, before climate scores were meaningful. Horizontal transport of
+the inherited legacy wind state exhausted a pressure layer in at least one
+cell before the vertical donor exchange. The kernel now raises that explicit
+admissibility error rather than dividing by an empty donor, taking an unbounded
+CFL sequence, capping the carrier, or reverting to a legacy path.
+
+**Decision:** retain the gate and pure closure as default-off research code;
+do not tune a wind scale, mass floor, damping, cap, fallback, or prescribed
+inner timestep. The next required Phase-2 replacement is a simultaneous
+horizontal pressure-mass and momentum transition that supplies an admissible
+carrier to the hydrostatic vertical/phase closure. The supported Earth
+baseline remains unchanged.
+
+`evolve_hydrostatic_sigma_mass_momentum` now provides the resulting pure
+carrier, including vapour/MSE/cloud/hydrometeor inventories on the identical
+adaptive donor parcels. Its controlled 30-day regression closes the carried
+inventories and remains finite. A 64x128 one-month runtime-coupling probe did
+not finish within 60 seconds, so this carrier is deliberately not substituted
+into the atmosphere gate: runtime admission requires an equivalently
+conservative implementation with bounded compact-screen cost, not relaxed
+Courant control or a capped wind.

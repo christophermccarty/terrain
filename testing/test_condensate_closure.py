@@ -5,7 +5,11 @@ import pytest
 
 from atmosphere import generate_precipitation
 from condensate import (
+    column_water_forcing_from_boundary_fluxes,
+    column_water_forcing_from_budget,
     evolve_bulk_condensate,
+    evolve_pressure_condensate_reservoirs,
+    transport_pressure_condensate_reservoirs,
     separate_cloud_and_hydrometeor_reservoirs,
     simplified_betts_miller_condensation,
     stability_aware_condensation,
@@ -97,6 +101,56 @@ def test_separate_cloud_hydrometeor_reservoirs_conserve_condensate():
     np.testing.assert_allclose(cloud + hydrometeors + fallout, 0.007)
     assert np.all(cloud >= 0.001)
     assert np.all(hydrometeors >= 0.0)
+
+
+def test_pressure_reservoir_transition_conserves_cloud_hydrometeor_mass():
+    cloud_in = np.full((2, 2), 1.0)
+    hydrometeors_in = np.full((2, 2), 2.0)
+    condensed = np.full((2, 2), 4.0)
+    result = evolve_pressure_condensate_reservoirs(
+        cloud_in, hydrometeors_in, condensed,
+        dt_days=0.25, autoconversion_timescale_days=0.25,
+        fallout_timescale_days=0.5, cloud_retention_kg_m2=1.0,
+    )
+    np.testing.assert_allclose(
+        result.cloud_condensate_kg_m2
+        + result.precipitating_hydrometeors_kg_m2
+        + result.fallout_kg_m2,
+        cloud_in + hydrometeors_in + condensed,
+        atol=1e-6,
+    )
+    assert np.all(result.autoconverted_kg_m2 > 0.0)
+
+
+def test_pressure_reservoir_transport_keeps_each_reservoir_mass():
+    cloud = np.array([[1.0, 2.0, 3.0, 2.0], [2.0, 3.0, 1.0, 2.0]])
+    hydrometeors = 0.5 * cloud
+    result = transport_pressure_condensate_reservoirs(
+        cloud, hydrometeors, np.full_like(cloud, 2.0), np.zeros_like(cloud),
+        dt_days=0.25, fallout_timescale_days=1.0, cloud_transport_scale=1.0,
+        transport_hydrometeors=True, dx_m=100_000.0, dy_m=100_000.0,
+        cell_area_m2=1.0e10, x_face_length_m=100_000.0, y_face_length_m=100_000.0,
+    )
+    np.testing.assert_allclose(np.sum(result.cloud_condensate_kg_m2), np.sum(cloud))
+    np.testing.assert_allclose(
+        np.sum(result.precipitating_hydrometeors_kg_m2), np.sum(hydrometeors),
+    )
+
+
+def test_column_water_forcing_uses_only_external_boundary_mass_fluxes():
+    forcing = column_water_forcing_from_boundary_fluxes(
+        np.array([[4.0, 1.0]]), np.array([[1.0, 3.0]]), dt_seconds=2.0,
+    )
+    np.testing.assert_allclose(forcing, np.array([[1.5, -1.0]]))
+
+
+def test_column_water_forcing_from_budget_includes_storage_tendency():
+    forcing = column_water_forcing_from_budget(
+        np.array([[5.0, 4.0]]), np.array([[1.0, 1.0]]),
+        np.array([[10.0, 10.0]]), np.array([[12.0, 7.0]]), dt_seconds=2.0,
+    )
+    # (source - fallout - (after - before)) / dt
+    np.testing.assert_allclose(forcing, np.array([[1.0, 3.0]]))
 
 
 @pytest.mark.parametrize("name,value", [("dt_days", 0.0), ("condensation_timescale_days", 0.0)])
