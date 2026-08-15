@@ -3783,6 +3783,7 @@ def generate_precipitation(
                 "hydrostatic_sigma_midlevel_wind_v": sigma_step.momentum.midlevel_v,
                 "hydrostatic_sigma_upperlevel_wind_u": sigma_step.momentum.upperlevel_u,
                 "hydrostatic_sigma_upperlevel_wind_v": sigma_step.momentum.upperlevel_v,
+                "hydrostatic_sigma_heat_convergence_w_m2": sigma_step.momentum.horizontal_mse_convergence_w_m2,
             })
         result = (P.astype(np.float32), sigma.lower_humidity, soil, soil_deep)
         if not return_condensate:

@@ -359,12 +359,16 @@ def test_hydrostatic_sigma_mass_momentum_moves_the_carrier_together():
         assert np.all(np.isfinite(value))
     assert np.all(result.lower_pressure_depth_pa > 0.0)
     assert result.substeps > 1
-    assert result.horizontal_courant_max <= 0.25 + 1e-12
+    assert result.horizontal_courant_max <= 0.9 + 1e-12
     assert result.vertical_courant_max <= 0.25 + 1e-12
     assert abs(result.relative_mass_residual) < 1e-12
     assert result.horizontal_momentum_relative_residual < 1e-10
     assert abs(result.water_relative_residual) < 1e-12
     assert abs(result.moist_static_energy_relative_residual) < 1e-12
+    heat = result.horizontal_mse_convergence_w_m2
+    assert heat is not None
+    area = np.broadcast_to(np.asarray(inputs["cell_area_m2"], dtype=np.float64), shape)
+    assert abs(float(np.sum(heat * area)) / float(np.sum(area))) < 1e-4
 
 
 def test_hydrostatic_sigma_mass_momentum_rejects_nonhydrostatic_carrier_speed():
@@ -1393,6 +1397,7 @@ def test_hydrostatic_sigma_gate_off_preserves_persisted_experimental_state():
         "lower_pressure_hydrometeors": np.full(shape, 0.05, dtype=np.float32),
         "midlevel_pressure_hydrometeors": np.full(shape, 0.07, dtype=np.float32),
         "upperlevel_pressure_hydrometeors": np.full(shape, 0.03, dtype=np.float32),
+        "pressure_coordinate_heat_convergence_w_m2": np.full(shape, 7.0, dtype=np.float32),
     }
     evolved, _ = simulate_step(state._replace(**fields), days=1.0, planet_params=EARTH)
     for name, expected in fields.items():
@@ -1433,6 +1438,7 @@ def test_hydrostatic_sigma_runtime_owns_and_persists_the_full_layer_state():
         "lower_pressure_cloud_condensate", "midlevel_pressure_cloud_condensate", "upperlevel_pressure_cloud_condensate",
         "lower_pressure_hydrometeors", "midlevel_pressure_hydrometeors", "upperlevel_pressure_hydrometeors",
         "midlevel_temperature", "upperlevel_temperature", "upperlevel_wind_u",
+        "pressure_coordinate_heat_convergence_w_m2",
     ):
         value = getattr(evolved, name)
         assert value is not None

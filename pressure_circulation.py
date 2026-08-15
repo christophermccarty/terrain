@@ -15,8 +15,17 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
+try:
+    from numba import njit  # pyright: ignore[reportMissingImports]
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    njit = None
+    _NUMBA_AVAILABLE = False
+
 
 _STEFAN_BOLTZMANN_W_M2_K4 = 5.670374419e-8
+_MOMENTUM_WAVE_FRACTION = 0.5
+"""Maximum resolved PGF speed increment as a fraction of gravity-wave speed."""
 
 
 def _cosine_area_balanced_zonal_anomaly(field: np.ndarray) -> np.ndarray:
@@ -370,6 +379,7 @@ class HydrostaticSigmaMassMomentumStep(NamedTuple):
     upperlevel_hydrometeors_kg_m2: np.ndarray | None = None
     water_relative_residual: float | None = None
     moist_static_energy_relative_residual: float | None = None
+    horizontal_mse_convergence_w_m2: np.ndarray | None = None
 
 
 class HydrostaticSigmaPressureCoordinateTransportStep(NamedTuple):
@@ -1079,6 +1089,248 @@ def diagnose_hydrostatic_sigma_continuity(
     )
 
 
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _evolve_hydrostatic_sigma_mass_momentum_numba(
+        state, area, x_length, y_length, source_water, dt_seconds,
+        gravity, gas_constant, cp_dry, latent_heat, heights, fractions,
+        dy_m, sidereal_day_hours, max_horizontal_courant,
+        max_vertical_courant,
+    ):
+        """Compiled finite-volume core for the sigma mass/momentum carrier.
+
+        ``state[layer, component]`` contains dry pressure mass, two momentum
+        components, vapour, MSE, cloud condensate, and hydrometeors.  It is
+        deliberately a direct donor-cell translation of the NumPy transition
+        below: all contents use the same face velocity and the same vertical
+        donor parcel at every CFL-limited substep.
+        """
+        nlayer, ncomponent, h, w = state.shape
+        tendency = np.empty_like(state)
+        trial = np.empty_like(state)
+        exchanged = np.empty_like(state)
+        row_temperature = np.empty((nlayer, h), dtype=np.float64)
+        row_gradient = np.empty((nlayer, h), dtype=np.float64)
+        interface_lm = np.zeros((h, w), dtype=np.float64)
+        interface_mu = np.zeros((h, w), dtype=np.float64)
+        remaining = dt_seconds
+        substeps = 0
+        horizontal_courant_max = 0.0
+        vertical_courant_max = 0.0
+        momentum_residual = 0.0
+        day_seconds = sidereal_day_hours * 3600.0
+
+        while remaining > 1.0e-9:
+            horizontal_rate = 0.0
+            maximum_speed = 0.0
+            for layer in range(nlayer):
+                for i in range(h):
+                    for j in range(w):
+                        mass = state[layer, 0, i, j]
+                        u = state[layer, 1, i, j] / mass
+                        v = state[layer, 2, i, j] / mass
+                        speed = np.sqrt(u * u + v * v)
+                        if speed > maximum_speed:
+                            maximum_speed = speed
+                        jp = 0 if j == w - 1 else j + 1
+                        jm = w - 1 if j == 0 else j - 1
+                        ue = 0.5 * (u + state[layer, 1, i, jp] / state[layer, 0, i, jp])
+                        uw = 0.5 * (state[layer, 1, i, jm] / state[layer, 0, i, jm] + u)
+                        north = 0.0
+                        south = 0.0
+                        if i > 0:
+                            north = 0.5 * (state[layer, 2, i - 1, j] / state[layer, 0, i - 1, j] + v)
+                        if i < h - 1:
+                            south = 0.5 * (v + state[layer, 2, i + 1, j] / state[layer, 0, i + 1, j])
+                        rate = (
+                            max(ue, 0.0) * x_length[i, j]
+                            + max(-uw, 0.0) * x_length[i, j]
+                            + max(north, 0.0) * y_length[i, j]
+                            + max(-south, 0.0) * y_length[i + 1, j]
+                        ) / area[i, j]
+                        if rate > horizontal_rate:
+                            horizontal_rate = rate
+            gravity_wave_speed = np.sqrt(gravity * max(heights[2] - heights[0], 1.0))
+            if maximum_speed >= gravity_wave_speed:
+                return state, interface_lm, interface_mu, -1, horizontal_courant_max, vertical_courant_max, momentum_residual
+            dt_sub = remaining
+            if horizontal_rate > 0.0:
+                dt_sub = min(dt_sub, max_horizontal_courant / horizontal_rate)
+
+            # Face flux divergence for every conserved component.  The face
+            # orientation and donor selection match ``horizontal_operator``.
+            for layer in range(nlayer):
+                for component in range(ncomponent):
+                    for i in range(h):
+                        for j in range(w):
+                            jp = 0 if j == w - 1 else j + 1
+                            jm = w - 1 if j == 0 else j - 1
+                            mass = state[layer, 0, i, j]
+                            u = state[layer, 1, i, j] / mass
+                            v = state[layer, 2, i, j] / mass
+                            ue = 0.5 * (u + state[layer, 1, i, jp] / state[layer, 0, i, jp])
+                            uw = 0.5 * (state[layer, 1, i, jm] / state[layer, 0, i, jm] + u)
+                            east = ue * (state[layer, component, i, j] if ue >= 0.0 else state[layer, component, i, jp]) * x_length[i, j]
+                            west = uw * (state[layer, component, i, jm] if uw >= 0.0 else state[layer, component, i, j]) * x_length[i, j]
+                            north = 0.0
+                            south = 0.0
+                            if i > 0:
+                                vn = 0.5 * (state[layer, 2, i - 1, j] / state[layer, 0, i - 1, j] + v)
+                                north = vn * (state[layer, component, i, j] if vn >= 0.0 else state[layer, component, i - 1, j]) * y_length[i, j]
+                            if i < h - 1:
+                                vs = 0.5 * (v + state[layer, 2, i + 1, j] / state[layer, 0, i + 1, j])
+                                south = vs * (state[layer, component, i + 1, j] if vs >= 0.0 else state[layer, component, i, j]) * y_length[i + 1, j]
+                            tendency[layer, component, i, j] = (west - east + south - north) / area[i, j]
+
+            # Find the common timestep that also satisfies simultaneous
+            # lower/middle and middle/upper donor fractions.
+            vertical_fraction = 0.0
+            while True:
+                vertical_fraction = 0.0
+                for i in range(h):
+                    for j in range(w):
+                        m0 = state[0, 0, i, j] + dt_sub * tendency[0, 0, i, j]
+                        m1 = state[1, 0, i, j] + dt_sub * tendency[1, 0, i, j]
+                        m2 = state[2, 0, i, j] + dt_sub * tendency[2, 0, i, j]
+                        if m0 <= 0.0 or m1 <= 0.0 or m2 <= 0.0:
+                            return state, interface_lm, interface_mu, -2, horizontal_courant_max, vertical_courant_max, momentum_residual
+                        total = m0 + m1 + m2
+                        lm = m0 - fractions[0] * total
+                        mu = fractions[2] * total - m2
+                        f0 = max(lm, 0.0) / m0
+                        f1 = (max(-lm, 0.0) + max(mu, 0.0)) / m1
+                        f2 = max(-mu, 0.0) / m2
+                        if f0 > vertical_fraction:
+                            vertical_fraction = f0
+                        if f1 > vertical_fraction:
+                            vertical_fraction = f1
+                        if f2 > vertical_fraction:
+                            vertical_fraction = f2
+                if vertical_fraction <= max_vertical_courant + 1.0e-14:
+                    break
+                dt_sub *= max_vertical_courant / vertical_fraction
+                if dt_sub <= 0.0 or not np.isfinite(dt_sub):
+                    return state, interface_lm, interface_mu, -3, horizontal_courant_max, vertical_courant_max, momentum_residual
+
+            before_u = 0.0
+            before_v = 0.0
+            before_u_scale = 0.0
+            before_v_scale = 0.0
+            for layer in range(nlayer):
+                for i in range(h):
+                    for j in range(w):
+                        before_u += state[layer, 1, i, j] * area[i, j]
+                        before_v += state[layer, 2, i, j] * area[i, j]
+                        before_u_scale += abs(state[layer, 1, i, j]) * area[i, j]
+                        before_v_scale += abs(state[layer, 2, i, j]) * area[i, j]
+                        for component in range(ncomponent):
+                            trial[layer, component, i, j] = state[layer, component, i, j] + dt_sub * tendency[layer, component, i, j]
+                        if layer == 0:
+                            trial[layer, 3, i, j] += dt_sub * source_water[i, j]
+                            trial[layer, 4, i, j] += dt_sub * latent_heat * source_water[i, j]
+            for layer in range(nlayer):
+                for component in range(ncomponent):
+                    for i in range(h):
+                        for j in range(w):
+                            exchanged[layer, component, i, j] = trial[layer, component, i, j]
+            for i in range(h):
+                for j in range(w):
+                    m0 = trial[0, 0, i, j]
+                    m1 = trial[1, 0, i, j]
+                    m2 = trial[2, 0, i, j]
+                    total = m0 + m1 + m2
+                    lm = m0 - fractions[0] * total
+                    mu = fractions[2] * total - m2
+                    interface_lm[i, j] += lm
+                    interface_mu[i, j] += mu
+                    exchanged[0, 0, i, j] = fractions[0] * total
+                    exchanged[1, 0, i, j] = fractions[1] * total
+                    exchanged[2, 0, i, j] = fractions[2] * total
+                    for component in range(1, ncomponent):
+                        if lm >= 0.0:
+                            parcel = trial[0, component, i, j] / m0 * lm
+                            exchanged[0, component, i, j] -= parcel
+                            exchanged[1, component, i, j] += parcel
+                        else:
+                            parcel = trial[1, component, i, j] / m1 * (-lm)
+                            exchanged[0, component, i, j] += parcel
+                            exchanged[1, component, i, j] -= parcel
+                        if mu >= 0.0:
+                            parcel = trial[1, component, i, j] / m1 * mu
+                            exchanged[1, component, i, j] -= parcel
+                            exchanged[2, component, i, j] += parcel
+                        else:
+                            parcel = trial[2, component, i, j] / m2 * (-mu)
+                            exchanged[1, component, i, j] += parcel
+                            exchanged[2, component, i, j] -= parcel
+            after_u = 0.0
+            after_v = 0.0
+            for layer in range(nlayer):
+                for i in range(h):
+                    for j in range(w):
+                        after_u += exchanged[layer, 1, i, j] * area[i, j]
+                        after_v += exchanged[layer, 2, i, j] * area[i, j]
+            momentum_residual = max(momentum_residual, abs(after_u - before_u) / max(before_u_scale, 1.0), abs(after_v - before_v) / max(before_v_scale, 1.0))
+
+            # Hydrostatic PGF and analytic Coriolis rotation are evaluated on
+            # the same post-exchange pressure/momentum state as the NumPy
+            # carrier, before it becomes the next donor state.
+            for layer in range(nlayer):
+                for i in range(h):
+                    row_sum = 0.0
+                    for j in range(w):
+                        mass = exchanged[layer, 0, i, j]
+                        q = exchanged[layer, 3, i, j] / mass
+                        temperature = (exchanged[layer, 4, i, j] / mass - gravity * heights[layer] - latent_heat * q) / cp_dry
+                        total_pressure = gravity * (exchanged[0, 0, i, j] + exchanged[1, 0, i, j] + exchanged[2, 0, i, j])
+                        if layer == 0:
+                            center_pressure = total_pressure - 0.5 * gravity * exchanged[0, 0, i, j]
+                        elif layer == 1:
+                            center_pressure = gravity * exchanged[2, 0, i, j] + 0.5 * gravity * exchanged[1, 0, i, j]
+                        else:
+                            center_pressure = 0.5 * gravity * exchanged[2, 0, i, j]
+                        row_sum += gas_constant * temperature * np.log(total_pressure / center_pressure)
+                    row_temperature[layer, i] = row_sum / w
+                for i in range(h):
+                    if i == 0:
+                        row_gradient[layer, i] = (row_temperature[layer, 1] - row_temperature[layer, 0]) / dy_m
+                    elif i == h - 1:
+                        row_gradient[layer, i] = (row_temperature[layer, h - 1] - row_temperature[layer, h - 2]) / dy_m
+                    else:
+                        row_gradient[layer, i] = (row_temperature[layer, i + 1] - row_temperature[layer, i - 1]) / (2.0 * dy_m)
+            for layer in range(nlayer):
+                for i in range(h):
+                    latitude = 0.5 * np.pi - (i + 0.5) * np.pi / h
+                    coriolis = 4.0 * np.pi / day_seconds * np.sin(latitude)
+                    theta = coriolis * dt_sub
+                    cosine = np.cos(theta)
+                    sine = np.sin(theta)
+                    if abs(theta) < 1.0e-5:
+                        sin_over_f = dt_sub * (1.0 - theta * theta / 6.0)
+                        one_minus_cos_over_f = 0.5 * dt_sub * theta
+                    else:
+                        sin_over_f = sine / coriolis
+                        one_minus_cos_over_f = (1.0 - cosine) / coriolis
+                    for j in range(w):
+                        mass = exchanged[layer, 0, i, j]
+                        u = exchanged[layer, 1, i, j] / mass
+                        v = exchanged[layer, 2, i, j] / mass
+                        next_u = cosine * u + sine * v + one_minus_cos_over_f * row_gradient[layer, i]
+                        next_v = -sine * u + cosine * v + sin_over_f * row_gradient[layer, i]
+                        exchanged[layer, 1, i, j] = mass * next_u
+                        exchanged[layer, 2, i, j] = mass * next_v
+            for layer in range(nlayer):
+                for component in range(ncomponent):
+                    for i in range(h):
+                        for j in range(w):
+                            state[layer, component, i, j] = exchanged[layer, component, i, j]
+            horizontal_courant_max = max(horizontal_courant_max, horizontal_rate * dt_sub)
+            vertical_courant_max = max(vertical_courant_max, vertical_fraction)
+            remaining -= dt_sub
+            substeps += 1
+        return state, interface_lm / dt_seconds, interface_mu / dt_seconds, substeps, horizontal_courant_max, vertical_courant_max, momentum_residual
+
+
 def evolve_hydrostatic_sigma_mass_momentum(
     lower_pressure_depth_pa: np.ndarray,
     midlevel_pressure_depth_pa: np.ndarray,
@@ -1104,7 +1356,7 @@ def evolve_hydrostatic_sigma_mass_momentum(
     x_face_length_m: np.ndarray | float = 1.0,
     y_face_length_m: np.ndarray | float = 1.0,
     layer_mass_fractions: tuple[float, float, float] = (0.40, 0.35, 0.25),
-    max_horizontal_courant: float = 0.25,
+    max_horizontal_courant: float = 0.9,
     max_vertical_courant: float = 0.25,
     lower_humidity: np.ndarray | None = None,
     midlevel_humidity: np.ndarray | None = None,
@@ -1192,6 +1444,79 @@ def evolve_hydrostatic_sigma_mass_momentum(
         float(gravity_m_s2) * max(float(np.max(heights) - np.min(heights)), 1.0)
     )
 
+    # The vectorized finite-volume path below is faster for the large grids
+    # used by the runtime gate.  Retain the compiled reference for explicitly
+    # requested low-Courant kernel checks, where its allocation-free state
+    # layout is useful without penalising the production transport loop.
+    if _NUMBA_AVAILABLE and tracer_active and max_horizontal_courant <= 0.25:
+        compiled = np.empty((3, 7, *shape), dtype=np.float64)
+        for index in range(3):
+            compiled[index, 0] = pressure_initial[index] / float(gravity_m_s2)
+            compiled[index, 1] = compiled[index, 0] * fields[6 + 2 * index]
+            compiled[index, 2] = compiled[index, 0] * fields[7 + 2 * index]
+            compiled[index, 3] = compiled[index, 0] * np.asarray(humidity_inputs[index], dtype=np.float64)
+            compiled[index, 4] = compiled[index, 0] * (
+                float(cp_dry_j_kg_k) * fields[3 + index]
+                + float(gravity_m_s2) * heights[index]
+                + float(latent_heat_j_kg) * np.asarray(humidity_inputs[index], dtype=np.float64)
+            )
+        if reservoirs_active:
+            for index, value in enumerate(reservoir_inputs[:3]):
+                compiled[index, 5] = np.asarray(value, dtype=np.float64)
+            for index, value in enumerate(reservoir_inputs[3:]):
+                compiled[index, 6] = np.asarray(value, dtype=np.float64)
+        else:
+            compiled[:, 5:] = 0.0
+        source = np.asarray(lower_surface_vapour_source_kg_m2_s, dtype=np.float64)
+        initial_mass = float(np.sum(np.sum(compiled[:, 0], axis=0) * area))
+        initial_water = float(np.sum(np.sum(compiled[:, 3], axis=0) * area))
+        initial_energy = float(np.sum(np.sum(compiled[:, 4], axis=0) * area))
+        result, interface_lm, interface_mu, substeps, horizontal_courant, vertical_courant, momentum_residual = (
+            _evolve_hydrostatic_sigma_mass_momentum_numba(
+                compiled, area, x_length, y_length, source, float(dt_seconds),
+                float(gravity_m_s2), float(gas_constant_dry_j_kg_k),
+                float(cp_dry_j_kg_k), float(latent_heat_j_kg), heights,
+                fractions, float(dy_m), float(sidereal_day_hours),
+                float(max_horizontal_courant), float(max_vertical_courant),
+            )
+        )
+        if substeps == -1:
+            raise RuntimeError(
+                "coupled sigma carrier exceeded its hydrostatic gravity-wave speed; "
+                "the pressure-coordinate approximation is no longer admissible"
+            )
+        if substeps == -2:
+            raise RuntimeError("coupled horizontal transport exhausted a sigma-layer mass")
+        if substeps == -3:
+            raise RuntimeError("coupled sigma CFL policy produced an invalid substep")
+        final_mass = float(np.sum(np.sum(result[:, 0], axis=0) * area))
+        actual_water = float(np.sum(np.sum(result[:, 3], axis=0) * area))
+        actual_energy = float(np.sum(np.sum(result[:, 4], axis=0) * area))
+        expected_water = initial_water + float(dt_seconds) * float(np.sum(source * area))
+        expected_energy = initial_energy + float(dt_seconds) * float(latent_heat_j_kg) * float(np.sum(source * area))
+        water_residual = (actual_water - expected_water) / max(abs(actual_water), abs(expected_water), 1.0)
+        mse_residual = (actual_energy - expected_energy) / max(abs(actual_energy), abs(expected_energy), 1.0)
+        humidity_next = [result[index, 3] / result[index, 0] for index in range(3)]
+        temperature_next = [
+            (result[index, 4] / result[index, 0] - float(gravity_m_s2) * heights[index]
+             - float(latent_heat_j_kg) * humidity_next[index]) / float(cp_dry_j_kg_k)
+            for index in range(3)
+        ]
+        return HydrostaticSigmaMassMomentumStep(
+            *(result[index, 0].astype(np.float32) * float(gravity_m_s2) for index in range(3)),
+            *(result[index, component].astype(np.float32) / result[index, 0].astype(np.float32) for index in range(3) for component in (1, 2)),
+            interface_lm.astype(np.float32), interface_mu.astype(np.float32),
+            (final_mass - initial_mass) / max(abs(initial_mass), abs(final_mass), 1.0),
+            float(momentum_residual), int(substeps), float(horizontal_courant), float(vertical_courant),
+            *(value.astype(np.float32) for value in humidity_next),
+            *(value.astype(np.float32) for value in temperature_next),
+            *(result[index, 5].astype(np.float32) for index in range(3)) if reservoirs_active else (None, None, None),
+            *(result[index, 6].astype(np.float32) for index in range(3)) if reservoirs_active else (None, None, None),
+            water_relative_residual=float(water_residual),
+            moist_static_energy_relative_residual=float(mse_residual),
+            horizontal_mse_convergence_w_m2=None,
+        )
+
     mass = [pressure / float(gravity_m_s2) for pressure in pressure_initial]
     momentum_u = [mass[index] * fields[6 + 2 * index] for index in range(3)]
     momentum_v = [mass[index] * fields[7 + 2 * index] for index in range(3)]
@@ -1229,6 +1554,7 @@ def evolve_hydrostatic_sigma_mass_momentum(
     initial_mass = sum(float(np.sum(value * area)) for value in mass)
     interface_lm_amount = np.zeros(shape, dtype=np.float64)
     interface_mu_amount = np.zeros(shape, dtype=np.float64)
+    horizontal_mse_convergence_j_m2 = np.zeros(shape, dtype=np.float64)
     residual_momentum = 0.0
     remaining = float(dt_seconds)
     substeps = 0
@@ -1274,8 +1600,43 @@ def evolve_hydrostatic_sigma_mass_momentum(
         if maximum_speed >= hydrostatic_gravity_wave_speed:
             raise RuntimeError(
                 "coupled sigma carrier exceeded its hydrostatic gravity-wave speed; "
+                f"maximum={maximum_speed:.3f} m/s, limit={hydrostatic_gravity_wave_speed:.3f} m/s; "
                 "the pressure-coordinate approximation is no longer admissible"
             )
+        # Momentum needs its own stability bound: a quiet column can have no
+        # advective CFL signal at all while a hydrostatic pressure gradient
+        # would accelerate it across the gravity-wave scale in one coarse host
+        # step.  This is derived from the resolved force and state, not a
+        # prescribed physical inner timestep or a wind limiter.
+        temperatures_for_cfl = temperatures
+        if tracer_active:
+            humidity_for_cfl = [inventories["water"][index] / mass[index] for index in range(3)]
+            temperatures_for_cfl = [
+                (inventories["energy"][index] / mass[index]
+                 - float(gravity_m_s2) * heights[index]
+                 - float(latent_heat_j_kg) * humidity_for_cfl[index]) / float(cp_dry_j_kg_k)
+                for index in range(3)
+            ]
+        total_pressure_for_cfl = sum(value * float(gravity_m_s2) for value in mass)
+        center_pressure_for_cfl = (
+            total_pressure_for_cfl - 0.5 * mass[0] * float(gravity_m_s2),
+            mass[2] * float(gravity_m_s2) + 0.5 * mass[1] * float(gravity_m_s2),
+            0.5 * mass[2] * float(gravity_m_s2),
+        )
+        maximum_pressure_gradient = 0.0
+        for temperature, center_pressure in zip(temperatures_for_cfl, center_pressure_for_cfl, strict=True):
+            geopotential = float(gas_constant_dry_j_kg_k) * np.mean(
+                temperature * np.log(total_pressure_for_cfl / center_pressure), axis=1
+            )
+            maximum_pressure_gradient = max(
+                maximum_pressure_gradient,
+                float(np.max(np.abs(np.gradient(geopotential, float(dy_m), edge_order=1)))),
+            )
+        momentum_dt_limit = np.inf if maximum_pressure_gradient == 0.0 else (
+            float(_MOMENTUM_WAVE_FRACTION)
+            * (hydrostatic_gravity_wave_speed - maximum_speed)
+            / maximum_pressure_gradient
+        )
         operators = [horizontal_operator(winds_u[index], winds_v[index]) for index in range(3)]
         inventory_names = tuple(inventories)
         stacked_state = [
@@ -1288,7 +1649,11 @@ def evolve_hydrostatic_sigma_mass_momentum(
         mass_tendency = [stacked_tendency[index][0] for index in range(3)]
         outbound = [operators[index][1] for index in range(3)]
         horizontal_rate = max(float(np.max(value)) for value in outbound)
-        dt_sub = remaining if horizontal_rate == 0.0 else min(remaining, max_horizontal_courant / horizontal_rate)
+        dt_sub = min(
+            remaining,
+            momentum_dt_limit,
+            np.inf if horizontal_rate == 0.0 else max_horizontal_courant / horizontal_rate,
+        )
         # The sigma-restoring exchange is computed from the same trial
         # horizontal mass update.  If it is the tighter donor constraint,
         # shorten the same substep before any state is committed.
@@ -1311,6 +1676,11 @@ def evolve_hydrostatic_sigma_mass_momentum(
             dt_sub *= max_vertical_courant / vertical_fraction
             if not np.isfinite(dt_sub) or dt_sub <= 0.0:
                 raise RuntimeError("coupled sigma CFL policy produced an invalid substep")
+
+        if tracer_active:
+            energy_component = 3 + inventory_names.index("energy")
+            for index in range(3):
+                horizontal_mse_convergence_j_m2 += dt_sub * stacked_tendency[index][energy_component]
 
         momentum_before_transport = [sum(float(np.sum(value * area)) for value in component) for component in (momentum_u, momentum_v)]
         momentum_scale = [sum(float(np.sum(np.abs(value) * area)) for value in component) for component in (momentum_u, momentum_v)]
@@ -1439,6 +1809,10 @@ def evolve_hydrostatic_sigma_mass_momentum(
         upperlevel_hydrometeors_kg_m2=None if hydrometeor_next is None else hydrometeor_next[2].astype(np.float32),
         water_relative_residual=water_relative_residual,
         moist_static_energy_relative_residual=mse_relative_residual,
+        horizontal_mse_convergence_w_m2=(
+            None if not tracer_active
+            else (horizontal_mse_convergence_j_m2 / float(dt_seconds)).astype(np.float32)
+        ),
     )
 
 
@@ -1725,30 +2099,67 @@ def evolve_hydrostatic_sigma_phase_reservoir_transport(
     """Own transport, phase conversion, and layer-resolved fallout once."""
     if not 0.0 < critical_relative_humidity < 1.0:
         raise ValueError("critical_relative_humidity must be in (0, 1)")
-    base = evolve_hydrostatic_sigma_pressure_coordinate_transport(
+    carrier = evolve_hydrostatic_sigma_mass_momentum(
         lower_pressure_depth_pa, midlevel_pressure_depth_pa, upperlevel_pressure_depth_pa,
-        lower_humidity, midlevel_humidity, upperlevel_humidity,
         lower_temperature_k, midlevel_temperature_k, upperlevel_temperature_k,
         lower_u_m_s, lower_v_m_s, midlevel_u_m_s, midlevel_v_m_s, upperlevel_u_m_s, upperlevel_v_m_s,
+        dt_seconds=dt_seconds, radius_m=radius_m, sidereal_day_hours=sidereal_day_hours,
+        gravity_m_s2=gravity_m_s2, cp_dry_j_kg_k=cp_dry_j_kg_k, latent_heat_j_kg=latent_heat_j_kg,
+        layer_heights_m=layer_heights_m, lower_humidity=lower_humidity,
+        midlevel_humidity=midlevel_humidity, upperlevel_humidity=upperlevel_humidity,
         lower_surface_vapour_source_kg_m2_s=lower_surface_vapour_source_kg_m2_s,
-        dt_seconds=dt_seconds, gravity_m_s2=gravity_m_s2, cp_dry_j_kg_k=cp_dry_j_kg_k,
-        latent_heat_j_kg=latent_heat_j_kg, layer_heights_m=layer_heights_m,
+        lower_cloud_condensate_kg_m2=lower_cloud_condensate_kg_m2,
+        midlevel_cloud_condensate_kg_m2=midlevel_cloud_condensate_kg_m2,
+        upperlevel_cloud_condensate_kg_m2=upperlevel_cloud_condensate_kg_m2,
+        lower_hydrometeors_kg_m2=lower_hydrometeors_kg_m2,
+        midlevel_hydrometeors_kg_m2=midlevel_hydrometeors_kg_m2,
+        upperlevel_hydrometeors_kg_m2=upperlevel_hydrometeors_kg_m2,
         dx_m=dx_m, dy_m=dy_m, cell_area_m2=cell_area_m2, x_face_length_m=x_face_length_m,
         y_face_length_m=y_face_length_m, layer_mass_fractions=layer_mass_fractions,
         max_vertical_courant=max_vertical_courant,
     )
-    from column_water import evolve_column_water
     from condensate import evolve_pressure_condensate_reservoirs
 
-    state = base.transport
+    initial_pressures = tuple(np.asarray(value, dtype=np.float64) for value in (
+        lower_pressure_depth_pa, midlevel_pressure_depth_pa, upperlevel_pressure_depth_pa,
+    ))
+    final_pressures = (
+        carrier.lower_pressure_depth_pa, carrier.midlevel_pressure_depth_pa,
+        carrier.upperlevel_pressure_depth_pa,
+    )
+    pressure_tendency = tuple(
+        (np.asarray(final_pressures[index], dtype=np.float64) - initial_pressures[index])
+        / float(gravity_m_s2) / float(dt_seconds)
+        for index in range(3)
+    )
+    transport = VariableMassPressureCoordinateTransportStep(
+        *final_pressures, carrier.lower_humidity, carrier.midlevel_humidity,
+        carrier.upperlevel_humidity, carrier.lower_temperature,
+        carrier.midlevel_temperature, carrier.upperlevel_temperature,
+        carrier.lower_mid_interface_mass_flux_kg_m2_s,
+        carrier.mid_upper_interface_mass_flux_kg_m2_s,
+        float(carrier.water_relative_residual),
+        float(carrier.moist_static_energy_relative_residual), carrier.substeps,
+        carrier.horizontal_courant_max, carrier.substeps, carrier.vertical_courant_max,
+    )
+    continuity = HydrostaticSigmaContinuityStep(
+        *pressure_tendency, carrier.lower_mid_interface_mass_flux_kg_m2_s,
+        carrier.mid_upper_interface_mass_flux_kg_m2_s,
+        (sum(np.asarray(value, dtype=np.float64) for value in final_pressures)
+         - sum(initial_pressures)) / float(dt_seconds),
+        0.0, carrier.substeps, carrier.horizontal_courant_max,
+    )
+    base = HydrostaticSigmaPressureCoordinateTransportStep(transport, continuity)
+    state = transport
     pressures = (state.lower_pressure_depth_pa, state.midlevel_pressure_depth_pa, state.upperlevel_pressure_depth_pa)
     humidity = [np.asarray(state.lower_humidity, dtype=np.float64), np.asarray(state.midlevel_humidity, dtype=np.float64), np.asarray(state.upperlevel_humidity, dtype=np.float64)]
     temperature = [np.asarray(state.lower_temperature, dtype=np.float64), np.asarray(state.midlevel_temperature, dtype=np.float64), np.asarray(state.upperlevel_temperature, dtype=np.float64)]
-    clouds = (lower_cloud_condensate_kg_m2, midlevel_cloud_condensate_kg_m2, upperlevel_cloud_condensate_kg_m2)
-    hydrometeors = (lower_hydrometeors_kg_m2, midlevel_hydrometeors_kg_m2, upperlevel_hydrometeors_kg_m2)
-    winds = ((lower_u_m_s, lower_v_m_s), (midlevel_u_m_s, midlevel_v_m_s), (upperlevel_u_m_s, upperlevel_v_m_s))
     shape = humidity[0].shape
-    reservoirs = tuple(np.asarray(value, dtype=np.float64) for value in clouds + hydrometeors)
+    reservoirs = tuple(np.asarray(value, dtype=np.float64) for value in (
+        carrier.lower_cloud_condensate_kg_m2, carrier.midlevel_cloud_condensate_kg_m2,
+        carrier.upperlevel_cloud_condensate_kg_m2, carrier.lower_hydrometeors_kg_m2,
+        carrier.midlevel_hydrometeors_kg_m2, carrier.upperlevel_hydrometeors_kg_m2,
+    ))
     if any(value.shape != shape or not np.all(np.isfinite(value)) or np.any(value < 0.0) for value in reservoirs):
         raise ValueError("layer condensate reservoirs must be finite, non-negative, and match the pressure state")
     fractions = np.asarray(layer_mass_fractions, dtype=np.float64)
@@ -1773,11 +2184,8 @@ def evolve_hydrostatic_sigma_phase_reservoir_transport(
         energy = mass * (float(cp_dry_j_kg_k) * temperature[index] + float(gravity_m_s2) * heights[index] + float(latent_heat_j_kg) * humidity[index])
         humidity[index] -= condensed_q
         temperature[index] = (energy / mass - float(gravity_m_s2) * heights[index] - float(latent_heat_j_kg) * humidity[index]) / float(cp_dry_j_kg_k)
-        kwargs = dict(dx_m=dx_m, dy_m=dy_m, dt_days=dt_seconds / 86400.0, cell_area_m2=cell_area_m2, x_face_length_m=x_face_length_m, y_face_length_m=y_face_length_m)
-        transported_cloud = evolve_column_water(reservoirs[index], np.zeros(shape), np.zeros(shape), *winds[index], **kwargs)
-        transported_hydro = evolve_column_water(reservoirs[3 + index], np.zeros(shape), np.zeros(shape), *winds[index], **kwargs)
         reservoir = evolve_pressure_condensate_reservoirs(
-            transported_cloud.water_mm, transported_hydro.water_mm, condensed_mass,
+            reservoirs[index], reservoirs[3 + index], condensed_mass,
             dt_days=dt_seconds / 86400.0, autoconversion_timescale_days=autoconversion_timescale_days,
             fallout_timescale_days=fallout_timescale_days,
             cloud_retention_kg_m2=float(cloud_retention_kg_m2) * fractions[index],
@@ -1785,7 +2193,6 @@ def evolve_hydrostatic_sigma_phase_reservoir_transport(
         cloud_next.append(reservoir.cloud_condensate_kg_m2)
         hydro_next.append(reservoir.precipitating_hydrometeors_kg_m2)
         fallout_parts.append(reservoir.fallout_kg_m2)
-        phase_water_residual = max(phase_water_residual, abs(float(transported_cloud.relative_residual)), abs(float(transported_hydro.relative_residual)))
     fallout = sum(np.asarray(value, dtype=np.float64) for value in fallout_parts)
     phased_transport = state._replace(
         lower_humidity=humidity[0].astype(np.float32), midlevel_humidity=humidity[1].astype(np.float32),
@@ -1793,17 +2200,9 @@ def evolve_hydrostatic_sigma_phase_reservoir_transport(
         midlevel_temperature=temperature[1].astype(np.float32), upperlevel_temperature=temperature[2].astype(np.float32),
     )
     phased_base = base._replace(transport=phased_transport)
-    momentum = evolve_variable_mass_pressure_momentum(
-        *pressures,
-        lower_u_m_s, lower_v_m_s, midlevel_u_m_s, midlevel_v_m_s, upperlevel_u_m_s, upperlevel_v_m_s,
-        temperature[0], temperature[1], temperature[2],
-        state.lower_mid_interface_mass_flux_kg_m2_s, state.mid_upper_interface_mass_flux_kg_m2_s,
-        dt_seconds=dt_seconds, radius_m=radius_m, sidereal_day_hours=sidereal_day_hours,
-        gravity_m_s2=gravity_m_s2, max_vertical_courant=max_vertical_courant,
-    )
     return HydrostaticSigmaPhaseReservoirStep(
         phased_base, *(np.asarray(value, dtype=np.float32) for value in cloud_next), *(np.asarray(value, dtype=np.float32) for value in hydro_next), fallout.astype(np.float32),
-        max(abs(state.water_relative_residual), phase_water_residual), state.moist_static_energy_relative_residual, momentum,
+        max(abs(state.water_relative_residual), phase_water_residual), state.moist_static_energy_relative_residual, carrier,
     )
 
 

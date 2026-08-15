@@ -3705,6 +3705,13 @@ def simulate_step(
         upperlevel_wind_v_full = state.upperlevel_wind_v
 
     pressure_overturning_heating_next = state.pressure_overturning_heating_w_m2
+    pressure_coordinate_heat_convergence_next = state.pressure_coordinate_heat_convergence_w_m2
+    if _hydrostatic_sigma_runtime_active:
+        pressure_coordinate_heat_convergence_next = _precipitation_diagnostics.get(
+            "hydrostatic_sigma_heat_convergence_w_m2"
+        )
+        if pressure_coordinate_heat_convergence_next is None:
+            raise RuntimeError("hydrostatic sigma gate did not emit its MSE heat-convergence diagnostic")
     if _prognostic_overturning_heat_active and not _hydrostatic_sigma_runtime_active:
         _simultaneous_heating = (
             None if _precipitation_diagnostics is None
@@ -4231,6 +4238,7 @@ def simulate_step(
             ) / max(float(days), 1e-12)
         ),
         pressure_overturning_heating_w_m2=pressure_overturning_heating_next,
+        pressure_coordinate_heat_convergence_w_m2=pressure_coordinate_heat_convergence_next,
         # The hydrostatic-sigma state is inert until its deepest experimental
         # gate owns a complete transition. Preserve it verbatim meanwhile so
         # save/load and gate-off stepping cannot silently discard it.

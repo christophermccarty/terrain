@@ -606,15 +606,35 @@ identical donor faces; it derives the two continuity exchanges from that same
 horizontal update, performs those parcels simultaneously, restores the sigma
 partition exactly, and then applies the hydrostatic
 pressure-gradient/Coriolis force. Its coupled horizontal and vertical donor
-fractions set the timestep; it has no wind cap, damping, mass floor, fallback,
-or prescribed cadence. A 30-day divergent-wind regression keeps every layer
-finite, preserves mass/water/MSE, and verifies both Courant bounds. A speed
+fractions set the timestep; the horizontal donor fraction is bounded by a
+strict 0.9 positivity margin (so roundoff cannot empty a donor layer) and the
+simultaneous vertical donor fraction by 0.25. It has no wind cap, damping,
+mass floor, fallback, or prescribed
+cadence. A 30-day divergent-wind regression keeps every layer finite,
+preserves mass/water/MSE, and verifies both Courant bounds. A speed
 that exceeds the hydrostatic gravity-wave scale is rejected rather than
-clipped. A 64x128 one-month runtime-coupling probe did not complete within 60
-seconds, so this more-expensive coupled carrier is retained as a pure kernel
-and is not yet wired into the atmosphere gate. The remaining integration work
-is an efficient, equivalently conservative carrier implementation suitable for
-the compact screen—not a relaxed or capped substitute.
+clipped. A derived pressure-gradient momentum-CFL bound now limits each
+resolved acceleration increment to half of the *remaining* gravity-wave-speed
+headroom; it is a state-derived numerical stability condition, not a wind cap
+or prescribed physical cadence. The atomic hydrostatic-sigma runtime gate now
+uses this carrier, rather than the older split transport/phase/momentum path.
+Its three-layer horizontal MSE-flux convergence is emitted as the
+area-balanced persisted diagnostic
+`pressure_coordinate_heat_convergence_w_m2`; this is the atmospheric
+heat-convergence term Phase 3 requires.
+
+**Runtime admission result (2026-08-14): rejected, redesign required.** The
+first real-terrain 64x128 MONTHLY screen without the momentum bound crossed
+the gravity-wave limit at 283.276 m/s against a 280.143 m/s limit. The
+headroom-bound version remains finite, but the standard one-year spin-up plus
+one-year evaluation protocol had consumed more than 37 CPU-minutes without
+finishing, because the MONTHLY policy invokes the atomic carrier five times
+per month and each call resolves the physical pressure-gradient and advective
+CFL constraints. Do not remove the bound, reintroduce damping, or use a cap
+to obtain a score. The next Phase-2 architecture is a conservative
+semi-implicit or otherwise fast gravity-wave/mass-continuity solve that
+remains finite under the same pressure-gradient contract; only then rerun the
+complete climate gate.
 
 A simulation-step gate-off regression now also seeds every persisted
 hydrostatic-sigma field and proves that the normal supported step retains each
