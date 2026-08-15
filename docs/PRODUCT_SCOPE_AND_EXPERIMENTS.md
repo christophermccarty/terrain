@@ -121,6 +121,7 @@ than candidate Earth defaults.
 |---|---|---|
 | Scenario forcing | `aerosol_optical_depth` | Valid clear-sky Earth baseline (`0.0`). A positive value is an explicit volcanic/aerosol scenario, not a missing baseline feature. |
 | Land-seasonal refinements | `land_transport_deficit_k`, `land_thermal_inertia_days`, `land_transport_seasonality`, `land_cap_softness_k`, `evap_cooling_amplitude` | Keep inert. These have individually shown useful directional behavior but no configuration has cleared the cross-resolution climate gates. Do not revisit them as independent scalar sweeps; priority 3 established that the credible follow-up is a redesigned force-restore path with atmospheric heat convergence. |
+| Phase 3 land replacement | `enable_force_restore_land`, `enable_force_restore_atmospheric_heat_convergence`, `enable_force_restore_conservative_land_air_exchange` | Default-off retained experiment. The convergence is diagnosed from the supported advection/diffusion increment, converted to W m-2, and globally area-closed. Five compact physical variants improved the uncoupled force-restore control but none matched the supported baseline. A subsequent conservative sensible-exchange candidate was energy-closed but failed its 32x64 directional screen, exposing the need for a distinct boundary-layer reservoir; no higher-resolution promotion run is authorized. |
 | Moisture transport | `moisture_advection_scale` | Keep inert. The added long-range transport is implemented and tested, but has no net validated Earth improvement over the calibrated path. |
 | Three-level tuning companions | `three_level_divergence_filter_strength`, `three_level_divergence_filter_passes`, `three_level_balanced_thermal_wind_relaxation`, `native_balanced_pressure_relaxation`, `native_balanced_ageostrophic_timescale_hours`, `native_balanced_overturning_speed_m_s`, `three_level_diabatic_ascent_scale` | Inactive because their parent three-level gates are off. They are not independent user controls and must not be tuned outside that family’s promotion protocol. |
 | Column-water tuning companion | `evaporation_downwelling_longwave_w_m2` | Inactive because `enable_energy_limited_evaporation` is off; evaluate only with the complete conserved-column-water family. |
@@ -254,25 +255,27 @@ retuning the ceiling by itself is not justified.
 The physically motivated replacement is present as the default-off
 `enable_force_restore_land` path. It replaces, rather than stacks on, the
 legacy seasonal blend and ceiling with a two-reservoir force-restore surface
-and moisture-dependent Penman--Monteith partition. Its local annual-cycle
-shape is more physical, but it does not yet represent the atmospheric
-eddy/storm-track heat convergence that the supported path currently supplies.
+and moisture-dependent Penman--Monteith partition. The companion default-off
+`enable_force_restore_atmospheric_heat_convergence` now supplies the exact
+supported advection/diffusion temperature increment in energy units and
+projects it to zero global area mean before coupling.
 
-A representative current CRU A/B at 64x128 (one year spin-up plus one year
-evaluation, 30-day restore time, 12 MJ m-2 K-1 deep capacity, and 2000 s m-1
-dry resistance) remains decisively outside the promotion gate: temperature
-RMSE is 6.279 -> 7.679 C, Koppen group accuracy 0.674 -> 0.603, and class
-accuracy 0.388 -> 0.248. Precipitation log-RMSE improves 1.406 -> 1.363, but
-that single gain cannot compensate for the temperature and biome regressions.
-The wider published-range screen is recorded in
-`docs/PRIOR_ART_IMPLEMENTATION_PLAN.md`.
+The completed 2026-08-15 compact matrix confirms that the forcing is useful
+but insufficient. All five bounded candidates improve the uncoupled
+force-restore control. The best temperature RMSE is 7.793 C, versus 7.940 C
+without convergence, but the supported path remains 6.276 C. The best-RMSE
+candidate also scores only 0.603/0.262 Koppen group/class accuracy versus the
+supported 0.674/0.389. Its annual-cycle shape is much less plateaued and its
+precipitation log error improves, but Central Europe and coastal East Asia
+retain excessive seasonal ranges. Full evidence and forcing diagnostics are
+recorded in `docs/REMAINING_WORK_PLAN.md`.
 
 Priority 3 is therefore complete as a supported-baseline decision: retain the
-current default and keep force-restore experimental. Do not perform another
-local parameter sweep or introduce a softer/global ceiling. A future promotion
-attempt needs a separately designed, diagnosed atmospheric heat-convergence
-term in the replacement architecture, with a physically defined forcing and
-the same CRU/Koppen gates; copying the legacy latitude trapezoids would only
-move the old surrogate into the new branch. The next work priority is the
-explicit promote/redesign/retire decision for each remaining experimental
-family.
+current default and keep force-restore plus diagnosed convergence experimental.
+Do not perform another local parameter sweep or introduce a softer/global
+ceiling. A direct full-column conservative land-air exchange was also tested
+and rejected at 32x64: it damped several regional seasonal ranges but worsened
+global CRU and Koppen skill. A future promotion attempt requires a distinct
+boundary-layer thermal reservoir and conservative boundary-layer/free-air
+exchange; copying the legacy latitude trapezoids would only move the old
+surrogate into the new branch.

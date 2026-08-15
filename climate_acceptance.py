@@ -16,7 +16,11 @@ SCORECARD_KEYS = (
 def _regional_target_errors(report: Mapping[str, Any]) -> dict[str, float]:
     """Return comparable named-region target errors when a report provides them."""
     values = (report.get("metrics") or {}).get("regional_target_error_fraction") or {}
-    return {str(name): float(value) for name, value in values.items()}
+    return {
+        str(name): float(value)
+        for name, value in values.items()
+        if value is not None
+    }
 
 
 def scorecard(report: Mapping[str, Any]) -> dict[str, float]:
@@ -121,6 +125,68 @@ def evaluate_land_candidate(
         "baseline": baseline,
         "candidate": candidate,
         "delta": deltas,
+        "gates": gates,
+        "accepted": all(gates.values()),
+    }
+
+
+def evaluate_phase3_candidate(
+    candidate_report: Mapping[str, Any], baseline_report: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Strict Phase 3 replacement gate against the supported land baseline."""
+    decision = evaluate_land_candidate(candidate_report, baseline_report)
+    candidate_metrics = candidate_report["metrics"]
+    baseline_metrics = baseline_report["metrics"]
+    candidate_thresholds = candidate_metrics.get("koppen_temperature_thresholds") or {}
+    baseline_thresholds = baseline_metrics.get("koppen_temperature_thresholds") or {}
+    candidate_cycle = candidate_metrics.get("land_seasonal_cycle") or {}
+    baseline_cycle = baseline_metrics.get("land_seasonal_cycle") or {}
+    convergence = candidate_metrics.get("atmospheric_heat_convergence") or {}
+    candidate_regional = _regional_target_errors(candidate_report)
+    baseline_regional = _regional_target_errors(baseline_report)
+    regional_names = sorted(set(candidate_regional) | set(baseline_regional))
+    regional_deltas = {
+        name: candidate_regional.get(name, float("inf"))
+        - baseline_regional.get(name, float("inf"))
+        for name in regional_names
+    }
+
+    threshold_delta: dict[str, float] = {}
+    for key in ("coldest_month", "warmest_month"):
+        candidate_value = (candidate_thresholds.get(key) or {}).get("accuracy")
+        baseline_value = (baseline_thresholds.get(key) or {}).get("accuracy")
+        if candidate_value is None or baseline_value is None:
+            raise ValueError(f"report lacks Phase 3 threshold metric {key}")
+        threshold_delta[key] = float(candidate_value) - float(baseline_value)
+    candidate_cycle_error = candidate_cycle.get("cycle_error_score")
+    baseline_cycle_error = baseline_cycle.get("cycle_error_score")
+    if candidate_cycle_error is None or baseline_cycle_error is None:
+        raise ValueError("report lacks Phase 3 land-cycle metric")
+
+    extra_gates = {
+        "coldest_month_threshold_preserved": threshold_delta["coldest_month"] >= 0.0,
+        "warmest_month_threshold_preserved": threshold_delta["warmest_month"] >= 0.0,
+        "land_cycle_shape_improves": float(candidate_cycle_error) < float(baseline_cycle_error),
+        "precipitation_log_correlation_preserved": (
+            decision["delta"]["precipitation_log_correlation"] >= -0.005
+        ),
+        "regional_precipitation_skill_preserved": (
+            all(delta <= 1e-12 for delta in regional_deltas.values())
+            if regional_names else True
+        ),
+        "heat_convergence_diagnosed": bool(convergence),
+        "heat_convergence_globally_closed": (
+            bool(convergence)
+            and float(convergence.get("max_abs_global_area_mean_w_m2", float("inf"))) <= 1e-3
+        ),
+    }
+    gates = {**decision["gates"], **extra_gates}
+    return {
+        **decision,
+        "threshold_accuracy_delta": threshold_delta,
+        "land_cycle_error_delta": float(candidate_cycle_error) - float(baseline_cycle_error),
+        "regional_target_error_delta": regional_deltas,
+        "regional_target_errors_checked": bool(regional_names),
         "gates": gates,
         "accepted": all(gates.values()),
     }

@@ -668,12 +668,20 @@ def _regional_land_temperature_metrics(
         model_series = np.mean(model[:, mask], axis=1)
         observed_series = np.mean(observed[:, mask], axis=1)
         delta_c = model_series - observed_series
+        worst_month = int(np.argmax(np.abs(delta_c)))
         result[region.name] = {
             "annual_bias_c": float(np.mean(delta_c)),
             "monthly_rmse_c": float(np.sqrt(np.mean(delta_c**2))),
+            "monthly_bias_c": [float(value) for value in delta_c],
+            "worst_month_index": worst_month + 1,
+            "worst_month_bias_c": float(delta_c[worst_month]),
             "model_seasonal_range_c": float(np.max(model_series) - np.min(model_series)),
             "reference_seasonal_range_c": float(
                 np.max(observed_series) - np.min(observed_series)
+            ),
+            "seasonal_range_error_c": float(
+                (np.max(model_series) - np.min(model_series))
+                - (np.max(observed_series) - np.min(observed_series))
             ),
         }
     return result
@@ -911,6 +919,39 @@ def _advance_cycle(
     return state
 
 
+def _advance_cycle_with_heat_convergence(
+    state: PlanetState,
+    mode: TimeScaleMode,
+    pp: PlanetParams,
+    config: RealTerrainValidationConfig,
+) -> tuple[PlanetState, list[np.ndarray], list[float]]:
+    """Advance one cycle while retaining the Phase 3 forcing fields."""
+    samples: list[np.ndarray] = []
+    area_means: list[float] = []
+    for step_days, update_wind in substeps_for_mode(mode, pp):
+        state, components = simulate_step(
+            state,
+            days=step_days,
+            block_size=config.block_size,
+            wind_block_size=config.wind_block_size,
+            precip_block_size=config.precip_block_size,
+            update_wind=update_wind,
+            time_scale=mode,
+            planet_params=pp,
+            track_components=True,
+        )
+        field = components.get("atmospheric_heat_convergence_w_m2")
+        if field is not None:
+            samples.append(np.asarray(field, dtype=np.float32))
+            area_mean = components.get(
+                "atmospheric_heat_convergence_applied_grid_area_mean_w_m2"
+            )
+            if area_mean is None:
+                raise RuntimeError("Phase 3 forcing lacks applied-grid closure diagnostic")
+            area_means.append(float(area_mean))
+    return state, samples, area_means
+
+
 def _regional_moisture_budget_snapshot(
     state: PlanetState,
     planet_params: PlanetParams,
@@ -976,6 +1017,7 @@ def run_real_terrain_validation(
     initial_state_path: str | Path | None = None,
     monthly_climatology_path: str | Path | None = None,
     wind_climatology_path: str | Path | None = None,
+    track_phase3_heat_convergence: bool = False,
 ) -> tuple[PlanetState, dict[str, Any]]:
     """Run a deterministic real-DEM spinup/evaluation and return state plus report.
 
@@ -1055,10 +1097,19 @@ def run_real_terrain_validation(
     seasonal_regional_moisture_snapshots: list[
         tuple[str, float, dict[str, dict[str, float | None]]]
     ] = []
+    heat_convergence_samples: list[np.ndarray] = []
+    heat_convergence_area_means: list[float] = []
     sampled_days = 0.0
     cycle_duration = cycle_days(mode, planet_params)
     for _ in range(evaluation_cycles):
-        state = _advance_cycle(state, mode, planet_params, config)
+        if track_phase3_heat_convergence:
+            state, cycle_heat_samples, cycle_heat_area_means = (
+                _advance_cycle_with_heat_convergence(state, mode, planet_params, config)
+            )
+            heat_convergence_samples.extend(cycle_heat_samples)
+            heat_convergence_area_means.extend(cycle_heat_area_means)
+        else:
+            state = _advance_cycle(state, mode, planet_params, config)
         regional_snapshot = _regional_moisture_budget_snapshot(state, planet_params)
         regional_moisture_snapshots.append((cycle_duration, regional_snapshot))
         seasonal_regional_moisture_snapshots.append(
@@ -1145,6 +1196,17 @@ def run_real_terrain_validation(
         mean_lower_meridional_wind_m_s=mean_lower_v,
         mean_upper_meridional_wind_m_s=mean_upper_v,
     )
+    if track_phase3_heat_convergence:
+        from atmospheric_heat_transport import summarize_heat_convergence_samples
+
+        latitude = (
+            0.5 - (np.arange(config.height, dtype=np.float64) + 0.5) / config.height
+        ) * np.pi
+        metrics["atmospheric_heat_convergence"] = summarize_heat_convergence_samples(
+            heat_convergence_samples,
+            latitude,
+            applied_grid_area_means_w_m2=heat_convergence_area_means,
+        )
     metrics["regional_moisture_budget"] = time_average_regional_moisture_budget(
         regional_moisture_snapshots
     )

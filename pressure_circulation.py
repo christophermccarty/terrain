@@ -382,6 +382,64 @@ class HydrostaticSigmaMassMomentumStep(NamedTuple):
     horizontal_mse_convergence_w_m2: np.ndarray | None = None
 
 
+def project_zonal_mean_barotropic_mass_flux(
+    lower_pressure_depth_pa: np.ndarray,
+    midlevel_pressure_depth_pa: np.ndarray,
+    upperlevel_pressure_depth_pa: np.ndarray,
+    lower_v_m_s: np.ndarray,
+    midlevel_v_m_s: np.ndarray,
+    upperlevel_v_m_s: np.ndarray,
+    *,
+    gravity_m_s2: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project out only the unresolved zonal-mean column mass-flux mode.
+
+    A hydrostatic sigma column cannot sustain a net zonal-mean meridional mass
+    export at one latitude without a matching pressure tendency or explicit
+    boundary source.  This anelastic projection removes that single barotropic
+    mode, leaving all longitude-dependent flow and every inter-level shear
+    unchanged.  It has no tunable coefficient, damping, or speed limiter.
+    """
+    if gravity_m_s2 <= 0.0:
+        raise ValueError("gravity_m_s2 must be positive")
+    raw = tuple(np.asarray(value, dtype=np.float64) for value in (
+        lower_pressure_depth_pa, midlevel_pressure_depth_pa, upperlevel_pressure_depth_pa,
+        lower_v_m_s, midlevel_v_m_s, upperlevel_v_m_s,
+    ))
+    shape = raw[0].shape
+    if len(shape) != 2 or shape[1] != 2 * shape[0] or any(value.shape != shape for value in raw):
+        raise ValueError("barotropic projection fields must share a two-dimensional 2:1 grid")
+    if any(not np.all(np.isfinite(value)) for value in raw) or any(np.any(value <= 0.0) for value in raw[:3]):
+        raise ValueError("barotropic projection requires finite winds and positive pressure depths")
+    masses = [raw[index] / float(gravity_m_s2) for index in range(3)]
+    velocities = raw[3:]
+    mass_mean = sum(np.mean(value, axis=1) for value in masses)
+    flux_mean = sum(np.mean(masses[index] * velocities[index], axis=1) for index in range(3))
+    correction = flux_mean / mass_mean
+    return tuple((velocity - correction[:, None]).astype(np.float32) for velocity in velocities)
+
+
+def conservative_periodic_uniform_remap(field: np.ndarray, courant: float) -> np.ndarray:
+    """Conservatively remap a periodic cell-average field at arbitrary CFL.
+
+    For a uniform face velocity the exact donor-cell remap is a whole-cell
+    translation plus one fractional overlap.  Unlike an explicit donor update,
+    this remains positive and conservative for Courant numbers above one and
+    contains no numerical timestep or damping control.
+    """
+    values = np.asarray(field, dtype=np.float64)
+    if values.ndim < 1 or values.shape[-1] < 2 or not np.all(np.isfinite(values)):
+        raise ValueError("periodic remap requires a finite field with at least two cells")
+    if not np.isfinite(courant):
+        raise ValueError("courant must be finite")
+    whole = int(np.floor(float(courant)))
+    fraction = float(courant) - whole
+    # Positive Courant transports a donor field eastward, hence samples from
+    # progressively western cells in the receiver representation.
+    return ((1.0 - fraction) * np.roll(values, whole, axis=-1)
+            + fraction * np.roll(values, whole + 1, axis=-1))
+
+
 class HydrostaticSigmaPressureCoordinateTransportStep(NamedTuple):
     """One fully continuity-closed hydrostatic sigma transport transition."""
 

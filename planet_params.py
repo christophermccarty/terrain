@@ -589,6 +589,54 @@ class PlanetParams:
     Köppen promotion gates.
     """
 
+    enable_force_restore_atmospheric_heat_convergence: bool = False
+    """Feed resolved atmospheric heat convergence to force-restore land.
+
+    This experimental Phase 3 gate diagnoses the exact temperature increment
+    produced by the supported atmosphere's horizontal advection and diffusion
+    operators, converts that increment with the represented column heat
+    capacity, and supplies it as a surface-energy forcing.  It has no effect
+    unless ``enable_force_restore_land`` is also true.
+    """
+
+    enable_force_restore_conservative_land_air_exchange: bool = False
+    """Use explicit equal-and-opposite sensible exchange in force-restore land.
+
+    When enabled with ``enable_force_restore_land``, the replacement branch
+    disables its empirical land-side air-temperature relaxation and instead
+    adds the Penman--Monteith surface sensible flux to the represented
+    atmospheric column using ``(p_s/g) cp``. Ocean relaxation is unchanged.
+    """
+
+    enable_force_restore_boundary_layer: bool = False
+    """Use a distinct prognostic land atmospheric mixed layer.
+
+    This experimental gate requires ``enable_force_restore_land``.  Penman--
+    Monteith uses the mixed-layer temperature, surface sensible heat enters
+    that reservoir, and conservative entrainment exchanges energy with the
+    horizontally transported free atmosphere.  The mixed layer itself has no
+    horizontal transport in this first diagnostic implementation.
+    """
+
+    boundary_layer_mixed_depth_m: float = 1_000.0
+    """Dry mixed-layer geometric depth [m], used to derive pressure mass."""
+
+    boundary_layer_entrainment_velocity_m_s: float = 0.005
+    """Mixed-layer/free-air entrainment velocity [m s-1].
+
+    The exchange conductance is ``rho * cp * w_e``; this is a physical mass-
+    exchange velocity rather than an unconstrained temperature relaxation.
+    """
+
+    enable_boundary_layer_stability_dependent_exchange: bool = False
+    """Suppress mixed-layer entrainment across stable inversions.
+
+    The experimental closure diagnoses the bulk Richardson number and limits
+    entrainment with the stable Businger--Dyer ``1 + 5 Ri`` form and a friction
+    velocity from the logarithmic wind law.  It preserves fixed entrainment as
+    an explicit control and has no effect outside the boundary-layer branch.
+    """
+
     land_force_restore_days: float = 30.0
     """Surface-to-deep-soil restore time scale [days] in the gated land path."""
 

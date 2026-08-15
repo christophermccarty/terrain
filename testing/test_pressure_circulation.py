@@ -33,6 +33,8 @@ from pressure_circulation import (
     water_constrained_three_branch_mse_pressure_coordinate_circulation,
     three_branch_mse_constrained_pressure_coordinate_circulation,
     shared_pressure_coordinate_circulation,
+    project_zonal_mean_barotropic_mass_flux,
+    conservative_periodic_uniform_remap,
     smooth_spherical_scalar,
     spherical_divergence,
 )
@@ -384,6 +386,30 @@ def test_hydrostatic_sigma_mass_momentum_rejects_nonhydrostatic_carrier_speed():
             cell_area_m2=inputs["cell_area_m2"], x_face_length_m=inputs["x_face_length_m"],
             y_face_length_m=inputs["y_face_length_m"],
         )
+
+
+def test_barotropic_mass_flux_projection_preserves_shear_and_closes_each_latitude():
+    shape = (8, 16)
+    lower_p, mid_p, upper_p = (np.full(shape, value) for value in (40_000.0, 35_000.0, 25_000.0))
+    longitude = np.linspace(0.0, 2.0 * np.pi, shape[1], endpoint=False)
+    lower_v = np.broadcast_to(4.0 + np.sin(longitude)[None, :], shape).copy()
+    mid_v = np.broadcast_to(8.0 + np.sin(longitude)[None, :], shape).copy()
+    upper_v = np.broadcast_to(-2.0 + np.sin(longitude)[None, :], shape).copy()
+    corrected = project_zonal_mean_barotropic_mass_flux(
+        lower_p, mid_p, upper_p, lower_v, mid_v, upper_v, gravity_m_s2=9.80665,
+    )
+    flux = sum(pressure / 9.80665 * velocity for pressure, velocity in zip((lower_p, mid_p, upper_p), corrected, strict=True))
+    np.testing.assert_allclose(np.mean(flux, axis=1), 0.0, atol=3e-4)
+    np.testing.assert_allclose(corrected[1] - corrected[0], mid_v - lower_v)
+    np.testing.assert_allclose(corrected[2] - corrected[1], upper_v - mid_v)
+
+
+def test_conservative_periodic_uniform_remap_handles_large_courant_without_loss():
+    field = np.array([[0.0, 1.0, 3.0, 2.0, 0.5, 4.0]], dtype=np.float64)
+    result = conservative_periodic_uniform_remap(field, 17.25)
+    np.testing.assert_allclose(np.sum(result), np.sum(field), rtol=1e-7)
+    assert np.min(result) >= np.min(field)
+    assert np.max(result) <= np.max(field)
 
 
 def test_hydrostatic_sigma_phase_transition_closes_water_with_layer_reservoirs():

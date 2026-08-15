@@ -67,6 +67,7 @@ def test_safe_npz_roundtrip_preserves_extended_state(tmp_path):
         lower_pressure_hydrometeors=np.full((8, 16), 0.05, dtype=np.float32),
         midlevel_pressure_hydrometeors=np.full((8, 16), 0.07, dtype=np.float32),
         upperlevel_pressure_hydrometeors=np.full((8, 16), 0.03, dtype=np.float32),
+        boundary_layer_temperature=np.full((8, 16), 289.0, dtype=np.float32),
     )
     path = tmp_path / "test.npz"
     save_state(state, path)

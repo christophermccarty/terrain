@@ -641,12 +641,118 @@ hydrostatic-sigma field and proves that the normal supported step retains each
 array exactly. This protects the forthcoming atomic bypass from both ordinary
 state loss and a false no-op claim.
 
+**Candidate 1 — compiled explicit carrier (2026-08-14): rejected.** The
+existing finite-volume carrier was moved wholesale into its compiled path,
+including the same pressure-gradient/gravity-wave-headroom timestep bound as
+the reference transition. Its 53 focused pressure-circulation regressions
+passed, but a realistic 64x128 six-day enabled transition exceeded 60 seconds
+(the baseline vectorised transition takes about 12.6 seconds after warm-up).
+The scalar compiled adaptive loop cannot amortise the many headroom-limited
+substeps. The edit was reverted. This rules out a direct implementation-only
+port: the next candidate must reduce the stiffness structurally while retaining
+conservative pressure/mass continuity and the hydrostatic admissibility test.
+
+**Candidate 2 — semi-implicit barotropic pressure response (2026-08-14):
+rejected.** A pure implicit gravity-wave pressure/continuity kernel passed its
+resting-column and coarse-step finite regressions and was wired behind a new
+default-off sub-gate. The first 64x128 six-day enabled transition completed in
+0.12 seconds, but its resolved carrier reached 289.5 m/s against the same
+280.1 m/s hydrostatic gravity-wave limit. The method removes the runtime
+stiffness but not the underlying unbalanced acceleration, so it is not a
+valid Phase-2 carrier. Revert the sub-gate and retain only the documented
+result; Candidate 3 must supply an actual balanced momentum/pressure relation,
+not merely an unconditionally stable pressure solve.
+
+**Candidate 3 — zonal-mean anelastic barotropic projection (2026-08-14):
+rejected.** The pure projection exactly removed each latitude's zonal-mean
+column meridional mass export while preserving vertical shear, and its focused
+regression suite passed. The first 64x128 six-day transition stayed admissible
+(52.5 m/s peak upper wind), but the required 30-day enabled sequence exceeded
+60 seconds. It does not relieve the carrier's adaptive transport cost, so the
+runtime integration was reverted. Candidate 4 must change the transport
+algorithm itself, not merely constrain one component of its input wind.
+
+**Candidate 4 — conservative large-Courant moving-frame remap (2026-08-14):
+rejected.** An arbitrary-Courant periodic remap preserved positivity and mass,
+and the complete carrier retained all 55 focused regressions when the same
+remap was applied to mass, momentum, water, MSE, cloud, and hydrometeors. In
+the 64x128 30-day runtime gate, day 6 took 19.1 seconds and day 12 reached 34.6
+seconds; day 18 did not finish before the 60-second limit. Removing uniform
+zonal translation does not remove the residual adaptive stiffness. The runtime
+wiring was reverted. Candidate 5 may optimize the full residual carrier only
+if it preserves the identical force and CFL contracts.
+
+**Candidate 5 — compiled carrier with in-substep anelastic projection
+(2026-08-14): rejected.** The compiled finite-volume path projected the
+zonal-mean column mass-flux mode before every donor transition and transported
+all seven conserved components together. All 55 focused regressions passed,
+but the 64x128 runtime gate took 48.3 seconds for its first six-day transition
+and did not complete day 12 before 60 seconds. Compiling the residual carrier
+therefore does not make the adaptive architecture admissible. The runtime edit
+was reverted. Five bounded redesign attempts have now rejected compilation,
+implicit pressure response, anelastic projection, large-Courant moving-frame
+remapping, and their compiled combination. Phase 2 remains redesign-required.
+
+**Equivalent-forcing investigation (2026-08-14): Phase 3 dependency met at
+compact admission scale.** Three independent alternatives were evaluated
+before relaxing the dependency on the rejected native pressure-column runtime:
+
+1. An offline seasonal-storage inversion produced a bounded field (land
+   monthly standard deviation 2.23 W m-2, 5th/95th percentiles -3.68/+3.66
+   W m-2), but its annual mean is zero by construction and its point-month
+   correlation with resolved supported transport was only 0.014. A fuller
+   CRU-target surface-energy residual was much worse: +409 W m-2 mean, 660
+   W m-2 standard deviation, and values up to 4.04 kW m-2. It conflates model
+   state error with missing transport and is rejected as a forcing; retain it
+   only as an offline falsification diagnostic.
+2. ExoPlaSim 3.4.2 exposes the required monthly energy fields: net top
+   radiation (`ntr`, code 261) and surface downward heat flux (`hfns`, code
+   263). With its downward-positive convention, atmospheric horizontal heat
+   convergence follows the auditable budget `storage - ntr + hfns`. The
+   retained T21 reference contains only `tas` and `pr`, however, and the local
+   Windows probe cannot build ExoPlaSim; a Linux rerun is required before this
+   route can be numerically validated. It remains an independent future
+   provider/falsification route, not a current runtime dependency.
+3. The supported single-layer atmosphere can provide an equivalent forcing
+   without the rejected pressure runtime. The exact temperature increment
+   immediately after its active horizontal advection and diffusion operators
+   is converted with `(p_s/g) cp / dt`. The prior public component diagnostic
+   was unsuitable because it subtracted from the final end-of-step air
+   temperature and therefore included downstream surface physics. The new
+   diagnostic is captured at the operator boundary and its area-weighted
+   global mean is removed, enforcing the closed-sphere requirement that
+   horizontal heat convergence integrate to zero.
+
+The third route is wired behind
+`enable_force_restore_atmospheric_heat_convergence`, which is default-off and
+requires `enable_force_restore_land`. On the bundled 64x128 Earth DEM with one
+year spin-up and one year evaluation against CRU TS v4.10, the exact current
+force-restore control and the globally closed forcing candidate measured:
+
+| Metric | Force-restore control | Closed resolved forcing |
+|---|---:|---:|
+| land monthly temperature RMSE (C) | 7.940 | 7.857 |
+| land monthly temperature correlation | 0.868 | 0.876 |
+| precipitation monthly RMSE (mm/day) | 2.626 | 2.614 |
+| precipitation annual log correlation | 0.518 | 0.522 |
+| Koppen group accuracy | 0.583 | 0.608 |
+| Koppen class accuracy | 0.229 | 0.267 |
+| coldest-month threshold accuracy | 0.743 | 0.770 |
+| warmest-month threshold accuracy | 0.369 | 0.412 |
+
+The candidate improves every stated compact admission metric, so it is
+**retained experimental** and Phase 3 may start. Its +2.70 C monthly bias and
+7.86 C RMSE remain worse than the supported legacy-land baseline (6.28 C
+tracked compact RMSE), so this is not default promotion. The next Phase 3 work
+is regional/seasonal error diagnosis and plateau-dependence measurement before
+the 128x256 five-year gate.
+
 ## Phase 3 — land temperature replacement with diagnosed heat convergence
 
-**Dependency:** Phase 2 must first provide a diagnosed atmospheric heat-
-convergence term or an equivalent validated forcing. The force-restore branch
-already proves that local radiative/turbulent/conductive physics alone is not
-enough.
+**Dependency:** met at compact scale by the globally closed resolved-transport
+forcing above. Phase 2 remains independently redesign-required; it is no
+longer on Phase 3's critical path. The force-restore branch already proves that
+local radiative/turbulent/conductive physics alone is not enough.
 
 **Work:** feed a physically defined atmospheric heat-convergence tendency into
 the two-reservoir force-restore land path. Retire the latitude-only land cap
@@ -663,6 +769,107 @@ Pass 64x128 before the 128x256 five-year promotion run.
 **Stop condition:** a prettier annual-cycle shape without climate skill is not
 enough. If the heat-convergence coupling regresses the climate gate, keep the
 legacy land path supported and record the replacement's missing process.
+
+### Phase 3 implementation pass (2026-08-15): compact matrix complete, promotion rejected
+
+The Phase 3 work is now reproducible through
+`scripts/run_phase3_land_validation.py`. It generates fresh supported and
+force-restore controls, runs five bounded physical candidates, records the
+resolved forcing on every evaluation step, adds per-month named-region errors,
+and evaluates both the mechanism-relative land gate and a strict promotion
+gate against the supported baseline. The strict gate includes CRU temperature,
+precipitation, Koppen group/class skill, warmest/coldest-month thresholds,
+annual-cycle shape, a present forcing diagnostic, and applied-grid global
+energy closure.
+
+The 64x128, one-year spin-up plus one-year evaluation matrix produced:
+
+| Candidate | CRU T RMSE (C) | T correlation | Koppen group/class | cycle error |
+|---|---:|---:|---:|---:|
+| supported legacy land | **6.276** | **0.930** | **0.674 / 0.389** | 5.269 |
+| force-restore, no convergence | 7.940 | 0.868 | 0.583 / 0.229 | 1.320 |
+| resolved convergence, 30 d | 7.857 | 0.876 | 0.608 / 0.267 | 1.852 |
+| resolved convergence, 15 d | 7.874 | 0.875 | 0.612 / 0.265 | 1.841 |
+| resolved convergence, 60 d | 7.825 | 0.877 | 0.605 / 0.264 | 1.795 |
+| 6 MJ m-2 K-1 deep store | 7.828 | 0.876 | 0.606 / 0.265 | 1.818 |
+| 1000 s m-1 dry resistance | **7.793** | 0.875 | 0.603 / 0.262 | **1.757** |
+
+All five convergence candidates improve temperature RMSE and both Koppen
+accuracies relative to the uncoupled force-restore control, confirming that
+the diagnosed forcing adds useful information. None passes against the actual
+supported baseline: even the best RMSE remains 1.52 C worse, group accuracy is
+7.1 percentage points lower, class accuracy is 12.7 points lower, and the
+warmest/coldest threshold accuracies remain lower. Precipitation log-RMSE is
+better than supported for every candidate, but every candidate slightly
+regresses the named East China and Southeast US precipitation-target errors.
+Plateau/cycle shape is much less clamp-like, but those isolated wins do not
+satisfy the stop condition.
+
+The forcing itself is finite and closed. Across 60 evaluation samples at
+64x128, its RMS is about 19 W m-2, 5th/95th percentiles are about -36.5/+31.5
+W m-2, maximum magnitude is 117 W m-2, and the maximum absolute applied-grid
+global mean is below 2.5e-7 W m-2. A separate 32x64 run remains closed below
+3.1e-7 W m-2 with 16.3 W m-2 RMS and 94 W m-2 maximum magnitude. A one-day
+versus two-half-day test preserves the spatial pattern (correlation 0.977) but
+has 21% relative RMS disagreement, consistent with the supported temperature
+operator's already-documented step-partition sensitivity. This is acceptable
+for retaining the diagnostic experimentally, but not for promotion.
+
+Regional/monthly attribution identifies the missing process. In the best-RMSE
+candidate, seasonal-range error is +19.1 C in Central Europe, +12.5 C in South
+Japan, +12.2 C in Atacama, and +9.3 C in the Southeast US. Central Europe's
+monthly RMSE rises from the supported 1.65 C to 7.59 C; South Japan rises from
+9.07 C to 13.14 C. Changing deep storage, restore time, or dry resistance does
+not repair this coherent continental/coastal over-amplitude. The replacement
+still lacks a conservative land-air boundary exchange and/or resolved maritime
+thermal moderation; it is not missing another local scalar value.
+
+**Disposition:** retain the globally closed forcing and evaluation
+infrastructure as default-off experimental Phase 3 work. Keep the legacy land
+path supported. Do not run the 128x256 five-year promotion checkpoint because
+zero of five candidates passed the required compact gate. The next structural
+candidate must address conservative land-air/maritime energy exchange, not
+repeat this bounded local parameter matrix or restore a latitude cap.
+
+### Conservative land-air exchange screen (2026-08-15): physically closed, rejected
+
+The next structural candidate replaced the force-restore branch's empirical
+two-day land-air relaxation with an explicit boundary transfer. The positive-
+upward Penman--Monteith sensible flux already subtracted from the surface was
+added to the represented atmospheric column using `(p_s/g) cp`; the exchange
+residual is zero to floating-point precision. Ocean relaxation and every
+supported default remain unchanged, and the candidate is independently gated
+by `enable_force_restore_conservative_land_air_exchange`.
+
+The required 32x64 directional screen rejected it before 64x128:
+
+| Metric | resolved forcing control | conservative exchange |
+|---|---:|---:|
+| CRU temperature RMSE (C) | **7.179** | 7.899 |
+| temperature correlation | **0.872** | 0.843 |
+| precipitation log-RMSE | 1.301 | **1.299** |
+| Koppen group accuracy | **0.547** | 0.543 |
+| Koppen class accuracy | **0.238** | 0.231 |
+| coldest-month accuracy | **0.695** | 0.615 |
+| warmest-month accuracy | 0.481 | **0.503** |
+| land-cycle error | **1.482** | 2.594 |
+
+The mechanism does provide the expected regional damping: Central Europe's
+seasonal-range error falls from +9.30 C to +5.32 C, the Southeast US from
++11.33 C to +7.20 C, and Atacama from +13.64 C to +12.74 C. But it warms the
+air climate, worsens overall spatial skill and cold thresholds, and moves East
+China from a near-correct +0.46 C range error to -4.73 C. Regional
+precipitation-target errors also regress in the Canadian Prairies, Central
+Europe, East China, and the US Midwest.
+
+**Decision:** retain the pure exchange kernel and gate as diagnostic
+infrastructure, but reject this full-column coupling. Do not run 64x128 or the
+five-year checkpoint. The result exposes a representation conflict: the single
+supported `T_air` field is used as near-surface/2 m air in turbulent fluxes but
+as a full atmospheric column in transport energy. A promotable conservative
+boundary exchange now requires a distinct boundary-layer heat reservoir (with
+a defined mass/depth and conservative exchange with the free atmosphere), not
+a fractional-strength retune of this failed coupling.
 
 ## Phase 4 — surface-water and land-ice foundations
 

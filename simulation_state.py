@@ -74,6 +74,7 @@ class PlanetState(NamedTuple):
     atmospheric_condensate: np.ndarray | None = None
     precipitating_hydrometeors: np.ndarray | None = None
     land_deep_temperature: np.ndarray | None = None
+    boundary_layer_temperature: np.ndarray | None = None
     midlevel_temperature: np.ndarray | None = None
     midlevel_humidity: np.ndarray | None = None
     upperlevel_temperature: np.ndarray | None = None

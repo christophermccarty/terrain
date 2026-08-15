@@ -881,6 +881,7 @@ def _evolve_temperature_substepped(
     T_sst, T_air = T_prev, T_air_prev
     cloud_cover, T_deep, cloud_water = prev_cloud_cover, T_deep_ocean, prev_cloud_water
     land_deep = kwargs.get("land_deep_temperature")
+    boundary_layer = kwargs.get("boundary_layer_temperature")
     day = float(day_of_year) - days
     t = (float(total_days) - days) if total_days is not None else None
     cloud_c = snow_c = components = None
@@ -896,6 +897,7 @@ def _evolve_temperature_substepped(
         kwargs_i = dict(kwargs)
         kwargs_i["T_base_land"] = T_base_land_i
         kwargs_i["land_deep_temperature"] = land_deep
+        kwargs_i["boundary_layer_temperature"] = boundary_layer
         T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water = _evolve_temperature(
             T_sst, T_base_i, elevation, Hc, Wc, block_size, H, W,
             day_of_year=day, days=sub_dt,
@@ -906,6 +908,7 @@ def _evolve_temperature_substepped(
         )
         cloud_cover = cloud_c
         land_deep = components.get("_land_deep_temperature", land_deep)
+        boundary_layer = components.get("_boundary_layer_temperature", boundary_layer)
     return T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water
 
 
@@ -1333,15 +1336,33 @@ def simulate_step(
     # Update monthly statistics for Köppen seasonality detection
     # Reclassify Köppen climate zones every 30 days
 
+    # The experimental mixed layer is the land near-surface/CRU temperature;
+    # air_temperature remains the transported free-atmosphere reservoir.  Feed
+    # the mixed layer into the existing climate accumulators without changing
+    # supported/default or ocean behavior.
+    _climate_state = state
+    if (
+        bool(pp.enable_force_restore_land)
+        and bool(pp.enable_force_restore_boundary_layer)
+        and state.boundary_layer_temperature is not None
+    ):
+        _, _climate_land = get_masks(state.elevation)
+        _near_surface_temperature = np.where(
+            _climate_land,
+            state.boundary_layer_temperature,
+            state.temperature,
+        ).astype(np.float32, copy=False)
+        _climate_state = state._replace(temperature=_near_surface_temperature)
+
     # Update climate averages (exponential moving average)
     temp_avg, precip_avg, sample_days = update_climate_averages(
-        state, days, orbital_period_days=pp.orbital_period_days,
+        _climate_state, days, orbital_period_days=pp.orbital_period_days,
         window_years=10.0,
     )
 
     # Update monthly statistics for Köppen classification
     monthly_temp, monthly_precip, monthly_sample_count = update_monthly_statistics(
-        state, days, window_years=1.0,
+        _climate_state, days, window_years=1.0,
         orbital_period_days=pp.orbital_period_days,
     )
 
@@ -3108,19 +3129,36 @@ def simulate_step(
             _group_c2_in["midlevel_condensate"] = state.atmospheric_condensate
     if state.land_deep_temperature is not None:
         _group_c2_in["land_deep"] = state.land_deep_temperature
+    if (
+        bool(pp.enable_force_restore_land)
+        and bool(pp.enable_force_restore_boundary_layer)
+        and state.boundary_layer_temperature is not None
+    ):
+        _group_c2_in["boundary_layer"] = state.boundary_layer_temperature
     _group_c2_out = _coarsen_many(_group_c2_in, Hc, Wc, block_size)
     cloud_cover_coarse = _group_c2_out.get("cloud_cover")
     T_deep_coarse = _group_c2_out.get("T_deep")
     cloud_water_coarse = _group_c2_out.get("cloud_water")
     midlevel_condensate_coarse = _group_c2_out.get("midlevel_condensate")
     land_deep_coarse = _group_c2_out.get("land_deep")
+    boundary_layer_coarse = _group_c2_out.get("boundary_layer")
     # ice_thick_prev_coarse already computed above
+
+    # The shallow mixed layer responds on sub-day timescales.  Couple it to
+    # force-restore at no more than six-hour intervals; the analytic internal
+    # exchange is unconditionally stable, but the sensible flux and radiative
+    # forcing are state dependent and must be resampled within a daily host
+    # step.  This affects only the experimental mixed-layer branch.
+    _temperature_substep_days = float(pp.temperature_substep_days)
+    if bool(pp.enable_force_restore_land) and bool(pp.enable_force_restore_boundary_layer):
+        if _temperature_substep_days <= 0.0 or _temperature_substep_days > 0.25:
+            _temperature_substep_days = 0.25
 
     # Always track components for diagnostics (minimal overhead)
     T_sst_coarse, T_air_coarse_new, cloud_c, snow_c, temp_components, T_deep_coarse_new, cloud_water_coarse_new = _evolve_temperature_substepped(
         T_prev_coarse, T_base, state.elevation, Hc, Wc, block_size, H, W,
         day_of_year=new_day, days=days,
-        substep_days=float(pp.temperature_substep_days),
+        substep_days=_temperature_substep_days,
         T_air_prev=T_air_coarse,
         wind_u=u_coarse, wind_v=v_coarse,
         T_base_land=T_base_land,
@@ -3154,6 +3192,7 @@ def simulate_step(
         prev_cloud_water=cloud_water_coarse,   # Feature: prognostic cloud water
         midlevel_condensate=midlevel_condensate_coarse,
         land_deep_temperature=land_deep_coarse,
+        boundary_layer_temperature=boundary_layer_coarse,
         temperature_bases_for_day=_temperature_bases_for_day,
     )
     T_coarse = T_sst_coarse  # alias: T_coarse continues to mean T_sst going forward
@@ -3172,6 +3211,7 @@ def simulate_step(
         temp_components = temp_components_full
 
     land_deep_full = temp_components.pop("_land_deep_temperature", None)
+    boundary_layer_full = temp_components.pop("_boundary_layer_temperature", None)
     
     if block_size > 1:
         _up_fields: dict[str, np.ndarray] = {"T": T_coarse, "cloud": cloud_c, "T_air": T_air_coarse_new}
@@ -3192,6 +3232,8 @@ def simulate_step(
 
     if land_deep_full is None:
         land_deep_full = state.land_deep_temperature
+    if boundary_layer_full is None:
+        boundary_layer_full = state.boundary_layer_temperature
 
     # Feature 5: initialize deep ocean on first step (SST - 15K, clamped to 271-285K).
     # Use the same value for land and ocean so coarsening never produces unphysical averages.
@@ -4172,6 +4214,7 @@ def simulate_step(
         atmospheric_condensate=condensate_next,
         precipitating_hydrometeors=hydrometeors_next,
         land_deep_temperature=land_deep_full,
+        boundary_layer_temperature=boundary_layer_full,
         midlevel_temperature=midlevel_temperature_next,
         midlevel_humidity=midlevel_humidity_next,
         upperlevel_temperature=upperlevel_temperature_next,
@@ -4350,6 +4393,7 @@ def _evolve_temperature(
     prev_cloud_water: np.ndarray | None = None,   # Feature: prognostic cloud water
     midlevel_condensate: np.ndarray | None = None,
     land_deep_temperature: np.ndarray | None = None,
+    boundary_layer_temperature: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray | None, np.ndarray | None]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -4399,6 +4443,8 @@ def _evolve_temperature(
     T_sst = T_prev.copy().astype(np.float32, copy=False)
     T_air = (T_air_prev.copy() if T_air_prev is not None else T_prev.copy()).astype(np.float32, copy=False)
     land_deep_out: np.ndarray | None = None
+    boundary_layer_out: np.ndarray | None = boundary_layer_temperature
+    boundary_exchange_gain = None
 
     # === PASS 1: T_air dynamics — advection, diffusion, surface exchange ===
     lat_1d = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
@@ -4425,12 +4471,14 @@ def _evolve_temperature(
         T_y = np.where(v >= 0, T_south, T_north)
         T_air = T_air + v_cfl * (T_y - T_air)
 
+    T_after_advection = T_air.copy()
+
     # Diffuse T_air (atmospheric mixing).
     # Explicit Laplacian diffusion is only stable for r = coeff*1.2*days below
     # ~0.5 per application (same forward-difference CFL bound handled for the
     # ocean eddy flux below); production substeps (days ≤ 7) are fine at the
     # 0.04 default, but direct calls with large `days` need sub-stepping.
-    T_before_diffusion = T_air.copy() if track_components else None
+    T_before_diffusion = T_air.copy()
     _r_diff = float(thermal_diffusion) * 1.2 * float(days)
     _n_diff_sub = max(1, int(np.ceil(_r_diff / 0.4)))
     _days_diff_sub = float(days) / _n_diff_sub
@@ -4448,6 +4496,12 @@ def _evolve_temperature(
                 T_lap = n + s + e + w - 4.0 * c
                 T_air = T_air + thermal_diffusion * 1.2 * np.clip(T_lap, -30.0, 30.0) * _days_diff_sub
 
+    # Capture this before surface exchange or any radiative/surface physics.
+    # The old end-of-step component subtraction included all downstream terms
+    # and therefore was not a usable atmospheric-transport diagnostic.
+    T_after_diffusion = T_air.copy()
+    resolved_transport_delta_k = T_after_diffusion - T_before_advection
+
     # T_air relaxes toward surface temperature (T_sst).
     # Over ocean: ~4-day time constant (efficient sensible heat flux at ocean surface).
     # Over land: ~2-day time constant (land surface heats/cools overlying air quickly).
@@ -4460,7 +4514,17 @@ def _evolve_temperature(
     # equal-and-opposite exchange added below does NOT subsume this -- that term
     # conserves heat between the two layers, but nothing else ties the air column
     # to the surface it sits on. See overnight/FINDINGS.md (2026-07-25).
-    k_air_surface = np.where(sea_mask, 0.25, 0.50).astype(np.float32, copy=False)
+    _conservative_land_air = bool(
+        _pp.enable_force_restore_land
+        and _pp.enable_force_restore_conservative_land_air_exchange
+    )
+    _boundary_layer_active = bool(
+        _pp.enable_force_restore_land and _pp.enable_force_restore_boundary_layer
+    )
+    _land_air_relaxation = 0.0 if (_conservative_land_air or _boundary_layer_active) else 0.50
+    k_air_surface = np.where(sea_mask, 0.25, _land_air_relaxation).astype(
+        np.float32, copy=False
+    )
     _air_frac = np.minimum(k_air_surface * float(days), 0.5).astype(np.float32, copy=False)
     T_air = (T_air + _air_frac * (T_sst - T_air)).astype(np.float32, copy=False)
 
@@ -4943,9 +5007,46 @@ def _evolve_temperature(
             None if soil_moisture_deep is None else np.clip(soil_moisture_deep, 0.0, 1.0)
         )
         wind_for_land = np.sqrt(u * u + v * v)
+        land_net_forcing = R_net
+        resolved_heat_convergence = None
+        resolved_heat_convergence_area_mean = None
+        if bool(_pp.enable_force_restore_atmospheric_heat_convergence):
+            from atmospheric_heat_transport import (
+                close_global_heat_convergence,
+                temperature_transport_to_heat_convergence,
+            )
+
+            resolved_heat_convergence = temperature_transport_to_heat_convergence(
+                resolved_transport_delta_k,
+                surface_pressure_pa=float(_pp.surface_pressure_pa),
+                cp_j_kg_k=float(_pp.cp_dry),
+                gravity_m_s2=float(_pp.surface_gravity),
+                dt_seconds=dt_sec,
+            )
+            resolved_heat_convergence = close_global_heat_convergence(
+                resolved_heat_convergence, lat_1d
+            )
+            _heat_weights = np.cos(lat_1d.astype(np.float64))[:, None]
+            resolved_heat_convergence_area_mean = float(
+                np.sum(resolved_heat_convergence.astype(np.float64) * _heat_weights)
+                / (resolved_heat_convergence.shape[1] * np.sum(_heat_weights))
+            )
+            # The mixed-layer experiment leaves resolved convergence in the
+            # transported free atmosphere.  Reapplying the diagnosed transport
+            # increment at the surface would count the same energy twice.
+            if not _boundary_layer_active:
+                land_net_forcing = R_net + resolved_heat_convergence
+
+        if _boundary_layer_active:
+            if boundary_layer_out is None or np.asarray(boundary_layer_out).shape != T_air.shape:
+                boundary_layer_out = T_air.copy()
+            air_for_land = np.asarray(boundary_layer_out, dtype=np.float32)
+        else:
+            air_for_land = T_air
+
         land_step = force_restore_penman_monteith(
-            T_sst, T_air, land_deep_temperature, soil_for_land, wind_for_land,
-            R_net, land_mask, dt_days=float(days),
+            T_sst, air_for_land, land_deep_temperature, soil_for_land, wind_for_land,
+            land_net_forcing, land_mask, dt_days=float(days),
             surface_heat_capacity_j_m2_k=float(_pp.land_surface_heat_capacity_j_m2_k),
             deep_heat_capacity_j_m2_k=float(_pp.land_deep_heat_capacity_j_m2_k),
             restore_days=float(_pp.land_force_restore_days),
@@ -4955,6 +5056,45 @@ def _evolve_temperature(
         )
         T_sst = land_step.temperature
         land_deep_out = land_step.deep_temperature
+        conservative_sensible_gain = None
+        boundary_exchange_gain = None
+        if _boundary_layer_active:
+            from boundary_layer import step_boundary_layer_energy
+
+            boundary_step = step_boundary_layer_energy(
+                boundary_layer_out,
+                T_air,
+                land_step.sensible_heat_w_m2,
+                land_mask,
+                surface_pressure_pa=float(_pp.surface_pressure_pa),
+                cp_j_kg_k=float(_pp.cp_dry),
+                gravity_m_s2=float(_pp.surface_gravity),
+                gas_constant_j_kg_k=float(_pp.gas_constant_dry),
+                reference_temperature_k=288.15,
+                mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
+                entrainment_velocity_m_s=float(_pp.boundary_layer_entrainment_velocity_m_s),
+                dt_seconds=dt_sec,
+                wind_speed_m_s=wind_for_land,
+                stability_dependent_exchange=bool(
+                    _pp.enable_boundary_layer_stability_dependent_exchange
+                ),
+            )
+            boundary_layer_out = boundary_step.boundary_temperature
+            T_air = boundary_step.free_temperature
+            conservative_sensible_gain = boundary_step.surface_gain_w_m2
+            boundary_exchange_gain = boundary_step.exchange_gain_w_m2
+        elif _conservative_land_air:
+            from atmospheric_heat_transport import apply_sensible_heat_to_atmospheric_column
+
+            T_air, conservative_sensible_gain = apply_sensible_heat_to_atmospheric_column(
+                T_air,
+                land_step.sensible_heat_w_m2,
+                land_mask,
+                surface_pressure_pa=float(_pp.surface_pressure_pa),
+                cp_j_kg_k=float(_pp.cp_dry),
+                gravity_m_s2=float(_pp.surface_gravity),
+                dt_seconds=dt_sec,
+            )
 
     # --- Equal-and-opposite air–surface sensible heat exchange (OCEAN ONLY) ---
     # The land branch of `k_couple` was 0.25 until 2026-07-25. Combined with
@@ -5156,6 +5296,10 @@ def _evolve_temperature(
     T_sst = np.clip(T_sst, 200.0, 323.0)
     # T_air: free air — allow slightly wider range (180K–340K)
     T_air = np.clip(T_air, 180.0, 340.0)
+    if boundary_layer_out is not None:
+        boundary_layer_out = np.clip(boundary_layer_out, 180.0, 340.0).astype(
+            np.float32, copy=False
+        )
 
     # Track component contributions
     components = {}
@@ -5166,9 +5310,41 @@ def _evolve_temperature(
         if track_components:
             components["land_latent_heat_w_m2"] = land_step.latent_heat_w_m2
             components["land_sensible_heat_w_m2"] = land_step.sensible_heat_w_m2
+            if conservative_sensible_gain is not None:
+                components[
+                    "land_air_sensible_atmospheric_gain_w_m2"
+                ] = conservative_sensible_gain
+                components[
+                    "land_air_sensible_exchange_closure_w_m2"
+                ] = conservative_sensible_gain - np.where(
+                    land_mask, land_step.sensible_heat_w_m2, 0.0
+                )
+            if boundary_exchange_gain is not None:
+                components["boundary_layer_exchange_gain_w_m2"] = boundary_exchange_gain
+                components["free_air_exchange_gain_w_m2"] = -boundary_exchange_gain
+                components["boundary_layer_pressure_thickness_pa"] = (
+                    boundary_step.pressure_thickness_pa
+                )
+                components["boundary_layer_effective_entrainment_velocity_m_s"] = (
+                    boundary_step.effective_entrainment_velocity_m_s
+                )
+                components["boundary_layer_bulk_richardson_number"] = (
+                    boundary_step.bulk_richardson_number
+                )
+                components["boundary_layer_horizontal_transport"] = "omitted"
+                components["resolved_heat_convergence_destination"] = "free_atmosphere"
+            if resolved_heat_convergence is not None:
+                components["atmospheric_heat_convergence_w_m2"] = resolved_heat_convergence
+                components[
+                    "atmospheric_heat_convergence_applied_grid_area_mean_w_m2"
+                ] = resolved_heat_convergence_area_mean
+    if boundary_layer_out is not None:
+        # Private channel threaded by the outer solver and omitted from public
+        # component diagnostics after it has been copied into PlanetState.
+        components["_boundary_layer_temperature"] = boundary_layer_out
     if track_components:
-        components['advection'] = T_air - T_before_advection  # type: ignore[operator]
-        components['diffusion'] = T_air - T_before_diffusion  # type: ignore[operator]
+        components['advection'] = T_after_advection - T_before_advection
+        components['diffusion'] = T_after_diffusion - T_before_diffusion
         components['radiation'] = k_relax * (T_eq - T_sst) * float(days)
         components['evaporation'] = -evap_cooling
         components['ocean_transport'] = T_ocean_adj
