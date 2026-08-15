@@ -530,6 +530,28 @@ def _ocean_seasonal_fraction(lat_deg: np.ndarray, pp) -> np.ndarray:
     return np.clip(frac, 0.03, seasonal_cap).astype(np.float32, copy=False)
 
 
+def _ocean_mixed_layer_depth(
+    lat_2d: np.ndarray, day_of_year: float, pp
+) -> np.ndarray:
+    """Return the seasonally varying slab-ocean mixed-layer depth [m]."""
+    abs_lat = np.abs(np.rad2deg(lat_2d))
+    mld_trop = float(pp.mixed_layer_depth_tropical_m)
+    mld_polar = float(pp.mixed_layer_depth_polar_m)
+    mld = mld_trop + (mld_polar - mld_trop) * (abs_lat / 90.0) ** 1.5
+    solstice = (172.0 / 365.2422) * float(pp.orbital_period_days)
+    gamma = (
+        2.0 * np.pi * (float(day_of_year) - solstice)
+        / float(pp.orbital_period_days)
+    )
+    nh_summer = float(0.5 * (1.0 + np.cos(gamma)))
+    sh_summer = float(0.5 * (1.0 - np.cos(gamma)))
+    hemi_summer = np.where(lat_2d >= 0, nh_summer, sh_summer)
+    polar_ramp = np.clip((abs_lat - 55.0) / 30.0, 0.0, 1.0)
+    return (mld * (1.0 - 0.50 * polar_ramp * hemi_summer)).astype(
+        np.float32, copy=False
+    )
+
+
 _MARITIME_CACHE: dict = {"key": None, "field": None}
 
 
@@ -882,6 +904,7 @@ def _evolve_temperature_substepped(
     cloud_cover, T_deep, cloud_water = prev_cloud_cover, T_deep_ocean, prev_cloud_water
     land_deep = kwargs.get("land_deep_temperature")
     boundary_layer = kwargs.get("boundary_layer_temperature")
+    boundary_interface = kwargs.get("boundary_layer_interface_temperature")
     day = float(day_of_year) - days
     t = (float(total_days) - days) if total_days is not None else None
     cloud_c = snow_c = components = None
@@ -898,6 +921,7 @@ def _evolve_temperature_substepped(
         kwargs_i["T_base_land"] = T_base_land_i
         kwargs_i["land_deep_temperature"] = land_deep
         kwargs_i["boundary_layer_temperature"] = boundary_layer
+        kwargs_i["boundary_layer_interface_temperature"] = boundary_interface
         T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water = _evolve_temperature(
             T_sst, T_base_i, elevation, Hc, Wc, block_size, H, W,
             day_of_year=day, days=sub_dt,
@@ -909,6 +933,9 @@ def _evolve_temperature_substepped(
         cloud_cover = cloud_c
         land_deep = components.get("_land_deep_temperature", land_deep)
         boundary_layer = components.get("_boundary_layer_temperature", boundary_layer)
+        boundary_interface = components.get(
+            "_boundary_layer_interface_temperature", boundary_interface
+        )
     return T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water
 
 
@@ -3135,6 +3162,14 @@ def simulate_step(
         and state.boundary_layer_temperature is not None
     ):
         _group_c2_in["boundary_layer"] = state.boundary_layer_temperature
+    if (
+        bool(pp.enable_force_restore_land)
+        and bool(pp.enable_force_restore_boundary_layer)
+        and state.boundary_layer_interface_temperature is not None
+    ):
+        _group_c2_in["boundary_interface"] = (
+            state.boundary_layer_interface_temperature
+        )
     _group_c2_out = _coarsen_many(_group_c2_in, Hc, Wc, block_size)
     cloud_cover_coarse = _group_c2_out.get("cloud_cover")
     T_deep_coarse = _group_c2_out.get("T_deep")
@@ -3142,6 +3177,7 @@ def simulate_step(
     midlevel_condensate_coarse = _group_c2_out.get("midlevel_condensate")
     land_deep_coarse = _group_c2_out.get("land_deep")
     boundary_layer_coarse = _group_c2_out.get("boundary_layer")
+    boundary_interface_coarse = _group_c2_out.get("boundary_interface")
     # ice_thick_prev_coarse already computed above
 
     # The shallow mixed layer responds on sub-day timescales.  Couple it to
@@ -3193,6 +3229,7 @@ def simulate_step(
         midlevel_condensate=midlevel_condensate_coarse,
         land_deep_temperature=land_deep_coarse,
         boundary_layer_temperature=boundary_layer_coarse,
+        boundary_layer_interface_temperature=boundary_interface_coarse,
         temperature_bases_for_day=_temperature_bases_for_day,
     )
     T_coarse = T_sst_coarse  # alias: T_coarse continues to mean T_sst going forward
@@ -3212,6 +3249,9 @@ def simulate_step(
 
     land_deep_full = temp_components.pop("_land_deep_temperature", None)
     boundary_layer_full = temp_components.pop("_boundary_layer_temperature", None)
+    boundary_interface_full = temp_components.pop(
+        "_boundary_layer_interface_temperature", None
+    )
     
     if block_size > 1:
         _up_fields: dict[str, np.ndarray] = {"T": T_coarse, "cloud": cloud_c, "T_air": T_air_coarse_new}
@@ -3234,6 +3274,8 @@ def simulate_step(
         land_deep_full = state.land_deep_temperature
     if boundary_layer_full is None:
         boundary_layer_full = state.boundary_layer_temperature
+    if boundary_interface_full is None:
+        boundary_interface_full = state.boundary_layer_interface_temperature
 
     # Feature 5: initialize deep ocean on first step (SST - 15K, clamped to 271-285K).
     # Use the same value for land and ocean so coarsening never produces unphysical averages.
@@ -4215,6 +4257,7 @@ def simulate_step(
         precipitating_hydrometeors=hydrometeors_next,
         land_deep_temperature=land_deep_full,
         boundary_layer_temperature=boundary_layer_full,
+        boundary_layer_interface_temperature=boundary_interface_full,
         midlevel_temperature=midlevel_temperature_next,
         midlevel_humidity=midlevel_humidity_next,
         upperlevel_temperature=upperlevel_temperature_next,
@@ -4394,6 +4437,7 @@ def _evolve_temperature(
     midlevel_condensate: np.ndarray | None = None,
     land_deep_temperature: np.ndarray | None = None,
     boundary_layer_temperature: np.ndarray | None = None,
+    boundary_layer_interface_temperature: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray | None, np.ndarray | None]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -4444,7 +4488,9 @@ def _evolve_temperature(
     T_air = (T_air_prev.copy() if T_air_prev is not None else T_prev.copy()).astype(np.float32, copy=False)
     land_deep_out: np.ndarray | None = None
     boundary_layer_out: np.ndarray | None = boundary_layer_temperature
+    boundary_interface_out: np.ndarray | None = boundary_layer_interface_temperature
     boundary_exchange_gain = None
+    boundary_interface_upper_gain = None
     boundary_horizontal_convergence = None
     boundary_continuity_exchange = None
     boundary_transport_substeps = None
@@ -4503,6 +4549,62 @@ def _evolve_temperature(
     # Capture this before surface exchange or any radiative/surface physics.
     # The old end-of-step component subtraction included all downstream terms
     # and therefore was not a usable atmospheric-transport diagnostic.
+    _free_transport_closure_delta_k = np.zeros_like(T_air, dtype=np.float32)
+    if (
+        _pp.enable_force_restore_land
+        and _pp.enable_force_restore_boundary_layer
+        and _pp.enable_boundary_layer_capacity_aware_free_air_transport
+    ):
+        from boundary_layer import (
+            close_free_air_transport_energy,
+            mixed_layer_pressure_thickness,
+            overlying_layer_pressure_thickness,
+        )
+
+        _transport_column_capacity = (
+            float(_pp.surface_pressure_pa) / float(_pp.surface_gravity)
+            * float(_pp.cp_dry)
+        )
+        _transport_delta_p = mixed_layer_pressure_thickness(
+            surface_pressure_pa=float(_pp.surface_pressure_pa),
+            gravity_m_s2=float(_pp.surface_gravity),
+            gas_constant_j_kg_k=float(_pp.gas_constant_dry),
+            reference_temperature_k=288.15,
+            mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
+        )
+        _transport_boundary_capacity = (
+            _transport_delta_p / float(_pp.surface_gravity) * float(_pp.cp_dry)
+        )
+        _transport_interface_delta_p = 0.0
+        if _pp.enable_boundary_layer_interface_reservoir:
+            _transport_interface_delta_p = overlying_layer_pressure_thickness(
+                surface_pressure_pa=float(_pp.surface_pressure_pa),
+                gravity_m_s2=float(_pp.surface_gravity),
+                gas_constant_j_kg_k=float(_pp.gas_constant_dry),
+                reference_temperature_k=288.15,
+                layer_base_m=float(_pp.boundary_layer_mixed_depth_m),
+                layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
+            )
+        _transport_interface_capacity = (
+            _transport_interface_delta_p
+            / float(_pp.surface_gravity)
+            * float(_pp.cp_dry)
+        )
+        _transport_free_capacity = np.where(
+            land_mask,
+            _transport_column_capacity
+            - _transport_boundary_capacity
+            - _transport_interface_capacity,
+            _transport_column_capacity,
+        )
+        _raw_T_after_diffusion = T_air
+        T_air = close_free_air_transport_energy(
+            T_before_advection,
+            T_air,
+            _transport_free_capacity,
+            lat_1d,
+        )
+        _free_transport_closure_delta_k = T_air - _raw_T_after_diffusion
     T_after_diffusion = T_air.copy()
     resolved_transport_delta_k = T_after_diffusion - T_before_advection
 
@@ -4525,12 +4627,88 @@ def _evolve_temperature(
     _boundary_layer_active = bool(
         _pp.enable_force_restore_land and _pp.enable_force_restore_boundary_layer
     )
+    _boundary_interface_active = bool(
+        _boundary_layer_active and _pp.enable_boundary_layer_interface_reservoir
+    )
+    if (
+        _boundary_interface_active
+        and (
+            boundary_interface_out is None
+            or np.asarray(boundary_interface_out).shape != T_air.shape
+        )
+    ):
+        boundary_interface_out = T_air.copy()
+    _boundary_cloud_temperature_active = bool(
+        _boundary_layer_active
+        and _pp.enable_boundary_layer_near_surface_cloud_temperature
+    )
+    _boundary_cloud_memory_active = bool(
+        _boundary_layer_active
+        and _pp.enable_boundary_layer_split_invariant_cloud_memory
+    )
+    if (
+        _boundary_cloud_temperature_active
+        and (
+            boundary_layer_out is None
+            or np.asarray(boundary_layer_out).shape != T_air.shape
+        )
+    ):
+        boundary_layer_out = T_air.copy()
+    _capacity_aware_airsea = bool(
+        _boundary_layer_active
+        and _pp.enable_boundary_layer_capacity_aware_airsea_exchange
+    )
+    _capacity_mld = (
+        _ocean_mixed_layer_depth(
+            np.repeat(lat_1d[:, None], Wc, axis=1), day_of_year, _pp
+        )
+        if _capacity_aware_airsea
+        else None
+    )
     _land_air_relaxation = 0.0 if (_conservative_land_air or _boundary_layer_active) else 0.50
     k_air_surface = np.where(sea_mask, 0.25, _land_air_relaxation).astype(
         np.float32, copy=False
     )
     _air_frac = np.minimum(k_air_surface * float(days), 0.5).astype(np.float32, copy=False)
-    T_air = (T_air + _air_frac * (T_sst - T_air)).astype(np.float32, copy=False)
+    _surface_air_relaxation_delta_k = _air_frac * (T_sst - T_air)
+    T_air = (T_air + _surface_air_relaxation_delta_k).astype(np.float32, copy=False)
+    _column_air_capacity = (
+        float(_pp.surface_pressure_pa) / float(_pp.surface_gravity)
+        * float(_pp.cp_dry)
+    )
+    _ocean_capacity = (
+        4.186e6 * _capacity_mld
+        if _capacity_mld is not None
+        else np.ones_like(T_air, dtype=np.float32)
+    )
+    _ocean_air_relaxation_ocean_delta_k = np.zeros_like(T_air, dtype=np.float32)
+    if _capacity_aware_airsea:
+        _ocean_air_relaxation_ocean_delta_k = np.where(
+            sea_mask,
+            -_column_air_capacity * _surface_air_relaxation_delta_k / _ocean_capacity,
+            0.0,
+        ).astype(np.float32, copy=False)
+        T_sst = (T_sst + _ocean_air_relaxation_ocean_delta_k).astype(
+            np.float32, copy=False
+        )
+    if dt_sec > 0.0:
+        _ocean_air_relaxation_gain_w_m2 = np.where(
+            sea_mask,
+            _column_air_capacity * _surface_air_relaxation_delta_k / dt_sec,
+            0.0,
+        )
+        _ocean_air_relaxation_ocean_gain_w_m2 = np.where(
+            sea_mask,
+            _ocean_capacity * _ocean_air_relaxation_ocean_delta_k / dt_sec,
+            0.0,
+        )
+    else:
+        _ocean_air_relaxation_gain_w_m2 = np.zeros_like(T_air, dtype=np.float32)
+        _ocean_air_relaxation_ocean_gain_w_m2 = np.zeros_like(T_air, dtype=np.float32)
+    _ocean_air_relaxation_residual_w_m2 = (
+        _ocean_air_relaxation_gain_w_m2
+        + _ocean_air_relaxation_ocean_gain_w_m2
+    )
 
     _boundary_transport_active = bool(
         _boundary_layer_active
@@ -4540,6 +4718,7 @@ def _evolve_temperature(
     if _boundary_transport_active:
         from boundary_layer import (
             mixed_layer_pressure_thickness,
+            overlying_layer_pressure_thickness,
             transport_boundary_layer_energy,
         )
 
@@ -4563,6 +4742,19 @@ def _evolve_temperature(
             gravity_m_s2=float(_pp.surface_gravity),
             radius_m=float(_pp.radius_m),
             dt_seconds=dt_sec,
+            active_mask=land_mask,
+            additional_reserved_pressure_pa=(
+                overlying_layer_pressure_thickness(
+                    surface_pressure_pa=float(_pp.surface_pressure_pa),
+                    gravity_m_s2=float(_pp.surface_gravity),
+                    gas_constant_j_kg_k=float(_pp.gas_constant_dry),
+                    reference_temperature_k=288.15,
+                    layer_base_m=float(_pp.boundary_layer_mixed_depth_m),
+                    layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
+                )
+                if _boundary_interface_active
+                else 0.0
+            ),
         )
         boundary_layer_out = transport_step.boundary_temperature
         T_air = transport_step.free_temperature
@@ -4572,7 +4764,12 @@ def _evolve_temperature(
         _bl_lat_edges = np.linspace(np.pi / 2.0, -np.pi / 2.0, Hc + 1)
         _bl_area_rows = np.sin(_bl_lat_edges[:-1]) - np.sin(_bl_lat_edges[1:])
         boundary_horizontal_area_mean = float(
-            np.sum(boundary_horizontal_convergence * _bl_area_rows[:, None])
+            np.sum(
+                (
+                    boundary_horizontal_convergence
+                    + transport_step.free_horizontal_convergence_w_m2
+                ) * _bl_area_rows[:, None]
+            )
             / (Wc * np.sum(_bl_area_rows))
         )
 
@@ -4604,13 +4801,20 @@ def _evolve_temperature(
         sea_ice = np.zeros_like(T_sst, dtype=np.float32)
 
     # Cloud cover — humidity lives in the atmosphere, so use T_air for Clausius-Clapeyron
-    Tc = np.clip(T_air - 273.15, -60.0, 60.0)
+    _cloud_thermodynamic_temperature = (
+        np.where(land_mask, boundary_layer_out, T_air)
+        if _boundary_cloud_temperature_active
+        else T_air
+    )
+    Tc = np.clip(_cloud_thermodynamic_temperature - 273.15, -60.0, 60.0)
     es = 6.112 * np.exp(17.67 * Tc / (Tc + 243.5))
     qsat = np.clip(0.622 * es / (_pp.surface_pressure_pa / 100.0), 1e-6, 0.035).astype(np.float32, copy=False)
     if humidity is not None:
         q = np.clip(humidity.astype(np.float32, copy=False), 0.0, qsat)
     else:
-        temp_norm = np.clip((T_air - 255.0) / 45.0, 0.0, 1.0)
+        temp_norm = np.clip(
+            (_cloud_thermodynamic_temperature - 255.0) / 45.0, 0.0, 1.0
+        )
         base_q = np.where(sea_mask, 0.012, 0.008).astype(np.float32, copy=False)
         q = base_q * (0.5 + 0.7 * temp_norm)
     rh = np.clip(q / qsat, 0.0, 1.5)
@@ -4648,17 +4852,23 @@ def _evolve_temperature(
     cloud_fraction = rh_core * ascent_term
     cloud_fraction = np.clip(cloud_fraction + 0.25 * rh_core * orog, 0.0, 1.0)
     cloud_fraction = np.clip(cloud_fraction * (1.0 - 0.6 * np.clip(subsidence, 0.0, 1.0)), 0.0, 1.0)
+    _cloud_fraction_instantaneous = cloud_fraction.copy()
 
     # Feature 1: cloud temporal persistence (~3-day memory).
     # Blend freshly-diagnosed cloud_fraction toward the previous-step value so
     # clouds don't jump discontinuously between steps.
     if prev_cloud_cover is not None and _fb_t.get('cloud_feedback', True):
         tau_cloud_days = 3.0
-        alpha = float(np.clip(days / tau_cloud_days, 0.0, 0.5))
+        if _boundary_cloud_memory_active:
+            _daily_alpha = min(1.0 / tau_cloud_days, 0.5)
+            alpha = float(1.0 - (1.0 - _daily_alpha) ** float(days))
+        else:
+            alpha = float(np.clip(days / tau_cloud_days, 0.0, 0.5))
         cloud_fraction = (
             alpha * cloud_fraction + (1.0 - alpha) * prev_cloud_cover.astype(np.float32, copy=False)
         )
         cloud_fraction = cloud_fraction.astype(np.float32, copy=False)
+    _cloud_fraction_after_persistence = cloud_fraction.copy()
 
     # Cloud <-> precipitation feedback: heavy rain rains a cloud out, so it shouldn't
     # persist at full cover into the next step. `precipitation` is last step's
@@ -4669,10 +4879,17 @@ def _evolve_temperature(
     # sheets don't get wiped out by their own drizzle (kept gentle deliberately —
     # this is a secondary coupling, not the primary cloud-cover driver).
     if precipitation is not None and _fb_t.get('cloud_feedback', True):
-        rain_deplete = np.clip(precipitation.astype(np.float32, copy=False) / 20.0, 0.0, 0.30)
+        _daily_rain_deplete = np.clip(
+            precipitation.astype(np.float32, copy=False) / 20.0, 0.0, 0.30
+        )
+        if _boundary_cloud_memory_active:
+            rain_deplete = 1.0 - (1.0 - _daily_rain_deplete) ** float(days)
+        else:
+            rain_deplete = _daily_rain_deplete
         cloud_fraction = np.clip(cloud_fraction * (1.0 - rain_deplete), 0.0, 1.0).astype(np.float32, copy=False)
     else:
         rain_deplete = np.zeros_like(cloud_fraction)
+    _cloud_fraction_after_rainout = cloud_fraction.copy()
 
     # Feature: prognostic cloud water (Jul 2026). A real liquid-water mass
     # budget layered on top of the RH-diagnosed cloud_fraction above -- gives
@@ -4829,6 +5046,10 @@ def _evolve_temperature(
     Q = np.maximum(0.0, Q)
     
     S_absorbed = np.maximum(0.0, Q * (1.0 - albedo_total) + _pp.aerosol_forcing_w_m2)
+    _S_absorbed_without_cloud = np.maximum(
+        0.0, Q * (1.0 - albedo_sfc) + _pp.aerosol_forcing_w_m2
+    )
+    _cloud_shortwave_forcing = S_absorbed - _S_absorbed_without_cloud
     
     # Outgoing Longwave (L_out) = sigma * T^4 * epsilon
     # Greenhouse effect reduces OLR - use latitude-dependent epsilon (like temperature.py)
@@ -4837,6 +5058,7 @@ def _evolve_temperature(
     epsilon_pole = float(epsilon_pole)     # Increased from 0.50 to reduce polar extremes
     lat_factor = np.cos(np.deg2rad(abs_lat_deg))  # 1.0 at equator, 0.0 at poles
     epsilon = epsilon_pole + (epsilon_equator - epsilon_pole) * lat_factor
+    _epsilon_without_cloud = np.asarray(epsilon).copy()
     
     # Feature 1: cloud greenhouse on OLR.
     # High clouds (cold tops) trap outgoing longwave; low/warm clouds do not.
@@ -4851,10 +5073,18 @@ def _evolve_temperature(
         # rh already computed above; higher RH → more WV → lower effective epsilon
         wv_reduction = _pp.wv_greenhouse_factor * np.clip(rh - 0.5, 0.0, 1.0).astype(np.float32, copy=False)
         epsilon = np.clip(epsilon - wv_reduction, 0.30, 0.95).astype(np.float32, copy=False)
+        _epsilon_without_cloud = np.clip(
+            _epsilon_without_cloud - wv_reduction, 0.30, 0.95
+        ).astype(np.float32, copy=False)
 
     sigma = STEFAN_BOLTZMANN
     # Longwave emission is from the surface (T_sst drives outgoing radiation)
     L_out = epsilon * sigma * (T_sst ** 4)
+    _L_out_without_cloud = _epsilon_without_cloud * sigma * (T_sst ** 4)
+    _cloud_longwave_forcing = _L_out_without_cloud - L_out
+    _cloud_net_radiative_forcing = (
+        _cloud_shortwave_forcing + _cloud_longwave_forcing
+    )
 
     R_net = S_absorbed - L_out  # W/m²
 
@@ -5106,31 +5336,57 @@ def _evolve_temperature(
         land_deep_out = land_step.deep_temperature
         conservative_sensible_gain = None
         boundary_exchange_gain = None
+        boundary_interface_upper_gain = None
         if _boundary_layer_active:
-            from boundary_layer import step_boundary_layer_energy
+            if _boundary_interface_active:
+                from boundary_layer import step_boundary_layer_interface_energy
 
-            boundary_step = step_boundary_layer_energy(
-                boundary_layer_out,
-                T_air,
-                land_step.sensible_heat_w_m2,
-                land_mask,
-                surface_pressure_pa=float(_pp.surface_pressure_pa),
-                cp_j_kg_k=float(_pp.cp_dry),
-                gravity_m_s2=float(_pp.surface_gravity),
-                gas_constant_j_kg_k=float(_pp.gas_constant_dry),
-                reference_temperature_k=288.15,
-                mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
-                entrainment_velocity_m_s=float(_pp.boundary_layer_entrainment_velocity_m_s),
-                dt_seconds=dt_sec,
-                wind_speed_m_s=wind_for_land,
-                stability_dependent_exchange=bool(
-                    _pp.enable_boundary_layer_stability_dependent_exchange
-                ),
-                exchange_mask=(
-                    np.ones_like(land_mask, dtype=bool)
-                    if _boundary_transport_active else land_mask
-                ),
-            )
+                boundary_step = step_boundary_layer_interface_energy(
+                    boundary_layer_out,
+                    boundary_interface_out,
+                    T_air,
+                    land_step.sensible_heat_w_m2,
+                    land_mask,
+                    surface_pressure_pa=float(_pp.surface_pressure_pa),
+                    cp_j_kg_k=float(_pp.cp_dry),
+                    gravity_m_s2=float(_pp.surface_gravity),
+                    gas_constant_j_kg_k=float(_pp.gas_constant_dry),
+                    reference_temperature_k=288.15,
+                    mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
+                    entrainment_velocity_m_s=float(
+                        _pp.boundary_layer_entrainment_velocity_m_s
+                    ),
+                    dt_seconds=dt_sec,
+                    wind_speed_m_s=wind_for_land,
+                )
+                boundary_interface_out = boundary_step.interface_temperature
+                boundary_interface_upper_gain = (
+                    boundary_step.interface_free_gain_w_m2
+                )
+            else:
+                from boundary_layer import step_boundary_layer_energy
+
+                boundary_step = step_boundary_layer_energy(
+                    boundary_layer_out,
+                    T_air,
+                    land_step.sensible_heat_w_m2,
+                    land_mask,
+                    surface_pressure_pa=float(_pp.surface_pressure_pa),
+                    cp_j_kg_k=float(_pp.cp_dry),
+                    gravity_m_s2=float(_pp.surface_gravity),
+                    gas_constant_j_kg_k=float(_pp.gas_constant_dry),
+                    reference_temperature_k=288.15,
+                    mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
+                    entrainment_velocity_m_s=float(
+                        _pp.boundary_layer_entrainment_velocity_m_s
+                    ),
+                    dt_seconds=dt_sec,
+                    wind_speed_m_s=wind_for_land,
+                    stability_dependent_exchange=bool(
+                        _pp.enable_boundary_layer_stability_dependent_exchange
+                    ),
+                    exchange_mask=land_mask,
+                )
             boundary_layer_out = boundary_step.boundary_temperature
             T_air = boundary_step.free_temperature
             conservative_sensible_gain = boundary_step.surface_gain_w_m2
@@ -5166,12 +5422,40 @@ def _evolve_temperature(
     # multiplier is measurement-neutral: 1.0 and 4.0 give identical results).
     # See overnight/FINDINGS.md (2026-07-25) for the full bisect.
     H_air = 1.0
-    H_surf = np.where(sea_mask, np.clip(mld / 50.0, 0.3, 4.0), 0.35).astype(np.float32, copy=False)
+    if _capacity_aware_airsea:
+        H_surf = np.where(
+            sea_mask, (4.186e6 * mld) / _column_air_capacity, 0.35
+        ).astype(np.float32, copy=False)
+    else:
+        H_surf = np.where(
+            sea_mask, np.clip(mld / 50.0, 0.3, 4.0), 0.35
+        ).astype(np.float32, copy=False)
     k_couple = np.where(sea_mask, float(_pp.k_airsea) * 4.0, 0.0).astype(np.float32, copy=False)
     dT_exchange = k_couple * (T_sst - T_air) * float(days)
     dT_exchange = np.clip(dT_exchange, -5.0, 5.0).astype(np.float32, copy=False)
+    _airsea_air_delta_k = dT_exchange / H_air
+    _airsea_ocean_delta_k = -dT_exchange / H_surf
     T_air = (T_air + dT_exchange / H_air).astype(np.float32, copy=False)
     T_sst = (T_sst - dT_exchange / H_surf).astype(np.float32, copy=False)
+    if dt_sec > 0.0:
+        _airsea_air_capacity = (
+            float(_pp.surface_pressure_pa) / float(_pp.surface_gravity)
+            * float(_pp.cp_dry)
+        )
+        _airsea_ocean_capacity = 4.186e6 * mld
+        _airsea_atmospheric_gain_w_m2 = np.where(
+            sea_mask, _airsea_air_capacity * _airsea_air_delta_k / dt_sec, 0.0
+        )
+        _airsea_ocean_gain_w_m2 = np.where(
+            sea_mask, _airsea_ocean_capacity * _airsea_ocean_delta_k / dt_sec, 0.0
+        )
+        _airsea_physical_residual_w_m2 = (
+            _airsea_atmospheric_gain_w_m2 + _airsea_ocean_gain_w_m2
+        )
+    else:
+        _airsea_atmospheric_gain_w_m2 = np.zeros_like(T_air, dtype=np.float32)
+        _airsea_ocean_gain_w_m2 = np.zeros_like(T_air, dtype=np.float32)
+        _airsea_physical_residual_w_m2 = np.zeros_like(T_air, dtype=np.float32)
 
     # --- Feature 5: Deep ocean heat uptake (heat-capacity weighted) ---
     # Mixed layer and abyss exchange equal heat fluxes; abyssal ΔT is scaled by
@@ -5344,6 +5628,10 @@ def _evolve_temperature(
     T_sst = (T_sst + subsidence).astype(np.float32, copy=False)
 
     # --- Final clamping ---
+    _T_air_before_final_clamp = T_air.copy()
+    _boundary_before_final_clamp = (
+        None if boundary_layer_out is None else np.asarray(boundary_layer_out).copy()
+    )
     # T_sst: ocean surface / land surface (200K–323K)
     T_sst = np.clip(T_sst, 200.0, 323.0)
     # T_air: free air — allow slightly wider range (180K–340K)
@@ -5352,6 +5640,10 @@ def _evolve_temperature(
         boundary_layer_out = np.clip(boundary_layer_out, 180.0, 340.0).astype(
             np.float32, copy=False
         )
+    if boundary_interface_out is not None:
+        boundary_interface_out = np.clip(
+            boundary_interface_out, 180.0, 340.0
+        ).astype(np.float32, copy=False)
 
     # Track component contributions
     components = {}
@@ -5373,7 +5665,17 @@ def _evolve_temperature(
                 )
             if boundary_exchange_gain is not None:
                 components["boundary_layer_exchange_gain_w_m2"] = boundary_exchange_gain
-                components["free_air_exchange_gain_w_m2"] = -boundary_exchange_gain
+                if _boundary_interface_active:
+                    components["boundary_layer_interface_exchange_gain_w_m2"] = (
+                        -boundary_exchange_gain + boundary_interface_upper_gain
+                    )
+                    components["free_air_exchange_gain_w_m2"] = (
+                        -boundary_interface_upper_gain
+                    )
+                else:
+                    components["free_air_exchange_gain_w_m2"] = (
+                        -boundary_exchange_gain
+                    )
                 components["boundary_layer_pressure_thickness_pa"] = (
                     boundary_step.pressure_thickness_pa
                 )
@@ -5383,6 +5685,22 @@ def _evolve_temperature(
                 components["boundary_layer_bulk_richardson_number"] = (
                     boundary_step.bulk_richardson_number
                 )
+                if _boundary_interface_active:
+                    components["boundary_layer_interface_pressure_thickness_pa"] = (
+                        boundary_step.interface_pressure_thickness_pa
+                    )
+                    components["boundary_layer_interface_free_gain_w_m2"] = (
+                        boundary_interface_upper_gain
+                    )
+                    components[
+                        "boundary_layer_mechanical_entrainment_velocity_m_s"
+                    ] = boundary_step.mechanical_entrainment_velocity_m_s
+                    components[
+                        "boundary_layer_convective_entrainment_velocity_m_s"
+                    ] = boundary_step.convective_entrainment_velocity_m_s
+                    components["boundary_layer_surface_buoyancy_flux_m2_s3"] = (
+                        boundary_step.surface_buoyancy_flux_m2_s3
+                    )
                 components["boundary_layer_horizontal_transport"] = "omitted"
                 components["resolved_heat_convergence_destination"] = "free_atmosphere"
                 if boundary_horizontal_convergence is not None:
@@ -5391,6 +5709,9 @@ def _evolve_temperature(
                     )
                     components["boundary_layer_continuity_exchange_gain_w_m2"] = (
                         boundary_continuity_exchange
+                    )
+                    components["free_air_horizontal_heat_convergence_w_m2"] = (
+                        transport_step.free_horizontal_convergence_w_m2
                     )
                     components["free_air_continuity_exchange_gain_w_m2"] = (
                         -boundary_continuity_exchange
@@ -5411,15 +5732,265 @@ def _evolve_temperature(
         # Private channel threaded by the outer solver and omitted from public
         # component diagnostics after it has been copied into PlanetState.
         components["_boundary_layer_temperature"] = boundary_layer_out
+    if boundary_interface_out is not None:
+        components["_boundary_layer_interface_temperature"] = (
+            boundary_interface_out
+        )
     if track_components:
+        _energy_lat_edges = np.linspace(np.pi / 2.0, -np.pi / 2.0, Hc + 1)
+        _energy_area_rows = np.sin(_energy_lat_edges[:-1]) - np.sin(_energy_lat_edges[1:])
+        _energy_denom = Wc * np.sum(_energy_area_rows)
+        def _energy_area_mean(field: np.ndarray) -> float:
+            return float(np.sum(np.asarray(field) * _energy_area_rows[:, None]) / _energy_denom)
+
+        def _masked_energy_area_mean(field: np.ndarray, mask: np.ndarray) -> float:
+            weighted_mask = np.asarray(mask) * _energy_area_rows[:, None]
+            denominator = float(np.sum(weighted_mask))
+            if denominator <= 0.0:
+                return float("nan")
+            return float(np.sum(np.asarray(field) * weighted_mask) / denominator)
+
+        _diagnostic_free_capacity = np.full_like(
+            T_air, _column_air_capacity, dtype=np.float64
+        )
+        if _boundary_layer_active and boundary_exchange_gain is not None:
+            _diagnostic_boundary_capacity = (
+                np.asarray(boundary_step.pressure_thickness_pa, dtype=np.float64)
+                / float(_pp.surface_gravity)
+                * float(_pp.cp_dry)
+            )
+            _diagnostic_free_capacity = np.where(
+                land_mask,
+                _column_air_capacity - _diagnostic_boundary_capacity,
+                _column_air_capacity,
+            )
+            if _boundary_interface_active:
+                _diagnostic_interface_capacity = (
+                    float(boundary_step.interface_pressure_thickness_pa)
+                    / float(_pp.surface_gravity)
+                    * float(_pp.cp_dry)
+                )
+                _diagnostic_free_capacity = np.where(
+                    land_mask,
+                    _diagnostic_free_capacity - _diagnostic_interface_capacity,
+                    _diagnostic_free_capacity,
+                )
+        _free_advection_gain = (
+            _diagnostic_free_capacity * (T_after_advection - T_before_advection)
+            / dt_sec
+            if dt_sec > 0.0
+            else np.zeros_like(T_air, dtype=np.float64)
+        )
+        _free_diffusion_gain = (
+            _diagnostic_free_capacity * (T_after_diffusion - T_before_diffusion)
+            / dt_sec
+            if dt_sec > 0.0
+            else np.zeros_like(T_air, dtype=np.float64)
+        )
+        _free_clamp_gain = (
+            _diagnostic_free_capacity * (T_air - _T_air_before_final_clamp) / dt_sec
+            if dt_sec > 0.0
+            else np.zeros_like(T_air, dtype=np.float64)
+        )
+        _boundary_clamp_gain = np.zeros_like(T_air, dtype=np.float64)
+        if (
+            dt_sec > 0.0
+            and _boundary_before_final_clamp is not None
+            and boundary_layer_out is not None
+            and _boundary_layer_active
+            and boundary_exchange_gain is not None
+        ):
+            _boundary_clamp_gain = np.where(
+                land_mask,
+                _diagnostic_boundary_capacity
+                * (boundary_layer_out - _boundary_before_final_clamp)
+                / dt_sec,
+                0.0,
+            )
+
         components['advection'] = T_after_advection - T_before_advection
         components['diffusion'] = T_after_diffusion - T_before_diffusion
+        components['free_air_advection_gain_w_m2'] = _free_advection_gain
+        components['free_air_diffusion_gain_w_m2'] = _free_diffusion_gain
+        components['free_air_transport_closure_delta_k'] = (
+            _free_transport_closure_delta_k
+        )
+        components['free_air_final_clamp_gain_w_m2'] = _free_clamp_gain
+        components['boundary_layer_final_clamp_gain_w_m2'] = _boundary_clamp_gain
+        components['free_air_advection_gain_area_mean_w_m2'] = _energy_area_mean(
+            _free_advection_gain
+        )
+        components['free_air_diffusion_gain_area_mean_w_m2'] = _energy_area_mean(
+            _free_diffusion_gain
+        )
+        components['free_air_final_clamp_gain_area_mean_w_m2'] = _energy_area_mean(
+            _free_clamp_gain
+        )
+        components['boundary_layer_final_clamp_gain_area_mean_w_m2'] = _energy_area_mean(
+            _boundary_clamp_gain
+        )
+        _surface_air_relaxation_gain = (
+            _column_air_capacity * _surface_air_relaxation_delta_k / dt_sec
+            if dt_sec > 0.0
+            else np.zeros_like(T_air, dtype=np.float64)
+        )
+        components['surface_air_relaxation_gain_w_m2'] = (
+            _surface_air_relaxation_gain
+        )
+        components['surface_air_relaxation_gain_area_mean_w_m2'] = (
+            _energy_area_mean(_surface_air_relaxation_gain)
+        )
+        if boundary_exchange_gain is not None:
+            components['boundary_layer_surface_sensible_gain_area_mean_w_m2'] = (
+                _energy_area_mean(
+                    np.where(land_mask, land_step.sensible_heat_w_m2, 0.0)
+                )
+            )
+            components['boundary_layer_exchange_gain_land_mean_w_m2'] = (
+                _masked_energy_area_mean(boundary_exchange_gain, land_mask)
+            )
+            components['boundary_layer_effective_entrainment_land_mean_m_s'] = (
+                _masked_energy_area_mean(
+                    boundary_step.effective_entrainment_velocity_m_s, land_mask
+                )
+            )
+            if _boundary_interface_active:
+                components[
+                    'boundary_layer_mechanical_entrainment_land_mean_m_s'
+                ] = _masked_energy_area_mean(
+                    boundary_step.mechanical_entrainment_velocity_m_s,
+                    land_mask,
+                )
+                components[
+                    'boundary_layer_convective_entrainment_land_mean_m_s'
+                ] = _masked_energy_area_mean(
+                    boundary_step.convective_entrainment_velocity_m_s,
+                    land_mask,
+                )
+                components['boundary_layer_surface_buoyancy_flux_land_mean_m2_s3'] = (
+                    _masked_energy_area_mean(
+                        boundary_step.surface_buoyancy_flux_m2_s3,
+                        land_mask,
+                    )
+                )
+            components['boundary_layer_bulk_ri_land_mean'] = (
+                _masked_energy_area_mean(
+                    boundary_step.bulk_richardson_number, land_mask
+                )
+            )
+            components['boundary_layer_stable_area_fraction'] = (
+                _masked_energy_area_mean(
+                    boundary_step.bulk_richardson_number > 0.0, land_mask
+                )
+            )
+            components['boundary_layer_strongly_stable_area_fraction'] = (
+                _masked_energy_area_mean(
+                    boundary_step.bulk_richardson_number > 0.2, land_mask
+                )
+            )
+            _inversion_top_temperature = (
+                boundary_interface_out if _boundary_interface_active else T_air
+            )
+            _post_exchange_inversion = np.asarray(
+                _inversion_top_temperature
+            ) - np.asarray(boundary_layer_out)
+            components['boundary_layer_post_exchange_inversion_land_mean_k'] = (
+                _masked_energy_area_mean(_post_exchange_inversion, land_mask)
+            )
+            components[
+                'boundary_layer_post_exchange_abs_inversion_land_mean_k'
+            ] = _masked_energy_area_mean(
+                np.abs(_post_exchange_inversion), land_mask
+            )
         components['radiation'] = k_relax * (T_eq - T_sst) * float(days)
         components['evaporation'] = -evap_cooling
         components['ocean_transport'] = T_ocean_adj
+        components['airsea_atmospheric_gain_w_m2'] = _airsea_atmospheric_gain_w_m2
+        components['airsea_ocean_gain_w_m2'] = _airsea_ocean_gain_w_m2
+        components['airsea_physical_energy_residual_w_m2'] = _airsea_physical_residual_w_m2
+        components['airsea_atmospheric_gain_area_mean_w_m2'] = _energy_area_mean(
+            _airsea_atmospheric_gain_w_m2
+        )
+        components['airsea_ocean_gain_area_mean_w_m2'] = _energy_area_mean(
+            _airsea_ocean_gain_w_m2
+        )
+        components['airsea_physical_energy_residual_area_mean_w_m2'] = _energy_area_mean(
+            _airsea_physical_residual_w_m2
+        )
+        components['ocean_air_relaxation_atmospheric_gain_w_m2'] = (
+            _ocean_air_relaxation_gain_w_m2
+        )
+        components['ocean_air_relaxation_atmospheric_gain_area_mean_w_m2'] = (
+            _energy_area_mean(_ocean_air_relaxation_gain_w_m2)
+        )
+        components['ocean_air_relaxation_ocean_gain_w_m2'] = (
+            _ocean_air_relaxation_ocean_gain_w_m2
+        )
+        components['ocean_air_relaxation_physical_energy_residual_w_m2'] = (
+            _ocean_air_relaxation_residual_w_m2
+        )
+        components['ocean_air_relaxation_ocean_gain_area_mean_w_m2'] = (
+            _energy_area_mean(_ocean_air_relaxation_ocean_gain_w_m2)
+        )
+        components['ocean_air_relaxation_physical_energy_residual_area_mean_w_m2'] = (
+            _energy_area_mean(_ocean_air_relaxation_residual_w_m2)
+        )
         components['subsidence'] = subsidence
         components['equilibrium_temp'] = T_eq
+        components['cloud_thermodynamic_temperature_k'] = (
+            _cloud_thermodynamic_temperature
+        )
+        components['cloud_saturation_specific_humidity'] = qsat
+        components['cloud_relative_humidity'] = rh
+        components['cloud_temperature_source'] = (
+            "boundary_layer_over_land"
+            if _boundary_cloud_temperature_active
+            else "free_atmosphere"
+        )
+        components['cloud_specific_humidity_area_mean'] = _energy_area_mean(q)
+        components['cloud_saturation_specific_humidity_area_mean'] = (
+            _energy_area_mean(qsat)
+        )
+        components['cloud_relative_humidity_area_mean'] = _energy_area_mean(rh)
+        components['cloud_rh_above_065_area_fraction'] = _energy_area_mean(
+            rh >= 0.65
+        )
+        components['land_cloud_relative_humidity_area_mean'] = (
+            _masked_energy_area_mean(rh, land_mask)
+        )
+        components['ocean_cloud_relative_humidity_area_mean'] = (
+            _masked_energy_area_mean(rh, sea_mask)
+        )
+        components['cloud_rh_core_area_mean'] = _energy_area_mean(rh_core)
+        components['cloud_ascent_term_area_mean'] = _energy_area_mean(ascent_term)
+        components['cloud_subsidence_area_mean'] = _energy_area_mean(subsidence)
+        components['cloud_orographic_driver_area_mean'] = _energy_area_mean(orog)
+        components['cloud_instantaneous_area_mean'] = _energy_area_mean(
+            _cloud_fraction_instantaneous
+        )
+        components['cloud_after_persistence_area_mean'] = _energy_area_mean(
+            _cloud_fraction_after_persistence
+        )
+        components['cloud_after_rainout_area_mean'] = _energy_area_mean(
+            _cloud_fraction_after_rainout
+        )
+        components['cloud_final_area_mean'] = _energy_area_mean(cloud_fraction)
         components['net_radiation'] = R_net
+        components['net_radiation_area_mean_w_m2'] = _energy_area_mean(R_net)
+        components['cloud_shortwave_forcing_w_m2'] = _cloud_shortwave_forcing
+        components['cloud_longwave_forcing_w_m2'] = _cloud_longwave_forcing
+        components['cloud_net_radiative_forcing_w_m2'] = (
+            _cloud_net_radiative_forcing
+        )
+        components['cloud_shortwave_forcing_area_mean_w_m2'] = _energy_area_mean(
+            _cloud_shortwave_forcing
+        )
+        components['cloud_longwave_forcing_area_mean_w_m2'] = _energy_area_mean(
+            _cloud_longwave_forcing
+        )
+        components['cloud_net_radiative_forcing_area_mean_w_m2'] = _energy_area_mean(
+            _cloud_net_radiative_forcing
+        )
         components['S_absorbed'] = S_absorbed
         components['L_out'] = L_out
         def _summ(field: np.ndarray) -> dict:

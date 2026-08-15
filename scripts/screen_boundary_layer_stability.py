@@ -31,6 +31,7 @@ def _advance(initial, *, dt_days: float, total_days: float, params):
         exchange = (
             diagnostics["boundary_layer_exchange_gain_w_m2"]
             + diagnostics["free_air_exchange_gain_w_m2"]
+            + diagnostics.get("boundary_layer_interface_exchange_gain_w_m2", 0.0)
         )
         max_surface_closure = max(max_surface_closure, float(np.max(np.abs(surface))))
         max_exchange_closure = max(max_exchange_closure, float(np.max(np.abs(exchange))))
@@ -67,8 +68,12 @@ def main() -> int:
         enable_force_restore_land=True,
         enable_force_restore_atmospheric_heat_convergence=True,
         enable_force_restore_boundary_layer=True,
-        enable_boundary_layer_stability_dependent_exchange=True,
         enable_boundary_layer_horizontal_transport=True,
+        enable_boundary_layer_interface_reservoir=True,
+        enable_boundary_layer_capacity_aware_airsea_exchange=True,
+        enable_boundary_layer_capacity_aware_free_air_transport=True,
+        enable_boundary_layer_near_surface_cloud_temperature=True,
+        enable_boundary_layer_split_invariant_cloud_memory=True,
     )
     clear_simulation_caches()
     initial = create_initial_state(elevation, planet_params=params)

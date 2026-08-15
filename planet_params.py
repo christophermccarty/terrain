@@ -626,6 +626,39 @@ class PlanetParams:
     thickness fixed.  This gate requires the force-restore boundary layer.
     """
 
+    enable_boundary_layer_capacity_aware_airsea_exchange: bool = False
+    """Close ocean/atmosphere heat exchange with physical heat capacities.
+
+    This experimental gate requires the force-restore boundary layer. It keeps
+    the existing atmospheric temperature tendencies over ocean but applies
+    their equal-and-opposite energy to the slab ocean using its physical mixed-
+    layer heat capacity. The supported/default coupling is unchanged when off.
+    """
+
+    enable_boundary_layer_capacity_aware_free_air_transport: bool = False
+    """Conserve resolved free-air transport with its residual heat capacity.
+
+    This experimental gate requires the force-restore boundary layer. It
+    removes the impossible global source or sink from the combined supported
+    advection/diffusion update after accounting for the mixed-layer mass split.
+    """
+
+    enable_boundary_layer_near_surface_cloud_temperature: bool = False
+    """Use mixed-layer temperature for land surface-pressure cloud RH.
+
+    This experimental gate requires the force-restore boundary layer. It only
+    changes the low-cloud saturation diagnostic over land; column precipitation
+    and high-cloud temperature weighting continue to use free-atmosphere state.
+    """
+
+    enable_boundary_layer_split_invariant_cloud_memory: bool = False
+    """Make cloud persistence and rainout invariant to mixed-layer substeps.
+
+    This experimental gate requires the force-restore boundary layer. Daily
+    survival fractions are exponentiated by the substep duration, preventing
+    four six-hour calls from applying four full days of cloud rainout.
+    """
+
     boundary_layer_mixed_depth_m: float = 1_000.0
     """Dry mixed-layer geometric depth [m], used to derive pressure mass."""
 
@@ -643,6 +676,15 @@ class PlanetParams:
     entrainment with the stable Businger--Dyer ``1 + 5 Ri`` form and a friction
     velocity from the logarithmic wind law.  It preserves fixed entrainment as
     an explicit control and has no effect outside the boundary-layer branch.
+    """
+
+    enable_boundary_layer_interface_reservoir: bool = False
+    """Use a prognostic inversion-top layer for stability-dependent exchange.
+
+    The interface layer occupies the hydrostatic slab immediately above the
+    mixed layer with the same geometric depth. It therefore adds no independent
+    thickness calibration parameter and conserves energy with both adjacent
+    atmospheric reservoirs. Requires the force-restore boundary layer.
     """
 
     land_force_restore_days: float = 30.0

@@ -35,8 +35,66 @@ class BoundaryLayerTransportStep(NamedTuple):
     boundary_temperature: np.ndarray
     free_temperature: np.ndarray
     horizontal_convergence_w_m2: np.ndarray
+    free_horizontal_convergence_w_m2: np.ndarray
     continuity_exchange_gain_w_m2: np.ndarray
     substeps: int
+
+
+class BoundaryLayerInterfaceStep(NamedTuple):
+    boundary_temperature: np.ndarray
+    interface_temperature: np.ndarray
+    free_temperature: np.ndarray
+    surface_gain_w_m2: np.ndarray
+    boundary_interface_gain_w_m2: np.ndarray
+    interface_free_gain_w_m2: np.ndarray
+    boundary_pressure_thickness_pa: float
+    interface_pressure_thickness_pa: float
+    effective_entrainment_velocity_m_s: np.ndarray
+    bulk_richardson_number: np.ndarray
+    mechanical_entrainment_velocity_m_s: np.ndarray
+    convective_entrainment_velocity_m_s: np.ndarray
+    surface_buoyancy_flux_m2_s3: np.ndarray
+
+    @property
+    def pressure_thickness_pa(self) -> float:
+        return self.boundary_pressure_thickness_pa
+
+    @property
+    def exchange_gain_w_m2(self) -> np.ndarray:
+        return self.boundary_interface_gain_w_m2
+
+
+def close_free_air_transport_energy(
+    initial_temperature_k: np.ndarray,
+    transported_temperature_k: np.ndarray,
+    heat_capacity_j_m2_k: np.ndarray,
+    latitude_radians: np.ndarray,
+) -> np.ndarray:
+    """Project a transport update onto exact global energy conservation.
+
+    The host atmosphere transports temperature. Once a land mixed layer is
+    split out, the remaining free-air heat capacity varies between land and
+    ocean, so a globally uniform temperature correction is not conservative.
+    This kernel instead removes the area-mean energy convergence and converts
+    the corrected energy tendency back to temperature cell by cell.
+    """
+    initial = np.asarray(initial_temperature_k, dtype=np.float64)
+    transported = np.asarray(transported_temperature_k, dtype=np.float64)
+    capacity = np.asarray(heat_capacity_j_m2_k, dtype=np.float64)
+    latitude = np.asarray(latitude_radians, dtype=np.float64)
+    if initial.ndim != 2 or transported.shape != initial.shape:
+        raise ValueError("temperature fields must be matching 2-D arrays")
+    if capacity.shape != initial.shape or latitude.shape != (initial.shape[0],):
+        raise ValueError("capacity and latitude must match the temperature grid")
+    if not np.all(np.isfinite(capacity)) or np.any(capacity <= 0.0):
+        raise ValueError("heat capacity must be finite and positive")
+    energy_change = capacity * (transported - initial)
+    weights = np.cos(latitude)[:, None]
+    area_mean = np.sum(energy_change * weights) / (
+        initial.shape[1] * np.sum(weights)
+    )
+    corrected = initial + (energy_change - area_mean) / capacity
+    return corrected.astype(np.result_type(initial_temperature_k, np.float32), copy=False)
 
 
 def mixed_layer_pressure_thickness(
@@ -61,6 +119,207 @@ def mixed_layer_pressure_thickness(
         gas_constant_j_kg_k * reference_temperature_k
     )
     return float(surface_pressure_pa * -np.expm1(exponent))
+
+
+def overlying_layer_pressure_thickness(
+    *,
+    surface_pressure_pa: float,
+    gravity_m_s2: float,
+    gas_constant_j_kg_k: float,
+    reference_temperature_k: float,
+    layer_base_m: float,
+    layer_depth_m: float,
+) -> float:
+    """Return hydrostatic pressure mass between two geometric heights."""
+    values = (
+        surface_pressure_pa,
+        gravity_m_s2,
+        gas_constant_j_kg_k,
+        reference_temperature_k,
+        layer_depth_m,
+    )
+    if not all(np.isfinite(value) and value > 0.0 for value in values):
+        raise ValueError("layer thermodynamic inputs must be finite and positive")
+    if not np.isfinite(layer_base_m) or layer_base_m < 0.0:
+        raise ValueError("layer_base_m must be finite and non-negative")
+    scale = gravity_m_s2 / (gas_constant_j_kg_k * reference_temperature_k)
+    p_base = surface_pressure_pa * np.exp(-scale * layer_base_m)
+    p_top = surface_pressure_pa * np.exp(
+        -scale * (layer_base_m + layer_depth_m)
+    )
+    return float(p_base - p_top)
+
+
+def step_boundary_layer_interface_energy(
+    boundary_temperature_k: np.ndarray,
+    interface_temperature_k: np.ndarray,
+    free_temperature_k: np.ndarray,
+    upward_surface_sensible_w_m2: np.ndarray,
+    land_mask: np.ndarray,
+    *,
+    surface_pressure_pa: float,
+    cp_j_kg_k: float,
+    gravity_m_s2: float,
+    gas_constant_j_kg_k: float,
+    reference_temperature_k: float,
+    mixed_layer_depth_m: float,
+    entrainment_velocity_m_s: float,
+    dt_seconds: float,
+    wind_speed_m_s: np.ndarray,
+) -> BoundaryLayerInterfaceStep:
+    """Advance a conservative mixed-layer/interface/free-air column.
+
+    The interface reservoir spans the geometric layer immediately above the
+    mixed layer and has the same thickness. Its pressure mass is hydrostatic,
+    so this adds no independent depth or heat-capacity calibration parameter.
+    Stability is diagnosed across the actual mixed-layer top rather than from
+    the residual-column mean temperature.
+    """
+    boundary = np.asarray(boundary_temperature_k, dtype=np.float64)
+    interface = np.asarray(interface_temperature_k, dtype=np.float64)
+    free = np.asarray(free_temperature_k, dtype=np.float64)
+    sensible = np.asarray(upward_surface_sensible_w_m2, dtype=np.float64)
+    land = np.asarray(land_mask, dtype=bool)
+    wind = np.asarray(wind_speed_m_s, dtype=np.float64)
+    if not (
+        boundary.shape == interface.shape == free.shape == sensible.shape
+        == land.shape == wind.shape
+    ):
+        raise ValueError("interface-column inputs must share a shape")
+    if dt_seconds <= 0.0 or not np.isfinite(dt_seconds):
+        raise ValueError("dt_seconds must be finite and positive")
+    if entrainment_velocity_m_s < 0.0 or not np.isfinite(entrainment_velocity_m_s):
+        raise ValueError("entrainment velocity must be finite and non-negative")
+    if not all(np.all(np.isfinite(field)) for field in (boundary, interface, free, sensible, wind)):
+        raise ValueError("interface-column inputs must be finite")
+
+    boundary_dp = mixed_layer_pressure_thickness(
+        surface_pressure_pa=surface_pressure_pa,
+        gravity_m_s2=gravity_m_s2,
+        gas_constant_j_kg_k=gas_constant_j_kg_k,
+        reference_temperature_k=reference_temperature_k,
+        mixed_layer_depth_m=mixed_layer_depth_m,
+    )
+    interface_dp = overlying_layer_pressure_thickness(
+        surface_pressure_pa=surface_pressure_pa,
+        gravity_m_s2=gravity_m_s2,
+        gas_constant_j_kg_k=gas_constant_j_kg_k,
+        reference_temperature_k=reference_temperature_k,
+        layer_base_m=mixed_layer_depth_m,
+        layer_depth_m=mixed_layer_depth_m,
+    )
+    free_dp = surface_pressure_pa - boundary_dp - interface_dp
+    if free_dp <= 0.0:
+        raise ValueError("boundary and interface layers exceed the atmospheric column")
+    boundary_capacity = boundary_dp * cp_j_kg_k / gravity_m_s2
+    interface_capacity = interface_dp * cp_j_kg_k / gravity_m_s2
+    free_capacity = free_dp * cp_j_kg_k / gravity_m_s2
+    surface_gain = np.where(land, sensible, 0.0)
+    boundary_heated = boundary + surface_gain * dt_seconds / boundary_capacity
+
+    shear_squared = np.maximum(wind * wind, 0.25**2)
+    bulk_ri = (
+        gravity_m_s2 * mixed_layer_depth_m * (interface - boundary_heated)
+        / (reference_temperature_k * shear_squared)
+    )
+    friction_velocity = 0.4 * np.maximum(wind, 0.0) / np.log(
+        mixed_layer_depth_m / 0.1
+    )
+    rho_ref = surface_pressure_pa / (
+        gas_constant_j_kg_k * reference_temperature_k
+    )
+    surface_buoyancy_flux = (
+        gravity_m_s2
+        / reference_temperature_k
+        * np.maximum(surface_gain, 0.0)
+        / (rho_ref * cp_j_kg_k)
+    )
+    buoyancy_jump = (
+        gravity_m_s2
+        * np.maximum(interface - boundary_heated, 0.0)
+        / reference_temperature_k
+    )
+    stable = buoyancy_jump > 0.0
+    energy_barrier = np.where(
+        stable, mixed_layer_depth_m * buoyancy_jump, 1.0
+    )
+    mechanical_velocity = np.where(
+        stable, friction_velocity**3 / energy_barrier, entrainment_velocity_m_s
+    )
+    # The canonical zero-order mixed-layer entrainment-flux ratio is about
+    # 0.2: one fifth of surface buoyancy production is available to entrain
+    # air through the capping inversion. It is a dimensionless closure from
+    # the mixed-layer TKE budget, not a temperature relaxation timescale.
+    convective_velocity = np.where(
+        stable,
+        0.2 * surface_buoyancy_flux / np.where(stable, buoyancy_jump, 1.0),
+        entrainment_velocity_m_s,
+    )
+    effective_velocity = np.where(
+        stable,
+        np.minimum(
+            entrainment_velocity_m_s,
+            mechanical_velocity + convective_velocity,
+        ),
+        entrainment_velocity_m_s,
+    )
+
+    def exchange_pair(first, first_capacity, second, second_capacity, velocity):
+        conductance = rho_ref * cp_j_kg_k * velocity
+        decay = np.exp(
+            -conductance
+            * (1.0 / first_capacity + 1.0 / second_capacity)
+            * dt_seconds
+        )
+        equilibrium = (
+            first_capacity * first + second_capacity * second
+        ) / (first_capacity + second_capacity)
+        first_out = equilibrium + (first - equilibrium) * decay
+        second_out = equilibrium + (second - equilibrium) * decay
+        return first_out, second_out
+
+    boundary_mixed, interface_after_lower = exchange_pair(
+        boundary_heated,
+        boundary_capacity,
+        interface,
+        interface_capacity,
+        effective_velocity,
+    )
+    interface_mixed, free_mixed = exchange_pair(
+        interface_after_lower,
+        interface_capacity,
+        free,
+        free_capacity,
+        entrainment_velocity_m_s,
+    )
+    boundary_out = np.where(land, boundary_mixed, boundary_heated)
+    interface_out = np.where(land, interface_mixed, free)
+    free_out = np.where(land, free_mixed, free)
+    lower_gain = np.where(
+        land,
+        boundary_capacity * (boundary_mixed - boundary_heated) / dt_seconds,
+        0.0,
+    )
+    upper_gain = np.where(
+        land,
+        free_capacity * (free - free_mixed) / dt_seconds,
+        0.0,
+    )
+    return BoundaryLayerInterfaceStep(
+        boundary_out,
+        interface_out,
+        free_out,
+        surface_gain,
+        lower_gain,
+        upper_gain,
+        boundary_dp,
+        interface_dp,
+        effective_velocity,
+        bulk_ri,
+        mechanical_velocity,
+        convective_velocity,
+        surface_buoyancy_flux,
+    )
 
 
 def step_boundary_layer_energy(
@@ -193,6 +452,8 @@ def transport_boundary_layer_energy(
     gravity_m_s2: float,
     radius_m: float,
     dt_seconds: float,
+    active_mask: np.ndarray | None = None,
+    additional_reserved_pressure_pa: float = 0.0,
 ) -> BoundaryLayerTransportStep:
     """Flux-form horizontal transport with conservative mass closure.
 
@@ -202,6 +463,9 @@ def transport_boundary_layer_energy(
     entrains a local mass deficit from the free atmosphere or detrains a mass
     surplus back to it.  That continuity exchange is equal-and-opposite in
     energy and makes a spatially uniform equilibrium an exact fixed point.
+    When ``active_mask`` is supplied, mixed-layer mass exists only in active
+    cells. Coastal inflow is drawn from marine free air and coastal outflow is
+    deposited into it; an opposite free-air return flux closes mass locally.
     """
     boundary = np.asarray(boundary_temperature_k, dtype=np.float64)
     free = np.asarray(free_temperature_k, dtype=np.float64)
@@ -211,6 +475,12 @@ def transport_boundary_layer_energy(
         raise ValueError("transport fields must be 2-D with identical shapes")
     if not all(np.all(np.isfinite(field)) for field in (boundary, free, u, v)):
         raise ValueError("transport fields must be finite")
+    active = (
+        np.ones(boundary.shape, dtype=bool)
+        if active_mask is None else np.asarray(active_mask, dtype=bool)
+    )
+    if active.shape != boundary.shape:
+        raise ValueError("active mask must share the transport-field shape")
     scalars = (
         pressure_thickness_pa, surface_pressure_pa, cp_j_kg_k,
         gravity_m_s2, radius_m, dt_seconds,
@@ -219,6 +489,13 @@ def transport_boundary_layer_energy(
         raise ValueError("transport thermodynamic and grid inputs must be positive")
     if pressure_thickness_pa >= surface_pressure_pa:
         raise ValueError("boundary-layer pressure thickness must be below surface pressure")
+    if (
+        not np.isfinite(additional_reserved_pressure_pa)
+        or additional_reserved_pressure_pa < 0.0
+        or pressure_thickness_pa + additional_reserved_pressure_pa
+        >= surface_pressure_pa
+    ):
+        raise ValueError("reserved layer pressure must leave positive free-air mass")
 
     height, width = boundary.shape
     dlat = np.pi / height
@@ -229,9 +506,15 @@ def transport_boundary_layer_energy(
     )
     area = np.broadcast_to(area_row[:, None], boundary.shape)
     layer_mass_area = pressure_thickness_pa / gravity_m_s2
-    free_mass_area = (surface_pressure_pa - pressure_thickness_pa) / gravity_m_s2
-    target_mass = layer_mass_area * area
-    target_free_mass = free_mass_area * area
+    active_f = active.astype(np.float64)
+    target_mass = layer_mass_area * area * active_f
+    target_free_mass = (
+        (
+            surface_pressure_pa
+            - (pressure_thickness_pa + additional_reserved_pressure_pa) * active_f
+        )
+        / gravity_m_s2 * area
+    )
 
     lat_centers = 0.5 * (lat_edges[:-1] + lat_edges[1:])
     dx = radius_m * dlon * np.maximum(np.cos(lat_centers), 1e-6)
@@ -240,6 +523,7 @@ def transport_boundary_layer_energy(
     substeps = max(1, int(np.ceil(cfl / 0.45)))
     sub_dt = dt_seconds / substeps
     horizontal_energy = np.zeros_like(boundary)
+    free_horizontal_energy = np.zeros_like(boundary)
     continuity_energy = np.zeros_like(boundary)
 
     for _ in range(substeps):
@@ -251,13 +535,26 @@ def transport_boundary_layer_energy(
         # East face of every cell; longitude is periodic.
         u_face = 0.5 * (u + np.roll(u, -1, axis=1))
         moved = np.abs(u_face) * sub_dt * layer_mass_area * (radius_m * dlat)
-        donor_t = np.where(u_face >= 0.0, boundary, np.roll(boundary, -1, axis=1))
-        signed_mass = np.where(u_face >= 0.0, moved, -moved)
+        active_e = np.roll(active, -1, axis=1)
+        face_active = active | active_e
+        source_i = np.where(active, boundary, free)
+        source_e = np.roll(source_i, -1, axis=1)
+        donor_t = np.where(u_face >= 0.0, source_i, source_e)
+        signed_mass = np.where(u_face >= 0.0, moved, -moved) * face_active
         signed_heat = signed_mass * cp_j_kg_k * donor_t
-        mass -= signed_mass
-        mass += np.roll(signed_mass, 1, axis=1)
-        heat -= signed_heat
-        heat += np.roll(signed_heat, 1, axis=1)
+        # Boundary-layer flux applies only on the land side of a coastal face.
+        mass -= signed_mass * active
+        mass += np.roll(signed_mass * active_e, 1, axis=1)
+        heat -= signed_heat * active
+        heat += np.roll(signed_heat * active_e, 1, axis=1)
+        # On an ocean side, the same directed flux is sourced from/deposited
+        # into free air. The equal-opposite return flux always uses free air.
+        ocean = ~active
+        ocean_e = ~active_e
+        free_mass -= signed_mass * ocean
+        free_mass += np.roll(signed_mass * ocean_e, 1, axis=1)
+        free_heat -= signed_heat * ocean
+        free_heat += np.roll(signed_heat * ocean_e, 1, axis=1)
         free_signed_mass = -signed_mass
         free_donor_t = np.where(
             free_signed_mass >= 0.0, free, np.roll(free, -1, axis=1)
@@ -273,14 +570,25 @@ def transport_boundary_layer_energy(
             v_face = 0.5 * (v[:-1, :] + v[1:, :])
             face_length = radius_m * dlon * np.cos(lat_edges[1:-1])[:, None]
             moved = np.abs(v_face) * sub_dt * layer_mass_area * face_length
-            donor_t = np.where(v_face < 0.0, boundary[:-1, :], boundary[1:, :])
+            active_n = active[:-1, :]
+            active_s = active[1:, :]
+            face_active = active_n | active_s
+            source_n = np.where(active_n, boundary[:-1, :], free[:-1, :])
+            source_s = np.where(active_s, boundary[1:, :], free[1:, :])
+            donor_t = np.where(v_face < 0.0, source_n, source_s)
             # Positive signed flux is from the north row to the south row.
-            signed_mass = np.where(v_face < 0.0, moved, -moved)
+            signed_mass = np.where(v_face < 0.0, moved, -moved) * face_active
             signed_heat = signed_mass * cp_j_kg_k * donor_t
-            mass[:-1, :] -= signed_mass
-            mass[1:, :] += signed_mass
-            heat[:-1, :] -= signed_heat
-            heat[1:, :] += signed_heat
+            mass[:-1, :] -= signed_mass * active_n
+            mass[1:, :] += signed_mass * active_s
+            heat[:-1, :] -= signed_heat * active_n
+            heat[1:, :] += signed_heat * active_s
+            ocean_n = ~active_n
+            ocean_s = ~active_s
+            free_mass[:-1, :] -= signed_mass * ocean_n
+            free_mass[1:, :] += signed_mass * ocean_s
+            free_heat[:-1, :] -= signed_heat * ocean_n
+            free_heat[1:, :] += signed_heat * ocean_s
             free_signed_mass = -signed_mass
             free_donor_t = np.where(
                 free_signed_mass >= 0.0, free[:-1, :], free[1:, :]
@@ -292,9 +600,13 @@ def transport_boundary_layer_energy(
             free_heat[1:, :] += free_signed_heat
 
         horizontal_energy += heat - target_mass * cp_j_kg_k * boundary
-        advected_temperature = heat / (mass * cp_j_kg_k)
+        free_horizontal_energy += free_heat - target_free_mass * cp_j_kg_k * free
+        advected_temperature = np.divide(
+            heat, mass * cp_j_kg_k,
+            out=np.asarray(boundary).copy(), where=mass > 0.0,
+        )
         advected_free_temperature = free_heat / (free_mass * cp_j_kg_k)
-        mass_deficit = target_mass - mass
+        mass_deficit = (target_mass - mass) * active_f
         # The equal-opposite return flow makes the free-layer mass anomaly the
         # negative of the mixed-layer anomaly. Deficits entrain advected free
         # air; surpluses detrain advected mixed-layer air.
@@ -305,13 +617,18 @@ def transport_boundary_layer_energy(
         heat += closure_heat
         free_heat -= closure_heat
         continuity_energy += closure_heat
-        boundary = heat / (target_mass * cp_j_kg_k)
+        boundary = np.where(
+            active,
+            heat / np.maximum(target_mass * cp_j_kg_k, 1.0),
+            free_heat / (target_free_mass * cp_j_kg_k),
+        )
         free = free_heat / (target_free_mass * cp_j_kg_k)
 
     return BoundaryLayerTransportStep(
         boundary,
         free,
         horizontal_energy / (area * dt_seconds),
+        free_horizontal_energy / (area * dt_seconds),
         continuity_energy / (area * dt_seconds),
         substeps,
     )
