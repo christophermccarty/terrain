@@ -42,6 +42,11 @@ from temperature import (
     STEFAN_BOLTZMANN,
     equilibrium_temperature_k,
 )
+from atmospheric_radiation import (
+    grey_surface_atmosphere_radiation,
+    pressure_defined_temperature_profile,
+    resolved_midlevel_emission_temperature,
+)
 from ocean import calculate_ocean_heat_transport, update_sea_ice, compute_ekman_transport, compute_gyre_currents
 from carbon_cycle import (
     carbon_cycle_step, co2_temperature_response, CO2_PREINDUSTRIAL,
@@ -112,6 +117,19 @@ _PRECIP_SUBSTEP_DAYS = 1.0
 # continent is a winter phenomenon, and 273.15 K is the physically meaningful
 # boundary rather than one more tunable. The gate's *width* is the parameter.
 _LAND_TRANSPORT_DEFICIT_REF_K = 273.15
+
+
+def _global_area_mean(field: np.ndarray) -> float:
+    """Return a latitude-area-weighted mean for a regular global grid."""
+    values = np.asarray(field, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("global area mean requires a two-dimensional field")
+    edges = np.linspace(np.pi / 2.0, -np.pi / 2.0, values.shape[0] + 1)
+    row_weights = np.sin(edges[:-1]) - np.sin(edges[1:])
+    return float(
+        np.sum(values * row_weights[:, None], dtype=np.float64)
+        / (values.shape[1] * np.sum(row_weights))
+    )
 
 
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
@@ -3788,6 +3806,85 @@ def simulate_step(
         upperlevel_wind_u_full = state.upperlevel_wind_u
         upperlevel_wind_v_full = state.upperlevel_wind_v
 
+    # This pressure-coordinate temperature state is independent of the
+    # experimental moisture/convection column. A prognostic thermodynamic
+    # layer remains its owner when active; otherwise the layer follows a dry
+    # adiabat from resolved free air. Radiation can therefore consume a real
+    # mid/upper profile without a fitted height lapse or near-surface proxy.
+    if pp.enable_pressure_defined_radiative_temperature_profile:
+        _radiative_profile = pressure_defined_temperature_profile(
+            T_air_full,
+            float(pp.surface_pressure_pa),
+            float(pp.two_layer_pressure_depth_pa),
+            float(pp.three_level_mid_upper_pressure_depth_pa),
+            gas_constant_dry_air_j_kg_k=float(pp.gas_constant_dry),
+            cp_dry_air_j_kg_k=float(pp.cp_dry),
+        )
+        if midlevel_temperature_next is None or not pp.enable_two_layer_convective_adjustment:
+            midlevel_temperature_next = _radiative_profile.midlevel_temperature_k.astype(
+                np.float32, copy=False
+            )
+        if upperlevel_temperature_next is None or not pp.enable_three_level_pressure_column:
+            upperlevel_temperature_next = _radiative_profile.upperlevel_temperature_k.astype(
+                np.float32, copy=False
+            )
+
+        if track_components:
+            _emission_temperature = resolved_midlevel_emission_temperature(
+                midlevel_temperature_next, expected_shape=T_full.shape
+            )
+            _absorbed_shortwave = np.asarray(
+                temp_components["S_absorbed"], dtype=np.float64
+            )
+            # The legacy epsilon multiplies surface emission directly and is
+            # therefore the atmospheric-window fraction in the grey contract.
+            _atmospheric_longwave_emissivity = 1.0 - np.asarray(
+                temp_components["effective_surface_longwave_emissivity"],
+                dtype=np.float64,
+            )
+            _grey_diagnostic = grey_surface_atmosphere_radiation(
+                T_full,
+                _emission_temperature,
+                _absorbed_shortwave,
+                _atmospheric_longwave_emissivity,
+            )
+            temp_components["grey_radiation_mode"] = "diagnostic_only"
+            temp_components["grey_emission_temperature_source"] = (
+                "resolved_pressure_midlevel"
+            )
+            temp_components["grey_emission_temperature_k"] = _emission_temperature
+            temp_components["grey_atmospheric_longwave_emissivity"] = (
+                _atmospheric_longwave_emissivity
+            )
+            temp_components["grey_surface_gain_w_m2"] = (
+                _grey_diagnostic.surface_gain_w_m2
+            )
+            temp_components["grey_atmospheric_gain_w_m2"] = (
+                _grey_diagnostic.atmospheric_gain_w_m2
+            )
+            temp_components["grey_outgoing_longwave_w_m2"] = (
+                _grey_diagnostic.outgoing_longwave_w_m2
+            )
+            temp_components["grey_toa_net_radiation_w_m2"] = (
+                _grey_diagnostic.toa_net_radiation_w_m2
+            )
+            for _name, _field in (
+                ("grey_emission_temperature_area_mean_k", _emission_temperature),
+                (
+                    "grey_free_air_minus_emission_temperature_area_mean_k",
+                    T_air_full - _emission_temperature,
+                ),
+                (
+                    "grey_upperlevel_temperature_area_mean_k",
+                    upperlevel_temperature_next,
+                ),
+                ("grey_surface_gain_area_mean_w_m2", _grey_diagnostic.surface_gain_w_m2),
+                ("grey_atmospheric_gain_area_mean_w_m2", _grey_diagnostic.atmospheric_gain_w_m2),
+                ("grey_outgoing_longwave_area_mean_w_m2", _grey_diagnostic.outgoing_longwave_w_m2),
+                ("grey_toa_net_radiation_area_mean_w_m2", _grey_diagnostic.toa_net_radiation_w_m2),
+            ):
+                temp_components[_name] = _global_area_mean(_field)
+
     pressure_overturning_heating_next = state.pressure_overturning_heating_w_m2
     pressure_coordinate_heat_convergence_next = state.pressure_coordinate_heat_convergence_w_m2
     if _hydrostatic_sigma_runtime_active:
@@ -5080,6 +5177,9 @@ def _evolve_temperature(
     sigma = STEFAN_BOLTZMANN
     # Longwave emission is from the surface (T_sst drives outgoing radiation)
     L_out = epsilon * sigma * (T_sst ** 4)
+    _effective_radiating_temperature = np.power(
+        np.maximum(L_out, 0.0) / sigma, 0.25
+    )
     _L_out_without_cloud = _epsilon_without_cloud * sigma * (T_sst ** 4)
     _cloud_longwave_forcing = _L_out_without_cloud - L_out
     _cloud_net_radiative_forcing = (
@@ -5993,6 +6093,19 @@ def _evolve_temperature(
         )
         components['S_absorbed'] = S_absorbed
         components['L_out'] = L_out
+        components['effective_surface_longwave_emissivity'] = epsilon
+        components['absorbed_shortwave_area_mean_w_m2'] = _energy_area_mean(
+            S_absorbed
+        )
+        components['outgoing_longwave_area_mean_w_m2'] = _energy_area_mean(
+            L_out
+        )
+        components['effective_radiating_temperature_area_mean_k'] = (
+            _energy_area_mean(_effective_radiating_temperature)
+        )
+        components['free_air_minus_effective_radiating_temperature_area_mean_k'] = (
+            _energy_area_mean(T_air - _effective_radiating_temperature)
+        )
         def _summ(field: np.ndarray) -> dict:
             return {"mean": float(np.mean(field)), "min": float(np.min(field)), "max": float(np.max(field))}
         components["toa"] = {

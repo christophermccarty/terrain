@@ -142,6 +142,17 @@ def _run(params, config):
         "boundary_layer_mechanical_entrainment_land_mean_m_s": 0.0,
         "boundary_layer_convective_entrainment_land_mean_m_s": 0.0,
         "boundary_layer_surface_buoyancy_flux_land_mean_m2_s3": 0.0,
+        "absorbed_shortwave_w_m2": 0.0,
+        "outgoing_longwave_w_m2": 0.0,
+        "effective_radiating_temperature_k": 0.0,
+        "free_air_minus_effective_radiating_temperature_k": 0.0,
+        "grey_emission_temperature_k": 0.0,
+        "grey_upperlevel_temperature_k": 0.0,
+        "free_air_minus_grey_emission_temperature_k": 0.0,
+        "grey_surface_gain_w_m2": 0.0,
+        "grey_atmospheric_gain_w_m2": 0.0,
+        "grey_outgoing_longwave_w_m2": 0.0,
+        "grey_toa_net_radiation_w_m2": 0.0,
     }
     seconds = 0.0
     start_energy = _atmospheric_energy_area_mean(
@@ -272,6 +283,41 @@ def _run(params, config):
                     "boundary_layer_surface_buoyancy_flux_land_mean_m2_s3",
                     "boundary_layer_surface_buoyancy_flux_land_mean_m2_s3",
                 ),
+                ("absorbed_shortwave_w_m2", "absorbed_shortwave_area_mean_w_m2"),
+                ("outgoing_longwave_w_m2", "outgoing_longwave_area_mean_w_m2"),
+                (
+                    "effective_radiating_temperature_k",
+                    "effective_radiating_temperature_area_mean_k",
+                ),
+                (
+                    "free_air_minus_effective_radiating_temperature_k",
+                    "free_air_minus_effective_radiating_temperature_area_mean_k",
+                ),
+                (
+                    "grey_emission_temperature_k",
+                    "grey_emission_temperature_area_mean_k",
+                ),
+                (
+                    "grey_upperlevel_temperature_k",
+                    "grey_upperlevel_temperature_area_mean_k",
+                ),
+                (
+                    "free_air_minus_grey_emission_temperature_k",
+                    "grey_free_air_minus_emission_temperature_area_mean_k",
+                ),
+                ("grey_surface_gain_w_m2", "grey_surface_gain_area_mean_w_m2"),
+                (
+                    "grey_atmospheric_gain_w_m2",
+                    "grey_atmospheric_gain_area_mean_w_m2",
+                ),
+                (
+                    "grey_outgoing_longwave_w_m2",
+                    "grey_outgoing_longwave_area_mean_w_m2",
+                ),
+                (
+                    "grey_toa_net_radiation_w_m2",
+                    "grey_toa_net_radiation_area_mean_w_m2",
+                ),
             ):
                 sums[target] += components.get(component_key, 0.0) * dt
             seconds += dt
@@ -307,6 +353,7 @@ def main() -> int:
         enable_boundary_layer_capacity_aware_free_air_transport=True,
         enable_boundary_layer_near_surface_cloud_temperature=True,
         enable_boundary_layer_split_invariant_cloud_memory=True,
+        enable_pressure_defined_radiative_temperature_profile=True,
     )
     report = {
         "schema_version": 1,
@@ -317,6 +364,23 @@ def main() -> int:
     report["candidate_minus_control"] = {
         key: report["candidate"][key] - report["control"][key]
         for key in report["control"]
+    }
+    grey_residual = (
+        report["candidate"]["grey_surface_gain_w_m2"]
+        + report["candidate"]["grey_atmospheric_gain_w_m2"]
+        - report["candidate"]["grey_toa_net_radiation_w_m2"]
+    )
+    resolved_gap = report["candidate"][
+        "free_air_minus_grey_emission_temperature_k"
+    ]
+    report["radiative_profile_admission"] = {
+        "grey_column_conservation_residual_w_m2": grey_residual,
+        "grey_column_conservation_pass": abs(grey_residual) <= 1.0e-9,
+        "resolved_emission_temperature_below_free_air": resolved_gap > 0.0,
+        "resolved_emission_temperature_finite": bool(np.isfinite(
+            report["candidate"]["grey_emission_temperature_k"]
+        )),
+        "coupling_status": "diagnostic_only",
     }
     output = ROOT / "temp" / "boundary_layer_column_energy_32x64.json"
     output.parent.mkdir(parents=True, exist_ok=True)

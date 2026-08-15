@@ -75,6 +75,61 @@ def test_force_restore_initializes_an_unknown_deep_reservoir_at_surface_equilibr
     np.testing.assert_allclose(step.deep_temperature, surface)
 
 
+def test_pressure_defined_radiative_profile_activates_without_convection_gates():
+    elevation = np.zeros((4, 8), dtype=np.float32)
+    planet = dataclasses.replace(
+        EARTH,
+        enable_pressure_defined_radiative_temperature_profile=True,
+    )
+    state = create_initial_state(elevation, planet_params=planet)
+    assert state.midlevel_temperature is not None
+    assert state.upperlevel_temperature is not None
+    exponent = planet.gas_constant_dry / planet.cp_dry
+    expected_mid = state.air_temperature * (
+        (planet.surface_pressure_pa - planet.two_layer_pressure_depth_pa)
+        / planet.surface_pressure_pa
+    ) ** exponent
+    expected_upper = state.air_temperature * (
+        (
+            planet.surface_pressure_pa
+            - planet.two_layer_pressure_depth_pa
+            - planet.three_level_mid_upper_pressure_depth_pa
+        )
+        / planet.surface_pressure_pa
+    ) ** exponent
+    np.testing.assert_allclose(state.midlevel_temperature, expected_mid, rtol=2e-6)
+    np.testing.assert_allclose(state.upperlevel_temperature, expected_upper, rtol=2e-6)
+    assert np.all(state.upperlevel_temperature < state.midlevel_temperature)
+    assert np.all(state.midlevel_temperature < state.air_temperature)
+
+
+def test_pressure_defined_grey_budget_is_resolved_and_diagnostic_only():
+    elevation = np.zeros((4, 8), dtype=np.float32)
+    planet = dataclasses.replace(
+        EARTH,
+        enable_pressure_defined_radiative_temperature_profile=True,
+    )
+    enabled = create_initial_state(elevation, planet_params=planet)
+    control = create_initial_state(elevation, planet_params=EARTH)
+    np.testing.assert_array_equal(enabled.temperature, control.temperature)
+    np.testing.assert_array_equal(enabled.air_temperature, control.air_temperature)
+
+    evolved, components = simulate_step(
+        enabled, days=1.0, planet_params=planet, track_components=True
+    )
+    assert components["grey_radiation_mode"] == "diagnostic_only"
+    assert components["grey_emission_temperature_source"] == "resolved_pressure_midlevel"
+    np.testing.assert_array_equal(
+        components["grey_emission_temperature_k"], evolved.midlevel_temperature
+    )
+    np.testing.assert_allclose(
+        components["grey_surface_gain_w_m2"]
+        + components["grey_atmospheric_gain_w_m2"],
+        components["grey_toa_net_radiation_w_m2"],
+        atol=1e-12,
+    )
+
+
 def test_force_restore_soil_moisture_deep_none_matches_shallow_fallback():
     """`soil_moisture_deep=None` must reproduce passing the shallow bucket twice.
 

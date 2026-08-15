@@ -132,6 +132,15 @@ class PlanetParams:
     cp_dry: float = 1004.0
     """Specific heat at constant pressure [J/(kg·K)]."""
 
+    enable_pressure_defined_radiative_temperature_profile: bool = False
+    """Persist dry-adiabatic mid/upper temperatures for radiation diagnostics.
+
+    This state is defined from the explicit pressure thicknesses used by the
+    native column and conserves dry potential temperature. It is independent
+    of the deeper convection gates, default-off, and does not by itself alter
+    the active radiative budget.
+    """
+
     # ------------------------------------------------------------------ #
     # Effective single-layer greenhouse parameters
     # These are used in the temperature baseline calculation and will be
