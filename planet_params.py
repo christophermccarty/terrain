@@ -614,8 +614,16 @@ class PlanetParams:
     This experimental gate requires ``enable_force_restore_land``.  Penman--
     Monteith uses the mixed-layer temperature, surface sensible heat enters
     that reservoir, and conservative entrainment exchanges energy with the
-    horizontally transported free atmosphere.  The mixed layer itself has no
-    horizontal transport in this first diagnostic implementation.
+    horizontally transported free atmosphere.  Horizontal mixed-layer
+    transport is controlled independently for fixed-versus-transported A/Bs.
+    """
+
+    enable_boundary_layer_horizontal_transport: bool = False
+    """Advect mixed-layer mass and heat with conservative finite-volume fluxes.
+
+    Divergence of the prescribed wind is closed by conservative entrainment or
+    detrainment with the free atmosphere, keeping the hydrostatic layer pressure
+    thickness fixed.  This gate requires the force-restore boundary layer.
     """
 
     boundary_layer_mixed_depth_m: float = 1_000.0

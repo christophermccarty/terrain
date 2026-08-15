@@ -31,6 +31,14 @@ class BoundaryLayerStep(NamedTuple):
     bulk_richardson_number: np.ndarray
 
 
+class BoundaryLayerTransportStep(NamedTuple):
+    boundary_temperature: np.ndarray
+    free_temperature: np.ndarray
+    horizontal_convergence_w_m2: np.ndarray
+    continuity_exchange_gain_w_m2: np.ndarray
+    substeps: int
+
+
 def mixed_layer_pressure_thickness(
     *,
     surface_pressure_pa: float,
@@ -71,6 +79,7 @@ def step_boundary_layer_energy(
     dt_seconds: float,
     wind_speed_m_s: np.ndarray | None = None,
     stability_dependent_exchange: bool = False,
+    exchange_mask: np.ndarray | None = None,
 ) -> BoundaryLayerStep:
     """Apply surface heating and conservative mixed-layer entrainment.
 
@@ -89,8 +98,11 @@ def step_boundary_layer_energy(
     free = np.asarray(free_temperature_k, dtype=np.float64)
     sensible = np.asarray(upward_surface_sensible_w_m2, dtype=np.float64)
     land = np.asarray(land_mask, dtype=bool)
+    exchange = land if exchange_mask is None else np.asarray(exchange_mask, dtype=bool)
     if boundary.shape != free.shape or boundary.shape != sensible.shape or boundary.shape != land.shape:
         raise ValueError("temperatures, sensible heat, and land mask must share a shape")
+    if exchange.shape != boundary.shape:
+        raise ValueError("exchange mask must share the temperature shape")
     if not np.all(np.isfinite(boundary)) or not np.all(np.isfinite(free)) or not np.all(np.isfinite(sensible)):
         raise ValueError("boundary-layer energy inputs must be finite")
 
@@ -151,10 +163,10 @@ def step_boundary_layer_energy(
     boundary_exchanged = equilibrium + (boundary_heated - equilibrium) * decay
     free_exchanged = equilibrium + (free - equilibrium) * decay
 
-    boundary_out = np.where(land, boundary_exchanged, boundary)
-    free_out = np.where(land, free_exchanged, free)
+    boundary_out = np.where(exchange, boundary_exchanged, boundary_heated)
+    free_out = np.where(exchange, free_exchanged, free)
     exchange_gain = np.where(
-        land,
+        exchange,
         boundary_capacity * (boundary_exchanged - boundary_heated) / dt_seconds,
         0.0,
     )
@@ -166,4 +178,140 @@ def step_boundary_layer_energy(
         delta_p,
         effective_velocity,
         bulk_ri,
+    )
+
+
+def transport_boundary_layer_energy(
+    boundary_temperature_k: np.ndarray,
+    free_temperature_k: np.ndarray,
+    wind_u_m_s: np.ndarray,
+    wind_v_m_s: np.ndarray,
+    *,
+    pressure_thickness_pa: float,
+    surface_pressure_pa: float,
+    cp_j_kg_k: float,
+    gravity_m_s2: float,
+    radius_m: float,
+    dt_seconds: float,
+) -> BoundaryLayerTransportStep:
+    """Flux-form horizontal transport with conservative mass closure.
+
+    Donor-cell face fluxes transport mixed-layer mass and enthalpy on the
+    latitude/longitude finite-volume grid.  Because the prescribed host wind
+    is divergent while mixed-layer pressure thickness is fixed, each substep
+    entrains a local mass deficit from the free atmosphere or detrains a mass
+    surplus back to it.  That continuity exchange is equal-and-opposite in
+    energy and makes a spatially uniform equilibrium an exact fixed point.
+    """
+    boundary = np.asarray(boundary_temperature_k, dtype=np.float64)
+    free = np.asarray(free_temperature_k, dtype=np.float64)
+    u = np.asarray(wind_u_m_s, dtype=np.float64)
+    v = np.asarray(wind_v_m_s, dtype=np.float64)
+    if boundary.ndim != 2 or free.shape != boundary.shape or u.shape != boundary.shape or v.shape != boundary.shape:
+        raise ValueError("transport fields must be 2-D with identical shapes")
+    if not all(np.all(np.isfinite(field)) for field in (boundary, free, u, v)):
+        raise ValueError("transport fields must be finite")
+    scalars = (
+        pressure_thickness_pa, surface_pressure_pa, cp_j_kg_k,
+        gravity_m_s2, radius_m, dt_seconds,
+    )
+    if not all(np.isfinite(value) and value > 0.0 for value in scalars):
+        raise ValueError("transport thermodynamic and grid inputs must be positive")
+    if pressure_thickness_pa >= surface_pressure_pa:
+        raise ValueError("boundary-layer pressure thickness must be below surface pressure")
+
+    height, width = boundary.shape
+    dlat = np.pi / height
+    dlon = 2.0 * np.pi / width
+    lat_edges = np.linspace(np.pi / 2.0, -np.pi / 2.0, height + 1)
+    area_row = radius_m**2 * dlon * (
+        np.sin(lat_edges[:-1]) - np.sin(lat_edges[1:])
+    )
+    area = np.broadcast_to(area_row[:, None], boundary.shape)
+    layer_mass_area = pressure_thickness_pa / gravity_m_s2
+    free_mass_area = (surface_pressure_pa - pressure_thickness_pa) / gravity_m_s2
+    target_mass = layer_mass_area * area
+    target_free_mass = free_mass_area * area
+
+    lat_centers = 0.5 * (lat_edges[:-1] + lat_edges[1:])
+    dx = radius_m * dlon * np.maximum(np.cos(lat_centers), 1e-6)
+    dy = radius_m * dlat
+    cfl = np.max(np.abs(u) * dt_seconds / dx[:, None] + np.abs(v) * dt_seconds / dy)
+    substeps = max(1, int(np.ceil(cfl / 0.45)))
+    sub_dt = dt_seconds / substeps
+    horizontal_energy = np.zeros_like(boundary)
+    continuity_energy = np.zeros_like(boundary)
+
+    for _ in range(substeps):
+        mass = target_mass.copy()
+        heat = target_mass * cp_j_kg_k * boundary
+        free_mass = target_free_mass.copy()
+        free_heat = target_free_mass * cp_j_kg_k * free
+
+        # East face of every cell; longitude is periodic.
+        u_face = 0.5 * (u + np.roll(u, -1, axis=1))
+        moved = np.abs(u_face) * sub_dt * layer_mass_area * (radius_m * dlat)
+        donor_t = np.where(u_face >= 0.0, boundary, np.roll(boundary, -1, axis=1))
+        signed_mass = np.where(u_face >= 0.0, moved, -moved)
+        signed_heat = signed_mass * cp_j_kg_k * donor_t
+        mass -= signed_mass
+        mass += np.roll(signed_mass, 1, axis=1)
+        heat -= signed_heat
+        heat += np.roll(signed_heat, 1, axis=1)
+        free_signed_mass = -signed_mass
+        free_donor_t = np.where(
+            free_signed_mass >= 0.0, free, np.roll(free, -1, axis=1)
+        )
+        free_signed_heat = free_signed_mass * cp_j_kg_k * free_donor_t
+        free_mass -= free_signed_mass
+        free_mass += np.roll(free_signed_mass, 1, axis=1)
+        free_heat -= free_signed_heat
+        free_heat += np.roll(free_signed_heat, 1, axis=1)
+
+        # South face between adjacent latitude rows. Positive v is northward.
+        if height > 1:
+            v_face = 0.5 * (v[:-1, :] + v[1:, :])
+            face_length = radius_m * dlon * np.cos(lat_edges[1:-1])[:, None]
+            moved = np.abs(v_face) * sub_dt * layer_mass_area * face_length
+            donor_t = np.where(v_face < 0.0, boundary[:-1, :], boundary[1:, :])
+            # Positive signed flux is from the north row to the south row.
+            signed_mass = np.where(v_face < 0.0, moved, -moved)
+            signed_heat = signed_mass * cp_j_kg_k * donor_t
+            mass[:-1, :] -= signed_mass
+            mass[1:, :] += signed_mass
+            heat[:-1, :] -= signed_heat
+            heat[1:, :] += signed_heat
+            free_signed_mass = -signed_mass
+            free_donor_t = np.where(
+                free_signed_mass >= 0.0, free[:-1, :], free[1:, :]
+            )
+            free_signed_heat = free_signed_mass * cp_j_kg_k * free_donor_t
+            free_mass[:-1, :] -= free_signed_mass
+            free_mass[1:, :] += free_signed_mass
+            free_heat[:-1, :] -= free_signed_heat
+            free_heat[1:, :] += free_signed_heat
+
+        horizontal_energy += heat - target_mass * cp_j_kg_k * boundary
+        advected_temperature = heat / (mass * cp_j_kg_k)
+        advected_free_temperature = free_heat / (free_mass * cp_j_kg_k)
+        mass_deficit = target_mass - mass
+        # The equal-opposite return flow makes the free-layer mass anomaly the
+        # negative of the mixed-layer anomaly. Deficits entrain advected free
+        # air; surpluses detrain advected mixed-layer air.
+        closure_temperature = np.where(
+            mass_deficit >= 0.0, advected_free_temperature, advected_temperature
+        )
+        closure_heat = mass_deficit * cp_j_kg_k * closure_temperature
+        heat += closure_heat
+        free_heat -= closure_heat
+        continuity_energy += closure_heat
+        boundary = heat / (target_mass * cp_j_kg_k)
+        free = free_heat / (target_free_mass * cp_j_kg_k)
+
+    return BoundaryLayerTransportStep(
+        boundary,
+        free,
+        horizontal_energy / (area * dt_seconds),
+        continuity_energy / (area * dt_seconds),
+        substeps,
     )

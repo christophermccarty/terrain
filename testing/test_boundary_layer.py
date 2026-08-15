@@ -5,7 +5,11 @@ import dataclasses
 import numpy as np
 import pytest
 
-from boundary_layer import mixed_layer_pressure_thickness, step_boundary_layer_energy
+from boundary_layer import (
+    mixed_layer_pressure_thickness,
+    step_boundary_layer_energy,
+    transport_boundary_layer_energy,
+)
 from planet_params import EARTH
 from simulate import create_initial_state, simulate_step
 
@@ -101,6 +105,53 @@ def test_bulk_richardson_gate_suppresses_stable_but_not_unstable_exchange():
     assert unstable.bulk_richardson_number[0] < 0.0
     assert unstable.effective_entrainment_velocity_m_s[0] == pytest.approx(0.005)
     assert 270.0 < stable.boundary_temperature[0] < 290.0
+
+
+def _cell_area(height, width, radius=6.4e6):
+    edges = np.linspace(np.pi / 2.0, -np.pi / 2.0, height + 1)
+    rows = radius**2 * (2.0 * np.pi / width) * (
+        np.sin(edges[:-1]) - np.sin(edges[1:])
+    )
+    return np.broadcast_to(rows[:, None], (height, width))
+
+
+def test_flux_form_transport_preserves_uniform_equilibrium():
+    shape = (8, 16)
+    result = transport_boundary_layer_energy(
+        np.full(shape, 285.0), np.full(shape, 285.0),
+        np.full(shape, 18.0), np.linspace(-8.0, 8.0, shape[0])[:, None] * np.ones(shape),
+        pressure_thickness_pa=10_000.0, surface_pressure_pa=100_000.0,
+        cp_j_kg_k=1_000.0, gravity_m_s2=10.0, radius_m=6.4e6,
+        dt_seconds=86_400.0,
+    )
+    np.testing.assert_allclose(result.boundary_temperature, 285.0, atol=1e-12)
+    np.testing.assert_allclose(result.free_temperature, 285.0, atol=1e-12)
+
+
+def test_flux_form_transport_conserves_total_atmospheric_energy():
+    shape = (8, 16)
+    boundary = np.full(shape, 280.0)
+    boundary[:, 3:6] = 310.0
+    free = np.full(shape, 270.0)
+    u = np.linspace(-20.0, 20.0, shape[1])[None, :] * np.ones(shape)
+    v = np.linspace(10.0, -10.0, shape[0])[:, None] * np.ones(shape)
+    result = transport_boundary_layer_energy(
+        boundary, free, u, v,
+        pressure_thickness_pa=10_000.0, surface_pressure_pa=100_000.0,
+        cp_j_kg_k=1_000.0, gravity_m_s2=10.0, radius_m=6.4e6,
+        dt_seconds=3.0 * 86_400.0,
+    )
+    area = _cell_area(*shape)
+    cb = 10_000.0 / 10.0 * 1_000.0
+    cf = 90_000.0 / 10.0 * 1_000.0
+    before = np.sum(area * (cb * boundary + cf * free))
+    after = np.sum(area * (cb * result.boundary_temperature + cf * result.free_temperature))
+    assert after == pytest.approx(before, rel=2e-15)
+    area_mean = float(np.sum(area * result.horizontal_convergence_w_m2) / np.sum(area))
+    assert abs(area_mean) < 1e-10
+    assert np.all(np.isfinite(result.boundary_temperature))
+    assert np.all(np.isfinite(result.free_temperature))
+    assert result.substeps > 1
 
 
 def test_boundary_layer_gate_is_default_off_identity_and_persistent_when_enabled():

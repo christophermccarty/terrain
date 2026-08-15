@@ -95,6 +95,8 @@ def _run(params, config, *, diagnose: bool):
                     ("boundary_exchange_gain_w_m2", "boundary_layer_exchange_gain_w_m2"),
                     ("free_air_exchange_gain_w_m2", "free_air_exchange_gain_w_m2"),
                     ("resolved_convergence_w_m2", "atmospheric_heat_convergence_w_m2"),
+                    ("boundary_horizontal_convergence_w_m2", "boundary_layer_horizontal_heat_convergence_w_m2"),
+                    ("continuity_exchange_gain_w_m2", "boundary_layer_continuity_exchange_gain_w_m2"),
                 ):
                     values = [
                         _mean(sample.get(component_name), region, land)
@@ -118,6 +120,8 @@ def _summary(control, candidate):
         b_temp = np.array([row["near_surface_temperature_c"] for row in b_rows])
         sensible = np.array([row["surface_sensible_gain_w_m2"] for row in b_rows])
         exchange = np.array([row["boundary_exchange_gain_w_m2"] for row in b_rows])
+        horizontal = np.array([row["boundary_horizontal_convergence_w_m2"] for row in b_rows])
+        continuity = np.array([row["continuity_exchange_gain_w_m2"] for row in b_rows])
         result[name] = {
             "resolved": True,
             "annual_near_surface_change_k": float(np.mean(b_temp - c_temp)),
@@ -127,6 +131,9 @@ def _summary(control, candidate):
             "warmest_month_change_k": float(np.max(b_temp) - np.max(c_temp)),
             "annual_surface_sensible_gain_w_m2": float(np.mean(sensible)),
             "annual_boundary_exchange_gain_w_m2": float(np.mean(exchange)),
+            "annual_horizontal_convergence_w_m2": float(np.mean(horizontal)),
+            "annual_continuity_exchange_gain_w_m2": float(np.mean(continuity)),
+            "cold_half_horizontal_convergence_w_m2": float(np.mean(horizontal[np.argsort(b_temp)[:6]])),
             "cold_half_exchange_gain_w_m2": float(np.mean(exchange[np.argsort(b_temp)[:6]])),
             "warm_half_exchange_gain_w_m2": float(np.mean(exchange[np.argsort(b_temp)[-6:]])),
             "annual_precipitation_change_mm_day": float(np.mean([
@@ -147,6 +154,7 @@ def main() -> int:
     candidate_params = dataclasses.replace(
         EARTH, **common, enable_force_restore_boundary_layer=True,
         enable_boundary_layer_stability_dependent_exchange=True,
+        enable_boundary_layer_horizontal_transport=True,
     )
     _, control = _run(control_params, config, diagnose=False)
     _, candidate = _run(candidate_params, config, diagnose=True)

@@ -20,6 +20,8 @@ def _advance(initial, *, dt_days: float, total_days: float, params):
     state = initial
     max_surface_closure = 0.0
     max_exchange_closure = 0.0
+    max_transport_area_mean = 0.0
+    max_continuity_closure = 0.0
     for _ in range(int(round(total_days / dt_days))):
         state, diagnostics = simulate_step(
             state, days=dt_days, planet_params=params,
@@ -32,7 +34,23 @@ def _advance(initial, *, dt_days: float, total_days: float, params):
         )
         max_surface_closure = max(max_surface_closure, float(np.max(np.abs(surface))))
         max_exchange_closure = max(max_exchange_closure, float(np.max(np.abs(exchange))))
-    return state, max_surface_closure, max_exchange_closure
+        horizontal = diagnostics.get("boundary_layer_horizontal_heat_convergence_w_m2")
+        if horizontal is not None:
+            area_mean = diagnostics[
+                "boundary_layer_horizontal_convergence_area_mean_w_m2"
+            ]
+            max_transport_area_mean = max(max_transport_area_mean, abs(float(area_mean)))
+            continuity_closure = (
+                diagnostics["boundary_layer_continuity_exchange_gain_w_m2"]
+                + diagnostics["free_air_continuity_exchange_gain_w_m2"]
+            )
+            max_continuity_closure = max(
+                max_continuity_closure, float(np.max(np.abs(continuity_closure)))
+            )
+    return (
+        state, max_surface_closure, max_exchange_closure,
+        max_transport_area_mean, max_continuity_closure,
+    )
 
 
 def main() -> int:
@@ -50,15 +68,16 @@ def main() -> int:
         enable_force_restore_atmospheric_heat_convergence=True,
         enable_force_restore_boundary_layer=True,
         enable_boundary_layer_stability_dependent_exchange=True,
+        enable_boundary_layer_horizontal_transport=True,
     )
     clear_simulation_caches()
     initial = create_initial_state(elevation, planet_params=params)
     duration_days = 1.0
-    one_day, surface_1d, exchange_1d = _advance(
+    one_day, surface_1d, exchange_1d, transport_1d, continuity_1d = _advance(
         initial, dt_days=1.0, total_days=duration_days, params=params
     )
     clear_simulation_caches()
-    half_day, surface_half, exchange_half = _advance(
+    half_day, surface_half, exchange_half, transport_half, continuity_half = _advance(
         initial, dt_days=0.5, total_days=duration_days, params=params
     )
     control_params = dataclasses.replace(params, enable_force_restore_boundary_layer=False)
@@ -100,6 +119,7 @@ def main() -> int:
     passed = bool(
         finite
         and max(surface_1d, surface_half, exchange_1d, exchange_half) < 1e-5
+        and max(transport_1d, transport_half, continuity_1d, continuity_half) < 1e-5
         and split_rms <= max(0.5, 1.25 * control_split_rms)
         and extrema["boundary_layer_k"][0] > 180.0
         and extrema["boundary_layer_k"][1] < 340.0
@@ -111,6 +131,8 @@ def main() -> int:
         "finite": finite,
         "max_surface_exchange_closure_w_m2": max(surface_1d, surface_half),
         "max_internal_exchange_closure_w_m2": max(exchange_1d, exchange_half),
+        "max_horizontal_transport_area_mean_w_m2": max(transport_1d, transport_half),
+        "max_continuity_exchange_closure_w_m2": max(continuity_1d, continuity_half),
         "one_day_vs_half_day_boundary_layer_rms_k": split_rms,
         "resolved_control_one_day_vs_half_day_air_rms_k": control_split_rms,
         "one_day_extrema": extrema,

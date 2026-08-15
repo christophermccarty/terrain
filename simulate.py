@@ -4445,6 +4445,10 @@ def _evolve_temperature(
     land_deep_out: np.ndarray | None = None
     boundary_layer_out: np.ndarray | None = boundary_layer_temperature
     boundary_exchange_gain = None
+    boundary_horizontal_convergence = None
+    boundary_continuity_exchange = None
+    boundary_transport_substeps = None
+    boundary_horizontal_area_mean = None
 
     # === PASS 1: T_air dynamics — advection, diffusion, surface exchange ===
     lat_1d = (0.5 - (np.arange(Hc, dtype=np.float32) + 0.5) / Hc) * np.pi
@@ -4527,6 +4531,50 @@ def _evolve_temperature(
     )
     _air_frac = np.minimum(k_air_surface * float(days), 0.5).astype(np.float32, copy=False)
     T_air = (T_air + _air_frac * (T_sst - T_air)).astype(np.float32, copy=False)
+
+    _boundary_transport_active = bool(
+        _boundary_layer_active
+        and _pp.enable_boundary_layer_horizontal_transport
+        and dt_sec > 0.0
+    )
+    if _boundary_transport_active:
+        from boundary_layer import (
+            mixed_layer_pressure_thickness,
+            transport_boundary_layer_energy,
+        )
+
+        if boundary_layer_out is None or np.asarray(boundary_layer_out).shape != T_air.shape:
+            boundary_layer_out = T_air.copy()
+        _boundary_pressure_pa = mixed_layer_pressure_thickness(
+            surface_pressure_pa=float(_pp.surface_pressure_pa),
+            gravity_m_s2=float(_pp.surface_gravity),
+            gas_constant_j_kg_k=float(_pp.gas_constant_dry),
+            reference_temperature_k=288.15,
+            mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
+        )
+        transport_step = transport_boundary_layer_energy(
+            boundary_layer_out,
+            T_air,
+            u,
+            v,
+            pressure_thickness_pa=_boundary_pressure_pa,
+            surface_pressure_pa=float(_pp.surface_pressure_pa),
+            cp_j_kg_k=float(_pp.cp_dry),
+            gravity_m_s2=float(_pp.surface_gravity),
+            radius_m=float(_pp.radius_m),
+            dt_seconds=dt_sec,
+        )
+        boundary_layer_out = transport_step.boundary_temperature
+        T_air = transport_step.free_temperature
+        boundary_horizontal_convergence = transport_step.horizontal_convergence_w_m2
+        boundary_continuity_exchange = transport_step.continuity_exchange_gain_w_m2
+        boundary_transport_substeps = transport_step.substeps
+        _bl_lat_edges = np.linspace(np.pi / 2.0, -np.pi / 2.0, Hc + 1)
+        _bl_area_rows = np.sin(_bl_lat_edges[:-1]) - np.sin(_bl_lat_edges[1:])
+        boundary_horizontal_area_mean = float(
+            np.sum(boundary_horizontal_convergence * _bl_area_rows[:, None])
+            / (Wc * np.sum(_bl_area_rows))
+        )
 
     # --- Radiative Balance (Physics Item 1, 2, 10, 12) ---
     # Incoming Solar (S_in) - Albedo (A)
@@ -5078,6 +5126,10 @@ def _evolve_temperature(
                 stability_dependent_exchange=bool(
                     _pp.enable_boundary_layer_stability_dependent_exchange
                 ),
+                exchange_mask=(
+                    np.ones_like(land_mask, dtype=bool)
+                    if _boundary_transport_active else land_mask
+                ),
             )
             boundary_layer_out = boundary_step.boundary_temperature
             T_air = boundary_step.free_temperature
@@ -5333,6 +5385,23 @@ def _evolve_temperature(
                 )
                 components["boundary_layer_horizontal_transport"] = "omitted"
                 components["resolved_heat_convergence_destination"] = "free_atmosphere"
+                if boundary_horizontal_convergence is not None:
+                    components["boundary_layer_horizontal_heat_convergence_w_m2"] = (
+                        boundary_horizontal_convergence
+                    )
+                    components["boundary_layer_continuity_exchange_gain_w_m2"] = (
+                        boundary_continuity_exchange
+                    )
+                    components["free_air_continuity_exchange_gain_w_m2"] = (
+                        -boundary_continuity_exchange
+                    )
+                    components["boundary_layer_transport_substeps"] = (
+                        boundary_transport_substeps
+                    )
+                    components[
+                        "boundary_layer_horizontal_convergence_area_mean_w_m2"
+                    ] = boundary_horizontal_area_mean
+                    components["boundary_layer_horizontal_transport"] = "flux_form"
             if resolved_heat_convergence is not None:
                 components["atmospheric_heat_convergence_w_m2"] = resolved_heat_convergence
                 components[

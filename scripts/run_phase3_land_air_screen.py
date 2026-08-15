@@ -51,6 +51,7 @@ def main() -> int:
             **common,
             enable_force_restore_boundary_layer=True,
             enable_boundary_layer_stability_dependent_exchange=True,
+            enable_boundary_layer_horizontal_transport=True,
         ),
         monthly_climatology_path=args.monthly_climatology,
         track_phase3_heat_convergence=True,
