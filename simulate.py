@@ -43,9 +43,12 @@ from temperature import (
     equilibrium_temperature_k,
 )
 from atmospheric_radiation import (
-    grey_surface_atmosphere_radiation,
+    TwoLayerGreyOpticalClosure,
     pressure_defined_temperature_profile,
+    pressure_split_emissivities_from_optical_depth,
     resolved_midlevel_emission_temperature,
+    two_layer_grey_radiation,
+    two_layer_optical_depth_for_target_olr,
 )
 from ocean import calculate_ocean_heat_transport, update_sea_ice, compute_ekman_transport, compute_gyre_currents
 from carbon_cycle import (
@@ -119,19 +122,6 @@ _PRECIP_SUBSTEP_DAYS = 1.0
 _LAND_TRANSPORT_DEFICIT_REF_K = 273.15
 
 
-def _global_area_mean(field: np.ndarray) -> float:
-    """Return a latitude-area-weighted mean for a regular global grid."""
-    values = np.asarray(field, dtype=np.float64)
-    if values.ndim != 2:
-        raise ValueError("global area mean requires a two-dimensional field")
-    edges = np.linspace(np.pi / 2.0, -np.pi / 2.0, values.shape[0] + 1)
-    row_weights = np.sin(edges[:-1]) - np.sin(edges[1:])
-    return float(
-        np.sum(values * row_weights[:, None], dtype=np.float64)
-        / (values.shape[1] * np.sum(row_weights))
-    )
-
-
 def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_v,
                                         wind_u_aloft, wind_v_aloft,
                                         wind_u_midlevel, wind_v_midlevel,
@@ -141,6 +131,8 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
                                         midlevel_humidity,
                                         upperlevel_temperature,
                                         upperlevel_humidity,
+                                        midlevel_radiative_flux_w_m2=None,
+                                        upperlevel_radiative_flux_w_m2=None,
                                         column_lower_temperature=None,
                                         previous_precipitation_mm_day=None,
                                         previous_large_scale_heating_w_m2=None,
@@ -196,6 +188,8 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             midlevel_humidity=midlevel_humidity,
             upperlevel_temperature=upperlevel_temperature,
             upperlevel_humidity=upperlevel_humidity,
+            midlevel_radiative_flux_w_m2=midlevel_radiative_flux_w_m2,
+            upperlevel_radiative_flux_w_m2=upperlevel_radiative_flux_w_m2,
             column_lower_temperature=column_lower_temperature,
             previous_precipitation_mm_day=previous_precipitation_mm_day,
             previous_large_scale_heating_w_m2=previous_large_scale_heating_w_m2,
@@ -249,6 +243,8 @@ def _generate_precipitation_substepped(H, W, elev, *, temperature, wind_u, wind_
             midlevel_humidity=mid_q,
             upperlevel_temperature=upper_t,
             upperlevel_humidity=upper_q,
+            midlevel_radiative_flux_w_m2=midlevel_radiative_flux_w_m2,
+            upperlevel_radiative_flux_w_m2=upperlevel_radiative_flux_w_m2,
             column_lower_temperature=column_lower_temperature,
             previous_precipitation_mm_day=previous_precipitation_mm_day,
             previous_large_scale_heating_w_m2=previous_large_scale_heating_w_m2,
@@ -923,9 +919,14 @@ def _evolve_temperature_substepped(
     land_deep = kwargs.get("land_deep_temperature")
     boundary_layer = kwargs.get("boundary_layer_temperature")
     boundary_interface = kwargs.get("boundary_layer_interface_temperature")
+    radiative_middle = kwargs.get("radiative_midlevel_temperature")
+    radiative_upper = kwargs.get("radiative_upperlevel_temperature")
+    radiative_optical_depth = kwargs.get("radiative_optical_depth")
     day = float(day_of_year) - days
     t = (float(total_days) - days) if total_days is not None else None
     cloud_c = snow_c = components = None
+    accumulated_grey_middle = None
+    accumulated_grey_upper = None
     for _ in range(n_sub):
         day += sub_dt
         if t is not None:
@@ -940,6 +941,9 @@ def _evolve_temperature_substepped(
         kwargs_i["land_deep_temperature"] = land_deep
         kwargs_i["boundary_layer_temperature"] = boundary_layer
         kwargs_i["boundary_layer_interface_temperature"] = boundary_interface
+        kwargs_i["radiative_midlevel_temperature"] = radiative_middle
+        kwargs_i["radiative_upperlevel_temperature"] = radiative_upper
+        kwargs_i["radiative_optical_depth"] = radiative_optical_depth
         T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water = _evolve_temperature(
             T_sst, T_base_i, elevation, Hc, Wc, block_size, H, W,
             day_of_year=day, days=sub_dt,
@@ -954,6 +958,33 @@ def _evolve_temperature_substepped(
         boundary_interface = components.get(
             "_boundary_layer_interface_temperature", boundary_interface
         )
+        radiative_middle = components.get(
+            "_radiative_midlevel_temperature", radiative_middle
+        )
+        radiative_upper = components.get(
+            "_radiative_upperlevel_temperature", radiative_upper
+        )
+        radiative_optical_depth = components.get(
+            "_radiative_optical_depth", radiative_optical_depth
+        )
+        if "_grey_midlevel_gain_w_m2" in components:
+            contribution = components["_grey_midlevel_gain_w_m2"] * sub_dt
+            accumulated_grey_middle = (
+                contribution
+                if accumulated_grey_middle is None
+                else accumulated_grey_middle + contribution
+            )
+        if "_grey_upperlevel_gain_w_m2" in components:
+            contribution = components["_grey_upperlevel_gain_w_m2"] * sub_dt
+            accumulated_grey_upper = (
+                contribution
+                if accumulated_grey_upper is None
+                else accumulated_grey_upper + contribution
+            )
+    if accumulated_grey_middle is not None:
+        components["_grey_midlevel_gain_w_m2"] = accumulated_grey_middle / days
+    if accumulated_grey_upper is not None:
+        components["_grey_upperlevel_gain_w_m2"] = accumulated_grey_upper / days
     return T_sst, T_air, cloud_c, snow_c, components, T_deep, cloud_water
 
 
@@ -1258,6 +1289,33 @@ def simulate_step(
         pp = orbital_params_at_time(base_pp, state.total_days)
     else:
         pp = base_pp
+    if (
+        pp.enable_coupled_two_layer_grey_radiation
+        and not pp.enable_pressure_defined_radiative_temperature_profile
+    ):
+        raise ValueError(
+            "coupled grey radiation requires the pressure-defined temperature profile"
+        )
+    if (
+        pp.enable_coupled_two_layer_grey_radiation
+        and state.grey_optical_depth is None
+    ):
+        raise ValueError(
+            "coupled grey radiation requires a diagnostic optical-depth spinup"
+        )
+    if pp.enable_coupled_two_layer_grey_radiation and not all((
+        pp.enable_prognostic_column_water,
+        pp.enable_stability_aware_condensation,
+        pp.enable_two_layer_convective_adjustment,
+        pp.enable_three_level_pressure_column,
+        pp.enable_closed_three_level_thermodynamics,
+        pp.enable_diabatic_interface_mass_flux,
+    )):
+        raise ValueError(
+            "coupled grey radiation requires closed three-level thermodynamics"
+        )
+    if pp.enable_coupled_two_layer_grey_radiation and float(days) > 1.0:
+        raise ValueError("coupled grey radiation requires daily-or-finer timesteps")
     _wind_cell_relax_days_arg = (
         float(pp.wind_cell_relax_days)
         if wind_cell_relax_days is None
@@ -3175,6 +3233,21 @@ def simulate_step(
     if state.land_deep_temperature is not None:
         _group_c2_in["land_deep"] = state.land_deep_temperature
     if (
+        pp.enable_pressure_defined_radiative_temperature_profile
+        and state.midlevel_temperature is not None
+    ):
+        _group_c2_in["radiative_midlevel"] = state.midlevel_temperature
+    if (
+        pp.enable_pressure_defined_radiative_temperature_profile
+        and state.upperlevel_temperature is not None
+    ):
+        _group_c2_in["radiative_upperlevel"] = state.upperlevel_temperature
+    if (
+        pp.enable_pressure_defined_radiative_temperature_profile
+        and state.grey_optical_depth is not None
+    ):
+        _group_c2_in["radiative_optical_depth"] = state.grey_optical_depth
+    if (
         bool(pp.enable_force_restore_land)
         and bool(pp.enable_force_restore_boundary_layer)
         and state.boundary_layer_temperature is not None
@@ -3196,6 +3269,9 @@ def simulate_step(
     land_deep_coarse = _group_c2_out.get("land_deep")
     boundary_layer_coarse = _group_c2_out.get("boundary_layer")
     boundary_interface_coarse = _group_c2_out.get("boundary_interface")
+    radiative_midlevel_coarse = _group_c2_out.get("radiative_midlevel")
+    radiative_upperlevel_coarse = _group_c2_out.get("radiative_upperlevel")
+    radiative_optical_depth_coarse = _group_c2_out.get("radiative_optical_depth")
     # ice_thick_prev_coarse already computed above
 
     # The shallow mixed layer responds on sub-day timescales.  Couple it to
@@ -3248,6 +3324,9 @@ def simulate_step(
         land_deep_temperature=land_deep_coarse,
         boundary_layer_temperature=boundary_layer_coarse,
         boundary_layer_interface_temperature=boundary_interface_coarse,
+        radiative_midlevel_temperature=radiative_midlevel_coarse,
+        radiative_upperlevel_temperature=radiative_upperlevel_coarse,
+        radiative_optical_depth=radiative_optical_depth_coarse,
         temperature_bases_for_day=_temperature_bases_for_day,
     )
     T_coarse = T_sst_coarse  # alias: T_coarse continues to mean T_sst going forward
@@ -3270,6 +3349,17 @@ def simulate_step(
     boundary_interface_full = temp_components.pop(
         "_boundary_layer_interface_temperature", None
     )
+    radiative_midlevel_full = temp_components.pop(
+        "_radiative_midlevel_temperature", None
+    )
+    radiative_upperlevel_full = temp_components.pop(
+        "_radiative_upperlevel_temperature", None
+    )
+    radiative_optical_depth_full = temp_components.pop(
+        "_radiative_optical_depth", None
+    )
+    grey_midlevel_gain_full = temp_components.pop("_grey_midlevel_gain_w_m2", None)
+    grey_upperlevel_gain_full = temp_components.pop("_grey_upperlevel_gain_w_m2", None)
     
     if block_size > 1:
         _up_fields: dict[str, np.ndarray] = {"T": T_coarse, "cloud": cloud_c, "T_air": T_air_coarse_new}
@@ -3554,6 +3644,10 @@ def simulate_step(
                 _group_p_in["midlevel_humidity"] = state.midlevel_humidity
             if upperlevel_temperature_for_precip is not None:
                 _group_p_in["upperlevel_temperature"] = upperlevel_temperature_for_precip
+            if grey_midlevel_gain_full is not None:
+                _group_p_in["grey_midlevel_gain"] = grey_midlevel_gain_full
+            if grey_upperlevel_gain_full is not None:
+                _group_p_in["grey_upperlevel_gain"] = grey_upperlevel_gain_full
             if state.upperlevel_humidity is not None:
                 _group_p_in["upperlevel_humidity"] = state.upperlevel_humidity
             _group_p_out = _coarsen_many(_group_p_in, _Hcp, _Wcp, _pbs)
@@ -3577,6 +3671,8 @@ def simulate_step(
             _midlevel_humidity_p = _group_p_out.get("midlevel_humidity")
             _upperlevel_temperature_p = _group_p_out.get("upperlevel_temperature")
             _upperlevel_humidity_p = _group_p_out.get("upperlevel_humidity")
+            _grey_midlevel_gain_p = _group_p_out.get("grey_midlevel_gain")
+            _grey_upperlevel_gain_p = _group_p_out.get("grey_upperlevel_gain")
             P_p, hum_p_next, soil_p_next, soil_deep_p_next, condensate_p_next, midlevel_temperature_p_next, midlevel_humidity_p_next, upperlevel_temperature_p_next, upperlevel_humidity_p_next, hydrometeors_p_next = _generate_precipitation_substepped(
                 _Hcp, _Wcp, _elev_p,
                 temperature=_T_p, wind_u=_u_p, wind_v=_v_p,
@@ -3589,6 +3685,8 @@ def simulate_step(
                 midlevel_humidity=_midlevel_humidity_p,
                 upperlevel_temperature=_upperlevel_temperature_p,
                 upperlevel_humidity=_upperlevel_humidity_p,
+                midlevel_radiative_flux_w_m2=_grey_midlevel_gain_p,
+                upperlevel_radiative_flux_w_m2=_grey_upperlevel_gain_p,
                 column_lower_temperature=_T_air_p,
                 previous_precipitation_mm_day=_previous_precipitation_p,
                 previous_large_scale_heating_w_m2=_previous_large_scale_heating_p,
@@ -3639,6 +3737,8 @@ def simulate_step(
                 midlevel_humidity=state.midlevel_humidity,
                 upperlevel_temperature=upperlevel_temperature_for_precip,
                 upperlevel_humidity=state.upperlevel_humidity,
+                midlevel_radiative_flux_w_m2=grey_midlevel_gain_full,
+                upperlevel_radiative_flux_w_m2=grey_upperlevel_gain_full,
                 column_lower_temperature=T_air_full,
                 previous_precipitation_mm_day=(
                     state.pressure_moisture_condensation_mm_day
@@ -3812,78 +3912,26 @@ def simulate_step(
     # adiabat from resolved free air. Radiation can therefore consume a real
     # mid/upper profile without a fitted height lapse or near-surface proxy.
     if pp.enable_pressure_defined_radiative_temperature_profile:
-        _radiative_profile = pressure_defined_temperature_profile(
-            T_air_full,
-            float(pp.surface_pressure_pa),
-            float(pp.two_layer_pressure_depth_pa),
-            float(pp.three_level_mid_upper_pressure_depth_pa),
-            gas_constant_dry_air_j_kg_k=float(pp.gas_constant_dry),
-            cp_dry_air_j_kg_k=float(pp.cp_dry),
-        )
-        if midlevel_temperature_next is None or not pp.enable_two_layer_convective_adjustment:
-            midlevel_temperature_next = _radiative_profile.midlevel_temperature_k.astype(
-                np.float32, copy=False
+        if pp.enable_coupled_two_layer_grey_radiation:
+            if midlevel_temperature_next is None or upperlevel_temperature_next is None:
+                raise RuntimeError("closed grey coupling did not return layer state")
+        else:
+            _radiative_profile = pressure_defined_temperature_profile(
+                T_air_full,
+                float(pp.surface_pressure_pa),
+                float(pp.two_layer_pressure_depth_pa),
+                float(pp.three_level_mid_upper_pressure_depth_pa),
+                gas_constant_dry_air_j_kg_k=float(pp.gas_constant_dry),
+                cp_dry_air_j_kg_k=float(pp.cp_dry),
             )
-        if upperlevel_temperature_next is None or not pp.enable_three_level_pressure_column:
-            upperlevel_temperature_next = _radiative_profile.upperlevel_temperature_k.astype(
-                np.float32, copy=False
-            )
-
-        if track_components:
-            _emission_temperature = resolved_midlevel_emission_temperature(
-                midlevel_temperature_next, expected_shape=T_full.shape
-            )
-            _absorbed_shortwave = np.asarray(
-                temp_components["S_absorbed"], dtype=np.float64
-            )
-            # The legacy epsilon multiplies surface emission directly and is
-            # therefore the atmospheric-window fraction in the grey contract.
-            _atmospheric_longwave_emissivity = 1.0 - np.asarray(
-                temp_components["effective_surface_longwave_emissivity"],
-                dtype=np.float64,
-            )
-            _grey_diagnostic = grey_surface_atmosphere_radiation(
-                T_full,
-                _emission_temperature,
-                _absorbed_shortwave,
-                _atmospheric_longwave_emissivity,
-            )
-            temp_components["grey_radiation_mode"] = "diagnostic_only"
-            temp_components["grey_emission_temperature_source"] = (
-                "resolved_pressure_midlevel"
-            )
-            temp_components["grey_emission_temperature_k"] = _emission_temperature
-            temp_components["grey_atmospheric_longwave_emissivity"] = (
-                _atmospheric_longwave_emissivity
-            )
-            temp_components["grey_surface_gain_w_m2"] = (
-                _grey_diagnostic.surface_gain_w_m2
-            )
-            temp_components["grey_atmospheric_gain_w_m2"] = (
-                _grey_diagnostic.atmospheric_gain_w_m2
-            )
-            temp_components["grey_outgoing_longwave_w_m2"] = (
-                _grey_diagnostic.outgoing_longwave_w_m2
-            )
-            temp_components["grey_toa_net_radiation_w_m2"] = (
-                _grey_diagnostic.toa_net_radiation_w_m2
-            )
-            for _name, _field in (
-                ("grey_emission_temperature_area_mean_k", _emission_temperature),
-                (
-                    "grey_free_air_minus_emission_temperature_area_mean_k",
-                    T_air_full - _emission_temperature,
-                ),
-                (
-                    "grey_upperlevel_temperature_area_mean_k",
-                    upperlevel_temperature_next,
-                ),
-                ("grey_surface_gain_area_mean_w_m2", _grey_diagnostic.surface_gain_w_m2),
-                ("grey_atmospheric_gain_area_mean_w_m2", _grey_diagnostic.atmospheric_gain_w_m2),
-                ("grey_outgoing_longwave_area_mean_w_m2", _grey_diagnostic.outgoing_longwave_w_m2),
-                ("grey_toa_net_radiation_area_mean_w_m2", _grey_diagnostic.toa_net_radiation_w_m2),
-            ):
-                temp_components[_name] = _global_area_mean(_field)
+            if midlevel_temperature_next is None or not pp.enable_two_layer_convective_adjustment:
+                midlevel_temperature_next = _radiative_profile.midlevel_temperature_k.astype(
+                    np.float32, copy=False
+                )
+            if upperlevel_temperature_next is None or not pp.enable_three_level_pressure_column:
+                upperlevel_temperature_next = _radiative_profile.upperlevel_temperature_k.astype(
+                    np.float32, copy=False
+                )
 
     pressure_overturning_heating_next = state.pressure_overturning_heating_w_m2
     pressure_coordinate_heat_convergence_next = state.pressure_coordinate_heat_convergence_w_m2
@@ -4358,6 +4406,11 @@ def simulate_step(
         midlevel_temperature=midlevel_temperature_next,
         midlevel_humidity=midlevel_humidity_next,
         upperlevel_temperature=upperlevel_temperature_next,
+        grey_optical_depth=(
+            radiative_optical_depth_full
+            if pp.enable_pressure_defined_radiative_temperature_profile
+            else state.grey_optical_depth
+        ),
         upperlevel_humidity=upperlevel_humidity_next,
         snow_depth=snow_depth_new,
         ice_cover=ice_full,
@@ -4535,6 +4588,9 @@ def _evolve_temperature(
     land_deep_temperature: np.ndarray | None = None,
     boundary_layer_temperature: np.ndarray | None = None,
     boundary_layer_interface_temperature: np.ndarray | None = None,
+    radiative_midlevel_temperature: np.ndarray | None = None,
+    radiative_upperlevel_temperature: np.ndarray | None = None,
+    radiative_optical_depth: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray | None, np.ndarray | None]:
     """Evolve temperature with FULL physics: Radiation, Advection, Latent Heat.
 
@@ -5176,7 +5232,9 @@ def _evolve_temperature(
 
     sigma = STEFAN_BOLTZMANN
     # Longwave emission is from the surface (T_sst drives outgoing radiation)
-    L_out = epsilon * sigma * (T_sst ** 4)
+    _radiative_surface_temperature = T_sst.copy()
+    _radiative_air_temperature = T_air.copy()
+    L_out = epsilon * sigma * (_radiative_surface_temperature ** 4)
     _effective_radiating_temperature = np.power(
         np.maximum(L_out, 0.0) / sigma, 0.25
     )
@@ -5187,6 +5245,84 @@ def _evolve_temperature(
     )
 
     R_net = S_absorbed - L_out  # W/m²
+
+    _grey = None
+    _optical_closure = None
+    _middle_emission_temperature = None
+    _upper_emission_temperature = None
+    _coupled_middle_temperature = None
+    _coupled_upper_temperature = None
+    _grey_air_temperature_increment = None
+    if _pp.enable_pressure_defined_radiative_temperature_profile:
+        _diagnosed_profile = pressure_defined_temperature_profile(
+            _radiative_air_temperature,
+            float(_pp.surface_pressure_pa),
+            float(_pp.two_layer_pressure_depth_pa),
+            float(_pp.three_level_mid_upper_pressure_depth_pa),
+            gas_constant_dry_air_j_kg_k=float(_pp.gas_constant_dry),
+            cp_dry_air_j_kg_k=float(_pp.cp_dry),
+        )
+        _middle_source = (
+            _diagnosed_profile.midlevel_temperature_k
+            if radiative_midlevel_temperature is None
+            else radiative_midlevel_temperature
+        )
+        _upper_source = (
+            _diagnosed_profile.upperlevel_temperature_k
+            if radiative_upperlevel_temperature is None
+            else radiative_upperlevel_temperature
+        )
+        _middle_emission_temperature = resolved_midlevel_emission_temperature(
+            _middle_source, expected_shape=_radiative_surface_temperature.shape
+        )
+        _upper_emission_temperature = resolved_midlevel_emission_temperature(
+            _upper_source, expected_shape=_radiative_surface_temperature.shape
+        )
+        if (
+            _pp.enable_coupled_two_layer_grey_radiation
+            and radiative_optical_depth is not None
+        ):
+            _persisted_optical_depth = np.asarray(
+                radiative_optical_depth, dtype=np.float64
+            )
+            if _persisted_optical_depth.shape != _radiative_surface_temperature.shape:
+                raise ValueError("persisted grey optical depth has an unexpected shape")
+            _split_emissivity = pressure_split_emissivities_from_optical_depth(
+                _persisted_optical_depth,
+                float(_pp.two_layer_pressure_depth_pa),
+                float(_pp.three_level_mid_upper_pressure_depth_pa),
+            )
+            _optical_closure = TwoLayerGreyOpticalClosure(
+                _persisted_optical_depth,
+                _split_emissivity.midlevel_emissivity,
+                _split_emissivity.upperlevel_emissivity,
+                _persisted_optical_depth >= 64.0,
+                np.zeros_like(_persisted_optical_depth),
+            )
+        else:
+            _optical_closure = two_layer_optical_depth_for_target_olr(
+                _radiative_surface_temperature,
+                _middle_emission_temperature,
+                _upper_emission_temperature,
+                L_out,
+                float(_pp.two_layer_pressure_depth_pa),
+                float(_pp.three_level_mid_upper_pressure_depth_pa),
+                allow_opaque_limit=True,
+            )
+        _grey = two_layer_grey_radiation(
+            _radiative_surface_temperature,
+            _middle_emission_temperature,
+            _upper_emission_temperature,
+            S_absorbed,
+            _optical_closure.midlevel_emissivity,
+            _optical_closure.upperlevel_emissivity,
+        )
+        _optical_closure = _optical_closure._replace(
+            target_olr_residual_w_m2=_grey.outgoing_longwave_w_m2 - L_out
+        )
+        # In coupled mode the grey atmospheric gains are applied later by the
+        # closed three-level moist-static-energy column. Applying them to the
+        # host air temperature here would create a second energy owner.
 
     # Radiative equilibrium temperature for the surface
     T_eq_rad = equilibrium_temperature_k(S_absorbed, epsilon, sigma=sigma)
@@ -5275,7 +5411,26 @@ def _evolve_temperature(
     # Fraction capped at 0.5 for unconditional stability at any dt (large-step modes
     # like MONTHLY/ANNUAL use dt=6-7 days where k_relax*dt can exceed 1 without this).
     _sst_frac = np.minimum(k_relax * float(days), 0.5).astype(np.float32, copy=False)
-    T_sst = (T_sst + _sst_frac * (T_eq - T_sst)).astype(np.float32, copy=False)
+    if _pp.enable_coupled_two_layer_grey_radiation:
+        assert _grey is not None
+        _surface_capacity = np.where(
+            sea_mask,
+            4.186e6 * mld,
+            float(_pp.land_surface_heat_capacity_j_m2_k),
+        )
+        _direct_surface_mask = (
+            sea_mask if _pp.enable_force_restore_land else np.ones_like(sea_mask)
+        )
+        T_sst = (
+            T_sst
+            + np.where(
+                _direct_surface_mask,
+                _grey.surface_gain_w_m2 * dt_sec / _surface_capacity,
+                0.0,
+            )
+        ).astype(np.float32, copy=False)
+    else:
+        T_sst = (T_sst + _sst_frac * (T_eq - T_sst)).astype(np.float32, copy=False)
     
     # --- Evaporation: bulk aerodynamic formula, applied to T_sst ---
     # Ocean evaporation depends on SST (surface saturation) and near-surface air humidity.
@@ -5385,7 +5540,11 @@ def _evolve_temperature(
             None if soil_moisture_deep is None else np.clip(soil_moisture_deep, 0.0, 1.0)
         )
         wind_for_land = np.sqrt(u * u + v * v)
-        land_net_forcing = R_net
+        land_net_forcing = (
+            _grey.surface_gain_w_m2
+            if _pp.enable_coupled_two_layer_grey_radiation
+            else R_net
+        )
         resolved_heat_convergence = None
         resolved_heat_convergence_area_mean = None
         if bool(_pp.enable_force_restore_atmospheric_heat_convergence):
@@ -5747,6 +5906,25 @@ def _evolve_temperature(
 
     # Track component contributions
     components = {}
+    if _coupled_middle_temperature is not None:
+        components["_radiative_midlevel_temperature"] = (
+            _coupled_middle_temperature.astype(np.float32, copy=False)
+        )
+    if _coupled_upper_temperature is not None:
+        components["_radiative_upperlevel_temperature"] = (
+            _coupled_upper_temperature.astype(np.float32, copy=False)
+        )
+    if _optical_closure is not None:
+        components["_radiative_optical_depth"] = (
+            _optical_closure.total_optical_depth.astype(np.float32, copy=False)
+        )
+    if _pp.enable_coupled_two_layer_grey_radiation and _grey is not None:
+        components["_grey_midlevel_gain_w_m2"] = (
+            _grey.midlevel_gain_w_m2.astype(np.float32, copy=False)
+        )
+        components["_grey_upperlevel_gain_w_m2"] = (
+            _grey.upperlevel_gain_w_m2.astype(np.float32, copy=False)
+        )
     if land_deep_out is not None:
         # Private transport channel; simulate_step removes it before exposing
         # public temperature diagnostics, preserving this function's API.
@@ -6094,6 +6272,7 @@ def _evolve_temperature(
         components['S_absorbed'] = S_absorbed
         components['L_out'] = L_out
         components['effective_surface_longwave_emissivity'] = epsilon
+        components['radiative_surface_temperature_k'] = _radiative_surface_temperature
         components['absorbed_shortwave_area_mean_w_m2'] = _energy_area_mean(
             S_absorbed
         )
@@ -6106,6 +6285,61 @@ def _evolve_temperature(
         components['free_air_minus_effective_radiating_temperature_area_mean_k'] = (
             _energy_area_mean(T_air - _effective_radiating_temperature)
         )
+        if _pp.enable_pressure_defined_radiative_temperature_profile:
+            assert _middle_emission_temperature is not None
+            assert _upper_emission_temperature is not None
+            assert _optical_closure is not None
+            assert _grey is not None
+            components.update({
+                'grey_radiation_mode': (
+                    'two_layer_coupled'
+                    if _pp.enable_coupled_two_layer_grey_radiation
+                    else 'two_layer_diagnostic_only'
+                ),
+                'grey_emission_temperature_source': 'resolved_pressure_midlevel_and_upperlevel',
+                'grey_emission_temperature_k': _middle_emission_temperature,
+                'grey_upperlevel_emission_temperature_k': _upper_emission_temperature,
+                'grey_total_optical_depth': _optical_closure.total_optical_depth,
+                'grey_midlevel_emissivity': _optical_closure.midlevel_emissivity,
+                'grey_upperlevel_emissivity': _optical_closure.upperlevel_emissivity,
+                'grey_opaque_limited': _optical_closure.opaque_limited,
+                'grey_target_olr_residual_w_m2': _optical_closure.target_olr_residual_w_m2,
+                'grey_surface_gain_w_m2': _grey.surface_gain_w_m2,
+                'grey_midlevel_gain_w_m2': _grey.midlevel_gain_w_m2,
+                'grey_upperlevel_gain_w_m2': _grey.upperlevel_gain_w_m2,
+                'grey_atmospheric_gain_w_m2': _grey.midlevel_gain_w_m2 + _grey.upperlevel_gain_w_m2,
+                'grey_downward_longwave_at_surface_w_m2': _grey.downward_longwave_at_surface_w_m2,
+                'grey_outgoing_longwave_w_m2': _grey.outgoing_longwave_w_m2,
+                'grey_toa_net_radiation_w_m2': _grey.toa_net_radiation_w_m2,
+                'grey_emission_temperature_area_mean_k': _energy_area_mean(_middle_emission_temperature),
+                'grey_free_air_minus_emission_temperature_area_mean_k': _energy_area_mean(
+                    _radiative_air_temperature - _middle_emission_temperature
+                ),
+                'grey_upperlevel_temperature_area_mean_k': _energy_area_mean(_upper_emission_temperature),
+                'grey_total_optical_depth_area_mean': _energy_area_mean(_optical_closure.total_optical_depth),
+                'grey_opaque_limited_area_fraction': _energy_area_mean(_optical_closure.opaque_limited),
+                'grey_target_olr_residual_area_mean_w_m2': _energy_area_mean(
+                    _optical_closure.target_olr_residual_w_m2
+                ),
+                'grey_surface_gain_area_mean_w_m2': _energy_area_mean(_grey.surface_gain_w_m2),
+                'grey_midlevel_gain_area_mean_w_m2': _energy_area_mean(_grey.midlevel_gain_w_m2),
+                'grey_upperlevel_gain_area_mean_w_m2': _energy_area_mean(_grey.upperlevel_gain_w_m2),
+                'grey_atmospheric_gain_area_mean_w_m2': _energy_area_mean(
+                    _grey.midlevel_gain_w_m2 + _grey.upperlevel_gain_w_m2
+                ),
+                'grey_downward_longwave_at_surface_area_mean_w_m2': _energy_area_mean(
+                    _grey.downward_longwave_at_surface_w_m2
+                ),
+                'grey_outgoing_longwave_area_mean_w_m2': _energy_area_mean(_grey.outgoing_longwave_w_m2),
+                'grey_toa_net_radiation_area_mean_w_m2': _energy_area_mean(_grey.toa_net_radiation_w_m2),
+            })
+            if _grey_air_temperature_increment is not None:
+                components['grey_air_temperature_increment_k'] = (
+                    _grey_air_temperature_increment
+                )
+                components['grey_air_temperature_increment_area_mean_k'] = (
+                    _energy_area_mean(_grey_air_temperature_increment)
+                )
         def _summ(field: np.ndarray) -> dict:
             return {"mean": float(np.mean(field)), "min": float(np.min(field)), "max": float(np.max(field))}
         components["toa"] = {

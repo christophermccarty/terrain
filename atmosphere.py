@@ -2958,6 +2958,8 @@ def generate_precipitation(
     midlevel_humidity: np.ndarray | None = None,
     upperlevel_temperature: np.ndarray | None = None,
     upperlevel_humidity: np.ndarray | None = None,
+    midlevel_radiative_flux_w_m2: np.ndarray | None = None,
+    upperlevel_radiative_flux_w_m2: np.ndarray | None = None,
     column_lower_temperature: np.ndarray | None = None,
     previous_precipitation_mm_day: np.ndarray | None = None,
     previous_large_scale_heating_w_m2: np.ndarray | None = None,
@@ -4296,6 +4298,15 @@ def generate_precipitation(
                         omega_upperlevel_pa_s, dt_seconds=_vertical_dt_seconds,
                         surface_pressure_pa=float(surface_pressure_hpa) * 100.0,
                         layer_heights_m=(0.0, float(pp.stability_condensation_reference_height_m), float(pp.three_level_upper_height_m)),
+                        radiative_flux_w_m2=(
+                            np.zeros_like(q),
+                            np.zeros_like(q)
+                            if midlevel_radiative_flux_w_m2 is None
+                            else np.asarray(midlevel_radiative_flux_w_m2),
+                            np.zeros_like(q)
+                            if upperlevel_radiative_flux_w_m2 is None
+                            else np.asarray(upperlevel_radiative_flux_w_m2),
+                        ),
                     )
                     q = closed_step.lower_humidity
                     midlevel_humidity_next = closed_step.midlevel_humidity

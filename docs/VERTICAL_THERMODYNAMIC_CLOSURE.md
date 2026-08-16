@@ -545,3 +545,71 @@ not finish within 60 seconds, so this carrier is deliberately not substituted
 into the atmosphere gate: runtime admission requires an equivalently
 conservative implementation with bounded compact-screen cost, not relaxed
 Courant control or a capped wind.
+
+## Coupled two-layer grey radiation admission (2026-08-15): handoff instability isolated, redesign required
+
+`enable_coupled_two_layer_grey_radiation` replaces the legacy radiative
+tendency with a conservative pressure-defined two-layer grey budget, routing
+its midlevel/upperlevel gains through the closed three-level MSE column
+(`evolve_closed_three_level_thermodynamic_column`) rather than a second,
+independent atmospheric energy owner. The column-internal residual is exact
+(`grey_column_conservation_residual_w_m2` is float64-roundoff-level, ~1e-14)
+and 125 related tests pass, but the 32x64 one-year spin-up/one-year evaluation
+screen (`scripts/audit_boundary_layer_column_energy.py`) rejects the candidate
+on temperature shock (+17.3 K air, +15.0 K surface) and TOA imbalance
+(-39.2 W m-2).
+
+A new full-system (atmosphere + land/ocean skin + land-deep + deep-ocean)
+energy-conservation check was added to the audit script alongside the
+existing column-internal one, comparing total storage change against the
+time-integrated `grey_toa_net_radiation_w_m2` -- the only flux that should
+cross the system boundary. It exposes a genuine, un-owned ~105 W m-2 mean
+annual residual, dominated by the surface/ocean reservoir. A flag-knockout
+sweep and a reverted trial (removing the legacy `T_eq` feed into
+`calculate_ocean_heat_transport`'s exchange term, which made the residual
+*worse* rather than better) both rule out the capacity-aware air-sea/free-air
+exchange, boundary-layer horizontal transport, the interface reservoir, and
+that legacy exchange term as the primary driver -- each is independently
+conservative or a small, steady bias, not this magnitude.
+
+Per-step tracing over the first several days after the handoff finds the
+actual mechanism: `diabatic_interface_mass_flux`'s precipitation-anomaly path
+computes omega by dividing a heating anomaly by resolved potential-temperature
+static stability with no floor (by design -- see the diabatic-interface
+verdict above). On the coupled-grey handoff specifically, the freshly
+bootstrapped mid/upper-level temperatures start close to neutral stability at
+some cells, and the resulting omega feeds back through next-day's
+precipitation anomaly: the diagnosed vertical Courant number roughly doubles
+each day (measured 0.069 -> 0.804 -> 1.733 -> 3.48 over four days). The
+existing CFL substep mechanism keeps each individual transfer conservative and
+bounded, so the closed column's own energy ledger stays exact even as this
+happens, but the compounding vertical mixing still drives mid/upper
+temperatures to non-physical values within days (T_air up to 556 K, T_mid
+down to -27 K measured), which is what the full-system audit reads as a large,
+sign-flipping implicit source.
+
+A stability-floor patch to the omega denominator was implemented and measured
+as numerically effective (day-4 Courant number bounded at ~0.4-0.7 instead of
+3.48; admission-screen air shock fell from +17.3 K to +3.4 K, implicit source
+from 105 to 79 W m-2, all 112 pressure-circulation/pressure-column/prior-art
+tests still passing) -- and then reverted unapplied. It contradicts this
+document's own repeated, explicit verdicts on this exact closure family
+("Do not add an omega cap, damping term..."; "A cap applied only to omega
+after the fact would discard the diagnosed circulation and merely create
+another unclosed tuning path; it is not an admissible repair."). Patching the
+symptom would also leave the remaining TOA/OLR-target mismatch (independently
+present before this instability was even triggered) unaddressed.
+
+**Decision:** retain the coupled grey-radiation gate, the closed-column
+adapter, and the new full-system energy-audit instrument as default-off
+research code; do not add a stability floor, omega cap, or damping term to
+`diabatic_interface_mass_flux_from_heating`. The next required replacement is
+a coupled-grey-aware spin-up/initialization for the mid/upper-level
+temperature and optical-depth state (so the handoff does not start near
+neutral stability), or a structurally independent bound on the diagnosed
+overturning consistent with the rest of this closure family's redesign
+requirement -- not a post-hoc cap on this specific instance. The TOA/OLR
+target mismatch (`grey_target_olr_residual_w_m2` ~+11-13 W m-2 even before
+this instability compounds it) is a separate, still-open calibration gap in
+the grey column's optical-depth solve and must be resolved independently of
+the handoff-stability fix.

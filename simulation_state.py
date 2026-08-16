@@ -79,6 +79,7 @@ class PlanetState(NamedTuple):
     midlevel_temperature: np.ndarray | None = None
     midlevel_humidity: np.ndarray | None = None
     upperlevel_temperature: np.ndarray | None = None
+    grey_optical_depth: np.ndarray | None = None
     upperlevel_humidity: np.ndarray | None = None
     midlevel_wind_u: np.ndarray | None = None
     midlevel_wind_v: np.ndarray | None = None

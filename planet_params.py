@@ -141,6 +141,16 @@ class PlanetParams:
     the active radiative budget.
     """
 
+    enable_coupled_two_layer_grey_radiation: bool = False
+    """Replace the legacy radiative tendency with the conservative grey budget.
+
+    Requires ``enable_pressure_defined_radiative_temperature_profile``. The
+    summed atmospheric gain updates the existing full-column air-energy owner;
+    midlevel and upper-level states retain the pressure-weighted differential
+    response without adding duplicate atmospheric mass. The surface gain enters
+    the existing land/ocean thermal stores. Default off until admission passes.
+    """
+
     # ------------------------------------------------------------------ #
     # Effective single-layer greenhouse parameters
     # These are used in the temperature baseline calculation and will be

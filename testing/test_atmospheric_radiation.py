@@ -5,10 +5,14 @@ import pytest
 
 from atmospheric_radiation import (
     STEFAN_BOLTZMANN,
+    atmospheric_emissivity_for_target_olr,
     effective_radiating_temperature,
     grey_surface_atmosphere_radiation,
     pressure_defined_temperature_profile,
+    pressure_split_emissivities_from_optical_depth,
     resolved_midlevel_emission_temperature,
+    two_layer_grey_radiation,
+    two_layer_optical_depth_for_target_olr,
 )
 
 
@@ -105,3 +109,168 @@ def test_resolved_emission_temperature_preserves_the_explicit_state():
     np.testing.assert_array_equal(emission, midlevel)
     with pytest.raises(ValueError, match="unexpected shape"):
         resolved_midlevel_emission_temperature(midlevel, expected_shape=(3, 2))
+
+
+def test_diagnosed_emissivity_reproduces_target_olr_exactly():
+    surface = np.array([290.0, 300.0, 320.0])
+    atmosphere = np.array([250.0, 260.0, 280.0])
+    expected_emissivity = np.array([0.0, 0.45, 1.0])
+    surface_emission = STEFAN_BOLTZMANN * surface**4
+    atmospheric_emission = STEFAN_BOLTZMANN * atmosphere**4
+    target = (
+        (1.0 - expected_emissivity) * surface_emission
+        + expected_emissivity * atmospheric_emission
+    )
+    diagnosed = atmospheric_emissivity_for_target_olr(
+        surface, atmosphere, target
+    )
+    np.testing.assert_allclose(diagnosed, expected_emissivity, atol=2e-15)
+    result = grey_surface_atmosphere_radiation(
+        surface, atmosphere, np.full(3, 240.0), diagnosed
+    )
+    np.testing.assert_allclose(result.outgoing_longwave_w_m2, target, atol=1e-12)
+
+
+def test_diagnosed_emissivity_handles_isothermal_column_without_division():
+    temperature = np.full((2, 3), 260.0)
+    target = STEFAN_BOLTZMANN * temperature**4
+    emissivity = atmospheric_emissivity_for_target_olr(
+        temperature, temperature, target
+    )
+    np.testing.assert_array_equal(emissivity, 0.0)
+    assert np.all(np.isfinite(emissivity))
+
+
+def test_diagnosed_emissivity_rejects_unrepresentable_target_olr():
+    surface = np.full((2, 2), 300.0)
+    atmosphere = np.full((2, 2), 260.0)
+    with pytest.raises(ValueError, match="outside"):
+        atmospheric_emissivity_for_target_olr(
+            surface, atmosphere, np.full((2, 2), 100.0)
+        )
+
+
+@pytest.mark.parametrize(
+    "surface,middle,upper,shortwave,middle_e,upper_e",
+    [
+        (300.0, 265.0, 225.0, 240.0, 0.7, 0.5),
+        (220.0, 205.0, 180.0, 0.0, 0.0, 0.0),
+        (350.0, 300.0, 240.0, 500.0, 1.0, 1.0),
+    ],
+)
+def test_two_layer_grey_budget_is_finite_and_conservative(
+    surface, middle, upper, shortwave, middle_e, upper_e
+):
+    shape = (2, 3)
+    result = two_layer_grey_radiation(
+        np.full(shape, surface),
+        np.full(shape, middle),
+        np.full(shape, upper),
+        np.full(shape, shortwave),
+        np.full(shape, middle_e),
+        np.full(shape, upper_e),
+    )
+    np.testing.assert_allclose(
+        result.surface_gain_w_m2
+        + result.midlevel_gain_w_m2
+        + result.upperlevel_gain_w_m2,
+        result.toa_net_radiation_w_m2,
+        atol=2e-12,
+    )
+    assert all(np.all(np.isfinite(field)) for field in result)
+    np.testing.assert_array_equal(
+        result.lower_downward_emission_w_m2,
+        result.lower_upward_emission_w_m2,
+    )
+    np.testing.assert_array_equal(
+        result.upper_downward_emission_w_m2,
+        result.upper_upward_emission_w_m2,
+    )
+
+
+def test_pressure_split_optical_depth_reproduces_target_olr():
+    surface = np.array([[300.0, 310.0], [280.0, 330.0]])
+    middle = 0.90 * surface
+    upper = 0.76 * surface
+    target_temperature = 0.86 * surface
+    target = STEFAN_BOLTZMANN * target_temperature**4
+    closure = two_layer_optical_depth_for_target_olr(
+        surface, middle, upper, target, 35_000.0, 30_000.0
+    )
+    result = two_layer_grey_radiation(
+        surface,
+        middle,
+        upper,
+        np.full(surface.shape, 240.0),
+        closure.midlevel_emissivity,
+        closure.upperlevel_emissivity,
+    )
+    np.testing.assert_allclose(result.outgoing_longwave_w_m2, target, rtol=2e-14)
+    assert np.all(closure.total_optical_depth > 0.0)
+    assert np.all((closure.midlevel_emissivity > 0.0) & (closure.midlevel_emissivity < 1.0))
+    assert np.all((closure.upperlevel_emissivity > 0.0) & (closure.upperlevel_emissivity < 1.0))
+
+
+def test_pressure_split_optical_depth_accepts_surface_inversion():
+    shape = (2, 2)
+    surface = np.full(shape, 300.0)
+    middle = np.full(shape, 265.0)
+    upper = np.full(shape, 225.0)
+    inverted_surface = np.full(shape, 250.0)
+    target = STEFAN_BOLTZMANN * np.full(shape, 240.0) ** 4
+    closure = two_layer_optical_depth_for_target_olr(
+        inverted_surface, middle, upper, target, 35_000.0, 30_000.0
+    )
+    result = two_layer_grey_radiation(
+        inverted_surface, middle, upper, np.zeros(shape),
+        closure.midlevel_emissivity, closure.upperlevel_emissivity,
+    )
+    np.testing.assert_allclose(result.outgoing_longwave_w_m2, target, rtol=2e-14)
+
+
+def test_pressure_split_optical_depth_rejects_upper_inversion_and_out_of_range_target():
+    shape = (2, 2)
+    surface = np.full(shape, 300.0)
+    middle = np.full(shape, 265.0)
+    upper = np.full(shape, 225.0)
+    with pytest.raises(ValueError, match="upper level"):
+        two_layer_optical_depth_for_target_olr(
+            surface, middle, np.full(shape, 270.0), np.full(shape, 240.0),
+            35_000.0, 30_000.0,
+        )
+    with pytest.raises(ValueError, match="outside"):
+        two_layer_optical_depth_for_target_olr(
+            surface, middle, upper, np.full(shape, 50.0), 35_000.0, 30_000.0
+        )
+
+
+def test_pressure_split_optical_depth_reports_explicit_opaque_limit():
+    shape = (2, 2)
+    surface = np.full(shape, 300.0)
+    middle = np.full(shape, 265.0)
+    upper = np.full(shape, 225.0)
+    target = STEFAN_BOLTZMANN * np.full(shape, 210.0) ** 4
+    closure = two_layer_optical_depth_for_target_olr(
+        surface, middle, upper, target, 35_000.0, 30_000.0,
+        allow_opaque_limit=True,
+    )
+    np.testing.assert_array_equal(closure.opaque_limited, True)
+    np.testing.assert_array_equal(closure.midlevel_emissivity, 1.0)
+    np.testing.assert_array_equal(closure.upperlevel_emissivity, 1.0)
+    expected_residual = STEFAN_BOLTZMANN * (225.0**4 - 210.0**4)
+    np.testing.assert_allclose(closure.target_olr_residual_w_m2, expected_residual)
+    assert np.all(np.isfinite(closure.total_optical_depth))
+
+
+def test_pressure_split_emissivity_preserves_total_transmission():
+    optical_depth = np.array([0.0, 0.5, 3.0, 64.0])
+    split = pressure_split_emissivities_from_optical_depth(
+        optical_depth, 35_000.0, 30_000.0
+    )
+    combined_transmission = (
+        (1.0 - split.midlevel_emissivity)
+        * (1.0 - split.upperlevel_emissivity)
+    )
+    np.testing.assert_allclose(
+        combined_transmission, np.exp(-optical_depth), atol=1e-27
+    )

@@ -117,16 +117,117 @@ def test_pressure_defined_grey_budget_is_resolved_and_diagnostic_only():
     evolved, components = simulate_step(
         enabled, days=1.0, planet_params=planet, track_components=True
     )
-    assert components["grey_radiation_mode"] == "diagnostic_only"
-    assert components["grey_emission_temperature_source"] == "resolved_pressure_midlevel"
-    np.testing.assert_array_equal(
-        components["grey_emission_temperature_k"], evolved.midlevel_temperature
+    assert components["grey_radiation_mode"] == "two_layer_diagnostic_only"
+    assert components["grey_emission_temperature_source"] == (
+        "resolved_pressure_midlevel_and_upperlevel"
+    )
+    np.testing.assert_allclose(
+        components["grey_emission_temperature_k"],
+        evolved.midlevel_temperature,
+        rtol=2e-6,
+        atol=5e-4,
     )
     np.testing.assert_allclose(
         components["grey_surface_gain_w_m2"]
         + components["grey_atmospheric_gain_w_m2"],
         components["grey_toa_net_radiation_w_m2"],
-        atol=1e-12,
+        atol=5e-6,
+    )
+    for _ in range(29):
+        evolved, _ = simulate_step(
+            evolved,
+            days=1.0,
+            planet_params=planet,
+            block_size=1,
+        )
+    assert 180.0 < float(np.min(evolved.air_temperature))
+    assert float(np.max(evolved.air_temperature)) < 340.0
+    assert 150.0 < float(np.min(evolved.midlevel_temperature))
+    assert float(np.max(evolved.midlevel_temperature)) < 350.0
+    assert 150.0 < float(np.min(evolved.upperlevel_temperature))
+    assert float(np.max(evolved.upperlevel_temperature)) < 350.0
+
+
+def test_coupled_grey_radiation_rejects_stale_multiday_flux():
+    profile_planet = dataclasses.replace(
+        EARTH,
+        enable_pressure_defined_radiative_temperature_profile=True,
+    )
+    state = create_initial_state(
+        np.zeros((4, 8), dtype=np.float32),
+        planet_params=profile_planet,
+        block_size=1,
+    )
+    coupled = dataclasses.replace(
+        profile_planet,
+        enable_prognostic_column_water=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+        enable_diabatic_interface_mass_flux=True,
+        enable_coupled_two_layer_grey_radiation=True,
+    )
+    with np.testing.assert_raises_regex(ValueError, "daily-or-finer"):
+        simulate_step(state, days=2.0, planet_params=coupled, block_size=1)
+
+
+def test_coupled_grey_radiation_requires_pressure_profile_gate():
+    planet = dataclasses.replace(
+        EARTH,
+        enable_coupled_two_layer_grey_radiation=True,
+    )
+    with np.testing.assert_raises_regex(ValueError, "pressure-defined"):
+        create_initial_state(
+            np.zeros((4, 8), dtype=np.float32),
+            planet_params=planet,
+            block_size=1,
+        )
+
+
+def test_coupled_grey_radiation_evolves_finite_pressure_layer_reservoirs():
+    profile_planet = dataclasses.replace(
+        EARTH,
+        enable_pressure_defined_radiative_temperature_profile=True,
+        enable_prognostic_column_water=True,
+        enable_stability_aware_condensation=True,
+        enable_two_layer_convective_adjustment=True,
+        enable_three_level_pressure_column=True,
+        enable_closed_three_level_thermodynamics=True,
+        enable_diabatic_interface_mass_flux=True,
+    )
+    planet = dataclasses.replace(
+        profile_planet,
+        enable_coupled_two_layer_grey_radiation=True,
+    )
+    state = create_initial_state(
+        np.zeros((4, 8), dtype=np.float32),
+        planet_params=profile_planet,
+        block_size=1,
+    )
+    before_middle = state.midlevel_temperature.copy()
+    before_upper = state.upperlevel_temperature.copy()
+    before_optical_depth = state.grey_optical_depth.copy()
+    evolved, components = simulate_step(
+        state,
+        days=1.0,
+        planet_params=planet,
+        block_size=1,
+        track_components=True,
+    )
+    assert components["grey_radiation_mode"] == "two_layer_coupled"
+    assert np.all(np.isfinite(evolved.temperature))
+    assert np.all(np.isfinite(evolved.midlevel_temperature))
+    assert np.all(np.isfinite(evolved.upperlevel_temperature))
+    assert not np.array_equal(evolved.midlevel_temperature, before_middle)
+    assert not np.array_equal(evolved.upperlevel_temperature, before_upper)
+    np.testing.assert_array_equal(evolved.grey_optical_depth, before_optical_depth)
+
+    np.testing.assert_allclose(
+        components["grey_surface_gain_w_m2"]
+        + components["grey_atmospheric_gain_w_m2"],
+        components["grey_toa_net_radiation_w_m2"],
+        atol=5e-6,
     )
 
 

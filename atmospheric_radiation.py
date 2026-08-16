@@ -25,6 +25,32 @@ class PressureDefinedTemperatureProfile(NamedTuple):
     upperlevel_temperature_k: np.ndarray
 
 
+class TwoLayerGreyOpticalClosure(NamedTuple):
+    total_optical_depth: np.ndarray
+    midlevel_emissivity: np.ndarray
+    upperlevel_emissivity: np.ndarray
+    opaque_limited: np.ndarray
+    target_olr_residual_w_m2: np.ndarray
+
+
+class PressureSplitGreyEmissivity(NamedTuple):
+    midlevel_emissivity: np.ndarray
+    upperlevel_emissivity: np.ndarray
+
+
+class TwoLayerGreyRadiationStep(NamedTuple):
+    surface_gain_w_m2: np.ndarray
+    midlevel_gain_w_m2: np.ndarray
+    upperlevel_gain_w_m2: np.ndarray
+    lower_downward_emission_w_m2: np.ndarray
+    lower_upward_emission_w_m2: np.ndarray
+    upper_downward_emission_w_m2: np.ndarray
+    upper_upward_emission_w_m2: np.ndarray
+    downward_longwave_at_surface_w_m2: np.ndarray
+    outgoing_longwave_w_m2: np.ndarray
+    toa_net_radiation_w_m2: np.ndarray
+
+
 def pressure_defined_temperature_profile(
     lower_temperature_k: np.ndarray,
     surface_pressure_pa: np.ndarray | float,
@@ -118,8 +144,272 @@ def resolved_midlevel_emission_temperature(
     if expected_shape is not None and temperature.shape != expected_shape:
         raise ValueError("midlevel emission temperature has an unexpected shape")
     if not np.all(np.isfinite(temperature)) or np.any(temperature <= 0.0):
-        raise ValueError("midlevel emission temperature must be finite and positive")
+        raise ValueError(
+            "midlevel emission temperature must be finite and positive "
+            f"(min_k={float(np.nanmin(temperature)):.6g})"
+        )
     return temperature
+
+
+def atmospheric_emissivity_for_target_olr(
+    surface_temperature_k: np.ndarray,
+    atmospheric_emission_temperature_k: np.ndarray,
+    target_outgoing_longwave_w_m2: np.ndarray,
+    *,
+    sigma_w_m2_k4: float = STEFAN_BOLTZMANN,
+) -> np.ndarray:
+    """Diagnose the bounded grey emissivity that reproduces a target OLR.
+
+    For the one-layer grey contract,
+    ``OLR = (1 - epsilon) sigma Ts^4 + epsilon sigma Ta^4``.  Solving this
+    equation makes the legacy/resolved TOA flux an explicit boundary condition
+    while retaining the pressure-defined atmospheric temperature.  No fitted
+    offset or emissivity calibration is introduced.
+
+    A target outside the interval spanned by surface and atmospheric blackbody
+    emission is not representable by a bounded grey emissivity and fails
+    closed.  In an isothermal column OLR is independent of emissivity; the
+    transparent representative is returned only when the target equals that
+    unique flux to numerical tolerance.
+    """
+    surface = np.asarray(surface_temperature_k, dtype=np.float64)
+    atmosphere = np.asarray(atmospheric_emission_temperature_k, dtype=np.float64)
+    target = np.asarray(target_outgoing_longwave_w_m2, dtype=np.float64)
+    if not (surface.shape == atmosphere.shape == target.shape):
+        raise ValueError("emissivity-closure fields must share a shape")
+    if sigma_w_m2_k4 <= 0.0 or not np.isfinite(sigma_w_m2_k4):
+        raise ValueError("Stefan--Boltzmann constant must be finite and positive")
+    if not all(np.all(np.isfinite(field)) for field in (surface, atmosphere, target)):
+        raise ValueError("emissivity-closure inputs must be finite")
+    if np.any(surface <= 0.0) or np.any(atmosphere <= 0.0) or np.any(target < 0.0):
+        raise ValueError("temperatures must be positive and target OLR non-negative")
+
+    surface_emission = sigma_w_m2_k4 * surface**4
+    atmospheric_emission = sigma_w_m2_k4 * atmosphere**4
+    lower = np.minimum(surface_emission, atmospheric_emission)
+    upper = np.maximum(surface_emission, atmospheric_emission)
+    tolerance = 1.0e-12 * np.maximum(np.maximum(np.abs(lower), np.abs(upper)), 1.0)
+    if np.any(target < lower - tolerance) or np.any(target > upper + tolerance):
+        raise ValueError("target OLR is outside the bounded grey-atmosphere range")
+
+    denominator = surface_emission - atmospheric_emission
+    isothermal = np.abs(denominator) <= tolerance
+    if np.any(isothermal & (np.abs(target - surface_emission) > tolerance)):
+        raise ValueError("isothermal grey column has a unique outgoing longwave flux")
+    emissivity = np.zeros_like(surface_emission)
+    np.divide(
+        surface_emission - target,
+        denominator,
+        out=emissivity,
+        where=~isothermal,
+    )
+    return np.clip(emissivity, 0.0, 1.0)
+
+
+def two_layer_grey_radiation(
+    surface_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    absorbed_shortwave_w_m2: np.ndarray,
+    midlevel_emissivity: np.ndarray,
+    upperlevel_emissivity: np.ndarray,
+    *,
+    sigma_w_m2_k4: float = STEFAN_BOLTZMANN,
+) -> TwoLayerGreyRadiationStep:
+    """Return a conservative two-atmospheric-layer grey radiative budget."""
+    fields = tuple(
+        np.asarray(value, dtype=np.float64)
+        for value in (
+            surface_temperature_k,
+            midlevel_temperature_k,
+            upperlevel_temperature_k,
+            absorbed_shortwave_w_m2,
+            midlevel_emissivity,
+            upperlevel_emissivity,
+        )
+    )
+    surface, middle, upper, shortwave, middle_e, upper_e = fields
+    if any(field.shape != surface.shape for field in fields[1:]):
+        raise ValueError("two-layer grey-radiation fields must share a shape")
+    if sigma_w_m2_k4 <= 0.0 or not np.isfinite(sigma_w_m2_k4):
+        raise ValueError("Stefan--Boltzmann constant must be finite and positive")
+    if any(not np.all(np.isfinite(field)) for field in fields):
+        raise ValueError("two-layer grey-radiation inputs must be finite")
+    if any(np.any(field <= 0.0) for field in (surface, middle, upper)):
+        raise ValueError("radiating temperatures must be positive")
+    if np.any(shortwave < 0.0) or any(
+        np.any((field < 0.0) | (field > 1.0)) for field in (middle_e, upper_e)
+    ):
+        raise ValueError("shortwave and emissivities are outside physical bounds")
+
+    surface_emission = sigma_w_m2_k4 * surface**4
+    middle_blackbody = sigma_w_m2_k4 * middle**4
+    upper_blackbody = sigma_w_m2_k4 * upper**4
+    middle_t = 1.0 - middle_e
+    upper_t = 1.0 - upper_e
+    middle_up = middle_e * middle_blackbody
+    middle_down = middle_up
+    upper_up = upper_e * upper_blackbody
+    upper_down = upper_up
+
+    upward_into_upper = middle_t * surface_emission + middle_up
+    downward_at_surface = middle_down + middle_t * upper_down
+    outgoing = upper_t * upward_into_upper + upper_up
+    surface_gain = shortwave + downward_at_surface - surface_emission
+    middle_gain = (
+        middle_e * surface_emission
+        + middle_e * upper_down
+        - middle_up
+        - middle_down
+    )
+    upper_gain = upper_e * upward_into_upper - upper_up - upper_down
+    toa_net = shortwave - outgoing
+    return TwoLayerGreyRadiationStep(
+        surface_gain,
+        middle_gain,
+        upper_gain,
+        middle_down,
+        middle_up,
+        upper_down,
+        upper_up,
+        downward_at_surface,
+        outgoing,
+        toa_net,
+    )
+
+
+def pressure_split_emissivities_from_optical_depth(
+    total_optical_depth: np.ndarray,
+    lower_mid_pressure_depth_pa: np.ndarray | float,
+    mid_upper_pressure_depth_pa: np.ndarray | float,
+) -> PressureSplitGreyEmissivity:
+    """Split a finite total optical depth in proportion to pressure mass."""
+    optical_depth = np.asarray(total_optical_depth, dtype=np.float64)
+    lower_depth = np.asarray(lower_mid_pressure_depth_pa, dtype=np.float64)
+    upper_depth = np.asarray(mid_upper_pressure_depth_pa, dtype=np.float64)
+    try:
+        optical_depth, lower_depth, upper_depth = np.broadcast_arrays(
+            optical_depth, lower_depth, upper_depth
+        )
+    except ValueError as exc:
+        raise ValueError("optical depth and pressure depths must be broadcast-compatible") from exc
+    if any(
+        not np.all(np.isfinite(field))
+        for field in (optical_depth, lower_depth, upper_depth)
+    ):
+        raise ValueError("optical depth and pressure depths must be finite")
+    if np.any(optical_depth < 0.0) or np.any(lower_depth <= 0.0) or np.any(upper_depth <= 0.0):
+        raise ValueError("optical depth must be non-negative and pressure depths positive")
+    middle_fraction = lower_depth / (lower_depth + upper_depth)
+    upper_fraction = 1.0 - middle_fraction
+    return PressureSplitGreyEmissivity(
+        -np.expm1(-optical_depth * middle_fraction),
+        -np.expm1(-optical_depth * upper_fraction),
+    )
+
+
+def two_layer_optical_depth_for_target_olr(
+    surface_temperature_k: np.ndarray,
+    midlevel_temperature_k: np.ndarray,
+    upperlevel_temperature_k: np.ndarray,
+    target_outgoing_longwave_w_m2: np.ndarray,
+    lower_mid_pressure_depth_pa: np.ndarray | float,
+    mid_upper_pressure_depth_pa: np.ndarray | float,
+    *,
+    sigma_w_m2_k4: float = STEFAN_BOLTZMANN,
+    allow_opaque_limit: bool = False,
+) -> TwoLayerGreyOpticalClosure:
+    """Solve pressure-split grey optical depth for an explicit target OLR.
+
+    Total optical depth is the sole diagnosed opacity.  It is divided between
+    the resolved midlevel and upper-level emitters in direct proportion to the
+    two supplied pressure thicknesses.  With temperature decreasing upward,
+    OLR varies monotonically from surface blackbody emission at zero optical
+    depth toward upper-level blackbody emission in the opaque limit.
+    """
+    surface = np.asarray(surface_temperature_k, dtype=np.float64)
+    middle = np.asarray(midlevel_temperature_k, dtype=np.float64)
+    upper = np.asarray(upperlevel_temperature_k, dtype=np.float64)
+    target = np.asarray(target_outgoing_longwave_w_m2, dtype=np.float64)
+    lower_depth = np.asarray(lower_mid_pressure_depth_pa, dtype=np.float64)
+    upper_depth = np.asarray(mid_upper_pressure_depth_pa, dtype=np.float64)
+    try:
+        surface, middle, upper, target, lower_depth, upper_depth = np.broadcast_arrays(
+            surface, middle, upper, target, lower_depth, upper_depth
+        )
+    except ValueError as exc:
+        raise ValueError("optical-depth closure fields must be broadcast-compatible") from exc
+    if sigma_w_m2_k4 <= 0.0 or not np.isfinite(sigma_w_m2_k4):
+        raise ValueError("Stefan--Boltzmann constant must be finite and positive")
+    if any(
+        not np.all(np.isfinite(field))
+        for field in (surface, middle, upper, target, lower_depth, upper_depth)
+    ):
+        raise ValueError("optical-depth closure inputs must be finite")
+    if any(np.any(field <= 0.0) for field in (surface, middle, upper)):
+        raise ValueError("radiating temperatures must be positive")
+    if np.any(target < 0.0) or np.any(lower_depth <= 0.0) or np.any(upper_depth <= 0.0):
+        raise ValueError("target OLR must be non-negative and pressure depths positive")
+    if np.any(middle < upper):
+        raise ValueError("two-layer optical closure requires upper level no warmer than midlevel")
+
+    surface_flux = sigma_w_m2_k4 * surface**4
+    middle_flux = sigma_w_m2_k4 * middle**4
+    upper_flux = sigma_w_m2_k4 * upper**4
+    tolerance = 1.0e-11 * np.maximum(surface_flux, 1.0)
+    too_high = target > surface_flux + tolerance
+    too_low = target < upper_flux - tolerance
+    if np.any(too_high) or (np.any(too_low) and not allow_opaque_limit):
+        raise ValueError(
+            "target OLR is outside the pressure-profile grey range "
+            f"(above_surface={int(np.count_nonzero(too_high))}, "
+            f"below_upper={int(np.count_nonzero(too_low))}, "
+            f"max_below_upper_w_m2={float(np.max(np.where(too_low, upper_flux - target, 0.0))):.6g})"
+        )
+
+    effective_target = np.maximum(target, upper_flux) if allow_opaque_limit else target
+    middle_fraction = lower_depth / (lower_depth + upper_depth)
+    upper_fraction = 1.0 - middle_fraction
+
+    def _olr(optical_depth: np.ndarray) -> np.ndarray:
+        middle_t = np.exp(-optical_depth * middle_fraction)
+        upper_t = np.exp(-optical_depth * upper_fraction)
+        return (
+            upper_t
+            * (middle_t * surface_flux + (1.0 - middle_t) * middle_flux)
+            + (1.0 - upper_t) * upper_flux
+        )
+
+    low = np.zeros_like(surface_flux)
+    high = np.full_like(surface_flux, 64.0)
+    if np.any(_olr(high) > effective_target + tolerance):
+        raise ValueError("target OLR requires effectively infinite optical depth")
+    for _ in range(64):
+        middle_tau = 0.5 * (low + high)
+        trial = _olr(middle_tau)
+        low = np.where(trial > effective_target, middle_tau, low)
+        high = np.where(trial > effective_target, high, middle_tau)
+    total = 0.5 * (low + high)
+    middle_emissivity = -np.expm1(-total * middle_fraction)
+    upper_emissivity = -np.expm1(-total * upper_fraction)
+    if allow_opaque_limit:
+        middle_emissivity = np.where(too_low, 1.0, middle_emissivity)
+        upper_emissivity = np.where(too_low, 1.0, upper_emissivity)
+    achieved_olr = (
+        (1.0 - upper_emissivity)
+        * (
+            (1.0 - middle_emissivity) * surface_flux
+            + middle_emissivity * middle_flux
+        )
+        + upper_emissivity * upper_flux
+    )
+    return TwoLayerGreyOpticalClosure(
+        total,
+        middle_emissivity,
+        upper_emissivity,
+        too_low.copy(),
+        achieved_olr - target,
+    )
 
 
 def grey_surface_atmosphere_radiation(
