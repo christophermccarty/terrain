@@ -608,6 +608,23 @@ class PlanetParams:
     Köppen promotion gates.
     """
 
+    enable_sesam_vertical_structure: bool = False
+    """Compute SESAM (CLIMBER-X) diagnostic vertical profiles (stage P1).
+
+    Pure diagnostic kernels in ``sesam_vertical.py`` — (A1) pressure/height
+    scale, (A5)-(A9) temperature and lapse-rate profiles, (A13)-(A15)
+    relative-humidity/specific-humidity profiles, (A12) potential temperature,
+    and the (A10)-(A11) tropopause rate and dynamical shape — transcribed from
+    Willeit et al. (2022), GMD 15, 5905–5948 Appendix A1.
+
+    This gate is off by default and is **not wired into the supported climate
+    path**: nothing in ``simulate.py`` calls these kernels, so enabling it has
+    zero default-path climate impact. It exists as the documented hook for the
+    SESAM stage P2 (dynamics) to consume the profiles diagnostically, and as
+    the reservation that ``simulate_step`` is not allowed to call
+    ``sesam_vertical`` while this remains False.
+    """
+
     enable_force_restore_atmospheric_heat_convergence: bool = False
     """Feed resolved atmospheric heat convergence to force-restore land.
 
