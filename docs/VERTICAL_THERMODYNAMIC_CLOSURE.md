@@ -613,3 +613,57 @@ target mismatch (`grey_target_olr_residual_w_m2` ~+11-13 W m-2 even before
 this instability compounds it) is a separate, still-open calibration gap in
 the grey column's optical-depth solve and must be resolved independently of
 the handoff-stability fix.
+
+## Handoff pathway diagnostic (2026-08-16): trigger isolated; near-neutral state develops, not inherited
+
+`scripts/diagnose_coupled_grey_handoff.py` reproduces the admission screen's
+exact warmup (12 MONTHLY cycles at 32x64, closed-column family off, profile
+gate on), records the handoff state, then traces 14 coupled DAILY steps with
+an exact recomputation of the live diabatic-omega branch, the zonal
+potential-temperature stability at both interfaces, the closed-form grey
+radiative-equilibrium profile implied by the persisted optical depth, and the
+audit script's full-system energy ledger. The instrument is validated against
+the earlier ad hoc trace: it reproduces the day-4 midlevel collapse to
+-26.9 K (prior trace: -27 K).
+
+Measured findings (`temp/coupled_grey_handoff_32x64.json`):
+
+1. **The handoff state is not near-neutral.** At handoff the zonal stability
+   is uniformly positive (lower-mid 5.6e-4 K/Pa, mid-upper 2.2e-3 K/Pa; zero
+   area below 1e-4 K/Pa) and the implied Courant numbers are benign
+   (0.085/0.025). The earlier "starts close to neutral stability" description
+   is refuted at the zonal scale the omega solve actually uses: the
+   near-neutral state *develops* during the first one to two coupled days
+   (lower-mid p5 stability is -2.4e-4 K/Pa after day 1 and stays negative).
+2. **The trigger is the grey-gain shock from a mis-initialized mid level.**
+   The dry-adiabatic bootstrap mid level is +15.2 K area-mean (max +60 K)
+   warmer than the grey radiative equilibrium implied by the persisted
+   optical depth (equilibrium mid 249.4 K vs bootstrap 264.6 K; upper level
+   is nearly consistent at -1.2 K mean). Day-1 grey gains extract -40 W m-2
+   from the mid level and deposit +31/+22 W m-2 in the upper/surface levels;
+   the omega/vertical-exchange feedback then executes the collapse (T_mid
+   range 90-300 K on day 2, -27-313 K on day 4; post-day-1 implied Courant
+   1.12). The daily implicit source oscillates between roughly -1.6 and
+   +2.9 kW m-2 and accumulates to +27 W m-2 by day 14.
+3. **Pure grey radiative equilibrium is not itself an admissible
+   initialization.** Its lower-mid stability is below 1e-4 K/Pa over ~23% of
+   area (negative over ~17%) -- radiative equilibrium is super-adiabatic in
+   the lower troposphere, which is precisely what convective adjustment
+   exists to repair. A grey-aware initialization must therefore be
+   radiative-*convective*: the grey equilibrium profile limited by the
+   adiabat, matching the family's already-required
+   `enable_two_layer_convective_adjustment`.
+4. **The OLR-target gap compounds with the collapse.**
+   `grey_target_olr_residual_w_m2` grows from -9.3 W m-2 on day 1 to
+   -29.9 W m-2 by day 4, so its independent calibration fix must be evaluated
+   against a stable integration, not this one.
+
+**Next bounded build:** a pure initialization kernel that, at the first
+coupled step, sets mid/upper temperatures to the adiabat-limited grey
+radiative-convective equilibrium from the persisted optical depth and current
+surface state, with regressions verifying zero grey layer gains and
+non-negative zonal stability at handoff. Whether an ongoing structurally
+independent bound on the diagnosed overturning remains necessary is an open
+question until that initialization is screened: days 2-14 show the stability
+denominator collapsing even after the initial shock, so the initialization
+alone may not be sufficient.
