@@ -1064,11 +1064,11 @@ def main(*, root_factory=None) -> None:
         return 1 if precip_full_res_var.get() else None
 
     # Terrain parameter inputs (Terrain tab)
-    seed_var = tk.IntVar(value=int(settings["seed"]))
-    octaves_var = tk.IntVar(value=int(settings["octaves"]))
-    freq_var = tk.DoubleVar(value=float(settings["freq"]))
-    lac_var = tk.DoubleVar(value=float(settings["lac"]))
-    gain_var = tk.DoubleVar(value=float(settings["gain"]))
+    seed_var = tk.IntVar(value=int(settings.get("seed", default_settings["seed"])))
+    octaves_var = tk.IntVar(value=int(settings.get("octaves", default_settings["octaves"])))
+    freq_var = tk.DoubleVar(value=float(settings.get("freq", default_settings["freq"])))
+    lac_var = tk.DoubleVar(value=float(settings.get("lac", default_settings["lac"])))
+    gain_var = tk.DoubleVar(value=float(settings.get("gain", default_settings["gain"])))
 
     def add_labeled_entry(parent, label, var, width=6):
         frm = ttk.Frame(parent)
@@ -1411,10 +1411,10 @@ def main(*, root_factory=None) -> None:
                 LOG.info(f"Loaded default heightmap successfully")
             else:
                 LOG.warning(f"Default heightmap has wrong dimensions {arr.shape}, using procedural")
-                tex0 = ensure_elevation(size, seed=settings["seed"], octaves=settings["octaves"], freq=settings["freq"], lac=settings["lac"], gain=settings["gain"])
+                tex0 = ensure_elevation(size, seed=settings.get("seed", default_settings["seed"]), octaves=settings.get("octaves", default_settings["octaves"]), freq=settings.get("freq", default_settings["freq"]), lac=settings.get("lac", default_settings["lac"]), gain=settings.get("gain", default_settings["gain"]))
     except Exception as e:
         LOG.warning(f"Could not load default heightmap: {e}, using procedural")
-        tex0 = ensure_elevation(size, seed=settings["seed"], octaves=settings["octaves"], freq=settings["freq"], lac=settings["lac"], gain=settings["gain"])
+        tex0 = ensure_elevation(size, seed=settings.get("seed", default_settings["seed"]), octaves=settings.get("octaves", default_settings["octaves"]), freq=settings.get("freq", default_settings["freq"]), lac=settings.get("lac", default_settings["lac"]), gain=settings.get("gain", default_settings["gain"]))
 
     # Initialize sim_state immediately (stopped) so wind particles can use sim winds even before Start.
     _init_sim_state_from_elevation(tex0)

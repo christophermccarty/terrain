@@ -681,6 +681,14 @@ class PlanetParams:
     boundary_layer_mixed_depth_m: float = 1_000.0
     """Dry mixed-layer geometric depth [m], used to derive pressure mass."""
 
+    boundary_layer_reference_temperature_k: float = 288.15
+    """Isothermal hydrostatic reference temperature [K] for layer pressure mass.
+
+    Used only to convert geometric boundary-layer depths to pressure
+    thicknesses.  It is a planet parameter so non-Earth configurations do not
+    inherit Earth's mean surface temperature.
+    """
+
     boundary_layer_entrainment_velocity_m_s: float = 0.005
     """Mixed-layer/free-air entrainment velocity [m s-1].
 

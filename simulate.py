@@ -4722,7 +4722,7 @@ def _evolve_temperature(
             surface_pressure_pa=float(_pp.surface_pressure_pa),
             gravity_m_s2=float(_pp.surface_gravity),
             gas_constant_j_kg_k=float(_pp.gas_constant_dry),
-            reference_temperature_k=288.15,
+            reference_temperature_k=float(_pp.boundary_layer_reference_temperature_k),
             mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
         )
         _transport_boundary_capacity = (
@@ -4734,7 +4734,7 @@ def _evolve_temperature(
                 surface_pressure_pa=float(_pp.surface_pressure_pa),
                 gravity_m_s2=float(_pp.surface_gravity),
                 gas_constant_j_kg_k=float(_pp.gas_constant_dry),
-                reference_temperature_k=288.15,
+                reference_temperature_k=float(_pp.boundary_layer_reference_temperature_k),
                 layer_base_m=float(_pp.boundary_layer_mixed_depth_m),
                 layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
             )
@@ -4881,7 +4881,7 @@ def _evolve_temperature(
             surface_pressure_pa=float(_pp.surface_pressure_pa),
             gravity_m_s2=float(_pp.surface_gravity),
             gas_constant_j_kg_k=float(_pp.gas_constant_dry),
-            reference_temperature_k=288.15,
+            reference_temperature_k=float(_pp.boundary_layer_reference_temperature_k),
             mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
         )
         transport_step = transport_boundary_layer_energy(
@@ -4901,7 +4901,7 @@ def _evolve_temperature(
                     surface_pressure_pa=float(_pp.surface_pressure_pa),
                     gravity_m_s2=float(_pp.surface_gravity),
                     gas_constant_j_kg_k=float(_pp.gas_constant_dry),
-                    reference_temperature_k=288.15,
+                    reference_temperature_k=float(_pp.boundary_layer_reference_temperature_k),
                     layer_base_m=float(_pp.boundary_layer_mixed_depth_m),
                     layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
                 )
@@ -5610,7 +5610,7 @@ def _evolve_temperature(
                     cp_j_kg_k=float(_pp.cp_dry),
                     gravity_m_s2=float(_pp.surface_gravity),
                     gas_constant_j_kg_k=float(_pp.gas_constant_dry),
-                    reference_temperature_k=288.15,
+                    reference_temperature_k=float(_pp.boundary_layer_reference_temperature_k),
                     mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
                     entrainment_velocity_m_s=float(
                         _pp.boundary_layer_entrainment_velocity_m_s
@@ -5634,7 +5634,7 @@ def _evolve_temperature(
                     cp_j_kg_k=float(_pp.cp_dry),
                     gravity_m_s2=float(_pp.surface_gravity),
                     gas_constant_j_kg_k=float(_pp.gas_constant_dry),
-                    reference_temperature_k=288.15,
+                    reference_temperature_k=float(_pp.boundary_layer_reference_temperature_k),
                     mixed_layer_depth_m=float(_pp.boundary_layer_mixed_depth_m),
                     entrainment_velocity_m_s=float(
                         _pp.boundary_layer_entrainment_velocity_m_s
