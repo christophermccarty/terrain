@@ -871,6 +871,115 @@ boundary exchange now requires a distinct boundary-layer heat reservoir (with
 a defined mass/depth and conservative exchange with the free atmosphere), not
 a fractional-strength retune of this failed coupling.
 
+### Boundary-layer reservoir candidate screen (2026-08-16): rejected
+
+The distinct boundary-layer reservoir required by the previous decision was
+built (horizontal transport, interface reservoir, capacity-aware air-sea and
+free-air exchange, near-surface cloud temperature, split-invariant cloud
+memory) and screened with legacy radiation -- deliberately without the
+coupled-grey/closed-three-level family, whose diabatic-omega instability is
+an independent, separately tracked blocker
+(`docs/VERTICAL_THERMODYNAMIC_CLOSURE.md`). The formal 32x64 one-year
+spin-up/one-year evaluation CRU screen
+(`scripts/run_phase3_land_air_screen.py`, candidate vs the same resolved
+forcing control as the table above) rejects it on 8 of 11 gates:
+
+| Metric | resolved forcing control | boundary-layer reservoir |
+|---|---:|---:|
+| CRU temperature RMSE (C) | **7.179** | 8.283 |
+| precipitation log-RMSE | **1.301** | 1.344 |
+| precipitation log-correlation | **0.478** | 0.454 |
+| Koppen group accuracy | **0.547** | 0.496 |
+| Koppen class accuracy | **0.238** | 0.221 |
+| coldest-month accuracy | 0.695 | **0.818** |
+| warmest-month accuracy | **0.481** | 0.189 |
+| land-cycle error | **1.482** | 2.667 |
+
+The heat-convergence forcing remains diagnosed and globally area-closed
+(<= 1e-3 W m-2). The failure pattern is a systematic warm bias: the
+corrected ablation matrix shows every boundary-layer variant 6-7.5 K hotter
+globally than the control with worse Koppen and cycle error, and the formal
+screen confirms the bias is worst in the warm season (warmest-month accuracy
+-29 pp) while cold-season thresholds improve (+12 pp). The reservoir as
+constructed insulates the lower atmosphere instead of exchanging
+conservatively with it.
+
+**Decision:** reject the boundary-layer reservoir candidate at 32x64; do not
+run 64x128. The force-restore-plus-convergence direction has now been
+rejected at every documented structural level: uncoupled, convergent
+full-column, conservative full-column, and distinct boundary-layer reservoir.
+The remaining documented atmospheric dependency is the diabatic-omega
+operator redesign shared with Phase 2
+(`docs/VERTICAL_THERMODYNAMIC_CLOSURE.md`, 2026-08-16). Before any further
+Phase 3 candidate construction, this phase needs an explicit re-scoping
+decision: either invest in that shared operator redesign, or redefine the
+phase's acceptance target around what the supported single-layer atmosphere
+can conservatively provide.
+
+### Active goal (2026-08-16): diabatic-omega stability reformulation (shared Phase 2/3 dependency)
+
+**Re-scoping decision:** invest in the shared operator redesign. Phase 3
+candidate construction is paused until the operator question is settled.
+
+**Goal:** replace the diabatic-omega operator's dry static-stability
+denominator with a reformulated stability measure that remains bounded under
+the grey budget's own equilibrium tendency -- with no stability floor, omega
+cap, or damping term -- so that the coupled conservative atmospheric branch
+(closed three-level column + coupled grey budget) integrates stably at
+compact resolution. This is the one remaining documented atmospheric
+dependency jointly blocking Phase 2's moisture closure and any conservative
+Phase 3 branch: the grey budget's radiative-equilibrium tendency drives dry
+static stability toward zero, the current operator is singular exactly there,
+and 2026-08-16 screening proved no initialization can hold the state away
+from that singularity.
+
+**Admission criteria:**
+
+1. Read-only boundedness diagnostic first (operating rule 2): the
+   reformulated stability, measured along the collapsing coupled trajectory,
+   stays positive and bounded at the rows/times where the heating acts.
+2. Pure kernel with regressions: identical to the current operator in the
+   dry-stable limit; bounded omega as dry stability approaches zero under
+   realistic humidity gradients; zero mass-weighted column divergence; no
+   new tunable strength or damping scalar.
+3. The coupled-grey handoff trace
+   (`scripts/diagnose_coupled_grey_handoff.py`) shows no mid/upper
+   temperature collapse and bounded Courant numbers over 14 days.
+4. The 32x64 column-energy audit's grey admission block passes, or any
+   residual failure is attributable to the independently tracked OLR
+   optical-depth calibration gap.
+5. Routine suite green; the decision is recorded either way in
+   `docs/VERTICAL_THERMODYNAMIC_CLOSURE.md`.
+
+If criterion 1 fails -- i.e. no humidity-informed stability measure stays
+bounded where the forcing acts either -- the fallback re-scoping is to close
+Phase 3 around the resolved-forcing control as its answer, and this goal is
+recorded as rejected with its measurements.
+
+**Criterion-1 outcome (2026-08-16):** humidity-informed stability
+denominators (`theta_e`, moist-static-energy forms) are eliminated with
+measurements -- the singular rows are moisture-free subpolar rows where both
+candidates are numerically identical to the dry operator and go equally
+negative (`docs/VERTICAL_THERMODYNAMIC_CLOSURE.md`). The follow-on
+water-budget omega measurement (same day, same doc) eliminates the
+moisture-contrast inversion as well: the tropical rows diverge there
+(Courant 51-152), the coupled collapse destroys the moisture contrast just
+as it destroys the temperature contrast, and its implied heat transport
+over-closes the heating by a median factor of ~5. Every diagnostic
+`forcing / state-contrast` inversion is therefore singular by construction
+under the coupled evolution, and the diagnostic-omega reformulation goal is
+**rejected with measurements**. The two remaining formulations are separate,
+larger programs -- prognostic pressure-coordinate momentum (previously
+rejected for runtime cost) and the simultaneous phase/reservoir closure
+(previously rejected for constraint degeneracy) -- and neither is an omega
+reformulation. Phase 3 accordingly closes with no land-temperature
+replacement: the supported land scheme remains the supported product, the
+force-restore/boundary-layer branch is retained default-off with its full
+rejection ledger, and the diagnosed heat-convergence instruments and dataset
+are the phase's deliverable. Phase 2's blocker is restated precisely by this
+goal's evidence: any future circulation operator must carry prognostic
+transport or a simultaneous phase/reservoir transition.
+
 ## Phase 4 — surface-water and land-ice foundations
 
 **Dependency:** land ice does not become a climate feature until surface

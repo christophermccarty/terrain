@@ -44,6 +44,7 @@ from temperature import (
 )
 from atmospheric_radiation import (
     TwoLayerGreyOpticalClosure,
+    grey_radiative_convective_equilibrium_temperatures,
     pressure_defined_temperature_profile,
     pressure_split_emissivities_from_optical_depth,
     resolved_midlevel_emission_temperature,
@@ -4516,6 +4517,53 @@ def simulate_multiple_steps(
         step_days,
         step_function=simulate_step,
         step_kwargs=kwargs,
+    )
+
+
+def initialize_coupled_grey_profile(state, planet_params):
+    """Return ``state`` with the mid/upper radiative profile re-initialized.
+
+    The coupled two-layer grey gate inherits its first mid/upper temperatures
+    from the dry-adiabatic diagnostic profile, which is far from the grey
+    budget's own equilibrium (measured 2026-08-16: +15.2 K area-mean, max
+    +60 K at the mid level for the 32x64 handoff state).  The day-1 grey
+    gains then shock the column and the diabatic-omega feedback destroys the
+    static stability it divides by.  Coupled-grey spin-up/evaluation
+    protocols should apply this once, at the handoff from the diagnostic
+    spin-up to the coupled integration; it is an explicit initialization
+    step, not a per-step adjustment, and has no effect on any other gate
+    configuration.
+    """
+    pp = planet_params
+    if not bool(pp.enable_coupled_two_layer_grey_radiation):
+        raise ValueError("grey profile initialization requires the coupled grey gate")
+    missing = [
+        name
+        for name, value in (
+            ("grey_optical_depth", state.grey_optical_depth),
+            ("midlevel_temperature", state.midlevel_temperature),
+            ("upperlevel_temperature", state.upperlevel_temperature),
+            ("air_temperature", state.air_temperature),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            "grey profile initialization requires a diagnostic spin-up state: "
+            + ", ".join(missing)
+        )
+    profile = grey_radiative_convective_equilibrium_temperatures(
+        np.asarray(state.temperature, dtype=np.float64),
+        np.asarray(state.air_temperature, dtype=np.float64),
+        np.asarray(state.grey_optical_depth, dtype=np.float64),
+        float(pp.two_layer_pressure_depth_pa),
+        float(pp.three_level_mid_upper_pressure_depth_pa),
+        gas_constant_dry_air_j_kg_k=float(pp.gas_constant_dry),
+        cp_dry_air_j_kg_k=float(pp.cp_dry),
+    )
+    return state._replace(
+        midlevel_temperature=profile.midlevel_temperature_k.astype(np.float32),
+        upperlevel_temperature=profile.upperlevel_temperature_k.astype(np.float32),
     )
 
 

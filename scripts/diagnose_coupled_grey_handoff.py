@@ -51,8 +51,7 @@ from audit_boundary_layer_column_energy import (  # noqa: E402
     _surface_and_deep_energy_area_mean,
 )
 from atmospheric_radiation import (  # noqa: E402
-    STEFAN_BOLTZMANN,
-    pressure_split_emissivities_from_optical_depth,
+    grey_radiative_convective_equilibrium_temperatures,
 )
 from masks import get_masks  # noqa: E402
 from planet_params import EARTH  # noqa: E402
@@ -67,6 +66,7 @@ from real_terrain_validation import (  # noqa: E402
 from simulate import (  # noqa: E402
     clear_simulation_caches,
     create_initial_state,
+    initialize_coupled_grey_profile,
     simulate_step,
 )
 from simulation_state import TimeScaleMode  # noqa: E402
@@ -121,6 +121,25 @@ def _warmup_params(params):
     )
 
 
+def _layer_center_pressures(params):
+    """Omega diagnostic's layer-centre pressures (fixed 0.40/0.35/0.25 partition)."""
+    fractions = _LAYER_MASS_FRACTIONS
+    p_s = float(params.surface_pressure_pa)
+    edges = p_s * np.array((1.0, 1.0 - fractions[0], fractions[2], 0.0))
+    return 0.5 * (edges[:-1] + edges[1:])
+
+
+def _zonal_theta(layer_temperature, center_pressure, params):
+    p_s = float(params.surface_pressure_pa)
+    kappa = 287.05 / float(params.cp_dry)
+    zonal = np.mean(np.asarray(layer_temperature, dtype=np.float64), axis=1)
+    return zonal * (p_s / center_pressure) ** kappa
+
+
+def _interface_gradient(upper_value, lower_value, pressure_depth_pa):
+    return (upper_value - lower_value) / float(pressure_depth_pa)
+
+
 def _zonal_interface_stability(lower, middle, upper, params):
     """Zonal potential-temperature gradient at both interfaces [K/Pa].
 
@@ -129,27 +148,196 @@ def _zonal_interface_stability(lower, middle, upper, params):
     the fixed 0.40/0.35/0.25 partition, kappa = R_d/c_p.  Pure diagnostic; any
     change to that operator's stability definition must be reflected here.
     """
-    fractions = _LAYER_MASS_FRACTIONS
-    p_s = float(params.surface_pressure_pa)
-    edges = p_s * np.array((1.0, 1.0 - fractions[0], fractions[2], 0.0))
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    kappa = 287.05 / float(params.cp_dry)
-
-    def _theta(layer_temperature, pressure):
-        zonal = np.mean(np.asarray(layer_temperature, dtype=np.float64), axis=1)
-        return zonal * (p_s / pressure) ** kappa
-
-    theta_lower = _theta(lower, centers[0])
-    theta_middle = _theta(middle, centers[1])
-    theta_upper = _theta(upper, centers[2])
-    stability_lower_mid = (
-        (theta_middle - theta_lower) / float(params.two_layer_pressure_depth_pa)
+    centers = _layer_center_pressures(params)
+    theta_lower = _zonal_theta(lower, centers[0], params)
+    theta_middle = _zonal_theta(middle, centers[1], params)
+    theta_upper = _zonal_theta(upper, centers[2], params)
+    stability_lower_mid = _interface_gradient(
+        theta_middle, theta_lower, params.two_layer_pressure_depth_pa
     )
-    stability_mid_upper = (
-        (theta_upper - theta_middle)
-        / float(params.three_level_mid_upper_pressure_depth_pa)
+    stability_mid_upper = _interface_gradient(
+        theta_upper, theta_middle, params.three_level_mid_upper_pressure_depth_pa
     )
     return stability_lower_mid, stability_mid_upper
+
+
+# Latent heat of vaporization [J/kg]; the fixed family constant shared with
+# pressure_circulation.py's diabatic path (no PlanetParams field exists).
+_LATENT_HEAT_J_KG = 2.5e6
+
+
+def _zonal_candidate_stability(state, params):
+    """Candidate reformulated stability measures at both interfaces [K/Pa].
+
+    All candidates share the current operator's structure (zonal means first,
+    layer-centre pressures, gradient per pressure depth); they differ only in
+    the thermodynamic variable.  ``dry_theta`` is the current operator.
+    ``theta_e`` uses the equivalent potential temperature
+    ``theta * exp(L q / (cp T))``; ``mse_cp`` uses the cp-normalized moist
+    static energy proxy ``theta + (L/cp) q``.  Humidity fields are the
+    resolved lower/mid/upper specific humidities.  Criterion-1 measurement
+    for the operator-redesign goal in docs/REMAINING_WORK_PLAN.md.
+    """
+    centers = _layer_center_pressures(params)
+    cp = float(params.cp_dry)
+    kappa = 287.05 / cp
+    p_s = float(params.surface_pressure_pa)
+
+    layers_t = (state.air_temperature, state.midlevel_temperature, state.upperlevel_temperature)
+    layers_q = (state.humidity, state.midlevel_humidity, state.upperlevel_humidity)
+    if any(q is None for q in layers_q):
+        return None
+    zonal_t = [np.mean(np.asarray(t, dtype=np.float64), axis=1) for t in layers_t]
+    zonal_q = [np.mean(np.asarray(q, dtype=np.float64), axis=1) for q in layers_q]
+    theta = [
+        zonal_t[i] * (p_s / centers[i]) ** kappa for i in range(3)
+    ]
+    theta_e = [
+        theta[i] * np.exp(_LATENT_HEAT_J_KG * zonal_q[i] / (cp * zonal_t[i]))
+        for i in range(3)
+    ]
+    mse_cp = [
+        theta[i] + (_LATENT_HEAT_J_KG / cp) * zonal_q[i] for i in range(3)
+    ]
+    dp_lm = float(params.two_layer_pressure_depth_pa)
+    dp_mu = float(params.three_level_mid_upper_pressure_depth_pa)
+    return {
+        "dry_theta": (
+            _interface_gradient(theta[1], theta[0], dp_lm),
+            _interface_gradient(theta[2], theta[1], dp_mu),
+        ),
+        "theta_e": (
+            _interface_gradient(theta_e[1], theta_e[0], dp_lm),
+            _interface_gradient(theta_e[2], theta_e[1], dp_mu),
+        ),
+        "mse_cp": (
+            _interface_gradient(mse_cp[1], mse_cp[0], dp_lm),
+            _interface_gradient(mse_cp[2], mse_cp[1], dp_mu),
+        ),
+    }
+
+
+def _heating_k_s(state, params):
+    """Zonal heating rate [K/s] on the live branch (mirrors pressure_circulation).
+
+    Precipitation-anomaly branch: cosine-area-balanced zonal anomaly of
+    max(zonal precip, 0) times L over 86400 s.  Heating-reservoir branch: the
+    persisted reservoir's zonal mean.  Both are then divided by cp times the
+    free-troposphere mass, as in the operator.
+    """
+    shape = np.asarray(state.air_temperature).shape
+    rows = shape[0]
+    cos_lat = np.cos(
+        np.radians(90.0 - (np.arange(rows) + 0.5) * 180.0 / rows)
+    )[:, None]
+    heating = state.pressure_overturning_heating_w_m2
+    if heating is None:
+        zonal_precip = np.maximum(
+            np.mean(np.asarray(state.precipitation, dtype=np.float64), axis=1, keepdims=True),
+            0.0,
+        )
+        mean_precip = np.sum(zonal_precip * cos_lat) / np.sum(cos_lat)
+        latent_flux = _LATENT_HEAT_J_KG * (zonal_precip - mean_precip) / 86400.0
+    else:
+        latent_flux = np.mean(np.asarray(heating, dtype=np.float64), axis=1, keepdims=True)
+    column_mass = float(params.surface_pressure_pa) / float(params.surface_gravity)
+    free_mass = column_mass * (_LAYER_MASS_FRACTIONS[1] + _LAYER_MASS_FRACTIONS[2])
+    heating_k_s = latent_flux / (float(params.cp_dry) * free_mass)
+    return np.broadcast_to(heating_k_s, (rows, 1)).copy()
+
+
+def _candidate_omega_response(heating_k_s, stability_lm, stability_mu, params):
+    """Omega/Courant the candidate stability would diagnose (same divide policy)."""
+    omega_lm = np.divide(
+        -heating_k_s, stability_lm[:, None],
+        out=np.zeros_like(heating_k_s), where=stability_lm[:, None] > 0.0,
+    )
+    omega_mu = np.divide(
+        -heating_k_s, stability_mu[:, None],
+        out=np.zeros_like(heating_k_s), where=stability_mu[:, None] > 0.0,
+    )
+    return {
+        "omega_lower_mid_abs_max_pa_s": float(np.max(np.abs(omega_lm))),
+        "omega_mid_upper_abs_max_pa_s": float(np.max(np.abs(omega_mu))),
+        "lower_mid_vertical_courant_max": float(
+            np.max(np.abs(omega_lm)) * 86400.0 / float(params.two_layer_pressure_depth_pa)
+        ),
+        "mid_upper_vertical_courant_max": float(
+            np.max(np.abs(omega_mu)) * 86400.0 / float(params.three_level_mid_upper_pressure_depth_pa)
+        ),
+    }
+
+
+def _water_budget_omega(state, params, dry_stability_lm, dry_stability_mu):
+    """Omega diagnosed from the column water budget instead of static stability.
+
+    Rising-branch closure: the zonal precipitation anomaly is supplied by
+    vertical moisture advection across the interface,
+    ``omega = -g * P_anomaly / (q_below - q_above)`` (P in kg m-2 day-1, the
+    anomaly cosine-area-balanced exactly as in the current operator).  Where
+    the resolved moisture contrast is non-positive no moisture-driven
+    overturning exists and the branch is zero -- a process classification,
+    not a floor.  Also reports the implied heat transport
+    ``omega * dry_stability`` against the live heating rate as the
+    heat-budget consistency ratio, and the q-contrast edge statistics.
+    """
+    shape = np.asarray(state.air_temperature).shape
+    rows = shape[0]
+    cos_lat = np.cos(
+        np.radians(90.0 - (np.arange(rows) + 0.5) * 180.0 / rows)
+    )[:, None]
+    zonal_precip = np.maximum(
+        np.mean(np.asarray(state.precipitation, dtype=np.float64), axis=1, keepdims=True),
+        0.0,
+    )
+    mean_precip = np.sum(zonal_precip * cos_lat) / np.sum(cos_lat)
+    precip_anomaly_kg_m2_s = (zonal_precip - mean_precip) / 86400.0
+
+    layers_q = (state.humidity, state.midlevel_humidity, state.upperlevel_humidity)
+    if any(q is None for q in layers_q):
+        return None
+    zonal_q = [
+        np.mean(np.asarray(q, dtype=np.float64), axis=1, keepdims=True)
+        for q in layers_q
+    ]
+    contrast_lm = zonal_q[0] - zonal_q[1]
+    contrast_mu = zonal_q[1] - zonal_q[2]
+    gravity = float(params.surface_gravity)
+    omega_lm = np.divide(
+        -gravity * precip_anomaly_kg_m2_s, contrast_lm,
+        out=np.zeros_like(contrast_lm), where=contrast_lm > 0.0,
+    )
+    omega_mu = np.divide(
+        -gravity * precip_anomaly_kg_m2_s, contrast_mu,
+        out=np.zeros_like(contrast_mu), where=contrast_mu > 0.0,
+    )
+    heating_k_s = _heating_k_s(state, params)
+    implied_heating_lm = omega_lm * dry_stability_lm[:, None]
+    ratio = np.divide(
+        np.abs(heating_k_s), np.abs(implied_heating_lm),
+        out=np.full_like(heating_k_s, np.nan),
+        where=(np.abs(implied_heating_lm) > 0.0),
+    )
+    significant_anomaly = np.abs(precip_anomaly_kg_m2_s) > 0.01 / 86400.0
+    edge_rows = significant_anomaly & (contrast_lm <= 1e-4)
+    return {
+        "omega_lower_mid_abs_max_pa_s": float(np.max(np.abs(omega_lm))),
+        "omega_mid_upper_abs_max_pa_s": float(np.max(np.abs(omega_mu))),
+        "omega_lower_mid_rms_pa_s": float(np.sqrt(np.mean(omega_lm**2))),
+        "lower_mid_vertical_courant_max": float(
+            np.max(np.abs(omega_lm)) * 86400.0 / float(params.two_layer_pressure_depth_pa)
+        ),
+        "mid_upper_vertical_courant_max": float(
+            np.max(np.abs(omega_mu)) * 86400.0 / float(params.three_level_mid_upper_pressure_depth_pa)
+        ),
+        "q_contrast_lower_mid_min": float(np.min(contrast_lm)),
+        "q_contrast_lower_mid_p05": float(np.percentile(contrast_lm, 5.0)),
+        "q_contrast_mid_upper_min": float(np.min(contrast_mu)),
+        "q_contrast_nonpositive_row_fraction_lm": float(np.mean(contrast_lm <= 0.0)),
+        "significant_anomaly_with_tiny_contrast_row_fraction": float(np.mean(edge_rows)),
+        "heat_budget_consistency_ratio_median": float(np.nanmedian(ratio)),
+        "heat_budget_consistency_ratio_p90": float(np.nanpercentile(ratio, 90.0)),
+    }
 
 
 def _stability_stats(stability, row_weights):
@@ -173,28 +361,18 @@ def _stability_stats(stability, row_weights):
     return stats
 
 
-def _grey_equilibrium_temperatures(surface_temperature_k, emissivity_mid, emissivity_upper):
-    """Closed-form two-layer grey radiative-equilibrium mid/upper temperatures.
-
-    Sets the model's own layer gains to zero (``two_layer_grey_radiation``):
-    ``2 B_m = E_s + eps_u B_u`` and ``2 B_u = (1 - eps_m) E_s + eps_m B_m``
-    with ``B = sigma T^4``.  Linear in the blackbody fluxes, so the solution is
-    exact and per-cell.  Absorbed shortwave passes through both layers and does
-    not enter the atmospheric gains, so it is not an input here.
-    """
-    surface_emission = STEFAN_BOLTZMANN * np.asarray(surface_temperature_k, dtype=np.float64) ** 4
-    eps_m = np.asarray(emissivity_mid, dtype=np.float64)
-    eps_u = np.asarray(emissivity_upper, dtype=np.float64)
-    middle_blackbody = (
-        surface_emission * (2.0 + eps_u - eps_u * eps_m) / (4.0 - eps_m * eps_u)
+def _grey_equilibrium_temperatures(surface_temperature_k, lower_temperature_k, optical_depth, params):
+    """Adiabat-limited grey equilibrium via the shared kernel."""
+    profile = grey_radiative_convective_equilibrium_temperatures(
+        np.asarray(surface_temperature_k, dtype=np.float64),
+        np.asarray(lower_temperature_k, dtype=np.float64),
+        np.asarray(optical_depth, dtype=np.float64),
+        float(params.two_layer_pressure_depth_pa),
+        float(params.three_level_mid_upper_pressure_depth_pa),
+        gas_constant_dry_air_j_kg_k=float(params.gas_constant_dry),
+        cp_dry_air_j_kg_k=float(params.cp_dry),
     )
-    upper_blackbody = (
-        (1.0 - eps_m) * surface_emission + eps_m * middle_blackbody
-    ) / 2.0
-    return (
-        (middle_blackbody / STEFAN_BOLTZMANN) ** 0.25,
-        (upper_blackbody / STEFAN_BOLTZMANN) ** 0.25,
-    )
+    return profile.midlevel_temperature_k, profile.upperlevel_temperature_k
 
 
 def _global_stats(field):
@@ -273,15 +451,58 @@ def _record(state, params, row_weights, components=None):
     record["stability_mid_upper_k_pa"] = _stability_stats(stability_mu, row_weights)
     record["diabatic_response"] = _diabatic_response(state, params)
 
+    candidates = _zonal_candidate_stability(state, params)
+    if candidates is not None:
+        heating_k_s = _heating_k_s(state, params)
+        record["candidate_stability"] = {
+            name: {
+                "lower_mid": _stability_stats(cand_lm, row_weights),
+                "mid_upper": _stability_stats(cand_mu, row_weights),
+                "omega_response": _candidate_omega_response(
+                    heating_k_s, cand_lm, cand_mu, params
+                ),
+            }
+            for name, (cand_lm, cand_mu) in candidates.items()
+        }
+        dry_lm = candidates["dry_theta"][0]
+        singular_row = int(np.argmin(dry_lm))
+        record["singular_row"] = {
+            "row": singular_row,
+            "dry_stability_lower_mid_k_pa": float(dry_lm[singular_row]),
+            "heating_k_s": float(heating_k_s[singular_row, 0]),
+            "zonal_precipitation_mm_day": float(
+                np.mean(np.asarray(state.precipitation, dtype=np.float64), axis=1)[singular_row]
+            ),
+            "zonal_q_lower": float(
+                np.mean(np.asarray(state.humidity, dtype=np.float64), axis=1)[singular_row]
+            ),
+            "zonal_q_midlevel": float(
+                np.mean(np.asarray(state.midlevel_humidity, dtype=np.float64), axis=1)[singular_row]
+            ),
+            "theta_e_stability_lower_mid_k_pa": float(
+                candidates["theta_e"][0][singular_row]
+            ),
+            "mse_cp_stability_lower_mid_k_pa": float(
+                candidates["mse_cp"][0][singular_row]
+            ),
+        }
+        water_budget = _water_budget_omega(
+            state, params, candidates["dry_theta"][0], candidates["dry_theta"][1]
+        )
+        if water_budget is not None:
+            record["water_budget_omega"] = water_budget
+    for field, key in (
+        ("omega_lower_mid_pa_s", "live_omega_lower_mid_abs_max_pa_s"),
+        ("omega_mid_upper_pa_s", "live_omega_mid_upper_abs_max_pa_s"),
+    ):
+        persisted = getattr(state, field, None)
+        if persisted is not None:
+            record[key] = float(np.max(np.abs(np.asarray(persisted, dtype=np.float64))))
+
     optical_depth = state.grey_optical_depth
     if optical_depth is not None:
-        split = pressure_split_emissivities_from_optical_depth(
-            np.asarray(optical_depth, dtype=np.float64),
-            float(params.two_layer_pressure_depth_pa),
-            float(params.three_level_mid_upper_pressure_depth_pa),
-        )
         eq_mid, eq_upper = _grey_equilibrium_temperatures(
-            state.temperature, split.midlevel_emissivity, split.upperlevel_emissivity
+            state.temperature, state.air_temperature, optical_depth, params
         )
         eq_stab_lm, eq_stab_mu = _zonal_interface_stability(
             state.air_temperature, eq_mid, eq_upper, params
@@ -321,6 +542,10 @@ def main() -> int:
         help="coupled DAILY steps traced after the handoff (default 14)",
     )
     parser.add_argument(
+        "--initialize", action="store_true",
+        help="apply initialize_coupled_grey_profile at the handoff before tracing",
+    )
+    parser.add_argument(
         "--output", type=Path, default=None,
         help="JSON output path (default temp/coupled_grey_handoff_<grid>.json)",
     )
@@ -357,17 +582,21 @@ def main() -> int:
                 planet_params=warmup, track_components=False,
             )
 
+    if args.initialize:
+        state = initialize_coupled_grey_profile(state, params)
+
     report = {
         "schema_version": 1,
         "grid": [config.height, config.width],
         "warmup": {"cycles": 12, "time_scale": config.time_scale},
+        "grey_equilibrium_initialization": bool(args.initialize),
         "handoff": _record(state, params, row_weights),
         "daily": [],
     }
 
     print(
-        "day  cour_lm  cour_mu  om_max_lm  om_max_mu  T_air    T_mid min/max   "
-        "stab_p5_lm  implicit_w_m2"
+        "day  cour_lm  cour_mu   T_air    T_mid min/max   stab_p5_lm  "
+        "cour_lm[te]  cour_lm[mse]  cour_lm[wb]  implicit_w_m2"
     )
     cumulative_toa_j_m2 = 0.0
     cumulative_storage_j_m2 = 0.0
@@ -416,16 +645,31 @@ def main() -> int:
         report["daily"].append(record)
 
         response = record["diabatic_response"]
+        candidate_block = record.get("candidate_stability") or {}
+        cour_te = (
+            candidate_block.get("theta_e", {})
+            .get("omega_response", {})
+            .get("lower_mid_vertical_courant_max", float("nan"))
+        )
+        cour_mse = (
+            candidate_block.get("mse_cp", {})
+            .get("omega_response", {})
+            .get("lower_mid_vertical_courant_max", float("nan"))
+        )
+        cour_wb = (record.get("water_budget_omega") or {}).get(
+            "lower_mid_vertical_courant_max", float("nan")
+        )
         print(
             f"{day:3d}  "
             f"{response['lower_mid_vertical_courant_max']:7.3f}  "
             f"{response['mid_upper_vertical_courant_max']:7.3f}  "
-            f"{response['omega_lower_mid_abs_max_pa_s']:9.3f}  "
-            f"{response['omega_mid_upper_abs_max_pa_s']:9.3f}  "
             f"{record['air_temperature_k']['mean']:7.2f}  "
             f"{record['midlevel_temperature_k']['min']:7.2f}/"
             f"{record['midlevel_temperature_k']['max']:7.2f}  "
             f"{record['stability_lower_mid_k_pa']['p05']:10.2e}  "
+            f"{cour_te:10.3f}  "
+            f"{cour_mse:12.3f}  "
+            f"{cour_wb:11.3f}  "
             f"{record['energy']['implicit_source_w_m2'] or float('nan'):13.3f}"
         )
 

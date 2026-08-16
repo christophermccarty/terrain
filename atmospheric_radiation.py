@@ -308,6 +308,123 @@ def pressure_split_emissivities_from_optical_depth(
     )
 
 
+class GreyEquilibriumProfile(NamedTuple):
+    """Adiabat-limited grey radiative-convective equilibrium profile."""
+
+    midlevel_temperature_k: np.ndarray
+    upperlevel_temperature_k: np.ndarray
+    adiabatic_limited_midlevel: np.ndarray
+    adiabatic_limited_upperlevel: np.ndarray
+
+
+def grey_radiative_convective_equilibrium_temperatures(
+    surface_temperature_k: np.ndarray,
+    lower_temperature_k: np.ndarray,
+    total_optical_depth: np.ndarray,
+    lower_mid_pressure_depth_pa: np.ndarray | float,
+    mid_upper_pressure_depth_pa: np.ndarray | float,
+    *,
+    gas_constant_dry_air_j_kg_k: float = 287.05,
+    cp_dry_air_j_kg_k: float = 1004.0,
+    layer_mass_fractions: tuple[float, float, float] = (0.40, 0.35, 0.25),
+    sigma_w_m2_k4: float = STEFAN_BOLTZMANN,
+) -> GreyEquilibriumProfile:
+    """Return the adiabat-limited grey radiative-convective equilibrium.
+
+    Sets the model's own two-layer grey layer gains to zero
+    (``two_layer_grey_radiation``): with ``B = sigma T**4`` and surface
+    emission ``E_s``, the equilibrium solves ``2 B_m = E_s + eps_u B_u`` and
+    ``2 B_u = (1 - eps_m) E_s + eps_m B_m``, which is linear in the blackbody
+    fluxes and therefore exact per cell.  Absorbed shortwave passes through
+    both atmospheric layers and does not enter their gains, so it is not an
+    input.
+
+    Pure radiative equilibrium is super-adiabatic in the lower troposphere
+    (measured 2026-08-16: its lower-mid potential-temperature gradient is
+    negative over ~17% of area for the 32x64 handoff state), which would feed
+    a near-zero or negative denominator to the diabatic-omega diagnostic.
+    The profile is therefore limited from below by the dry adiabat anchored
+    on the resolved lower temperature, evaluated at the same layer-centre
+    pressures the omega diagnostic uses (the fixed 0.40/0.35/0.25
+    pressure-mass partition, a contract of the three-level closure family).
+    This is an initialization-time convective constraint -- the standard
+    radiative-convective equilibrium -- not a runtime cap, floor, or damping
+    term on any tendency.
+
+    The solve is sequential: the mid level is clamped first, then the upper
+    level's zero-gain point is re-solved against the *actual* (possibly
+    clamped) mid-level blackbody flux, ``2 B_u = (1 - eps_m) E_s + eps_m
+    B_m_actual``, before applying its own adiabatic floor.  An unclamped
+    upper level therefore has exactly zero grey gain even when the mid level
+    is clamped.  Cells where a floor binds are reported in the returned
+    masks; there the profile keeps non-negative static stability by
+    construction while a bounded residual grey gain remains.
+
+    Screening note (2026-08-16, docs/VERTICAL_THERMODYNAMIC_CLOSURE.md): as a
+    handoff initialization for the coupled grey gate this profile removes the
+    day-1 grey-gain shock, but clamped rows sit exactly at neutral stability
+    -- the singular point of the diabatic-omega diagnostic -- and the coupled
+    column collapses regardless.  It is retained as a measured equilibrium
+    diagnostic, not as an admissible initialization.
+    """
+    surface = np.asarray(surface_temperature_k, dtype=np.float64)
+    lower = np.asarray(lower_temperature_k, dtype=np.float64)
+    optical_depth = np.asarray(total_optical_depth, dtype=np.float64)
+    if surface.shape != lower.shape or surface.shape != optical_depth.shape:
+        raise ValueError("surface, lower, and optical-depth fields must share a shape")
+    if not all(
+        np.all(np.isfinite(field)) for field in (surface, lower, optical_depth)
+    ):
+        raise ValueError("equilibrium inputs must be finite")
+    if np.any(surface <= 0.0) or np.any(lower <= 0.0):
+        raise ValueError("surface and lower temperatures must be positive")
+    if np.any(optical_depth < 0.0):
+        raise ValueError("optical depth must be non-negative")
+    if gas_constant_dry_air_j_kg_k <= 0.0 or cp_dry_air_j_kg_k <= 0.0:
+        raise ValueError("dry-air gas constant and heat capacity must be positive")
+    if gas_constant_dry_air_j_kg_k >= cp_dry_air_j_kg_k:
+        raise ValueError("dry-air gas constant must be smaller than heat capacity")
+    fractions = np.asarray(layer_mass_fractions, dtype=np.float64)
+    if fractions.shape != (3,) or np.any(fractions <= 0.0) or not np.isclose(np.sum(fractions), 1.0):
+        raise ValueError("layer mass fractions must be three positive values summing to one")
+
+    split = pressure_split_emissivities_from_optical_depth(
+        optical_depth, lower_mid_pressure_depth_pa, mid_upper_pressure_depth_pa
+    )
+    eps_m = split.midlevel_emissivity
+    eps_u = split.upperlevel_emissivity
+    surface_emission = sigma_w_m2_k4 * surface**4
+    middle_blackbody = (
+        surface_emission * (2.0 + eps_u - eps_u * eps_m) / (4.0 - eps_m * eps_u)
+    )
+    middle_equilibrium = (middle_blackbody / sigma_w_m2_k4) ** 0.25
+
+    # Layer-centre pressures of the omega diagnostic, as fractions of surface
+    # pressure; only their ratios enter, so surface pressure itself cancels.
+    edges = np.array((1.0, 1.0 - fractions[0], fractions[2], 0.0))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    kappa = gas_constant_dry_air_j_kg_k / cp_dry_air_j_kg_k
+    middle_floor = lower * (centers[1] / centers[0]) ** kappa
+    midlevel_temperature = np.maximum(middle_equilibrium, middle_floor)
+
+    # Re-solve the upper level's zero-gain point against the actual mid-level
+    # blackbody flux so an unclamped upper level has zero gain even when the
+    # mid level's floor bound.
+    actual_middle_blackbody = sigma_w_m2_k4 * midlevel_temperature**4
+    upper_blackbody = (
+        (1.0 - eps_m) * surface_emission + eps_m * actual_middle_blackbody
+    ) / 2.0
+    upper_equilibrium = (upper_blackbody / sigma_w_m2_k4) ** 0.25
+    upper_floor = midlevel_temperature * (centers[2] / centers[1]) ** kappa
+    upperlevel_temperature = np.maximum(upper_equilibrium, upper_floor)
+    return GreyEquilibriumProfile(
+        midlevel_temperature,
+        upperlevel_temperature,
+        middle_equilibrium < middle_floor,
+        upper_equilibrium < upper_floor,
+    )
+
+
 def two_layer_optical_depth_for_target_olr(
     surface_temperature_k: np.ndarray,
     midlevel_temperature_k: np.ndarray,

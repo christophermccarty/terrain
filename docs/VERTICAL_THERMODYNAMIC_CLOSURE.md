@@ -667,3 +667,152 @@ independent bound on the diagnosed overturning remains necessary is an open
 question until that initialization is screened: days 2-14 show the stability
 denominator collapsing even after the initial shock, so the initialization
 alone may not be sufficient.
+
+## Adiabat-limited equilibrium initialization screen (2026-08-16): rejected; instability is a property of the coupled operator, not the handoff state
+
+The bounded build above was implemented and screened.
+`grey_radiative_convective_equilibrium_temperatures` (atmospheric_radiation.py)
+solves the model's own two-layer grey gains for zero exactly (linear in the
+blackbody fluxes), limited from below by the dry adiabat at the omega
+diagnostic's layer centres, with the upper level re-solved against the actual
+clamped mid level; `initialize_coupled_grey_profile` (simulate.py) applies it
+once at the warmup-to-coupled handoff. Unit regressions verify zero layer
+gains for unclamped cells, exact adiabatic floors for clamped cells, and
+elementwise theta monotonicity. The diagnostic script's `--initialize` mode
+screens it at 32x64 (`temp/coupled_grey_handoff_initialized.json`).
+
+Measured outcome:
+
+1. **The kernel works as designed.** Day-1 grey gains fall from
+   -40.3/+30.7/+21.7 W m-2 (mid/upper/surface, uninitialized) to
+   -5.9/-1.9/+14.6 W m-2, and the initialized profile has non-negative zonal
+   stability at every row. The grey-gain trigger identified by the handoff
+   diagnostic is removed.
+2. **The adiabatic limiter places ~15% of zonal rows exactly on the neutral
+   singularity.** Clamped rows sit at theta_mid == theta_lower by
+   construction, so the omega denominator there is ~3e-7 K/Pa and the
+   handoff-state recompute gives a lower-mid Courant maximum of 124.6
+   (uninitialized: 0.085). Because the closed column's substeps preserve the
+   diagnosed flux exactly (atmosphere.py: quarter-layer substepping), that
+   omega is applied in full -- the affected columns are homogenized many
+   times over on day 1.
+3. **The column collapses anyway.** T_mid reaches -34 K on day 3, the
+   lower-mid Courant spikes to 18.1 on day 5, and the lower-mid p5 stability
+   is negative from day 1 onward -- the same qualitative trajectory as the
+   uninitialized run. The daily implicit source still oscillates at kW m-2
+   amplitude.
+
+**Decision:** the adiabat-limited equilibrium initialization is rejected as
+the handoff repair, and -- more importantly -- the screening result closes
+the initialization question itself. Both a healthy-stability handoff
+(uninitialized: 5.6e-4 K/Pa everywhere) and a zero-grey-gain handoff
+(initialized) reach the same collapsing state within one to two days, because
+the grey budget's own equilibrium tendency drives the dry static stability
+toward zero and the diabatic-omega operator is singular exactly there. No
+choice of initial state can keep the handoff away from that singularity for
+more than about a day. The remaining admissible branch from the 2026-08-15
+decision is therefore the operative one: a structurally independent bound on
+the diagnosed overturning -- i.e. a reformulation of the omega diagnostic
+whose stability measure is bounded under the grey budget's equilibrium
+tendency (for example a gross moist stability that accounts for the latent
+feedback the precipitation-anomaly forcing represents), not a floor, cap, or
+damping term on the current operator. The kernel, helper, and regressions are
+retained as default-off research code; the TOA/OLR optical-depth calibration
+gap remains an independent open item.
+
+## Criterion-1 boundedness diagnostic (2026-08-16): humidity-informed stability denominators eliminated
+
+Following the goal recorded in `docs/REMAINING_WORK_PLAN.md` (2026-08-16:
+diabatic-omega stability reformulation), the handoff diagnostic now measures
+candidate reformulated stability measures along both collapsing 32x64 coupled
+trajectories (uninitialized and grey-initialized, 14 days each): the current
+dry `d(theta)/dp`, an equivalent-potential-temperature form
+`d(theta_e)/dp` with `theta_e = theta exp(L q / cp T)`, and a cp-normalized
+moist-static-energy form `d(theta + (L/cp) q)/dp`, all on the operator's own
+zonal layer-centre structure, plus the omega/Courant each would diagnose from
+the live heating.
+
+Measured outcome (`temp/coupled_grey_handoff_32x64.json`,
+`temp/coupled_grey_handoff_initialized.json`):
+
+1. **At the rows that drive the singularity, the humidity candidates are
+   indistinguishable from dry.** The minimum-stability rows are the dry
+   subpolar rows, where the resolved mid-level humidity is effectively zero
+   (zonal q_mid as low as 1e-18 kg/kg). There `theta_e` and `mse_cp`
+   reproduce the dry value to within a few percent (e.g. day 4
+   uninitialized: dry -1.79e-2, theta_e -1.91e-2, mse_cp -1.90e-2 K/Pa).
+   The moisture correction is material only at tropical rows, which are not
+   the singular ones.
+2. **All three candidates go firmly negative at the same rows** (minima
+   around -1e-2 K/Pa throughout the trajectory), so the collapse is not a
+   near-zero approach any of them reclassifies; the Courant explosions come
+   from other rows with small *positive* stability, and the candidate
+   recompute reproduces the same spikes there (initialized day 3: dry 0.65,
+   theta_e 1.53, mse_cp 11.1).
+3. **Criterion 1 therefore fails for humidity-informed denominators:** no
+   humidity-based stability measure stays positive and bounded at the
+   rows/times where the heating acts, because there is no moisture there to
+   inform it. This direction is eliminated with measurements.
+4. **The remaining admissible formulations, with evidence:**
+   (a) *Water-budget / moisture-convergence omega* -- the singular rows carry
+   zonal precipitation of only 0.03-0.3 mm/day and heating anomalies around
+   -3e-5 K/s, so an omega diagnosed from the column water budget
+   (`omega ~ P g / (q_lower - q_mid)`) is order 1e-2 Pa/s there (Courant
+   ~0.03) -- bounded by construction where the dry operator produces Courant
+   ~60. Its own edge (q-contrast -> 0 in a homogenized column) must be
+   measured next; this is also the documented Phase 2 moisture-closure
+   direction ("circulation-coupled evaporation/condensate/fallout
+   production").
+   (b) *Storage/self-consistency partition* -- the singular-row heating
+   anomaly (~2.4 K/day equivalent tendency) would erase the row's own theta
+   contrast within the step, so the steady-balance assumption the operator
+   encodes is internally inconsistent there; partitioning the heating between
+   circulation and storage is the transient route, partially explored and
+   rejected for the MSE/water branch system on 2026-08-13 and thus requiring
+   a fresh formulation, not a revival.
+
+Next diagnostic: water-budget omega boundedness along the same trajectories,
+including its q-contrast edge and its implied heat-transport consistency with
+the closed column.
+
+## Water-budget omega diagnostic (2026-08-16): eliminated; diagnostic inversion is singular by construction
+
+The water-budget form was measured on both 14-day trajectories:
+`omega = -g * P_anomaly / (q_below - q_above)` per interface, zonal,
+cosine-area-balanced anomaly exactly as in the current operator, with the
+non-positive-contrast branch at zero.
+
+Measured outcome:
+
+1. **The same singularity, relocated.** The tropical rows carry large
+   precipitation anomalies with modest resolved moisture contrast, giving
+   Courant maxima of 51 (uninitialized day 1), 12 (day 6), and 152
+   (initialized day 13). The calm polar rows (Courant ~0.03) are exactly
+   where the dry operator explodes, and vice versa: the two diagnostics are
+   complementary in where they diverge.
+2. **The coupled collapse destroys the moisture contrast too.** The lower-mid
+   q contrast is non-positive at 3-28% of rows along the trajectory (the
+   homogenized column has q_mid >= q_lower), so the water budget's own
+   denominator is driven through zero by the same state evolution.
+3. **The heat budget does not close on it.** The implied heat transport
+   `omega * dry_stability` exceeds the live heating by a median factor of ~5
+   (consistency ratio median ~0.2), so even where bounded the water-budget
+   omega would thermally destabilize the column it is meant to steady.
+
+**Structural conclusion.** With this measurement, every *diagnostic*
+inversion of the form `omega = forcing / (state contrast)` stands
+eliminated: dry static stability (current), humidity-informed stability
+(theta_e, MSE forms -- identical to dry at the moisture-free singular rows),
+and water-budget moisture contrast (this section). The coupled grey/closed
+column evolution drives *any* contrast through zero, so no state-contrast
+denominator can bound the operator. The two remaining formulations are the
+documented larger programs, not omega reformulations: prognostic
+pressure-coordinate momentum transport (rejected 2026-08-13/15 for runtime
+cost and spin-up layer exhaustion, with five runtime redesigns already
+rejected) and the simultaneous phase/reservoir closure (rejected 2026-08-13
+for constraint degeneracy, condition number 2.91e17). The diagnostic-omega
+reformulation goal is therefore recorded as **rejected with measurements**;
+its evidence defines the requirement any future operator must meet: the
+transport must be a prognostic state or the phase/reservoir transition must
+be simultaneous, because no diagnostic division survives the coupled state
+evolution.
