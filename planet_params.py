@@ -625,6 +625,31 @@ class PlanetParams:
     ``sesam_vertical`` while this remains False.
     """
 
+    enable_sesam_dynamics: bool = False
+    """Compute SESAM (CLIMBER-X) diagnostic SLP, wind and EKE (stages P2-P3).
+
+    Pure diagnostic kernels transcribed from Willeit et al. (2022),
+    GMD 15, 5905-5948:
+    - ``sesam_dynamics.py``, Appendix A2 — zonal SLP from mean-meridional-cell
+      physics (A29)-(A35), azonal thermal SLP (A37), the Charney-Eliassen
+      topographic term (A38)-(A39), assembled per (A28)/(A36), and the 3-D
+      wind assembly (A16)-(A27): surface geostrophic + thermal-wind shear,
+      Taylor-model surface wind with the (A21) cross-isobar solve, katabatic
+      term, and the mass-conserving ageostrophic profile;
+    - ``sesam_synoptic.py``, Appendix A5 — the eddy-kinetic-energy closure
+      (A50)-(A60): Eady-baroclinicity production, drag dissipation, macro-
+      turbulent diffusion coefficients, synoptic surface wind and 700 hPa
+      vertical velocity, and wind stress.
+
+    This gate is off by default and is **not wired into the supported climate
+    path**: nothing in ``simulate.py`` calls these kernels, so enabling it has
+    zero default-path climate impact. It exists as the documented hook for
+    the SESAM stages P4 (transport) and P5 (radiation) to consume the
+    wind/SLP/EKE fields, and as the reservation that ``simulate_step`` is not
+    allowed to call ``sesam_dynamics`` or ``sesam_synoptic`` while this
+    remains False.
+    """
+
     enable_force_restore_atmospheric_heat_convergence: bool = False
     """Feed resolved atmospheric heat convergence to force-restore land.
 

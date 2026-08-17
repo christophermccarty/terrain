@@ -124,13 +124,13 @@ Legend: ✅ present and equivalent · ◐ partially present · ❌ missing ·
 
 | SESAM term | PlanetSim status | Where |
 |---|---|---|
-| SLP = zonal + azonal construction | ❌ SLP is not a state; pressure anomalies are synthesized inside the wind generator | `atmosphere.py:1797–1845` |
-| Zonal SLP from cell physics: `v̄a(ϕ) = −Ci·ΔTij·Fz(ϕ)·sinφ`, cells driven by zonal-mean T gradients at π/6, π/3, π/2, ITCZ from inter-hemispheric T contrast, Hadley width from tropical T (A30–A35) | ⚠️ **prescribed 3-cell targets instead**: fixed centers/widths (14°/48°/74°) and U/V target velocities, with zonal-mean relaxation toward them | `atmosphere.py:131–146`, `:2554–2607`, `:1889–1998` |
-| Azonal thermal SLP `∝ T_sl*` (A37) | ❌ (the missing monsoon/maritime driver) | — |
-| Charney–Eliassen topographic Rossby waves per latitude belt (A38–A39) | ❌ (terrain PGF gate exists experimentally) | `wind_terrain_pgf_scale` |
-| Geostrophic + thermal wind (A17–A18) | ◐ geostrophic from synthetic pressure + thermal-wind jet mixing; Taylor ageostrophic + katabatic absent | `atmosphere.py:2451–2531` |
-| Taylor surface wind + cross-isobar angle solved from drag (A21–A25) | ◐ fixed 3% cross-isobar factor | `atmosphere.py:2514–2520` |
-| Katabatic wind (A26–A27) | ❌ | — |
+| SLP = zonal + azonal construction | ◐ diagnostic kernels exist (default-off, P2 first sub-deliverable); still not a state in the supported path | `sesam_dynamics.py` |
+| Zonal SLP from cell physics: `v̄a(ϕ) = −Ci·ΔTij·Fz(ϕ)·sinφ`, cells driven by zonal-mean T gradients at π/6, π/3, π/2, ITCZ from inter-hemispheric T contrast, Hadley width from tropical T (A30–A35) | ⚠️ **prescribed 3-cell targets still in the supported path**: fixed centers/widths (14°/48°/74°) and U/V target velocities, with zonal-mean relaxation toward them; ◐ derived-cell kernels exist diagnostically | `atmosphere.py:131–146`, `:2554–2607`, `:1889–1998`; `sesam_dynamics.py` |
+| Azonal thermal SLP `∝ T_sl*` (A37) | ◐ diagnostic kernel exists (default-off); still absent from the supported path (the missing monsoon/maritime driver) | `sesam_dynamics.py` |
+| Charney–Eliassen topographic Rossby waves per latitude belt (A38–A39) | ◐ diagnostic kernel exists (default-off; terrain PGF gate exists experimentally) | `sesam_dynamics.py`, `wind_terrain_pgf_scale` |
+| Geostrophic + thermal wind (A17–A18) | ◐ supported path: geostrophic from synthetic pressure + thermal-wind jet mixing; ◐ SESAM diagnostic kernels exist (default-off) | `atmosphere.py:2451–2531`; `sesam_wind.py` |
+| Taylor surface wind + cross-isobar angle solved from drag (A21–A25) | ◐ supported path: fixed 3% cross-isobar factor; ◐ SESAM diagnostic kernels with the (A21) bisection solve exist (default-off) | `atmosphere.py:2514–2520`; `sesam_wind.py` |
+| Katabatic wind (A26–A27) | ◐ diagnostic kernel exists (default-off) | `sesam_wind.py` |
 
 ### 3.3 Thermodynamics (A3)
 
@@ -155,7 +155,7 @@ Legend: ✅ present and equivalent · ◐ partially present · ❌ missing ·
 
 | SESAM term | PlanetSim status | Where |
 |---|---|---|
-| Prognostic EKE `∂K/∂t = −∇·(uK) + ∇·(AT∇K) + PK − DK` (A52) | ❌ no EKE state | — |
+| Prognostic EKE `∂K/∂t = −∇·(uK) + ∇·(AT∇K) + PK − DK` (A52) | ◐ production/dissipation/diffusivity/synoptic-wind kernels exist (default-off, local steady state); the (A52) advection/diffusion transport of K is stage P4 | `sesam_synoptic.py` |
 | Production ∝ Eady growth rate from 850–500 hPa shear/stability (A53–A54) | ❌ (requires the A1 vertical profiles to exist) | — |
 | Dissipation `(c3 + c4·CD)·K^1.5` (A55) | ❌ | — |
 | Synoptic wind `Usyn ∝ √K` entering fluxes and cloud (A56–A58) | ⚠️ fixed storm-track window (48°±15°) + prescribed wave pressure anomalies | `atmosphere.py:3105`, `:2413–2445` |
@@ -273,10 +273,100 @@ so each is evaluable without the next.
   circulation diagnostics are the comparison harness). *Exit*: DJF/JJA SLP and
   surface-wind patterns beat the current prescribed-cell generator on the
   jet/Hadley scorecard before any coupling.
+  - **First sub-deliverable complete (2026-08-16): the SLP construction**
+    (A28–A39) as pure functions in `sesam_dynamics.py` — (A31) cell coordinate,
+    (A32) ITCZ position, (A33) Hadley width scale, (A34) cell temperature
+    gradients, (A35) topography factor, (A30) mean overturning wind, (A29)
+    zonal-SLP integral, (A37) azonal thermal SLP, (A38)–(A39) Charney–Eliassen
+    topographic term, (A28)/(A36) assembly with mass restoration, plus the
+    zonal-extrema scorecard. Gated `enable_sesam_dynamics` (default False,
+    **not wired into the supported path**), guarded by
+    `testing/test_sesam_dynamics.py` (23 tests: hand-equation checks, all-six-
+    branch circulation signs, planted (A34) sign violation, mass conservation,
+    machine-precision Charney–Eliassen cross-check, equator stability).
+    `scripts/build_ncep_slp_reference.py` builds the NCEP/NCAR 1991–2020 SLP
+    climatology (Pa units verified from the file attribute), and
+    `scripts/diagnose_sesam_slp.py` runs the reconstruction diagnostically on
+    a saved state for DJF/JJA and scores it against NCEP. The wind assembly
+    (A16–A27) is the remaining sub-deliverable. Equation-semantics findings
+    from this stage are recorded in §10 below.
+  - **Second sub-deliverable complete (2026-08-16): the 3-D wind assembly**
+    (A16)–(A27) as pure functions in `sesam_wind.py` — (A22)–(A23) drag
+    coefficient, (A21) cross-isobar bisection solve, spherical SLP gradients,
+    (A17)–(A18) surface geostrophic wind and thermal-wind shear, (A19)–(A20)
+    ageostrophic PBL wind, the mass-conserving ageostrophic vertical profile,
+    (A26)–(A27) katabatic wind, (A24)–(A25) Taylor surface wind, and the
+    (A16) assembly with the 500 hPa wind closing the Charney–Eliassen input
+    of the SLP stage (two-pass closure, replacing the first sub-deliverable's
+    documented `sin_cos_alpha_bar` and `u500` placeholders). Guarded by
+    `testing/test_sesam_wind.py` (16 tests, incl. the analytic-gradient and
+    hand-solve checks that caught a real d/dλ scaling bug during
+    development). `scripts/diagnose_sesam_wind.py` runs the full chain
+    (SLP → wind) diagnostically on a saved state for DJF/JJA and scores it
+    head-to-head against the prescribed-cell generator and NCEP/NCAR wind.
+  - **Exit-gate measurement (2026-08-16, saved 512×1024 state): NOT passed —
+    with a decisive decomposition.** Full-chain surface-wind speed vs NCEP:
+    pattern correlation −0.28 (DJF) / −0.19 (JJA), RMSE 73 / 113 m s⁻¹ — the
+    prescribed generator holds +0.34 / +0.23 and 2.8 / 3.6 m s⁻¹. But with
+    the azonal SLP terms removed, the *zonal-only* chain **beats the
+    generator**: +0.55 / +0.46 correlation, 2.9 / 3.7 m s⁻¹ RMSE, mean
+    surface speed 2.2–2.4 m s⁻¹ (NCEP 3.9–4.0), SH jet −56°/8.7 m s⁻¹ vs
+    NCEP −51°/8.2. The catastrophic full-chain failure is entirely the
+    **azonal channel amplifying the saved state's sharp regional fields**:
+    (A37)'s 232 Pa K⁻¹ converts the state's ±35…+51 K sea-level-temperature
+    anomalies (ice sheets, high plateaus, sharp coastlines) into ±118 hPa
+    SLP, and (A38)–(A39) respond to full-resolution 8848 m terrain with
+    ±100–170 hPa — whose gradients then drive 100+ m s⁻¹ local geostrophic
+    winds, further amplified by the |f| = 3e-5 s⁻¹ tropical floor. The
+    cell-physics core is sound; the azonal closures need conditioned inputs
+    (SESAM-native smoothing like the reference implementation's own
+    `nsmooth_*` filters, or a state spun up with the SESAM closures active)
+    before any coupling or calibration sweep is admissible. Also measured:
+    the SH-summer Hadley cell in the saved state is too weak for the cell
+    physics (ΔT = 0.28 K in DJF) — a state property, not a kernel error.
+  - *First honest SLP-only baseline (2026-08-16, first sub-deliverable,
+    documented placeholders for sin α·cos α, u500 and H_T):* DJF full-field
+    pattern correlation vs NCEP 0.49 (RMSE 11.2 hPa), DJF zonal-mean profile
+    0.78; JJA 0.29 / 0.31. The NH-winter subtropical high is reproduced at
+    the right latitude and strength; the summer-hemisphere cells and the
+    model state's polar gradients are the weak points. The SLP-stage
+    placeholders were subsequently closed by the wind assembly (the (A21)
+    solve and the two-pass u500 closure), and the full exit-gate measurement
+    above supersedes this baseline for the completed P2.
 - **P3 — EKE and synoptic transport** (A5): prognostic K, Eady production from
   P1 profiles, drag dissipation, `AT/Aq` diffusivities, synoptic wind. *Exit*:
   storm-track placement responds to baroclinicity; macroturbulent heat/moisture
   fluxes replace the fixed-window eddy term in the branch.
+  - **Sub-deliverable complete (2026-08-16): the EKE closure** (A50)–(A60) as
+    pure functions in `sesam_synoptic.py` — (A54) Brunt–Väisälä frequency,
+    (A53) Eady-baroclinicity production, (A55) drag dissipation, (A50)/(A51)
+    macroturbulent diffusion coefficients, (A56)/(A57) synoptic surface wind
+    and 700 hPa vertical velocity, (A58) total surface wind, (A59)/(A60) wind
+    stress, and the diagnostic steady-state EKE (local production/dissipation
+    balance; transport of K is stage P4). Guarded by
+    `testing/test_sesam_synoptic.py` (12 tests).
+    `scripts/diagnose_sesam_synoptic.py` runs it on the saved state for
+    DJF/JJA. The stage-P2 missing storminess component is now closed: total
+    surface wind ≈ zonal-cell wind (2.2–2.4 m s⁻¹) + synoptic gustiness
+    (≈7 m s⁻¹) ≈ 8 m s⁻¹, EKE mean ≈ 240 m² s⁻² (p50 ~160–190, p90 ~480),
+    storm track ≈ 49°, wind stress ≈ 0.06 Pa, macroturbulent heat
+    diffusivity ≈ 3.1e6 m² s⁻¹ — all Earth-realistic. Two methodological
+    findings are recorded in §10: the EKE must be driven by the *zonal-only*
+    P2 wind (the full-chain wind inherits the P2 azonal input-conditioning
+    inflation), and the (A54) Brunt–Väisälä frequency must use *potential*
+    temperature.
+  - *Constant correction (2026-08-16, §5-mandated cross-check):* the
+    published supplement transcribes `c2syn` = 1.6e4, but the reference
+    namelist `c_syn_2` = 1.6e2 is authoritative — 1.6e4 gives an absurd ~5e3
+    m² s⁻² equilibrium EKE / ~30 m s⁻¹ synoptic wind; 1.6e2 gives the
+    validated ~2e2 m² s⁻² / ~7 m s⁻¹. `c5syn` also corrected to the namelist
+    `c_syn_5` = 2.3e5. Both recorded in `sesam_reference.py` notes.
+  - *Exit gate status:* the storm-track placement in this diagnostic responds
+    to baroclinicity as required (peak EKE at the jet's latitude, zero at the
+    equator). The *transport* sub-deliverable (macroturbulent heat/moisture
+    fluxes replacing the fixed-window eddy term) is stage P4, so the full P3
+    exit gate is not yet closed — this sub-deliverable covers the closure and
+    its diagnostics, not the transport wiring.
 - **P4 — Column energy and water closure** (A3/A4): prognostic `QT`, `Qq` (reuse
   `column_water.py` flux machinery), 95% RH + land turnover precipitation,
   per-surface-type fluxes with `T2m`. This is the stage that **bypasses the
@@ -320,3 +410,116 @@ chemistry, GOLDSTEIN/SISIM/PALADYN internals, ice-sheet coupling (SICOPOLIS/Yelm
 — all either out of scope or already covered by PlanetSim components. The
 `koppenpasta`-style "external reference run" path (Option B) remains available
 unchanged if this branch fails.
+
+## 10. Equation-semantics verification log
+
+Findings from checking appendix equations against the article's HTML MathML
+(which preserves fraction/cases structure that the PDF text layer flattens)
+and — per the §5 licensing policy, read-only — against the CLIMBER-X Fortran
+semantics. Recorded as they are verified, so no later stage re-derives them.
+
+- **(A31) operand grouping** (verified 2026-08-16): the cell coordinate is
+  `φ = 6·Dhad·(ϕ − φITCZ/(c1mmc·(ϕ − φITCZ)² + 1))`; the rational factor
+  applies to `φITCZ` only, not to the whole `(ϕ − φITCZ)` difference.
+- **(A33) is a fraction**: `Dhad = c3mmc/(T_trp − c4mmc)`, not a product.
+  Dimensionally consistent (Dhad ≈ 1 at present tropical temperatures) and
+  gives the paper's stated behaviour (warming → smaller Dhad → `φ = ±π`
+  crossings move poleward → Hadley cells expand). Reference-implementation
+  safeguards adopted: scale clamped to [0.5, 1.5], `T_trp` floored at
+  `c4mmc + 50 K`. The `sesam_reference.py` c3mmc/c4mmc notes were corrected
+  2026-08-16.
+- **(A34) operand order (the one real correction)**: as printed, the
+  gradients are negative on Earth in all three cells and, fed through
+  (A29)–(A30), yield poleward surface flow in all six cell branches — a
+  divergent, physically impossible circulation with SLP highs on the equator.
+  The circulation-correct ordering, and the one the reference implementation
+  evaluates, is the reverse difference at the same fixed latitudes: Hadley
+  `max(0, max(T̄) − T̄(±π/6))`, Ferrel `T̄(±π/6) − T̄(±π/3)`, polar
+  `T̄(±π/3) − T̄(±π/2)`. This gives equatorward Hadley/polar and poleward
+  Ferrel surface flow in both hemispheres, hence subtropical highs, subpolar
+  lows and the ITCZ trough out of (A29). `sesam_dynamics.py` implements the
+  corrected ordering; `test_sesam_dynamics.py` pins every branch's sign and
+  plants the printed ordering to show it reverses the circulation.
+- **(A39) glyph**: the printed `p*sl,O = 9fρ(500 hPa)` is the streamfunction
+  Ψ mis-OCR'd: `p*sl,O = ρ(500 hPa)·f·Ψ` (with `|f|` in the conversion).
+- **The (A14) ftrop coordinate** (P1 placeholder resolution): ftrop is
+  `1 − sin⁸(fi)` with `fi = clamp(c_hrs·(ϕ − had_fi)/(0.5·had_width), ±π/2)`,
+  `c_hrs = 0.7` (CLIMBER-X namelist `c_hrs_6`; the paper prints ftrop without
+  defining φ's construction; the same structure with 0.85 = asin(0.1^{1/8})
+  is printed in (A11)). `had_fi`/`had_width` are the Hadley centre/width
+  diagnosed from the (A31) cell coordinate
+  (`sesam_dynamics.hadley_geometry`), replacing P1's latitude placeholder via
+  `sesam_dynamics.tropical_weight_from_hadley`.
+- **Reference-implementation features deliberately not ported** (grid
+  artifacts/tuning, not paper equations): staggered-grid moving averages,
+  azonal-SLP spatial smoothing, polar/equatorial azonal damping factors, and
+  azonal-SLP time relaxation (the P2 kernels are diagnostic, not time-stepped).
+- **NCEP SLP reference**: the NOAA PSL `slp.mon.ltm.1991-2020.nc` file is in
+  millibars; `scripts/build_ncep_slp_reference.py` converts to Pa explicitly
+  (verified against the file's `units` attribute, per the ExoPlaSim
+  precipitation-unit lesson in `docs/EXTERNAL_DYCORE_WORKFLOW.md`).
+
+### Wind-assembly stage (verified 2026-08-16)
+
+- **ε = √(1 − sin 2α)** in (A21)/(A24)/(A25): the printed ``sin2α`` is the
+  double angle sin(2α), and ε is computed from |α| (the drag closure is
+  hemisphere-symmetric; α itself is signed, positive NH, used only in the
+  Taylor rotation). Verified against the reference implementation.
+- **The (A21) cross-isobar solve needs no EKE input**: with the paper's
+  `Us ≈ √(2K)` and the reference implementation's PBL viscosity tied to the
+  EKE (Kv = K), K cancels and the closure reduces to
+  `sinα/√(1 − sin 2α) = CD/√|f|`, solved by bisection on [0, π/4] and
+  clamped to α ∈ [0.05, 0.5] rad (namelist `acbar_max`).
+- **sinα·cosα enters (A19)/(A20)/(A29) as a positive magnitude** with |f|
+  (flow crosses isobars toward low pressure in both hemispheres). The
+  `sesam_dynamics` zonal-SLP convention was corrected to this form on
+  2026-08-16 (algebraically identical to the earlier signed form for the
+  scalar path, but unambiguous for array input).
+- **Coriolis floors**: paper text |f| ≥ 3e-5 s⁻¹ (geostrophic) and
+  |f| ≥ 1e-5 s⁻¹ (ageostrophic); the reference namelist uses 1e-5 for both.
+  The paper's two-floor form is implemented.
+- **Thermal-wind damping** (reference safeguard, adopted, not printed):
+  shear × `min(1, c_uter_eq·sin²ϕ)·min(1, c_uter_pol·cos²ϕ)` with
+  c_uter_eq = 5, c_uter_pol = 3.
+- **Ageostrophic profile**: surface value uniform through the PBL
+  (σ_pbl(ϕ) = 0.85 − 0.05·cos²ϕ, namelist pblp/pble), compensated by a
+  uniform counter-flow over a σ = 0.2 layer below the tropopause (namelist
+  dpc), exact column mass balance.
+- **Katabatic (A26)–(A27)**: slope magnitude is *inside* the radical
+  (`uk = √(g·h/CD·(T2m−T*)/T2m·|slope|)·sign(−slope)`), gated on the
+  inversion condition T2m > T*, h = 100 m (paper prose).
+- **Input conditioning is the P2 blocker, not the closures** (measured,
+  see §7 P2): (A37)'s 232 Pa K⁻¹ and (A38)–(A39) respond linearly to the
+  saved state's ±35…+51 K sea-level-temperature anomalies and full-
+  resolution terrain, producing ±118/±170 hPa azonal SLP and 100+ m s⁻¹
+  winds; the zonal-only chain on the same state is sane and beats the
+  prescribed generator. Also: the (A9) near-surface lapse Γ = (Ta−T*)/zpbl
+  is catastrophically sensitive to season-mismatched Ta/T* inputs (a
+  January Ta with a July skin produced a −50 K/km inverted profile in the
+  diagnostic driver) — diagnostic drivers must use season-consistent
+  Ta/T* pairs.
+
+### Synoptic/EKE stage (verified 2026-08-16)
+
+- **`c2syn` transcription corrected** (§5-mandated cross-check at first use):
+  the published supplement (t06) transcribes `c2syn` = 1.6e4, but the
+  CLIMBER-X reference namelist `c_syn_2` = 1.6e2. With 1.6e4 the local
+  equilibrium EKE is ~5e3 m² s⁻² and the synoptic surface wind ~30 m s⁻¹ —
+  physically absurd; with 1.6e2 the diagnostic gives ~2e2 m² s⁻² and
+  ~7 m s⁻¹, matching validated CLIMBER-X behaviour. `c5syn` also corrected
+  to the namelist `c_syn_5` = 2.3e5. Recorded in `sesam_reference.py`.
+- **(A54) Brunt–Väisälä frequency uses *potential* temperature.** With
+  temperature differences, `N² = (g/T)·ΔT/Δz` is negative in the stably
+  stratified troposphere (T decreases upward) and the frequency comes out
+  zero/NaN. The reference implementation's `tp` field is potential
+  temperature; `N² = (g/θ)·Δθ/Δz` is positive. Implemented accordingly.
+- **(A53) production uses the full Eady shear**: `f/N·√((∂u/∂z)² + (∂v/∂z)²)`
+  (both components), not just the printed `(f/N)·(∂u/∂z)` — the Hoskins and
+  Valdes (1990) form the accompanying text specifies.
+- **EKE diagnostic must be driven by the zonal-only P2 wind.** The full-chain
+  P2 3-D wind inherits the P2 azonal input-conditioning inflation (see
+  above); driving the Eady production with it compounds the artefact
+  (a ~5e3 m² s⁻² EKE). Driven by the zonal-only wind (the sane ~2.4 m s⁻¹
+  circulation), the EKE is realistic (~2e2 m² s⁻²) and the storminess term
+  correctly *adds* to it. This is a methodological finding, not a kernel
+  correction.

@@ -35,7 +35,8 @@ def test_all_appendix_tables_present():
         ("A2_dynamics", "c5mmc", 750.0),
         ("A4_hydrology", "ra_max", 0.95),  # the 95% RH precipitation threshold
         ("A4_hydrology", "tau_p", 50.0),   # land turnover time, days
-        ("A5_synoptic", "c5syn", 2.0e5),   # AT = c5syn·√K
+        ("A5_synoptic", "c2syn", 1.6e2),   # PK ∝ Eady rate (reference namelist value)
+        ("A5_synoptic", "c5syn", 2.3e5),   # AT = c5syn·√K (reference namelist value)
         ("A5_synoptic", "c6syn", 2.0e4),   # Aq = c6syn·K
         ("A6_clouds", "H_pbl", 1500.0),
         ("A6_clouds", "c4cld", 1.5),

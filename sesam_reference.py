@@ -134,8 +134,14 @@ TABLE_A2_DYNAMICS: dict[str, Any] = {
         "c2mmc": _p(0.017, "K^-1", "c2mmc", ("A32",),
             note="ITCZ latitude = c2mmc·(T_NH − T_SH)"),
         "c3mmc": _p(90.0, "K", "c3mmc", ("A33",),
-            note="Hadley width = c3mmc·(T_trp − c4mmc)"),
-        "c4mmc": _p(200.0, "K", "c4mmc", ("A33",)),
+            note="Hadley width scale Dhad = c3mmc/(T_trp − c4mmc): the "
+            "fraction form was verified 2026-08-16 against the article HTML "
+            "MathML (mfrac) and the CLIMBER-X reference implementation "
+            "(hadwidsc = c_mmc_3/(ttrp-c_mmc_4), clamped [0.5, 1.5]); the "
+            "PDF text layer flattens it to a product"),
+        "c4mmc": _p(200.0, "K", "c4mmc", ("A33",),
+            note="offset in the (A33) fraction Dhad = c3mmc/(T_trp − c4mmc); "
+            "see the c3mmc note for the 2026-08-16 verification"),
         "c5mmc": _p(750.0, "m", "c5mmc", ("A35",),
             note="topography factor Fz = mean(1 − zs/c5mmc)"),
         # --- azonal sea-level pressure (A37-A38) ---
@@ -175,13 +181,21 @@ TABLE_A5_SYNOPTIC: dict[str, Any] = {
     "entries": {
         "c1syn": _p(1.0e-4, "m^2 s^-3", "c1syn", ("A53",),
             note="EKE production baseline term"),
-        "c2syn": _p(1.6e4, "m^2 s^-2", "c2syn", ("A53",),
-            note="EKE production ∝ Eady growth rate (f/N)·|∂u/∂z|"),
+        "c2syn": _p(1.6e2, "m^2 s^-2", "c2syn", ("A53",),
+            note="EKE production ∝ Eady growth rate. CORRECTED 2026-08-16 at "
+            "first use: the published supplement (t06) transcribes 1.6e4, but "
+            "the CLIMBER-X reference namelist c_syn_2 = 1.6e2 gives the "
+            "validated, realistic midlatitude EKE (~10^2 m^2/s^2, synoptic "
+            "surface wind ~5-10 m/s); with 1.6e4 the equilibrium EKE is "
+            "~5e3 m^2/s^2 and the synoptic wind ~30 m/s, physically absurd. The "
+            "runnable reference value is authoritative (docs/SESAM_GAP_ANALYSIS.md §5)."),
         "c3syn": _p(8.0e-7, "m^-1", "c3syn", ("A55",)),
         "c4syn": _p(1.0e-4, "m^-1", "c4syn", ("A55",),
             note="EKE dissipation (c3syn + c4syn·CD)·K^1.5"),
-        "c5syn": _p(2.0e5, "m", "c5syn", ("A50",),
-            note="heat diffusivity AT = c5syn·√K"),
+        "c5syn": _p(2.3e5, "m", "c5syn", ("A50",),
+            note="heat diffusivity AT = c5syn·√K. CORRECTED 2026-08-16 at "
+            "first use to the reference namelist value c_syn_5 = 2.3e5 (the "
+            "transcribed 2.0e5 was a minor supplement/namelist mismatch)."),
         "c6syn": _p(2.0e4, "s", "c6syn", ("A51",),
             note="moisture diffusivity Aq = c6syn·K"),
         "c7syn": _p(0.7, "-", "c7syn", ("A56",),
