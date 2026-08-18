@@ -62,8 +62,63 @@ from the CC-BY paper):
 8.  **Reference-implementation features deliberately not ported** (grid
     artifacts or time-stepping, not paper equations): staggered-grid
     interpolations, spatial smoothing of α/CD, time relaxation of the
-    katabatic wind, pole-half damping of the surface wind, and the
-    advective-mass-flux closure (that is stage P4's transport machinery).
+    katabatic wind, and the advective-mass-flux closure (that is stage P4's
+    transport machinery). Polar damping of the surface wind is a distinct
+    decision -- see note 9: it is ported, independently derived rather than
+    translated from the reference's specific technique.
+9.  **Polar cosϕ singularity in vg(0)/ua (2026-08-17, P2 exit-gate fix).**
+    (A17)-(A20) as printed divide by ``cosϕ``, which the paper's own text
+    only excuses at the *equator* (the ``|f|`` floor's stated rationale,
+    "the geostrophic approximation is not valid close to the equator").  The
+    identical breakdown holds at the poles: on this module's discrete grid
+    ``∂psl/∂λ`` does not vanish at the pole row the way the continuous field
+    would, so the printed ``1/cosϕ`` diverges there -- measured to reach
+    thousands of m/s within one grid row of a pole, a distinct defect from
+    the (A38) fix in ``sesam_dynamics.py``. :func:`surface_geostrophic_wind`
+    and :func:`ageostrophic_surface_wind` apply :func:`thermal_wind_shear`'s
+    own ``min(1, c_pol·cos²ϕ)`` envelope (module docstring note 5) to
+    ``vg(0)`` and ``ua`` -- the same documented safeguard already accepted
+    into this module for the identical singularity in the shear integral,
+    not a new mechanism and not the reference implementation's own
+    "pole-half damping" (which remains unported, note 8).
+11. **Equatorial breakdown of ug(0)/ua too, not just the pole (2026-08-17).**
+    Fixing notes 7/9/10 in ``sesam_dynamics.py`` still left the P2 exit gate
+    failing at specific real mid-to-low latitudes (~15-40°): a physically
+    ordinary, smooth meridional SLP gradient (~1.4 hPa per grid row, matched
+    to a measured real-data location) drove ``ug(0)`` to 100+ m/s. The
+    paper's own equatorial ``|f|`` floor (module docstring note 4) bounds
+    |f| away from exactly zero but does not scale down the response as
+    latitude approaches it -- a floored-but-still-small ``f`` still divides
+    an ordinary gradient into an extraordinary wind. Note 9's fix only
+    covered ``vg(0)``/``ua``'s pole ``cosϕ`` term; ``ug(0)`` and ``va`` had
+    no analogous protection at either extreme. Both
+    :func:`surface_geostrophic_wind` and :func:`ageostrophic_surface_wind`
+    now apply the *full* ``min(1, c_eq·sin²ϕ)·min(1, c_pol·cos²ϕ)`` envelope
+    (both factors, not just the polar one) to *all four* surface components
+    (``ug0``, ``vg0``, ``ua``, ``va``) via the shared
+    :func:`_geostrophic_frame_damping` helper -- exactly
+    :func:`thermal_wind_shear`'s pre-existing damping, now applied
+    consistently across the whole (A17)-(A20) surface-plus-shear family
+    instead of only the shear half. The ``polar_damping`` parameter was
+    renamed ``damping`` (now a ``(c_eq, c_pol)`` tuple, matching
+    :func:`thermal_wind_shear`'s signature) in both functions;
+    :func:`compute_wind` exposes it as ``surface_damping`` (independent of
+    ``thermal_wind_damping``); ``None`` still disables it.
+
+    **Measured sensitivity, not tuned (2026-08-17).** ``c_eq`` reuses
+    :func:`thermal_wind_shear`'s namelist value (5.0) as a principled
+    starting point, not a value chosen to fit this measurement. A direct
+    sweep on the saved 512x1024 state (`docs/SESAM_GAP_ANALYSIS.md`'s
+    2026-08-17 P2 entry) found the exit-gate correlation/RMSE response to
+    ``c_eq`` is real but *non-monotonic and season-inconsistent* --
+    ``c_eq=2`` scores best for DJF correlation while JJA prefers weaker
+    values and neither is uniformly best on RMSE. That pattern -- a
+    parameter whose "best" value depends on which season's snapshot is
+    scored -- is the signature of a genuine constant-calibration question,
+    not a discrete defect, and is exactly what
+    `docs/SESAM_GAP_ANALYSIS.md` §6's bounded P6 calibration window exists
+    for. The shared 5.0/3.0 default is kept rather than hand-picked from
+    this sweep.
 
 Grids follow the P1/P2 convention: 2-D fields are ``(H, W)``, rows run
 north-to-south on cell centres, the vertical dimension is ``(N, H, W)`` on
@@ -95,6 +150,23 @@ _F_AGEO_FLOOR_S = 1.0e-5  # paper text: |f| floor in the ageostrophic relations
 
 _C_UTER_EQ = 5.0  # reference namelist: equatorial thermal-wind damping
 _C_UTER_POL = 3.0  # reference namelist: polar thermal-wind damping
+
+
+def _geostrophic_frame_damping(
+    lat: np.ndarray, c_eq: float, c_pol: float
+) -> np.ndarray:
+    """``min(1, c_eq·sin²ϕ)·min(1, c_pol·cos²ϕ)`` (module docstring notes 5/9/11).
+
+    Shared by :func:`thermal_wind_shear` (where it was already applied) and
+    :func:`surface_geostrophic_wind`/:func:`ageostrophic_surface_wind`
+    (note 11): the same geostrophic-frame breakdown the paper's own equatorial
+    ``|f|`` floor addresses, and the pole ``cosϕ`` singularity note 9 found,
+    is a property of the (A17)-(A20) frame as a whole, not specific to the
+    shear integral.
+    """
+    return np.minimum(1.0, float(c_eq) * np.sin(lat) ** 2) * np.minimum(
+        1.0, float(c_pol) * np.cos(lat) ** 2
+    )
 
 _PBL_TOP_POLE = 0.85  # reference namelist pblp (σ of PBL top at poles)
 _PBL_TOP_EQ = 0.8  # reference namelist pble (σ of PBL top at equator)
@@ -249,12 +321,32 @@ def surface_geostrophic_wind(
     omega: float,
     rho0_kg_m3: float,
     coriolis_floor_s: float = _F_GEO_FLOOR_S,
+    damping: tuple[float, float] | None = (_C_UTER_EQ, _C_UTER_POL),
 ) -> tuple[np.ndarray, np.ndarray]:
     """(A17)-(A18) at z = 0: geostrophic wind from the SLP gradient.
 
     ``ug(0) = −(1/(ρ0·f·Re))·∂psl/∂ϕ``,
     ``vg(0) = (1/(ρ0·f·Re·cosϕ))·∂psl/∂λ`` with ``f = 2Ω·sinϕ``
     sign-preserving and |f| floored at 3e-5 s⁻¹ (paper text).
+
+    ``vg(0)`` as printed is singular at the poles (``cosϕ → 0`` with
+    ``∂psl/∂λ`` generally nonzero on this module's discrete grid, unlike the
+    true continuous field), and both components amplify without bound as
+    ``|f| → coriolis_floor_s`` near the equator even with the paper's own
+    hard floor (module docstring note 11): a smooth, physically ordinary
+    ``∂psl/∂ϕ`` at low latitude is enough to drive |ug(0)| to 100+ m/s once
+    divided by the floored-but-still-small ``f``. Module docstring note 8
+    already flags a pole-only version of this as the reference
+    implementation's own "pole-half damping" -- not ported there because it
+    is a reference-specific numerical technique, not a paper equation.
+    ``damping`` applies the same ``min(1, c_eq·sin²ϕ)·min(1, c_pol·cos²ϕ)``
+    envelope :func:`thermal_wind_shear` already uses for the identical
+    breakdown in the shear integral (module docstring note 5) to *both*
+    surface components: an independently-derived numerical safeguard for the
+    same well-known breakdown of the geostrophic approximation the paper
+    text itself invokes for the equatorial ``|f|`` floor -- not a
+    translation of the reference's technique. Pass ``damping=None`` to
+    disable (the pre-2026-08-17 behaviour).
     """
     dp_dphi = _check_2d("dpsl_dphi", dpsl_dphi)
     dp_dlam = _check_2d("dpsl_dlam", dpsl_dlam)
@@ -266,8 +358,14 @@ def surface_geostrophic_wind(
     f = 2.0 * float(omega) * np.sin(lat)
     f = np.sign(f) * np.maximum(np.abs(f), coriolis_floor_s)
     cos_lat = np.cos(lat)
+    cos_lat_safe = np.where(np.abs(cos_lat) < 1e-6, 1e-6, cos_lat)
     ug0 = -dp_dphi / (float(rho0_kg_m3) * f[:, None] * float(radius_m))
-    vg0 = dp_dlam / (float(rho0_kg_m3) * f[:, None] * float(radius_m) * cos_lat[:, None])
+    vg0 = dp_dlam / (float(rho0_kg_m3) * f[:, None] * float(radius_m) * cos_lat_safe[:, None])
+    if damping is not None:
+        c_eq, c_pol = damping
+        damp = _geostrophic_frame_damping(lat, c_eq, c_pol)
+        ug0 = ug0 * damp[:, None]
+        vg0 = vg0 * damp[:, None]
     return ug0, vg0
 
 
@@ -321,9 +419,7 @@ def thermal_wind_shear(
 
     if damping is not None:
         c_eq, c_pol = damping
-        damp = np.minimum(1.0, c_eq * np.sin(lat) ** 2) * np.minimum(
-            1.0, c_pol * np.cos(lat) ** 2
-        )
+        damp = _geostrophic_frame_damping(lat, c_eq, c_pol)
         shear_u = shear_u * damp[None, :, None]
         shear_v = shear_v * damp[None, :, None]
     return shear_u, shear_v
@@ -344,6 +440,7 @@ def ageostrophic_surface_wind(
     omega: float,
     rho0_kg_m3: float,
     coriolis_floor_s: float = _F_AGEO_FLOOR_S,
+    damping: tuple[float, float] | None = (_C_UTER_EQ, _C_UTER_POL),
 ) -> tuple[np.ndarray, np.ndarray]:
     """(A19)-(A20): ageostrophic PBL wind from SLP and the cross-isobar angle.
 
@@ -351,6 +448,14 @@ def ageostrophic_surface_wind(
     ``va = −(sinα·cosα)/(ρ0·|f|·Re)·∂psl/∂ϕ`` with |f| floored at 1e-5 s⁻¹
     and ``sinα·cosα`` a positive magnitude (module docstring note 3): flow
     crosses isobars toward low pressure in both hemispheres.
+
+    ``ua``/``va`` share ``ug(0)``/``vg(0)``'s pole ``cosϕ`` singularity and
+    equatorial breakdown (see :func:`surface_geostrophic_wind`, module
+    docstring note 11) -- more so, since the ageostrophic ``|f|`` floor
+    (1e-5) is smaller than the geostrophic one (3e-5). ``damping`` applies
+    the same ``min(1, c_eq·sin²ϕ)·min(1, c_pol·cos²ϕ)`` envelope to both
+    components. Pass ``damping=None`` to disable (the pre-2026-08-17
+    behaviour).
     """
     dp_dphi = _check_2d("dpsl_dphi", dpsl_dphi)
     dp_dlam = _check_2d("dpsl_dlam", dpsl_dlam)
@@ -364,9 +469,15 @@ def ageostrophic_surface_wind(
         raise ValueError("sin_cos_alpha must match the gradient shape")
     f_abs = np.maximum(2.0 * float(omega) * np.abs(np.sin(lat)), coriolis_floor_s)
     cos_lat = np.cos(lat)
+    cos_lat_safe = np.where(np.abs(cos_lat) < 1e-6, 1e-6, cos_lat)
     denom = float(rho0_kg_m3) * f_abs * float(radius_m)
-    ua = -scab * dp_dlam / (denom * cos_lat)[:, None]
+    ua = -scab * dp_dlam / (denom * cos_lat_safe)[:, None]
     va = -scab * dp_dphi / denom[:, None]
+    if damping is not None:
+        c_eq, c_pol = damping
+        damp = _geostrophic_frame_damping(lat, c_eq, c_pol)
+        ua = ua * damp[:, None]
+        va = va * damp[:, None]
     return ua, va
 
 
@@ -592,6 +703,7 @@ def compute_wind(
     rho0_kg_m3: float,
     reference_temp_k: float,
     thermal_wind_damping: tuple[float, float] | None = (_C_UTER_EQ, _C_UTER_POL),
+    surface_damping: tuple[float, float] | None = (_C_UTER_EQ, _C_UTER_POL),
 ) -> SesamWind:
     """Assemble the full (A16) wind field from SLP and 3-D temperature.
 
@@ -602,7 +714,10 @@ def compute_wind(
     ``sigma_oro_m`` is the sub-grid orography standard deviation feeding
     (A23) (pass ``None`` for zero orographic roughness);
     ``tropopause_sigma`` is the σ = p/p0 of the tropopause for the
-    ageostrophic compensation layer (scalar or 2-D).
+    ageostrophic compensation layer (scalar or 2-D). ``surface_damping``
+    (module docstring note 11) is the ``(c_eq, c_pol)`` pair passed to
+    :func:`surface_geostrophic_wind`/:func:`ageostrophic_surface_wind`,
+    independent of ``thermal_wind_damping``.
     """
     slp = _check_2d("slp_pa", slp_pa)
     t_z = np.asarray(temperature_z, dtype=np.float64)
@@ -628,7 +743,8 @@ def compute_wind(
 
     dp_dphi, dp_dlam = horizontal_gradient(slp, lat)
     ug0, vg0 = surface_geostrophic_wind(
-        dp_dphi, dp_dlam, lat, radius_m=radius_m, omega=omega, rho0_kg_m3=rho0_kg_m3
+        dp_dphi, dp_dlam, lat, radius_m=radius_m, omega=omega, rho0_kg_m3=rho0_kg_m3,
+        damping=surface_damping,
     )
     shear_u, shear_v = thermal_wind_shear(
         t_z,
@@ -651,6 +767,7 @@ def compute_wind(
         radius_m=radius_m,
         omega=omega,
         rho0_kg_m3=rho0_kg_m3,
+        damping=surface_damping,
     )
     # σ levels of the input grid, from the surface column-mean pressure
     # profile (the exponential reference profile is uniform to first order).

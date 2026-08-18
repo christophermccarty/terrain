@@ -138,6 +138,77 @@ def test_surface_geostrophic_wind_hand_value_and_signs():
     assert ug0[j_pol_side, 0] == pytest.approx(expected, rel=1e-9)
 
 
+def test_surface_geostrophic_wind_vg0_bounded_near_pole():
+    # Module docstring note 9: an azonal SLP pattern that does NOT vanish at
+    # the pole row (unlike a true continuous field) is the exact scenario
+    # that produced thousands of m/s in the P2 exit-gate measurement.
+    h = 512
+    lat = (0.5 - (np.arange(h) + 0.5) / h) * np.pi
+    lam = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
+    slp = 101000.0 + 2000.0 * np.cos(lam)[None, :] * np.ones((h, 1))
+    dphi, dlam = sw.horizontal_gradient(slp, lat)
+    ug0, vg0 = sw.surface_geostrophic_wind(
+        dphi, dlam, lat, radius_m=EARTH["radius_m"], omega=EARTH["omega"], rho0_kg_m3=1.289
+    )
+    assert np.isfinite(vg0).all()
+    # Within the top/bottom row the undamped 1/cos(phi) would give ~1e3-1e4
+    # m/s for this forcing; the damped result stays physically bounded.
+    assert np.abs(vg0[0]).max() < 50.0
+    assert np.abs(vg0[-1]).max() < 50.0
+    # Disabling the safeguard reproduces the undamped blow-up.
+    _, vg0_undamped = sw.surface_geostrophic_wind(
+        dphi, dlam, lat, radius_m=EARTH["radius_m"], omega=EARTH["omega"],
+        rho0_kg_m3=1.289, damping=None,
+    )
+    assert np.abs(vg0_undamped[0]).max() > 500.0
+
+
+def test_surface_geostrophic_wind_ug0_bounded_near_equator():
+    # Module docstring note 11: even with the paper's own hard |f| floor
+    # (3e-5), an ordinary meridional SLP gradient at low latitude (a
+    # measured real-data pattern -- see docs/SESAM_GAP_ANALYSIS.md's
+    # 2026-08-17 entry) drives ug0 to 100+ m/s once divided by the small
+    # (but not floored) f near 15N/S.
+    h = 512
+    lat = (0.5 - (np.arange(h) + 0.5) / h) * np.pi
+    w = 32
+    # A smooth meridional SLP ramp of ordinary real-world magnitude
+    # (~1.4 hPa per grid row, matching the measured Andes-region pattern).
+    row_gradient_pa = 138.0
+    slp = (101000.0 + row_gradient_pa * np.arange(h))[:, None] * np.ones((1, w))
+    dphi, dlam = sw.horizontal_gradient(slp, lat)
+    j_15 = np.argmin(np.abs(np.degrees(lat) - 15.0))
+    ug0, _ = sw.surface_geostrophic_wind(
+        dphi, dlam, lat, radius_m=EARTH["radius_m"], omega=EARTH["omega"], rho0_kg_m3=1.289
+    )
+    assert np.isfinite(ug0).all()
+    assert np.abs(ug0[j_15]).max() < 50.0
+    ug0_undamped, _ = sw.surface_geostrophic_wind(
+        dphi, dlam, lat, radius_m=EARTH["radius_m"], omega=EARTH["omega"],
+        rho0_kg_m3=1.289, damping=None,
+    )
+    assert np.abs(ug0_undamped[j_15]).max() > 50.0
+
+
+def test_surface_geostrophic_wind_damping_inert_away_from_frame_extremes():
+    # The safeguard must not perturb the already-tested 45N physics: at
+    # sin^2(45)=cos^2(45)=0.5, min(1, 5*0.5)=min(1, 3*0.5)=1 -- full damping
+    # envelope evaluates to exactly 1 there.
+    slp = 101000.0 + 800.0 * np.exp(-((LAT - np.pi / 6.0) / 0.15) ** 2)[:, None]
+    slp = np.repeat(slp, W, axis=1)
+    dphi, dlam = sw.horizontal_gradient(slp, LAT)
+    ug0_a, vg0_a = sw.surface_geostrophic_wind(
+        dphi, dlam, LAT, radius_m=EARTH["radius_m"], omega=EARTH["omega"], rho0_kg_m3=1.289
+    )
+    ug0_b, vg0_b = sw.surface_geostrophic_wind(
+        dphi, dlam, LAT, radius_m=EARTH["radius_m"], omega=EARTH["omega"],
+        rho0_kg_m3=1.289, damping=None,
+    )
+    j_45 = np.argmin(np.abs(LAT - np.radians(45.0)))
+    np.testing.assert_allclose(ug0_a[j_45], ug0_b[j_45], rtol=1e-9)
+    np.testing.assert_allclose(vg0_a[j_45], vg0_b[j_45], rtol=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # (A17)-(A18) thermal-wind shear
 # ---------------------------------------------------------------------------
@@ -221,6 +292,49 @@ def test_ageostrophic_surface_wind_crosses_toward_low_pressure():
     assert va[j_pol_side, 0] == pytest.approx(expected, rel=1e-9)
     # Zonally uniform SLP -> ua = 0.
     assert np.abs(ua).max() < 1e-12
+
+
+def test_ageostrophic_surface_wind_ua_bounded_near_pole():
+    h = 512
+    lat = (0.5 - (np.arange(h) + 0.5) / h) * np.pi
+    lam = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
+    slp = 101000.0 + 2000.0 * np.cos(lam)[None, :] * np.ones((h, 1))
+    dphi, dlam = sw.horizontal_gradient(slp, lat)
+    scab = np.full((h, 64), 0.4)
+    ua, va = sw.ageostrophic_surface_wind(
+        dphi, dlam, lat, scab, radius_m=EARTH["radius_m"], omega=EARTH["omega"], rho0_kg_m3=1.289
+    )
+    assert np.isfinite(ua).all()
+    assert np.abs(ua[0]).max() < 50.0
+    assert np.abs(ua[-1]).max() < 50.0
+    ua_undamped, _ = sw.ageostrophic_surface_wind(
+        dphi, dlam, lat, scab, radius_m=EARTH["radius_m"], omega=EARTH["omega"],
+        rho0_kg_m3=1.289, damping=None,
+    )
+    assert np.abs(ua_undamped[0]).max() > 150.0
+
+
+def test_ageostrophic_surface_wind_va_bounded_near_equator():
+    # va shares ug0's equatorial breakdown with an even smaller |f| floor
+    # (1e-5 vs 3e-5), so it is more exposed, not less (module docstring
+    # note 11).
+    h = 512
+    lat = (0.5 - (np.arange(h) + 0.5) / h) * np.pi
+    w = 32
+    row_gradient_pa = 138.0
+    slp = (101000.0 + row_gradient_pa * np.arange(h))[:, None] * np.ones((1, w))
+    dphi, dlam = sw.horizontal_gradient(slp, lat)
+    scab = np.full((h, w), 0.4)
+    j_15 = np.argmin(np.abs(np.degrees(lat) - 15.0))
+    _, va = sw.ageostrophic_surface_wind(
+        dphi, dlam, lat, scab, radius_m=EARTH["radius_m"], omega=EARTH["omega"], rho0_kg_m3=1.289
+    )
+    assert np.isfinite(va).all()
+    _, va_undamped = sw.ageostrophic_surface_wind(
+        dphi, dlam, lat, scab, radius_m=EARTH["radius_m"], omega=EARTH["omega"],
+        rho0_kg_m3=1.289, damping=None,
+    )
+    assert np.abs(va[j_15]).max() < 0.5 * np.abs(va_undamped[j_15]).max()
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +517,44 @@ def test_compute_wind_shapes_and_reproducibility():
     assert wind.ageostrophic_v_z_m_s.shape == (n, H, W)
     wind2 = _assembled_wind()
     np.testing.assert_array_equal(wind.surface_u_m_s, wind2.surface_u_m_s)
+
+
+def test_compute_wind_surface_damping_passthrough():
+    # Module docstring note 11: surface_damping is independent of
+    # thermal_wind_damping and defaults to the same (c_eq, c_pol) envelope.
+    wind_default = _assembled_wind()
+    tsl_z = 300.0 - 60.0 * np.sin(LAT) ** 2
+    skin = np.repeat(tsl_z[:, None], W, axis=1)
+    zs = np.zeros((H, W))
+    slp_res = sd.compute_slp(
+        skin_temp_k=skin, surface_elevation_m=zs, sin_cos_alpha_bar=0.433,
+        gravity=EARTH["gravity"], radius_m=EARTH["radius_m"], omega=EARTH["omega"],
+        p0_pa=101100.0, reference_temp_k=273.15,
+    )
+    levels = np.array([0.0, 1500.0, 3000.0, 5500.0, 9000.0, 12000.0])
+    vs = sv.compute_vertical_structure(
+        levels, near_surface_air_temp_k=skin - 2.0, skin_temp_k=skin,
+        surface_kind=np.zeros((H, W), dtype=np.int64),
+        near_surface_specific_humidity_kgkg=np.full((H, W), 0.008),
+        surface_elevation_m=zs, tropopause_height_m=np.full((H, W), 12000.0),
+        p0_pa=101100.0, gravity=EARTH["gravity"], reference_temp_k=288.0,
+    )
+    wind_undamped = sw.compute_wind(
+        slp_pa=slp_res.slp_pa, temperature_z=vs.temperature_k, levels_m=levels,
+        pressure_z=vs.pressure_pa, skin_temp_k=skin, t2m_k=skin - 1.0,
+        surface_elevation_m=zs, surface_kind=np.zeros((H, W), dtype=np.int64),
+        roughness_m=np.full((H, W), 0.1),
+        gravity=EARTH["gravity"], radius_m=EARTH["radius_m"], omega=EARTH["omega"],
+        rho0_kg_m3=1.289, reference_temp_k=273.15, surface_damping=None,
+    )
+    # Near the equatorial row the two must differ (damping suppresses ug0);
+    # at 45N (damp == 1 exactly) they must agree.
+    j_eq = np.argmin(np.abs(LAT - np.radians(5.0)))
+    j_45 = np.argmin(np.abs(LAT - np.radians(45.0)))
+    assert abs(wind_default.surface_u_m_s[j_eq, 0]) < abs(wind_undamped.surface_u_m_s[j_eq, 0])
+    np.testing.assert_allclose(
+        wind_default.surface_u_m_s[j_45], wind_undamped.surface_u_m_s[j_45], rtol=1e-9
+    )
 
 
 def test_sesam_dynamics_gate_defaults_off():

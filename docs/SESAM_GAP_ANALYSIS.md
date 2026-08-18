@@ -333,6 +333,109 @@ so each is evaluable without the next.
     placeholders were subsequently closed by the wind assembly (the (A21)
     solve and the two-pass u500 closure), and the full exit-gate measurement
     above supersedes this baseline for the completed P2.
+  - **Exit-gate re-investigation (2026-08-17/18): four structural bugs found
+    and fixed; exit gate massively improved but still NOT passed, and the
+    remainder is now measured to be a calibration question, not a further
+    bug.** The 2026-08-16 verdict's diagnosis ("azonal channel amplifying the
+    saved state's sharp regional fields") named resolution as the cause.
+    That turned out to be a minor contributor; the investigation instead
+    found and fixed, in order:
+    1. **(A38) denominator, erroneous extra `u` factor.** Fetching the
+       article PDF directly (a smaller preprint mirror,
+       `gmd-2022-56-manuscript-version2.pdf`, pages 43-44 -- the final
+       typeset PDF and full HTML/XML both exceed this session's fetch-size
+       limits before reaching the appendix) and re-deriving the (A38)
+       spectral solution from the literally printed vorticity equation
+       reproduced this module's own documented formula
+       (`u·Kn² − β − i·Kn²/(τe·kzn)`), but the *code* computed
+       `Kn²/(τe·kzn·u)` -- an extra `u` absent from both the derivation and
+       the function's own docstring one line above it. Confirmed wrong
+       dimensionally (m⁻² vs. every other term's s⁻¹m⁻¹) and by measurement
+       (a (lat, n, u500) sweep found |response| spiking above 1e5 at the
+       stationary-wavenumber resonance `u·Kn² = β` that exists for some
+       integer n at any positive u -- not an edge case). Fixed
+       (`sesam_dynamics.py`, module docstring note 9); real-terrain
+       orographic SLP fell from ±97-170 hPa to ±18-20 hPa.
+    2. **Pole `cosϕ` singularity in `vg(0)`/`ua`.** (A17)-(A20) divide by
+       `cosϕ`, excused by the paper's text only at the equator; the same
+       breakdown holds at the poles on this module's discrete grid, measured
+       at >6500 m/s within one row of a pole. Fixed (`sesam_wind.py`, note
+       9) with `thermal_wind_shear`'s own already-accepted
+       `min(1, c_pol·cos²ϕ)` envelope.
+    3. **`u500(ϕ)` row-to-row noise.** With 1-2 fixed, the exit gate still
+       failed at real mid-latitudes despite smooth 2-D SLP inputs: `dp/dλ`
+       was small but `dp/dϕ` was ~90x larger. (A38) is solved independently
+       per row with no coupling between adjacent latitudes, so nothing kept
+       it smooth in ϕ even when every input was -- and its driver, `u500`
+       (closing the two-pass SLP<->wind loop from real, ungridded saved-state
+       fields), genuinely oscillates row to row (measured: -28, -16, -15,
+       -18, -1, +13, +26 m/s across seven adjacent rows), which the
+       westerly-only `+0.1 m/s` floor turns into a near-discontinuous
+       regime switch on every sign flip. Fixed (`sesam_dynamics.py`, note
+       10) with `resolution_matched_profile`, a new 1-D latitude analogue of
+       note 7's 2-D regrid, applied to `u500` before it drives the per-row
+       solve.
+    4. **Equatorial breakdown of `ug(0)`/`va`, not just the pole.** With 1-3
+       fixed, the gate still failed at real low-to-mid latitudes (~15-40°)
+       from an *already-smooth* SLP gradient (~1.4 hPa/row, a genuine,
+       non-noisy feature) divided by a small-but-not-floored `f`. Fix 2 only
+       covered `vg(0)`/`ua`'s `cosϕ` term; `ug(0)` and `va` had no analogous
+       protection. Fixed (`sesam_wind.py`, note 11) by applying the *full*
+       `min(1, c_eq·sin²ϕ)·min(1, c_pol·cos²ϕ)` envelope (both factors, not
+       just the polar one) to all four surface components, via a new shared
+       `_geostrophic_frame_damping` helper reused by `thermal_wind_shear`
+       (unchanged behaviour there) -- i.e. the same damping the shear
+       integral already had, now applied to the surface terms too.
+       `compute_wind` exposes it as a new `surface_damping` parameter.
+
+    All four fixes are guarded by new tests (planted-bug /
+    planted-undamped-blowup style, matching the existing (A34) precedent):
+    `testing/test_sesam_dynamics.py` (11 new tests) and
+    `testing/test_sesam_wind.py` (7 new tests); full SESAM suite 109/109,
+    full project suite 999 passed/1 skipped/20 xfailed/2 xpassed (no
+    regressions -- both modules stay behind `enable_sesam_dynamics`, default
+    off, unreferenced by `simulate.py`).
+
+    **Combined exit-gate result** (saved 512×1024 state, all four fixes):
+    full-chain surface-wind speed vs NCEP pattern correlation −0.011 (DJF) /
+    −0.121 (JJA), RMSE 6.74 / 6.82 m s⁻¹ -- RMSE improved **10.8x / 16.6x**
+    from the 2026-08-16 baseline (73/113 m s⁻¹) and mean surface speed
+    (5.46/5.05 m s⁻¹) is now close to NCEP's own (3.9-4.0). The generator
+    (+0.34/+0.23, 2.8/3.6 m s⁻¹) still wins on correlation, though DJF is now
+    within 0.35 correlation points of it (JJA remains further off).
+
+    **The remainder is measured to be a calibration question, not a further
+    bug.** Two checks close this out: (a) clipping the top 1-10% of
+    remaining wind-speed outliers *does not* improve correlation (it stays
+    flat or worsens slightly across p90-p99 clip thresholds), meaning the
+    residual gap is a broad pattern mismatch, not a few hot cells; (b) the
+    equatorial-damping strength `c_eq` (reused at 5.0 from
+    `thermal_wind_shear`'s existing namelist value, not chosen for this
+    metric) was swept from 0.5 to 5 on the same state: the correlation
+    response is real but **non-monotonic and season-inconsistent** -- `c_eq
+    ≈ 2` scores best for DJF while JJA prefers weaker values and neither is
+    uniformly best on RMSE. A parameter whose "best" value depends on which
+    season's snapshot is scored is the signature of a genuine
+    constant-calibration question, not a discrete defect -- exactly what §6's
+    bounded P6 calibration window exists for. The default was left at the
+    principled 5.0/3.0 value rather than hand-picked from this sweep, per
+    §6/§7's own discipline against per-instance constant fitting. Separately
+    (state-specific, already noted 2026-08-16): the saved state's own
+    SH-summer Hadley cell is too weak for the cell physics, a state
+    property unrelated to any of the four fixes.
+
+    **Verdict: P2's kernels are now bug-free as far as this investigation can
+    determine; the exit gate is not passed and is not expected to pass via
+    further debugging.** All four fixes are real, dimensionally/textually
+    verified corrections (not tuned knobs) and stay in unconditionally; do
+    not revert them. Closing the remaining gap requires either (i) the P6
+    calibration window (after P4), scoring a bounded sweep of SESAM's own
+    constants against the full standard gate set rather than this one
+    state's wind correlation, or (ii) validating against additional
+    states/seasons to separate genuine constant miscalibration from this
+    particular saved state's own known biases. Neither is admissible as a
+    P2-stage action per the project's own staged discipline; P2 does not
+    re-open for further hand-tuning until one of those conditions is met.
 - **P3 — EKE and synoptic transport** (A5): prognostic K, Eady production from
   P1 profiles, drag dissipation, `AT/Aq` diffusivities, synoptic wind. *Exit*:
   storm-track placement responds to baroclinicity; macroturbulent heat/moisture
@@ -458,6 +561,51 @@ semantics. Recorded as they are verified, so no later stage re-derives them.
   millibars; `scripts/build_ncep_slp_reference.py` converts to Pa explicitly
   (verified against the file's `units` attribute, per the ExoPlaSim
   precipitation-unit lesson in `docs/EXTERNAL_DYCORE_WORKFLOW.md`).
+- **(A38) denominator: erroneous extra `u` factor, found and fixed
+  (2026-08-17).** The article does not print a closed-form spectral solution
+  for (A38) -- only the PDE and "solved... by Fourier expansion... using
+  FFTW3" (confirmed by direct PDF read, pages 43-44 of
+  `gmd-2022-56-manuscript-version2.pdf`; the final typeset PDF is 14 MB,
+  over this session's fetch cap, and the HTML/XML full text both truncate
+  before the appendix). Re-deriving the spectral solution from the literal
+  printed equation (`u∂ζ/∂λ + βv + ζ/τe = -(f/HT)·0.4·u∂zs/∂λ`, a single
+  Fourier/meridional mode, `ζ=-Kn²Ψ̂`, `v=i·kzn·Ψ̂`) gives
+  `Ψ̂ₙ = (f/HT)·0.4·u·ẑsₙ / (u·Kn² − β − i·Kn²/(τe·kzn))` -- exactly
+  `sesam_dynamics.charney_eliassen_slp`'s own docstring formula. The
+  *implementation*, however, computed `Kn²/(τe·kzn·u)`: an extra `u` absent
+  from the derivation and the docstring one line above it. Confirmed wrong
+  two ways: dimensionally (the erroneous term is m⁻², every other term in
+  the denominator is s⁻¹m⁻¹) and by measurement (a (lat, n, u500) sweep at
+  realistic values shows the erroneous damping is ~1e-13, four orders of
+  magnitude too weak to bound the resonance `u·Kn² = β` that exists for
+  some low integer n at any positive u -- the actual mechanism behind the
+  2026-08-16 exit-gate's ">100 m/s local winds"). Fixed by removing the
+  extra `u`; real-terrain orographic SLP range fell from ±97-170 hPa to
+  ±18-20 hPa (physically plausible; real stationary waves are ~10-20 hPa).
+  The accompanying hand-Fourier test (`test_charney_eliassen_matches_hand_
+  fourier_solution`) had the same extra `u` baked into its own hand
+  computation and passed regardless -- it was verifying self-consistency
+  with the bug, not correctness against the source; fixed alongside, plus a
+  new dedicated resonance-boundedness regression.
+- **`u500(ϕ)` row-to-row noise driving spurious meridional SLP gradients,
+  found and fixed (2026-08-17).** Once the two bugs above were fixed, the
+  exit gate still failed at specific real latitudes despite every 2-D input
+  (thermal, orographic, zonal) being smooth there: `dp/dλ` was ~2e3 Pa/rad
+  but `dp/dϕ` was ~1.8e5 Pa/rad -- a meridional, not zonal, problem. (A38)
+  is solved independently per latitude row with no coupling between
+  adjacent rows, so a smooth 2-D input does not guarantee a smooth output
+  in ϕ; the actual driver was `u500` itself (the zonal-mean 500 hPa wind
+  closing the two-pass SLP<->wind loop), measured oscillating -28, -16,
+  -15, -18, -1, +13, +26 m/s across seven adjacent rows of the real
+  saved-state DJF diagnostic. Combined with the westerly-only `+0.1 m/s`
+  floor, each sign flip in that noise produced a near-discontinuous jump
+  between a floored (near-zero) and unfloored (full-amplitude) response.
+  Fixed with `sesam_dynamics.resolution_matched_profile` (a new 1-D
+  latitude-only analogue of the existing 2-D `resolution_matched_field`,
+  same box+linear-interp mechanism, no longitude to wrap) applied to `u500`
+  before `compute_slp` passes it to `charney_eliassen_slp`; verified to turn
+  the measured seven-row oscillation into a monotonic profile and the
+  corresponding orographic SLP from an oscillating jump into a smooth ramp.
 
 ### Wind-assembly stage (verified 2026-08-16)
 
@@ -498,6 +646,52 @@ semantics. Recorded as they are verified, so no later stage re-derives them.
   January Ta with a July skin produced a −50 K/km inverted profile in the
   diagnostic driver) — diagnostic drivers must use season-consistent
   Ta/T* pairs.
+- **Pole `cosϕ` singularity in `vg(0)`/`ua`, found and fixed (2026-08-17).**
+  (A17)-(A20) as printed divide by `cosϕ`; the paper's text excuses this
+  only at the equator (the stated rationale for the `|f|` floor above). The
+  same breakdown holds at the poles, where this module's discrete azonal
+  SLP does not vanish in longitude the way the continuous field would --
+  measured at >6500 m/s within one grid row of the pole in the DJF
+  diagnostic, a second and independent defect from the (A38) fix above.
+  Fixed by applying `thermal_wind_shear`'s own already-accepted
+  `min(1, c_pol·cos²ϕ)` envelope to `vg(0)` and `ua` (`sesam_wind.py`) --
+  the identical safeguard already used for the identical singularity in the
+  shear integral, not a new mechanism and not the reference implementation's
+  own unported "pole-half damping".
+- **Equatorial breakdown of `ug(0)`/`va`, found and fixed (2026-08-17).**
+  With the (A38) and pole fixes above in place, the exit gate still failed
+  at real low-to-mid latitudes (~15-40°) driven by an *already-smooth* SLP
+  gradient (~1.4 hPa/row, a genuine feature, not noise) divided by a small
+  but not-floored `f` -- the paper's hard `|f|` floor (3e-5 geostrophic,
+  1e-5 ageostrophic) bounds the denominator away from exactly zero but does
+  not scale the response down as latitude approaches it, so a floored-but-
+  still-small `f` still turns an ordinary gradient into 100+ m/s. The pole
+  fix above only covered `vg(0)`/`ua`'s `cosϕ` term; `ug(0)` and `va` had no
+  analogous protection at either singularity. Fixed by applying the *full*
+  `min(1, c_eq·sin²ϕ)·min(1, c_pol·cos²ϕ)` envelope (both factors) to all
+  four surface components via a new shared `_geostrophic_frame_damping`
+  helper, also now used by `thermal_wind_shear` (behaviour there
+  unchanged). `compute_wind` gained a `surface_damping` parameter,
+  independent of `thermal_wind_damping`.
+- **`c_eq` sensitivity swept, not tuned (2026-08-17).** A direct sweep of
+  the equatorial-damping strength (0.5 to 5) on the saved 512x1024 DJF/JJA
+  state found the exit-gate correlation/RMSE response is real but
+  non-monotonic and season-inconsistent: `c_eq≈2` scores best for DJF while
+  JJA prefers weaker values, and neither is uniformly best on RMSE. That
+  pattern is the signature of a genuine constant-calibration question (§6),
+  not a discrete defect worth chasing further at the P2 stage -- the shared
+  5.0/3.0 value (`thermal_wind_shear`'s existing namelist constant) is kept
+  as the principled default rather than hand-picked from this sweep.
+- **Exit-gate result after all four fixes (2026-08-17/18):** saved-state
+  (512x1024) full-chain surface wind vs NCEP: pattern correlation -0.011
+  (DJF) / -0.121 (JJA), RMSE 6.74 / 6.82 m/s -- down from 73/113 m/s
+  pre-fix (10.8x/16.6x), mean surface speed 5.46/5.05 m/s (NCEP 3.9-4.0).
+  Still short of the generator's +0.34/+0.23, 2.8/3.6 m/s. Clipping the
+  worst 1-10% of remaining outliers does not improve correlation (flat or
+  slightly worse), so the gap is a broad pattern mismatch, not a few hot
+  cells -- consistent with the `c_eq` finding above pointing at calibration
+  rather than a fifth bug. See §7 P2's 2026-08-17/18 entry for the full
+  verdict and admission status.
 
 ### Synoptic/EKE stage (verified 2026-08-16)
 

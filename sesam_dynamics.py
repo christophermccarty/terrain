@@ -58,6 +58,8 @@ from the CC-BY paper):
 4.  **(A39) glyph.** The printed ``p*sl,O = 9fρ(500 hPa)`` is the
     streamfunction Ψ mis-OCR'd: ``p*sl,O = ρ(500 hPa)·f·Ψ`` (confirmed by the
     reference implementation, which also uses ``|f|`` in the conversion).
+    Directly confirmed 2026-08-17 against the article PDF (Appendix A2,
+    p. 44): the printed equation is ``p∗sl,O = Ψfρ(500hPa)``.
 5.  **Cross-isobar factor.** (A29) divides by the zonal mean of
     ``sinα·cosα``.  α is solved from the drag closure (A21) by the wind
     assembly (P2's second sub-deliverable, ``sesam_wind.py``).  Until then
@@ -74,10 +76,40 @@ from the CC-BY paper):
     amplitude scales with 1/|sinαcosα|.
 6.  **Reference-implementation features deliberately not ported** (they are
     grid/stability artifacts or tuning, not paper equations): staggered-grid
-    moving averages, spatial smoothing of the azonal SLP, the polar and
-    equatorial azonal damping factors, and the time relaxation of the azonal
-    SLP (this module is a diagnostic, not a time-stepped state).
-7.  **The ftrop coordinate.** The (A14) tropical weight consumed by
+    moving averages, the reference implementation's own spatial-smoothing
+    filters, the polar and equatorial azonal damping factors, and the time
+    relaxation of the azonal SLP (this module is a diagnostic, not a
+    time-stepped state). This is a distinct decision from note 7 below: no
+    Fortran technique or constant is used anywhere in this module.
+7.  **Resolution matching (2026-08-17, P2 exit-gate fix).** The P2 exit-gate
+    measurement (`docs/SESAM_GAP_ANALYSIS.md` §7) found the full azonal chain
+    scoring *worse* than the incumbent generator at PlanetSim's native
+    512x1024 grid, while the zonal-only chain already beat it: (A37)'s
+    ~232 Pa/K coefficient turns the saved state's full-resolution sea-level
+    temperature anomalies into implausible local SLP swings, and (A38)-(A39)
+    respond to full-resolution 8848 m terrain the same way. This is not a
+    numerical instability; the SESAM constants (`H0_slp`, `c5mmc`, the
+    Charney-Eliassen wave geometry) come from a paper validated at a native
+    5 deg x 5 deg grid (`docs/SESAM_GAP_ANALYSIS.md` §8's own risk note), and
+    a 5 deg grid cell's temperature/terrain variance is intrinsically smaller
+    than a 0.35 deg cell's -- feeding sub-grid variance the equations were
+    never calibrated against is a resolution-domain mismatch, not a
+    grid-stability artifact of the kind note 6 excludes.  :func:`resolution_matched_field`
+    box-averages to a grid matched to that native resolution (default 36
+    rows, i.e. ~5 deg, derived from the caller's grid, never a hardcoded
+    Earth literal) and bilinearly regrids back (periodic in longitude,
+    edge-clamped at the poles) so the SLP gradients the wind assembly
+    differentiates stay smooth. It is a generic, symmetric box+bilinear
+    regrid -- a standard numerical technique applied identically at every
+    latitude/longitude, written independently of the reference
+    implementation, not a translation of its `nsmooth_*` filters (which
+    remain unported per note 6; those are staggered-grid, non-periodic, and
+    tuned to the reference's own timestep). :func:`compute_slp` applies it to
+    the 2-D inputs of the azonal thermal and orographic terms only -- the
+    zonal cell-physics path (A29)-(A35) already collapses to a 1-D zonal-mean
+    profile and is unaffected. **Measured (2026-08-17) to be insufficient on
+    its own** -- see note 9.
+8.  **The ftrop coordinate.** The (A14) tropical weight consumed by
     ``sesam_vertical.tropical_weight`` is ``1 − sin⁸(fi)`` with
     ``fi = clamp(c_hrs·(ϕ − had_fi)/(0.5·had_width), ±π/2)`` where
     ``had_fi``/``had_width`` are the Hadley centre/width diagnosed from the
@@ -86,6 +118,60 @@ from the CC-BY paper):
     without defining φ's construction; the same rescaled-latitude structure
     with 0.85 = asin(0.1^(1/8)) appears in the printed (A11)).  This replaces
     P1's documented latitude placeholder.
+9.  **(A38) denominator: erroneous extra `u` factor (2026-08-17, the real P2
+    exit-gate fix).**  The printed (A38) is the barotropic vorticity equation
+    ``u·∂ζ/∂λ + β·v + ζ/τe = −(f/H_T)·0.4·u·∂zs/∂λ`` (confirmed 2026-08-17
+    against the article PDF, Appendix A2 p. 43-44 -- the paper states the
+    equation and that it is solved by Fourier expansion per latitudinal belt
+    using FFTW3, but does not print a closed-form spectral solution).
+    Substituting a single Fourier/meridional mode (``ζ = −Kn²Ψ̂``,
+    ``v = i·kzn·Ψ̂``) and collecting terms gives
+    ``Ψ̂ₙ·[u·Kn² − β − i·Kn²/(τe·kzn)] = (f/H_T)·0.4·u·ẑsₙ`` -- matching
+    this function's own documented formula.  The *code*, however, computed
+    ``denom_imag = Kn²/(τe·kzn·u)`` -- an extra ``u`` in the denominator not
+    present in the derivation or the docstring above it.  Two independent
+    checks confirm the extra factor is wrong: (a) dimensional analysis --
+    ``denom_real`` has units s⁻¹m⁻¹ (matching ``β``); the erroneous form has
+    units m⁻², the corrected form s⁻¹m⁻¹; (b) measurement -- at realistic
+    mid-latitude u500 (10-30 m/s) the erroneous damping term is ~1e-13,
+    roughly four orders of magnitude too small to bound the response near
+    the resonance ``u·Kn² = β`` that exists for some low integer n at any
+    positive u, giving |response| spikes above 1e5 and, propagated through
+    (A39) and the wind assembly's SLP gradient, the P2 exit-gate's measured
+    100+ m/s local winds.  With the fix, the same sweep stays in the
+    1e3-1e4 range at every tested (lat, n, u) -- bounded, no resonance.
+    ``testing/test_sesam_dynamics.py`` pins the corrected formula and plants
+    the erroneous one to show it reproduces the resonance spike.  This was
+    the dominant P2 exit-gate defect; note 7's resolution matching remains a
+    real, independently-justified secondary improvement (it also damps the
+    (A37) thermal term, which this fix does not touch).
+10. **`u500(ϕ)` row-to-row noise, not the 2-D fields (2026-08-17).**  After
+    notes 7 and 9, the exit gate was still failing at specific real
+    latitudes (Sea-of-Japan-adjacent rows near 35°N) despite the 2-D SLP
+    inputs there being smooth: ``dp/dλ`` was small (~2e3 Pa/rad) but
+    ``dp/dϕ`` was enormous (~1.8e5 Pa/rad), i.e. a meridional, not zonal,
+    problem. Tracing it: (A38) is solved *independently per row* with no
+    coupling between adjacent latitudes, so it has no mechanism to keep its
+    output smooth in ϕ even when every 2-D input is. The row-to-row driver
+    turned out to be ``u500`` itself -- the zonal-mean 500 hPa wind closing
+    the two-pass SLP↔wind loop -- which is derived from real, ungridded
+    saved-state temperature/SLP fields and genuinely oscillates row to row
+    (measured: -28, -16, -15, -18, -1, +13, +26 m/s across seven adjacent
+    rows). Combined with the ``+0.1 m/s`` westerly-only floor (module
+    docstring note: "resonance is only supported for westerly flow"), a
+    sign flip between rows means the response jumps from near-zero (u
+    floored) to its full unfloored value within 1-2 grid rows -- a sharp,
+    physically spurious meridional gradient with nothing to do with
+    resolution or the (A38) fix above. Fixing notes 7/9 could not remove
+    this: it is a defect in the *driving profile*, not the kernel.
+    :func:`resolution_matched_profile` (the 1-D latitude analogue of note
+    7's 2-D regrid -- same box+linear-interp mechanism, no longitude to
+    wrap) smooths ``u500`` to the same ~5° scale before :func:`compute_slp`
+    passes it to :func:`charney_eliassen_slp`; verified to turn the same
+    seven-row oscillation into a monotonic profile and the corresponding
+    orographic SLP from an oscillating ±15 hPa/row jump into a smooth
+    ramp. Applies only when ``resolution_match_rows`` is not None (the
+    default), consistent with notes 7/9.
 
 Grids follow the P1 convention: 2-D fields are ``(H, W)``, rows run
 north-to-south on cell centres, zonal means are ``(H,)``.  Planetary
@@ -100,6 +186,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from sesam_reference import value as _param
+from sim_grid import _coarsen as _block_mean_coarsen
 
 # ---------------------------------------------------------------------------
 # A2 parameter registry (single source: sesam_reference.py)
@@ -140,6 +227,11 @@ _C_HRS = 0.7  # ftrop coordinate factor (module docstring note 7)
 # integrand is dominated by placeholder noise (physical values are ~0.4 for
 # α ≈ 25–35°).
 _SIN_COS_ALPHA_FLOOR = 0.05
+
+# Module docstring note 9: SESAM's validated native grid is 5°x5° (180°/5°
+# rows). Not an Earth literal -- it is the paper's own resolution, applied to
+# whatever grid the caller passes.
+_RESOLUTION_MATCH_TARGET_ROWS = 36
 
 _SECONDS_PER_DAY = 86400.0
 
@@ -188,6 +280,103 @@ def _interp_at_latitudes(latitude_rad: np.ndarray, values: np.ndarray, targets) 
     val = np.asarray(values, dtype=np.float64)
     # np.interp requires ascending x; rows are north-to-south (descending lat).
     return np.interp(np.asarray(targets, dtype=np.float64), lat[::-1], val[::-1])
+
+
+# ---------------------------------------------------------------------------
+# Resolution matching (module docstring note 9) -- P2 exit-gate fix
+# ---------------------------------------------------------------------------
+
+
+def _coarse_block_size(h: int, target_rows: int) -> int:
+    if target_rows <= 0:
+        raise ValueError("target_rows must be positive")
+    return max(1, round(h / float(target_rows)))
+
+
+def _bilinear_refine(coarse: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Separable bilinear regrid of a coarse (Hc, Wc) field back to (h, w).
+
+    Latitude (rows) is edge-clamped (no wrap at the poles); longitude
+    (columns) wraps periodically, matching the grid's spherical topology.
+    Both axes interpolate on normalized cell-centre coordinates so the result
+    is independent of the absolute grid size.
+    """
+    hc, wc = coarse.shape
+    if (hc, wc) == (h, w):
+        return coarse.astype(np.float64, copy=True)
+
+    src_row = (np.arange(hc, dtype=np.float64) + 0.5) / hc
+    dst_row = (np.arange(h, dtype=np.float64) + 0.5) / h
+    row_stage = np.empty((h, wc), dtype=np.float64)
+    for j in range(wc):
+        row_stage[:, j] = np.interp(dst_row, src_row, coarse[:, j])
+
+    src_col = (np.arange(wc, dtype=np.float64) + 0.5) / wc
+    dst_col = (np.arange(w, dtype=np.float64) + 0.5) / w
+    ext_col = np.concatenate(([src_col[-1] - 1.0], src_col, [src_col[0] + 1.0]))
+    ext_vals = np.empty((h, wc + 2), dtype=np.float64)
+    ext_vals[:, 1:-1] = row_stage
+    ext_vals[:, 0] = row_stage[:, -1]
+    ext_vals[:, -1] = row_stage[:, 0]
+    out = np.empty((h, w), dtype=np.float64)
+    for i in range(h):
+        out[i, :] = np.interp(dst_col, ext_col, ext_vals[i, :])
+    return out
+
+
+def resolution_matched_field(
+    field_2d: np.ndarray,
+    *,
+    target_rows: int = _RESOLUTION_MATCH_TARGET_ROWS,
+) -> np.ndarray:
+    """Low-pass a 2-D field to SESAM's native ~5° validated resolution.
+
+    Box-averages to a coarse grid with roughly ``target_rows`` latitude rows
+    (derived from the caller's own grid height -- never a hardcoded Earth
+    literal) and bilinearly regrids back to the input's shape (module
+    docstring note 9). A no-op (returns a copy) when the input already has
+    ``target_rows`` rows or fewer.  Pure and deterministic; carries no
+    reference-implementation code (module docstring note 6/9 distinction).
+    """
+    arr = np.asarray(field_2d, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError("field_2d must be a 2-D (H, W) field")
+    h, w = arr.shape
+    bs = _coarse_block_size(h, target_rows)
+    if bs <= 1:
+        return arr.copy()
+    hc = max(1, -(-h // bs))  # ceil division: _coarsen requires Hc*bs >= h
+    wc = max(1, -(-w // bs))
+    coarse = _block_mean_coarsen(arr.astype(np.float32), hc, wc, bs).astype(np.float64)
+    return _bilinear_refine(coarse, h, w)
+
+
+def resolution_matched_profile(
+    profile_1d: np.ndarray,
+    *,
+    target_rows: int = _RESOLUTION_MATCH_TARGET_ROWS,
+) -> np.ndarray:
+    """1-D latitude analogue of :func:`resolution_matched_field` (note 10).
+
+    Box-averages a ``(H,)`` zonal profile to ``target_rows`` latitude bands
+    and linearly regrids back (edge-clamped, no longitude to wrap). Used for
+    ``u500`` -- see module docstring note 10 for why a per-row-independent
+    Charney-Eliassen solve needs a smooth ``u500(ϕ)`` input regardless of
+    how smooth the 2-D fields already are.
+    """
+    arr = np.asarray(profile_1d, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError("profile_1d must be a 1-D (H,) array")
+    h = arr.shape[0]
+    bs = _coarse_block_size(h, target_rows)
+    if bs <= 1:
+        return arr.copy()
+    hc = max(1, -(-h // bs))
+    padded = np.pad(arr, (0, hc * bs - h), mode="edge")
+    coarse = padded.reshape(hc, bs).mean(axis=1)
+    src = (np.arange(hc, dtype=np.float64) + 0.5) / hc
+    dst = (np.arange(h, dtype=np.float64) + 0.5) / h
+    return np.interp(dst, src, coarse)
 
 
 # ---------------------------------------------------------------------------
@@ -558,12 +747,18 @@ def charney_eliassen_slp(
 
     ``Ψ̂ₙ = (f/H_T)·0.4·u·ẑsₙ / (u·Kn² − β − i·Kn²/(τe·n·k₀))``  (n ≥ 1)
 
-    and ``p*sl,O = ρ(500 hPa)·|f|·Ψ`` (A39), with ``ρ(500) = ρ0·p500/p0`` in
-    the exponential reference atmosphere.  ``u`` is the zonal-mean 500 hPa
-    zonal wind floored at +0.1 m s⁻¹ (reference-implementation safeguard:
-    stationary-wave resonance is only supported for westerly flow);
-    ``H_T`` is the zonal-mean tropopause height.  The zonal-mean (n = 0)
-    response is zero by construction, so the result is purely azonal.
+    derived from the printed (A38) (module docstring note 9; the paper gives
+    the PDE and says it is solved by per-row Fourier expansion, not a closed
+    form) and ``p*sl,O = ρ(500 hPa)·|f|·Ψ`` (A39), with
+    ``ρ(500) = ρ0·p500/p0`` in the exponential reference atmosphere.  ``u``
+    is the zonal-mean 500 hPa zonal wind floored at +0.1 m s⁻¹
+    (reference-implementation safeguard: stationary-wave resonance is only
+    supported for westerly flow); ``H_T`` is the zonal-mean tropopause
+    height.  The zonal-mean (n = 0) response is zero by construction, so the
+    result is purely azonal.  The ``τe`` term is the only real damping in the
+    denominator away from ``u·Kn² = β``; get its ``kzn`` power wrong (module
+    docstring note 9) and the response is unbounded at whatever integer n
+    happens to sit near that resonance for the given ``u``, ``β``.
     """
     params = a2 or _a2_defaults()
     zs = np.asarray(topography_m, dtype=np.float64)
@@ -596,7 +791,7 @@ def charney_eliassen_slp(
         kn2 = kzn**2 + m_wave**2
         denom_real = u[j] * kn2 - beta[j]
         with np.errstate(divide="ignore", invalid="ignore"):
-            denom_imag = kn2 / (tau_s * kzn * u[j])
+            denom_imag = kn2 / (tau_s * kzn)
         # n = 0 has no azonal content; zero its response (also removes 0/0).
         denom_imag[0] = 1.0
         response = np.where(
@@ -659,6 +854,7 @@ def compute_slp(
     u500_m_s: np.ndarray | None = None,
     tropopause_height_m: np.ndarray | None = None,
     a2: dict[str, float] | None = None,
+    resolution_match_rows: int | None = _RESOLUTION_MATCH_TARGET_ROWS,
 ) -> SesamSlp:
     """Assemble the full (A28) sea-level pressure from 2-D input fields.
 
@@ -676,6 +872,15 @@ def compute_slp(
     passes (provisional ±π/6 tropical band, then the band between the
     detected edges).  The reference implementation uses the previous day's
     edges instead; the two agree at equilibrium.
+
+    ``resolution_match_rows`` (module docstring note 7) applies
+    :func:`resolution_matched_field` to the 2-D inputs of the azonal thermal
+    (A37) and orographic (A38–A39) terms before evaluating them, and (module
+    docstring note 10) :func:`resolution_matched_profile` to ``u500_m_s``
+    before it drives the per-row-independent (A38) solve, matching all three
+    to SESAM's validated ~5° grid; pass ``None`` to evaluate the raw
+    full-resolution/unsmoothed inputs (the pre-2026-08-17 behaviour, kept for
+    A/B comparison). The zonal cell-physics path is unaffected either way.
     """
     params = a2 or _a2_defaults()
     t_skin = np.asarray(skin_temp_k, dtype=np.float64)
@@ -733,8 +938,13 @@ def compute_slp(
         rho0_kg_m3=rho0_kg_m3,
     )
 
+    tsl_for_thermal = (
+        resolution_matched_field(tsl, target_rows=resolution_match_rows)
+        if resolution_match_rows is not None
+        else tsl
+    )
     p_thermal = thermal_azonal_slp(
-        tsl,
+        tsl_for_thermal,
         gravity=gravity,
         p0_pa=p0_pa,
         reference_temp_k=reference_temp_k,
@@ -748,10 +958,22 @@ def compute_slp(
                 "tropopause_height_m is required when u500_m_s enables the "
                 "Charney–Eliassen term (no fabricated tropopause)"
             )
+        zs_for_oro = (
+            resolution_matched_field(zs, target_rows=resolution_match_rows)
+            if resolution_match_rows is not None
+            else zs
+        )
+        u500_for_oro = (
+            resolution_matched_profile(
+                _as_zonal("u500_m_s", u500_m_s, h), target_rows=resolution_match_rows
+            )
+            if resolution_match_rows is not None
+            else u500_m_s
+        )
         p_oro = charney_eliassen_slp(
-            zs,
+            zs_for_oro,
             lat,
-            u500_m_s,
+            u500_for_oro,
             tropopause_height_m,
             radius_m=radius_m,
             omega=omega,
@@ -860,6 +1082,8 @@ __all__ = [
     "hemispheric_mean_temperatures",
     "itcz_latitude",
     "mean_overturning_wind",
+    "resolution_matched_field",
+    "resolution_matched_profile",
     "sea_level_temperature",
     "thermal_azonal_slp",
     "topography_factor",
