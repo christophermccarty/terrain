@@ -246,3 +246,452 @@ def test_compute_synoptic_shapes_finite_and_positive():
 
 def test_sesam_synoptic_gate_defaults_off():
     assert PlanetParams().enable_sesam_dynamics is False
+
+
+# ---------------------------------------------------------------------------
+# (A52) prognostic K: advection + diffusion transport
+# ---------------------------------------------------------------------------
+
+_RADIUS_M = 6.371e6
+
+
+def _geometry(h, w):
+    area, xlen, ylen = ss.spherical_transport_geometry(h, w, _RADIUS_M)
+    dx = ss.zonal_center_spacing_m(h, w, _RADIUS_M)
+    dy = _RADIUS_M * (np.pi / h)
+    return area, xlen, ylen, dx, dy
+
+
+def test_spherical_transport_geometry_matches_sphere_area_and_poles():
+    h, w = 8, 16
+    area, xlen, ylen = ss.spherical_transport_geometry(h, w, _RADIUS_M)
+    assert area.shape == (h, w) and xlen.shape == (h, w) and ylen.shape == (h + 1, w)
+    # Cell areas sum to the full sphere.
+    assert np.sum(area) == pytest.approx(4.0 * np.pi * _RADIUS_M ** 2, rel=1e-9)
+    # North/south faces shrink to exactly zero at the poles.
+    assert np.allclose(ylen[0], 0.0) and np.allclose(ylen[-1], 0.0)
+
+
+def test_eke_diffusion_step_hand_value_single_substep():
+    """Hand-computable (A52) diffusion: one interior peak, one Euler substep.
+
+    3x4 grid, uniform 1000 m spacing, c5syn overridden to 1.0 so
+    AT = sqrt(K).  A single nonzero cell (K=4 -> AT=2) has zero-AT neighbours
+    on every side (AT=0 there), so every face diffusivity is the average of
+    (2, 0) = 1.0.  The exact per-face self-loss geometry for this uniform
+    1000 m grid is ``4 * x_len/(dx*area) = 4 * 1000/(1000*1e6) = 4e-6``
+    (four identical faces, each contributing ``x_len/(dx*area)``), so the
+    diffusion number at the peak is ``AT * 4e-6 * dt_seconds``; dt_days=0.5
+    keeps it at 0.3456 < 0.4, so the kernel takes exactly one substep and the
+    result is hand-computable: each of the 4 face fluxes is
+    ``1.0 * 4.0 / 1000 * 1000 = 4.0`` (m^2 s^-2 m^2 s^-1), and the peak loses
+    ``4 * 4.0 * 43200 = 691,200`` (m^2 s^-2 * m^2) of its 4,000,000 initial
+    mass while each neighbour gains 172,800 -- conserving the total exactly.
+    """
+    a5 = dict(A5)
+    a5["c5syn"] = 1.0
+    k0 = np.zeros((3, 4))
+    k0[1, 1] = 4.0
+    res = ss.eke_diffusion_step(
+        k0, dx_m=1000.0, dy_m=1000.0, dt_days=0.5,
+        cell_area_m2=1e6, x_face_length_m=1000.0, y_face_length_m=1000.0,
+        eke_floor=0.0, a5=a5,
+    )
+    assert res.substeps == 1
+    assert res.eke_m2_s2[1, 1] == pytest.approx(3.3088, rel=1e-9)
+    for j, i in [(1, 0), (1, 2), (0, 1), (2, 1)]:
+        assert res.eke_m2_s2[j, i] == pytest.approx(0.1728, rel=1e-9)
+    # Untouched corners stay exactly zero.
+    for j, i in [(0, 0), (0, 2), (2, 0), (2, 2), (0, 3), (1, 3), (2, 3)]:
+        assert res.eke_m2_s2[j, i] == 0.0
+    assert res.residual_m2_s2 == pytest.approx(0.0, abs=1e-6)
+
+
+def test_eke_diffusion_omitting_face_averaging_breaks_symmetry_planted_violation():
+    """Plant the (A50) face-averaging omission and show it desymmetrises a
+    symmetric bump -- the same setup as the hand-value test above.
+
+    The correct implementation face-averages AT before forming each flux, so
+    a symmetric bump diffuses identically to all four neighbours (0.1728
+    each, per the hand-value test). Using the *donor* cell's own AT instead
+    (no averaging) still conserves the global total (the same flux value is
+    subtracted from one side and added to the other either way), but breaks
+    the physical symmetry: the neighbour on the AT=0 side of each face gets
+    no flux at all (donor AT=0), while the neighbour on the peak's own side
+    gets double the correct amount.  This is exactly the failure the module
+    docstring's note 6 warns about, reproduced here without touching the
+    module so a real regression of the averaging would be caught the same
+    way.
+    """
+    a5 = dict(A5)
+    a5["c5syn"] = 1.0
+    k0 = np.zeros((3, 4))
+    k0[1, 1] = 4.0
+    correct = ss.eke_diffusion_step(
+        k0, dx_m=1000.0, dy_m=1000.0, dt_days=0.5,
+        cell_area_m2=1e6, x_face_length_m=1000.0, y_face_length_m=1000.0,
+        eke_floor=0.0, a5=a5,
+    )
+    neighbours_correct = [correct.eke_m2_s2[j, i] for j, i in [(1, 0), (1, 2), (0, 1), (2, 1)]]
+    assert len(set(np.round(neighbours_correct, 6))) == 1  # all four identical
+
+    def buggy_one_sided_diffusion(k0, dt_days, c5):
+        depth = k0.copy()
+        dt_seconds = dt_days * 86400.0
+        at = c5 * np.sqrt(np.maximum(depth, 0.0))
+        east_flux = at * (depth - np.roll(depth, -1, axis=1)) / 1000.0 * 1000.0  # no averaging
+        west_flux_in = np.roll(east_flux, 1, axis=1)
+        h, w = depth.shape
+        face_flux = np.zeros((h + 1, w))
+        face_flux[1:-1] = at[:-1] * (depth[:-1] - depth[1:]) / 1000.0 * 1000.0  # no averaging
+        mass = depth * 1e6 + dt_seconds * (west_flux_in - east_flux + face_flux[:-1] - face_flux[1:])
+        return mass / 1e6
+
+    buggy = buggy_one_sided_diffusion(k0, 0.5, a5["c5syn"])
+    neighbours_buggy = [buggy[j, i] for j, i in [(1, 0), (1, 2), (0, 1), (2, 1)]]
+    # The buggy, un-averaged scheme desymmetrises: two neighbours get nothing,
+    # two get double -- unlike the real, face-averaged implementation.
+    assert len(set(np.round(neighbours_buggy, 6))) > 1
+    assert buggy[1, 0] == pytest.approx(0.0, abs=1e-9)
+    assert buggy[0, 1] == pytest.approx(0.0, abs=1e-9)
+    assert buggy[1, 2] == pytest.approx(2.0 * 0.1728, rel=1e-6)
+    assert buggy[2, 1] == pytest.approx(2.0 * 0.1728, rel=1e-6)
+
+
+def test_eke_diffusion_cfl_substepping_prevents_maximum_principle_violation_planted_violation():
+    """Plant the CFL-substepping omission and show it lets a single big Euler
+    step wildly overshoot the physical bound.
+
+    Pure diffusion (no source) can never raise a field's peak above its own
+    initial peak (discrete maximum principle). With a large initial K
+    (AT = 100) and a 1-day step, the real dissipation-free kernel needs 44
+    substeps and stays within [K0.min(), K0.max()]; forcing a single
+    unsubstepped Euler step over the same dt (dropping the module's own CFL
+    substepping) blows past that bound by more than 4x and drives a
+    neighbour cell negative -- exactly the failure `diffusion_r_limit`
+    substepping exists to prevent.
+    """
+    a5 = dict(A5)
+    a5["c5syn"] = 1.0
+    k0 = np.zeros((3, 4))
+    k0[1, 1] = 10000.0
+    correct = ss.eke_diffusion_step(
+        k0, dx_m=1000.0, dy_m=1000.0, dt_days=1.0,
+        cell_area_m2=1e6, x_face_length_m=1000.0, y_face_length_m=1000.0,
+        eke_floor=0.0, a5=a5,
+    )
+    assert correct.substeps > 1
+    assert correct.eke_m2_s2.max() <= k0.max() + 1e-6
+    assert correct.eke_m2_s2.min() >= 0.0
+
+    def buggy_single_step_no_cfl(k0, dt_days, c5):
+        depth = k0.copy()
+        dt_seconds = dt_days * 86400.0  # the *entire* step in one go, no substepping
+        at = c5 * np.sqrt(np.maximum(depth, 0.0))
+        at_east = 0.5 * (at + np.roll(at, -1, axis=1))
+        east_flux = at_east * (depth - np.roll(depth, -1, axis=1)) / 1000.0 * 1000.0
+        west_flux_in = np.roll(east_flux, 1, axis=1)
+        h, w = depth.shape
+        at_face_y = np.zeros((h + 1, w))
+        at_face_y[1:-1] = 0.5 * (at[:-1] + at[1:])
+        face_flux = np.zeros((h + 1, w))
+        face_flux[1:-1] = at_face_y[1:-1] * (depth[:-1] - depth[1:]) / 1000.0 * 1000.0
+        mass = depth * 1e6 + dt_seconds * (west_flux_in - east_flux + face_flux[:-1] - face_flux[1:])
+        return mass / 1e6
+
+    buggy = buggy_single_step_no_cfl(k0, 1.0, a5["c5syn"])
+    assert buggy.max() > 4.0 * k0.max()  # gross overshoot of the maximum principle
+    assert buggy.min() < 0.0  # unphysical negative EKE
+
+
+def test_eke_transport_step_conserves_total_energy_pure_transport():
+    """Pure transport (no production/dissipation supplied) must conserve
+    total K modulo the non-negativity floor, matching column_water.py's own
+    conservation contract -- `eke_transport_step` literally reuses
+    `evolve_column_water` for the advective term.
+    """
+    h, w = 16, 32
+    area, xlen, ylen, dx, dy = _geometry(h, w)
+    rng = np.random.default_rng(0)
+    lat = ss._latitude_rad(h)
+    k0 = np.full((h, w), 150.0) + 20.0 * rng.standard_normal((h, w)) ** 2
+    u = 12.0 * np.cos(lat)[:, None] * np.ones((h, w))
+    v = 3.0 * np.sin(2 * lat)[:, None] * np.ones((h, w))
+    step = ss.eke_transport_step(
+        k0, u, v, dx_m=dx, dy_m=dy, dt_days=0.5,
+        cell_area_m2=area, x_face_length_m=xlen, y_face_length_m=ylen,
+    )
+    total_before = float(np.sum(k0 * area))
+    total_after = float(np.sum(step.eke_m2_s2 * area))
+    # column_water.evolve_column_water stores its result as float32 (see its
+    # own tests, e.g. test_prior_art_kernels.py's 1e-5-scale residual
+    # tolerances), so the achievable precision here is float32-limited, not
+    # float64 machine precision.
+    assert total_after == pytest.approx(total_before, rel=1e-6)
+    assert abs(step.relative_residual) < 1e-5
+    assert np.isfinite(step.eke_m2_s2).all()
+    assert (step.eke_m2_s2 >= 0.0).all()
+
+
+def test_eke_diffusion_smooths_bump_and_preserves_centroid():
+    """Physical-sanity check: diffusion alone smooths a bump (peak drops,
+    the total conserves, and -- since diffusion has no directional bias on a
+    periodic domain away from a boundary -- the bump's centroid does not
+    drift).
+    """
+    h, w = 24, 48
+    area, xlen, ylen, dx, dy = _geometry(h, w)
+    lat = ss._latitude_rad(h)
+    lon = np.linspace(-np.pi, np.pi, w, endpoint=False)
+    j0 = int(np.argmin(np.abs(lat - np.radians(30.0))))
+    i0 = w // 2
+    k0 = np.full((h, w), 50.0)
+    k0[j0, i0] = 4000.0
+
+    res = ss.eke_diffusion_step(
+        k0, dx_m=dx, dy_m=dy, dt_days=2.0,
+        cell_area_m2=area, x_face_length_m=xlen, y_face_length_m=ylen,
+    )
+    assert res.eke_m2_s2[j0, i0] < k0[j0, i0]
+    assert res.eke_m2_s2[j0, i0 - 1] > k0[j0, i0 - 1]
+    assert res.eke_m2_s2[j0, i0 + 1] > k0[j0, i0 + 1]
+    assert res.residual_m2_s2 == pytest.approx(0.0, abs=1.0)
+
+    def centroid_lon(field, row):
+        weight = field[row] - float(field[row].min())
+        ang = np.exp(1j * lon)
+        return np.angle(np.sum(weight * ang) / np.sum(weight))
+
+    dlon = centroid_lon(res.eke_m2_s2, j0) - centroid_lon(k0, j0)
+    dlon = (dlon + np.pi) % (2 * np.pi) - np.pi
+    shift_m = abs(dlon) * _RADIUS_M * np.cos(lat[j0])
+    assert shift_m < 0.5 * float(dx[j0, i0])  # sub-grid-cell centroid drift
+
+
+def test_eke_advection_translates_bump_downstream_by_expected_distance():
+    """Physical-sanity check: a uniform zonal wind should translate a K
+    bump's centroid downstream by roughly ``u * dt`` -- diffusion (also
+    active in `eke_transport_step`) smooths the bump but, being symmetric
+    on a periodic domain away from a boundary, does not itself move the
+    centroid, so the measured shift isolates the advective displacement.
+    """
+    h, w = 32, 64
+    area, xlen, ylen, dx, dy = _geometry(h, w)
+    lat = ss._latitude_rad(h)
+    lon = np.linspace(-np.pi, np.pi, w, endpoint=False)
+    j0 = int(np.argmin(np.abs(lat - np.radians(45.0))))
+    i0 = w // 4
+
+    k0 = np.full((h, w), 50.0)
+    # Gaussian bump, wrapped across the periodic longitude boundary.
+    offsets = (np.arange(w) - i0 + w // 2) % w - w // 2
+    bump = 5000.0 * np.exp(-0.5 * (offsets / 1.2) ** 2)
+    k0[j0, :] += bump
+
+    u_speed = 20.0
+    u = np.full((h, w), u_speed)
+    v = np.zeros((h, w))
+    dt_days = 0.25
+
+    step = ss.eke_transport_step(
+        k0, u, v, dx_m=dx, dy_m=dy, dt_days=dt_days,
+        cell_area_m2=area, x_face_length_m=xlen, y_face_length_m=ylen,
+    )
+
+    def centroid_lon(field, row):
+        weight = field[row] - float(field[row].min())
+        ang = np.exp(1j * lon)
+        return np.angle(np.sum(weight * ang) / np.sum(weight))
+
+    dlon = centroid_lon(step.eke_m2_s2, j0) - centroid_lon(k0, j0)
+    dlon = (dlon + np.pi) % (2 * np.pi) - np.pi
+    actual_shift_m = dlon * _RADIUS_M * np.cos(lat[j0])
+    expected_shift_m = u_speed * dt_days * 86400.0
+    assert actual_shift_m == pytest.approx(expected_shift_m, rel=0.05)
+
+
+def test_evolve_eke_full_step_shapes_finite_and_gate_off():
+    h, w = 12, 24
+    area, xlen, ylen, dx, dy = _geometry(h, w)
+    k0 = np.full((h, w), 200.0)
+    production = np.full((h, w), 2.0e-4)
+    cd = np.full((h, w), 1.3e-3)
+    u = np.full((h, w), 5.0)
+    v = np.full((h, w), 1.0)
+    step = ss.evolve_eke(
+        k0, production, cd, u, v,
+        dx_m=dx, dy_m=dy, dt_days=1.0,
+        cell_area_m2=area, x_face_length_m=xlen, y_face_length_m=ylen,
+    )
+    assert step.eke_m2_s2.shape == (h, w)
+    assert np.isfinite(step.eke_m2_s2).all()
+    assert (step.eke_m2_s2 >= 1.0).all()  # reference-implementation floor
+    assert step.advection_substeps >= 1
+    assert step.diffusion_substeps >= 1
+    assert step.reaction_substeps >= 1
+    # Stronger production -> higher equilibrium-ward EKE after the step.
+    step_more = ss.evolve_eke(
+        k0, production * 5.0, cd, u, v,
+        dx_m=dx, dy_m=dy, dt_days=1.0,
+        cell_area_m2=area, x_face_length_m=xlen, y_face_length_m=ylen,
+    )
+    assert np.mean(step_more.eke_m2_s2) > np.mean(step.eke_m2_s2)
+    assert PlanetParams().enable_sesam_dynamics is False
+
+
+# ---------------------------------------------------------------------------
+# (A52) implicit-zonal diffusion -- the 512x1024 polar-stiffness remedy
+# (docs/SESAM_GAP_ANALYSIS.md P3, 2026-08-18 follow-up entry)
+# ---------------------------------------------------------------------------
+
+
+def test_cyclic_thomas_batch_matches_dense_solve():
+    """`_cyclic_thomas_batch` against `numpy.linalg.solve` on the equivalent
+    dense periodic matrix, arbitrary (non-constant-coefficient) rows -- the
+    linear-algebra primitive `eke_diffusion_step_implicit_zonal`'s zonal
+    half-step depends on, verified independently of the diffusion physics.
+    """
+    rng = np.random.default_rng(0)
+    for h, w in [(1, 4), (3, 5), (5, 8), (2, 16)]:
+        sub = rng.uniform(0.1, 2.0, (h, w))
+        diag = rng.uniform(5.0, 10.0, (h, w))
+        sup = rng.uniform(0.1, 2.0, (h, w))
+        rhs = rng.standard_normal((h, w))
+        x_batch = ss._cyclic_thomas_batch(sub, diag, sup, rhs)
+        for r in range(h):
+            m = np.zeros((w, w))
+            for i in range(w):
+                m[i, i] = diag[r, i]
+                m[i, (i - 1) % w] += sub[r, i]
+                m[i, (i + 1) % w] += sup[r, i]
+            x_dense = np.linalg.solve(m, rhs[r])
+            np.testing.assert_allclose(x_batch[r], x_dense, atol=1e-8, rtol=1e-8)
+
+
+def test_eke_diffusion_implicit_zonal_matches_explicit_on_tractable_grid():
+    """Small grid where the explicit scheme is itself tractable: the
+    implicit-zonal path (a different time-discretisation of the identical
+    continuous PDE) should land close to the explicit result after the same
+    simulated time, and both must independently conserve total energy.
+    """
+    h, w = 24, 48
+    area, xlen, ylen, dx, dy = _geometry(h, w)
+    lat = ss._latitude_rad(h)
+    j0 = int(np.argmin(np.abs(lat - np.radians(30.0))))
+    i0 = w // 2
+    k0 = np.full((h, w), 50.0)
+    k0[j0, i0] = 4000.0
+
+    explicit = ss.eke_diffusion_step(
+        k0, dx_m=dx, dy_m=dy, dt_days=2.0, cell_area_m2=area,
+        x_face_length_m=xlen, y_face_length_m=ylen,
+    )
+    implicit = ss.eke_diffusion_step_implicit_zonal(
+        k0, dx_m=dx, dy_m=dy, dt_days=2.0, cell_area_m2=area,
+        x_face_length_m=xlen, y_face_length_m=ylen,
+    )
+    assert explicit.residual_m2_s2 == pytest.approx(0.0, abs=1e-6)
+    assert implicit.residual_m2_s2 == pytest.approx(0.0, abs=1e-6)
+    # Same qualitative smoothing response (peak drops from the same start).
+    assert implicit.eke_m2_s2[j0, i0] < k0[j0, i0]
+    assert explicit.eke_m2_s2[j0, i0] < k0[j0, i0]
+    # Within ~5% of each other -- close agreement expected since both solve
+    # the same PDE, not identical since backward- vs forward-Euler differ.
+    assert implicit.eke_m2_s2[j0, i0] == pytest.approx(explicit.eke_m2_s2[j0, i0], rel=0.05)
+    for j, i in [(j0, i0 - 1), (j0, i0 + 1), (j0 - 1, i0), (j0 + 1, i0)]:
+        assert implicit.eke_m2_s2[j, i] == pytest.approx(explicit.eke_m2_s2[j, i], rel=0.15)
+
+
+def _pole_like_geometry(h: int, w: int, shrink: float = 1.0e-6):
+    """Synthetic small grid reproducing the *exact mechanism* measured on
+    the real 512x1024 grid (`docs/SESAM_GAP_ANALYSIS.md` P3, 2026-08-18): row
+    0's cell area shrinks sharply (mimicking the true spherical polar-cap
+    area) while the east/west face length stays the *same constant* as every
+    other row (mimicking `spherical_transport_geometry`'s ``x_len =
+    radius*dlat``, which does not shrink with latitude) -- this is what makes
+    the zonal self-loss term ``x_len/(dx*area)`` diverge specifically at the
+    pole. The north-facing face bordering row 0 is shrunk *proportionally*
+    with area (matching the real geometry, where the interior polar face
+    length and the cap area shrink together with dlat), which keeps the
+    meridional term the same order at every row -- reproducing the real
+    finding that only the zonal term is pole-stiff, not the meridional one.
+    """
+    area_normal = 1.0e10
+    area = np.full((h, w), area_normal)
+    area[0, :] = area_normal * shrink
+    x_len = np.full((h, w), 50000.0)
+    dx = np.full((h, w), 50000.0)
+    y_len = np.full((h + 1, w), 50000.0)
+    y_len[0, :] = 0.0
+    y_len[1, :] = 50000.0 * shrink
+    y_len[-1, :] = 0.0
+    dy = 50000.0
+    return area, x_len, dx, y_len, dy
+
+
+def test_eke_diffusion_implicit_zonal_stable_where_explicit_is_infeasible():
+    """The actual motivating case: reproduce the real grid's pole mechanism
+    (see `_pole_like_geometry`) with a realistic near-pole EKE magnitude.
+    The plain explicit `eke_diffusion_step` must fail to converge within its
+    own substep cap (the same failure mode that made a real 512x1024 run
+    impractical -- see the P3 2026-08-18 gap-analysis entry for the measured
+    substep counts); `eke_diffusion_step_implicit_zonal` on the identical
+    geometry/state must complete in a handful of substeps, stay finite, and
+    respect the discrete maximum principle (pure diffusion cannot raise a
+    field's peak above its own initial peak).
+    """
+    h, w = 6, 8
+    area, x_len, dx, y_len, dy = _pole_like_geometry(h, w)
+    k0 = np.full((h, w), 500.0)
+    k0[0, :] = 6202.0  # matches the diagnosed real near-pole EKE magnitude
+
+    with pytest.raises(RuntimeError):
+        ss.eke_diffusion_step(
+            k0, dx_m=dx, dy_m=dy, dt_days=0.25, cell_area_m2=area,
+            x_face_length_m=x_len, y_face_length_m=y_len,
+        )
+
+    implicit = ss.eke_diffusion_step_implicit_zonal(
+        k0, dx_m=dx, dy_m=dy, dt_days=0.25, cell_area_m2=area,
+        x_face_length_m=x_len, y_face_length_m=y_len,
+    )
+    assert implicit.substeps < 500  # explicit would need > 200,000 on the same case
+    assert np.isfinite(implicit.eke_m2_s2).all()
+    assert implicit.eke_m2_s2.min() >= 0.0
+    assert implicit.eke_m2_s2.max() <= k0.max() + 1e-6  # discrete maximum principle
+    assert implicit.relative_residual == pytest.approx(0.0, abs=1e-9)
+
+
+def test_eke_transport_step_implicit_zonal_flag_wired_and_conserves():
+    """`implicit_zonal_diffusion=True` on `eke_transport_step`/`evolve_eke`
+    actually routes through the new kernel (not silently ignored) and keeps
+    the same conservation contract as the default explicit path.
+    """
+    h, w = 16, 32
+    area, xlen, ylen, dx, dy = _geometry(h, w)
+    rng = np.random.default_rng(1)
+    lat = ss._latitude_rad(h)
+    k0 = np.full((h, w), 150.0) + 20.0 * rng.standard_normal((h, w)) ** 2
+    u = 12.0 * np.cos(lat)[:, None] * np.ones((h, w))
+    v = 3.0 * np.sin(2 * lat)[:, None] * np.ones((h, w))
+    step = ss.eke_transport_step(
+        k0, u, v, dx_m=dx, dy_m=dy, dt_days=0.5,
+        cell_area_m2=area, x_face_length_m=xlen, y_face_length_m=ylen,
+        implicit_zonal_diffusion=True,
+    )
+    total_before = float(np.sum(k0 * area))
+    total_after = float(np.sum(step.eke_m2_s2 * area))
+    assert total_after == pytest.approx(total_before, rel=1e-6)
+    assert np.isfinite(step.eke_m2_s2).all()
+    assert (step.eke_m2_s2 >= 0.0).all()
+
+    production = np.full((h, w), 2.0e-4)
+    cd = np.full((h, w), 1.3e-3)
+    full = ss.evolve_eke(
+        k0, production, cd, u, v,
+        dx_m=dx, dy_m=dy, dt_days=0.5,
+        cell_area_m2=area, x_face_length_m=xlen, y_face_length_m=ylen,
+        implicit_zonal_diffusion=True,
+    )
+    assert np.isfinite(full.eke_m2_s2).all()
+    assert (full.eke_m2_s2 >= 1.0).all()

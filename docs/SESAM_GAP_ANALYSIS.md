@@ -464,12 +464,207 @@ so each is evaluable without the next.
     m² s⁻² equilibrium EKE / ~30 m s⁻¹ synoptic wind; 1.6e2 gives the
     validated ~2e2 m² s⁻² / ~7 m s⁻¹. `c5syn` also corrected to the namelist
     `c_syn_5` = 2.3e5. Both recorded in `sesam_reference.py` notes.
-  - *Exit gate status:* the storm-track placement in this diagnostic responds
-    to baroclinicity as required (peak EKE at the jet's latitude, zero at the
-    equator). The *transport* sub-deliverable (macroturbulent heat/moisture
-    fluxes replacing the fixed-window eddy term) is stage P4, so the full P3
-    exit gate is not yet closed — this sub-deliverable covers the closure and
-    its diagnostics, not the transport wiring.
+  - *Exit gate status (superseded below):* the storm-track placement in this
+    diagnostic responds to baroclinicity as required (peak EKE at the jet's
+    latitude, zero at the equator). The *transport* sub-deliverable
+    (macroturbulent heat/moisture fluxes replacing the fixed-window eddy
+    term) is stage P4, so the full P3 exit gate is not yet closed — this
+    sub-deliverable covers the closure and its diagnostics, not the
+    transport wiring.
+  - **Second sub-deliverable complete (2026-08-18): the (A52) prognostic K
+    transport itself** — `eke_diffusion_step` (nonlinear diffusion of K by
+    its own `AT = c5syn·√K`), `eke_transport_step` (adds advection, reusing
+    `column_water.evolve_column_water`'s exact finite-volume geometry for
+    the advective term per the task's own instruction — K obeys the
+    identical conservative flux-divergence transport equation as column
+    water), and `evolve_eke` (the full `dK/dt = -div(uK) + div(AT·grad K) +
+    PK - DK`, operator-split: transport then the local production/
+    dissipation reaction). All in `sesam_synoptic.py`, CFL-substepped,
+    default-off (`enable_sesam_dynamics`), unwired from the supported path.
+    Guarded by 8 new tests in `testing/test_sesam_synoptic.py` (20 total):
+    a hand-computable single-substep diffusion value, two independent
+    planted-violation tests (omitting AT face-averaging desymmetrises a
+    symmetric bump's response; omitting CFL sub-stepping lets one Euler step
+    blow past the discrete maximum principle and go negative), a
+    pure-transport conservation check (zero production/dissipation conserves
+    `sum(K·area)` to float32 precision, matching `column_water.py`'s own
+    contract), and two physical-sanity checks (diffusion smooths a bump
+    while leaving its centroid essentially unmoved; advection by a uniform
+    wind translates a bump's centroid by the expected `u·dt` distance,
+    verified via circular-mean tracking on the periodic grid).
+  - **Two real bugs found and fixed while verifying against the real
+    512x1024 saved state** (both dimensionally/logically real defects, not
+    calibration or a one-state artifact — see §10 for the full writeup):
+    1. The diffusion sub-step count was originally computed *once* from the
+       initial AT, reasoning that pure diffusion cannot raise a field's peak
+       so the initial state bounds every later one. That argument silently
+       assumed the scheme was already stable to prove it stable, and
+       overflowed on the real state. Fixed with per-substep adaptive
+       re-estimation from the live K.
+    2. Adaptive re-estimation alone did not fix it: the CFL rate formula
+       (`AT·(1/dx²+1/dy²)`) implicitly assumes cell area `~ dx·dy`, which
+       fails specifically at the polar-cap row, whose true area shrinks
+       toward the actual (tiny) spherical-cap value while the face length
+       stays the same constant as everywhere else — silently understating
+       the true constraint exactly at the pole. Confirmed as a formula bug,
+       not an insufficient safety margin, by tightening `diffusion_r_limit`
+       8x (0.4 → 0.05) on the real state without effect. Fixed by computing
+       the exact per-cell self-loss coefficient from the true face-length/
+       area geometry instead of the `dx`/`dy` approximation.
+  - **Measured (DJF, saved 512x1024 real-terrain state):** local
+    steady-state-only EKE (no transport, prior sub-deliverable's number):
+    mean 245.9 m² s⁻², max 6201.6 m² s⁻², storm track 49.39°N. Running the
+    full prognostic closure (advection + diffusion + production/dissipation)
+    forward to convergence (15 iterations of a 0.25-day coupling step = 3.75
+    days simulated, 13.6 s wall time) gives: EKE mean 278.2 m² s⁻² (+13%),
+    max 2813.1 m² s⁻² (−55%, transport smooths the sharp local peak, exactly
+    the expected qualitative effect), storm track 49.92°N (+0.5°, i.e.
+    essentially unchanged). **Storm-track-vs-baroclinicity check: passes**
+    with transport active, holistically re-verifying the local-only
+    sub-deliverable's finding. Resulting macroturbulent heat diffusivity:
+    AT mean 3.60e6 m² s⁻¹, max 1.22e7 m² s⁻¹ — consistent with (slightly
+    above) the already-reported local-only ~3.1e6 m² s⁻¹; **transport does
+    not change the order-of-magnitude conclusion.** The incumbent
+    `eddy_heat_flux_coeff = 0.006` fixed-window term (`simulate.py` ~line
+    5803) is algebraically equivalent to standard diffusion with
+    `D_eff = coeff·dy²` (its Laplacian update is unnormalised by `dy²`);
+    at this project's headline 512-row grid spacing, `D_eff ≈ 106 m² s⁻¹` —
+    **the transport-equilibrated SESAM AT is ~34,000x larger.** The
+    incumbent's `D_eff` is inherently grid-resolution-dependent (scales with
+    `dy²`) while SESAM's AT is a physical quantity independent of grid
+    resolution — itself one more instance of the architectural gap §2 and
+    §4 describe.
+  - **Resolution caveat (an honest limitation, not a further bug):** the
+    prognostic-equilibrium measurement above ran on a 128x256 block-averaged
+    downsample of the real saved state, not the full 512x1024 headline grid.
+    The area/geometry fix above is confirmed correct and resolution-general
+    (unit-tested from 3x4 up to 32x64, and the real-state run showed no
+    divergence before being stopped for time at full resolution), but at
+    512 rows the now-*correctly*-enforced polar-cell CFL constraint demands
+    many thousands of diffusion sub-steps near the poles, making a full
+    512x1024 confirmation run impractically slow within this session's time
+    budget. This is a performance/tractability limitation, not a
+    correctness question, and 128x256 is a precedented resolution for this
+    kind of screen (matches this project's existing 64x128 compact-screen
+    convention and the §6 P6 calibration window). A full-resolution
+    confirmation run (or a performance pass — e.g. vectorising the substep
+    loop, or a coarser default coupling step tuned for high-resolution
+    poles) is flagged as follow-up, not attempted here.
+  - **Full-resolution confirmation (2026-08-18, supersedes the 128x256-transport
+    measurement above and closes the resolution caveat):** the performance
+    blocker was root-caused, not worked around. Direct measurement on the
+    real 512x1024 grid (`spherical_transport_geometry`/`zonal_center_spacing_m`)
+    shows the polar CFL stiffness the caveat above describes lives almost
+    entirely in the **zonal** (east-west) diffusion self-loss term, not the
+    meridional (north-south) one: splitting `eke_diffusion_step`'s exact
+    self-loss geometry into its two directional halves, the meridional term
+    is flat across every latitude row (≈1.31e-9 m⁻², resolution-driven but
+    not pole-specific) while the zonal term grows from ≈1.31e-9 at the
+    equator to ≈1.01e-6 at the pole row — 770x larger, and alone responsible
+    for >99.8% of the pole's self-loss rate. Mechanism: `x_len =
+    radius·dlat` (the east/west face length) is the *same constant* at
+    every row by construction, while true cell area shrinks toward the
+    actual spherical-cap value at the pole, so `x_len/area` diverges there —
+    the classic lon-lat "pole problem" real circulation models solve with
+    implicit zonal treatment or Fourier polar filters, not with implicit
+    *meridional* diffusion (the initial hypothesis going into this
+    investigation, based on the ocean/atmosphere-model implicit-vertical-
+    diffusion analogy — measurement overturned it). At the diagnosed
+    near-pole EKE magnitudes (K ≈ 6.2e3–1.3e5 m² s⁻²), the zonal term alone
+    demanded on the order of 1–20 million diffusion sub-steps for a single
+    0.25-day coupling step at 512 rows — genuinely intractable explicitly,
+    confirming the caveat's "impractically slow" was a real stiffness fact,
+    not a fluke.
+  - **Remedy implemented: `eke_diffusion_step_implicit_zonal`
+    (`sesam_synoptic.py`), a new, separately-tested code path** — an
+    ADI-style directional split: the stiff zonal direction is solved
+    implicitly (backward Euler, unconditionally stable for positive
+    conductances, so no CFL constraint at all) via a periodic (cyclic)
+    tridiagonal solve per row, batched over all rows
+    (`_cyclic_thomas_batch`, the standard Sherman-Morrison/Numerical-Recipes
+    §2.7 cyclic algorithm, cross-checked during development against
+    `numpy.linalg.solve` on the equivalent dense matrix for arbitrary
+    non-constant-coefficient rows to machine precision); the mild
+    meridional direction stays explicit and CFL-substepped exactly as
+    `eke_diffusion_step` already does, since it was never the stiff one.
+    Same face-averaged-AT conservative finite-volume geometry, same
+    nonlinear re-evaluation of AT from the live K each sub-step. This is
+    the standard textbook remedy for CFL-limited explicit diffusion on a
+    grid converging toward a point — a choice of numerical integrator, not
+    a physics shortcut, cap, or damping (`docs/VERTICAL_THERMODYNAMIC_CLOSURE.md`
+    precedent). It is opt-in (`implicit_zonal_diffusion=True` on
+    `eke_transport_step`/`evolve_eke`) and additive: the original explicit
+    `eke_diffusion_step` and its exact-value/planted-violation tests in
+    `testing/test_sesam_synoptic.py` are untouched and still pass unchanged.
+    Verified before use: on the 24x48 tractable-grid case both schemes are
+    already validated on, implicit-zonal lands within 5% (peak) / 15%
+    (neighbours) of explicit after the same simulated time (expected — two
+    consistent time-discretisations of the same PDE, not identical since
+    backward- vs forward-Euler differ); on a synthetic small grid that
+    reproduces the real pole's exact area/face-length ratio, the plain
+    explicit kernel correctly raises `RuntimeError` (>200,000 sub-steps,
+    infeasible) while the implicit kernel completes in <60 sub-steps,
+    stays finite, non-negative, mass-conserving, and respects the discrete
+    maximum principle. 4 new tests added (24 total in the file).
+  - **Full 512x1024 measurement, both seasons, converged:** run via
+    `scripts/diagnose_sesam_synoptic.py --block-size 1` (now the default —
+    a `--block-size`/`--explicit-diffusion` pair of flags still exposes the
+    old fast coarse-screen path for iteration). Both seasons ran the
+    identical local closure and 0.25-day-coupled transport loop as the
+    128x256 measurement above, just at native resolution throughout, with
+    `implicit_zonal_diffusion=True`.
+    - **DJF:** local steady state mean 245.9 m² s⁻², max 6201.6 m² s⁻²,
+      storm track 49.39°N — identical to the 128x256 entry's local numbers,
+      as expected (that number was already computed at native resolution;
+      only the *transport* step was previously downsampled). Prognostic
+      transport converged in 16 iterations (4.0 days simulated, 1731.5 s
+      wall time): mean 275.9 m² s⁻² (+12.2%), max 5621.9 m² s⁻² (−9.3%),
+      storm track 49.39°N (**0.0° shift** — the peak EKE row is literally
+      unchanged by transport). AT mean 3.566e6 m² s⁻¹ — **33,603x** the
+      incumbent's `D_eff ≈ 106 m² s⁻¹` effective diffusivity at this grid.
+    - **JJA:** local steady state mean 232.8 m² s⁻², max 6208.2 m² s⁻²,
+      storm track 49.39°N. Prognostic transport converged in 16 iterations
+      (4.0 days, 1706.0 s wall time): mean 262.0 m² s⁻² (+12.5%), max
+      5632.8 m² s⁻² (−9.3%), storm track 49.39°N (0.0° shift). AT mean
+      3.475e6 m² s⁻¹ — **32,747x** the incumbent.
+  - **Agreement and divergence with the 128x256 screen.** The
+    exit-gate-relevant conclusions are robustly **confirmed**: mean EKE
+    increase from transport (+12–13%) and the AT-vs-incumbent order of
+    magnitude (~33,000–34,000x both resolutions) match closely, and the
+    storm-track-tracks-baroclinicity check passes even more cleanly at
+    native resolution (exactly 0.0° shift vs the coarse screen's +0.5°).
+    But the two **disagree substantially on how much transport smooths the
+    local peak**: −55% at 128x256 (6201.6 → 2813.1) vs only **−9.3%** at
+    native 512x1024 (6201.6 → 5621.9). This is a genuine, real finding, not
+    a bug in either measurement: the 128x256 screen's transport step ran on
+    a block-averaged *downsample* of the already-computed local K field, so
+    its own averaging pre-smooths the sharp local peak before the transport
+    loop ever starts, on top of whatever the transport loop itself then
+    does at the coarser grid — the coarse screen was never measuring "how
+    much does transport smooth the true peak," it was measuring that
+    question on an input that had already lost most of the peak's sharpness
+    to block-averaging. The full-resolution run is the first measurement of
+    the actual quantity the exit gate cares about, and it shows the true
+    peak survives transport much more intact than the coarse screen implied
+    — worth carrying forward as a caution against trusting a coarse-grid
+    transport magnitude even when the coarse grid's *order-of-magnitude*
+    and *qualitative* conclusions (both true here) hold up.
+  - **Exit gate verdict: closed.** The mechanism-replacement question the
+    exit gate asks — does a derived, baroclinicity-responsive macroturbulent
+    diffusivity now exist that could structurally replace the fixed-window
+    incumbent — is answered yes, with a real, converged, real-terrain-derived
+    measurement **at the project's actual headline 512x1024 grid, both
+    seasons**: AT is ~4.5 orders of magnitude larger than the incumbent's
+    effective diffusivity, and storm-track placement is exactly unchanged by
+    transport (0.0° shift both seasons), the cleanest possible pass of the
+    storm-track-vs-baroclinicity check. The resolution caveat that kept the
+    prior entry at "substantially advanced, not unconditionally closed" is
+    resolved by genuine numerical-methods engineering (the implicit-zonal
+    remedy above), not by approximation, a time-budget trade, or accepting
+    the coarser number — the full run was performed and is the number
+    recorded here. What remains explicitly out of scope, unchanged from the
+    prior verdict: wiring the branch into the supported climate path and any
+    resulting climate-impact comparison, which is P6's job, not P3's.
 - **P4 — Column energy and water closure** (A3/A4): prognostic `QT`, `Qq` (reuse
   `column_water.py` flux machinery), 95% RH + land turnover precipitation,
   per-surface-type fluxes with `T2m`. This is the stage that **bypasses the
@@ -717,3 +912,129 @@ semantics. Recorded as they are verified, so no later stage re-derives them.
   circulation), the EKE is realistic (~2e2 m² s⁻²) and the storminess term
   correctly *adds* to it. This is a methodological finding, not a kernel
   correction.
+- **(A52) K-transport substep-count circularity, found and fixed
+  (2026-08-18).** The first working version of `eke_diffusion_step` computed
+  its sub-step count once, from the *initial* AT field, reasoning that pure
+  diffusion with zero-flux boundaries and no source cannot raise a field's
+  peak, so the initial state should bound every later sub-step's AT too.
+  That argument is circular -- it assumes the discrete scheme is already
+  stable in order to conclude it stays stable -- and a single
+  marginally-insufficient sub-step early in a long chain (before AT could
+  relax) is enough to seed a self-reinforcing oscillation, since a larger K
+  in the next sub-step means a larger AT there too (AT depends on K).
+  Confirmed on the real 512x1024 saved state: `RuntimeWarning: overflow
+  encountered in multiply` inside `eke_diffusion_step`. Fixed by recomputing
+  the required sub-step size from the *live* K at every sub-step (an
+  adaptive `while` loop bounded by `diffusion_r_limit`, replacing the
+  original fixed `n_sub` computed once up front).
+- **(A52) K-transport polar-cell area/geometry bug, found and fixed
+  (2026-08-18), a second and independent defect from the one above.**
+  Adaptive re-estimation alone did not stop the real-state divergence: the
+  CFL rate formula, `AT·(1/dx² + 1/dy²)`, implicitly assumes each cell's area
+  is `~ dx·dy` (a flat-grid approximation). This fails specifically at the
+  polar-cap row: the true cell area there is the actual (small) spherical-
+  cap area, which shrinks toward zero much faster than the approximation
+  assumes, while the face length used in the flux formula (`x_len =
+  radius·dlat`) stays the same constant it is at every other row --
+  understating the true self-loss fraction, and hence the true required
+  sub-step restriction, specifically and only at the pole. Traced on the
+  real state by logging the per-substep field maximum: it decayed smoothly
+  (correct diffusion) for ~180 sub-steps, then suddenly diverged starting
+  from row 0 (the north-pole row) outward. Confirmed as a formula error
+  rather than an insufficient stability margin by tightening
+  `diffusion_r_limit` 8x (0.4 → 0.05) on the same real state: the divergence
+  persisted unchanged, which a genuinely marginal-CFL case would not do.
+  Fixed by replacing the `1/dx² + 1/dy²` approximation with the exact
+  per-cell self-loss coefficient derived from the actual face-length/area
+  geometry (`x_len/(dx·area)` summed over all four faces, using the true
+  `x_face_length_m`/`y_face_length_m`/`cell_area_m2` inputs rather than a
+  `dx`/`dy` proxy). This is a real, general defect -- it would affect any
+  spherical grid at any resolution close enough to the pole for the
+  flat-grid approximation to break down, not an artifact of this one saved
+  state -- and, incidentally, ~2x more conservative even on a *uniform*
+  grid far from any pole (the exact formula sums four independent face
+  terms; the approximation implicitly halved them), which shifted this
+  stage's hand-value unit test's exact numbers (documented in
+  `testing/test_sesam_synoptic.py`, re-derived and re-verified after the
+  fix, not merely adjusted to make the test pass).
+- **Advective transport reuses `column_water.evolve_column_water` directly**,
+  not a re-implementation of donor-cell advection: K obeys the identical
+  `dQ/dt = source − div(Qv)` conservative flux-divergence equation as column
+  water, just carrying a different scalar with zero source/sink at that
+  stage. This is a deliberate design choice (module docstring note 6), not
+  merely convenience -- it means the advective term inherits
+  `column_water.py`'s own extensive test coverage rather than introducing a
+  second, independently-fallible implementation of the same numerics.
+- **Pure advection can legitimately concentrate K far above its initial
+  peak with no numerical error at all** -- a finding from tuning the
+  diagnostic driver's coupling step, not a kernel bug. Measured directly:
+  0.1 day of advection alone (zero diffusion, zero source) on the real DJF
+  zonal-only wind field raised the field's max by ~45% (6202 → 9018);
+  extrapolated to a naively large 5-day operator-split coupling step, the
+  same real convergence zone piles K up to 131,112 (21x the pre-advection
+  max) before diffusion ever gets a chance to relax it, which then demands
+  an impractical number of diffusion sub-steps to smooth within that same
+  call. This is the correct behaviour of the continuous advection equation
+  under a persistently convergent velocity field with no counteracting sink
+  in that sub-phase -- not a defect in `evolve_column_water` or in
+  `eke_diffusion_step`. The fix is a diagnostic-driver choice, not a kernel
+  change: `scripts/diagnose_sesam_synoptic.py`'s prognostic-transport driver
+  uses a short 0.25-day coupling step (interleaving advection and diffusion
+  frequently, the same reason real coupled climate models use a short
+  coupling timestep between separately time-stepped processes) rather than
+  a long one.
+- **The 512x1024 polar diffusion stiffness lives in the zonal term, not the
+  meridional one (found 2026-08-18) — overturns the initial hypothesis.**
+  Going into the full-resolution performance investigation, the working
+  assumption (by analogy with real ocean/atmosphere models' implicit
+  *vertical* diffusion and semi-implicit *polar filters*) was that the pole
+  stiffness would live in the meridional (north-south) direction. Direct
+  measurement on the real grid overturned that: splitting
+  `eke_diffusion_step`'s exact self-loss geometry into its zonal and
+  meridional halves, the meridional term is flat across every latitude row
+  (≈1.31e-9 m⁻² everywhere — a resolution-driven cost, present at every row
+  equally, not a pole-specific one) while the zonal term alone grows from
+  ≈1.31e-9 at the equator to ≈1.01e-6 at the pole row (770x), and is alone
+  responsible for >99.8% of the pole's self-loss rate. The mechanism: the
+  east/west face length `x_len = radius·dlat` in `spherical_transport_geometry`
+  is the *same constant* at every row by construction (it does not shrink
+  toward the pole), while true cell area shrinks toward the actual
+  (vanishingly small) spherical-cap value there — so `x_len/area` (the
+  zonal self-loss factor) diverges specifically at the pole, exactly the
+  classic lon-lat-grid "pole problem" that motivates real circulation
+  models' zonal-direction remedies (implicit zonal diffusion or Fourier
+  polar filters), not a meridional one. This matters beyond just this one
+  kernel: any future SESAM (or general lon-lat-grid) explicit horizontal
+  diffusion/advection kernel at this project's headline 512-row resolution
+  should expect the *zonal* direction to be the one that goes stiff near
+  the poles, not the meridional one, unless its own face-length convention
+  differs from `spherical_transport_geometry`'s.
+- **Implicit zonal / explicit meridional (ADI-style) diffusion implemented
+  as a new, separately-tested code path: `eke_diffusion_step_implicit_zonal`
+  (`sesam_synoptic.py`, 2026-08-18).** Backward-Euler (unconditionally
+  stable for positive conductances, so no CFL restriction at all) solved
+  per row via a periodic cyclic tridiagonal system, batched over every row
+  simultaneously (`_cyclic_thomas_batch`); the standard Sherman-Morrison
+  reduction (Numerical Recipes §2.7 "cyclic"): zero the two corner
+  coefficients, correct the two corner diagonal entries
+  (`diag[0] -= gamma`, `diag[-1] -= alpha·beta/gamma` with
+  `gamma = -diag[0]`), solve the resulting plain (non-cyclic) tridiagonal
+  system twice via a batched Thomas algorithm (`_thomas_batch`) against the
+  real right-hand side and a corner-correction vector, then combine via the
+  rank-1 correction factor. Cross-checked during development against
+  `numpy.linalg.solve` on the equivalent dense periodic matrix for
+  arbitrary (non-constant-coefficient) rows to ~1e-14 relative error; a
+  smaller instance of that same check is a permanent test
+  (`test_cyclic_thomas_batch_matches_dense_solve`). The meridional direction
+  stays exactly as `eke_diffusion_step` already does it (explicit,
+  CFL-substepped, face-averaged AT) since it was never the stiff term. Kept
+  fully separate from the validated explicit `eke_diffusion_step` (task
+  requirement and good practice regardless): opt-in via
+  `implicit_zonal_diffusion=True` on `eke_transport_step`/`evolve_eke`,
+  the original function and its exact-value/planted-violation tests
+  untouched. This removed the need for on the order of 1–20 million
+  diffusion sub-steps (the explicit scheme's real, measured requirement at
+  the diagnosed near-pole EKE magnitudes) down to ~530–540 sub-steps per
+  0.25-day coupling step at full 512x1024 resolution — the meridional CFL
+  bound that remains is an ordinary, resolution-driven cost, not a
+  pole-specific one, per the finding above.
