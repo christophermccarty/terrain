@@ -807,9 +807,70 @@ so each is evaluable without the next.
     A5 constants only; the live reference repo's namelist has since drifted
     from them (e.g. `c_cld_5=0.75` there vs the paper's printed 0.5) and is
     not a citable source under the section 6 calibration-window policy.
-    Remaining P5 sub-deliverables: (A69)-(A105) shortwave delta-Eddington,
-    (A106)-(A117) longwave two-stream, the (A10) tropopause radiative
-    closure, and the TOA-flux exit-gate measurement.
+  - **Second sub-deliverable complete (2026-08-19): shortwave radiation**
+    (A69)-(A105) as pure functions in `sesam_shortwave.py` — (A79)-(A80)
+    atmospheric scattering albedo, (A81)-(A82) cloud albedo, (A87)-(A89)
+    water-vapour/aerosol transmission, (A94)-(A105) the shared absorber-mass-
+    path structure (water and aerosol are the literal same formula), (A75)-
+    (A78) planetary albedo and (A83)-(A86) surface transmission (both via one
+    shared two-stream adding-method combinator), and the (A69)-(A74) band/sky
+    combination, assembled end to end by `shortwave_radiation()`. Guarded by
+    `testing/test_sesam_shortwave.py` (26 tests). Verified against the source
+    PDF (500-600 dpi renders) and, for two genuine paper transcription
+    errors, against `src/atm/swr.f90`/`constants.f90` (read-only, per section
+    5): (A87)/(A88)'s visible/IR band labels are swapped in the published
+    PDF (water vapour absorbs in near-IR, not visible/UV — corrected to match
+    physics and the reference code), and (A97)'s cloud-thickness term has a
+    sign error (printed `e^{+Dcld/Hq}`, unbounded; corrected to the reference
+    implementation's bounded `e^{-Dcld/Hq}`, consistent with the paper's own
+    neighbouring `f_exp` definitions). Confirmed no ozone climatology is
+    needed anywhere in the shortwave scheme — (A90)/(A91) are fixed constants
+    (0.96/1), not a field — so the ozone-climatology design question raised
+    at P5's scoping applies only to the (A106)-(A117) longwave stage.
+  - **Third sub-deliverable complete (2026-08-19): longwave radiation**
+    (A108)-(A116) as pure functions in `sesam_longwave.py` — (A110)-(A112)
+    water-vapour/CO2/ozone transmission, (A113) cloud transmission (only
+    inside cloud layers), (A108)/(A109) combination, (A114)-(A116) absorber
+    mass paths, and the (A106)/(A107) flux-profile assembly discretized as a
+    Riemann-Stieltjes sum over the level grid. Gated `enable_sesam_radiation`
+    (same gate as clouds/shortwave; default False, **not wired into the
+    supported path**), guarded by `testing/test_sesam_longwave.py` (26
+    tests) including two structural boundary-condition checks derived
+    directly from (A106)/(A107) themselves (discretized downward flux
+    vanishes at the top of atmosphere; discretized upward flux at the
+    surface level equals the surface's own blackbody emission exactly) — a
+    stronger correctness guarantee than a hand-value check alone, since both
+    hold for *any* transmission matrix. The absorber-mass integrals
+    (A114)-(A116), which the GMD paper states only as an abstract integral
+    with no worked discretization, use the exponential reference pressure
+    profile stage P1 already provides ((A1), exact for well-mixed CO2, since
+    P1's own profile literally is that exponential; trapezoidal quadrature
+    against P1's real humidity profile for water vapour). This closure
+    method is independently verified against a second citable source located
+    with the user's direct help: **Petoukhov, Ganopolski & Claussen (2003),
+    PIK Report No. 81** — SESAM's direct scientific ancestor (POTSDAM-2 is
+    CLIMBER-2's atmosphere module) — whose §6.1.2 confirms in prose that its
+    own absorber-mass integral (the same integral as A114-A116) is evaluated
+    "on the assumption that the vertical profiles are quasi-exponential for
+    pressure and air density." This resolved a real scope question raised
+    mid-implementation: the reference Fortran's absorber-mass closure
+    initially looked sourced only from an inaccessible internal report methodology
+    rather than the published paper, which would have sat closer to the
+    project's "written from the paper" licensing line than any prior P5
+    disambiguation; the PIK report — found by the user, not fetchable by
+    Claude directly — closes that gap with a real citation. One open item
+    remains flagged in the module docstring (not blocking): CO2's ppm-to-
+    column-mass conversion is a standard atmospheric-chemistry calculation
+    but not verified against the paper's specific "cm" absorber-mass
+    convention the way the water-vapour identity is. Ozone is confirmed to
+    need a real climatology here (unlike shortwave) and remains an accepted
+    external input — the constant/zonal-climatology/real-dataset decision is
+    still open.
+
+  Remaining P5 items: the (A10) tropopause radiative closure (wiring this
+  stage's `Rstr,net` into P1's already-built but input-starved
+  `tropopause_tendency`), the ozone-climatology decision, and the TOA-flux
+  exit-gate measurement against the paper's validation figures.
 - **P6 — The calibration window** (§6), then the standard 128×256 five-year
   promotion checkpoint.
 

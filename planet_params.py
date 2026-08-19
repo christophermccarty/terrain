@@ -676,26 +676,49 @@ class PlanetParams:
     """
 
     enable_sesam_radiation: bool = False
-    """Compute SESAM (CLIMBER-X) diagnostic cloud fraction/height/optical
-    thickness (stage P5, sub-deliverable 1: clouds).
+    """Compute SESAM (CLIMBER-X) diagnostic clouds, shortwave and longwave
+    radiation (stage P5, sub-deliverables 1-3 of 5: clouds, shortwave,
+    longwave).
 
-    Pure diagnostic kernels in ``sesam_radiation.py``, Appendix A6 of
-    Willeit et al. (2022), GMD 15, 5905-5948: the (A61)-(A62) combined
-    humidity/vertical-velocity cloud fraction, the (A63)-(A64) effective
-    cloud-level vertical velocity (mean 700 hPa + synoptic + orographic
-    terms), the (A65)-(A66) inversion/low-cloud fraction with its freeze-dry
-    factor, the (A67) cloud top height, and the (A68) cloud optical
-    thickness. Reuses stage P1's ``saturation_specific_humidity``, stage
-    P4's ``surface_relative_humidity_star``/``t2m_diagnostic``, and stage
-    P3's ``synoptic_vertical_velocity``/``total_wind_magnitude`` directly
-    rather than recomputing them.
+    Pure diagnostic kernels transcribed from Willeit et al. (2022),
+    GMD 15, 5905-5948:
+    - ``sesam_radiation.py``, Appendix A6 — the (A61)-(A62) combined
+      humidity/vertical-velocity cloud fraction, the (A63)-(A64) effective
+      cloud-level vertical velocity (mean 700 hPa + synoptic + orographic
+      terms), the (A65)-(A66) inversion/low-cloud fraction with its freeze-
+      dry factor, the (A67) cloud top height, and the (A68) cloud optical
+      thickness;
+    - ``sesam_shortwave.py``, Appendix A7 — the two-band delta-Eddington
+      shortwave scheme: (A79)-(A82) scattering/cloud albedo, (A87)-(A89)
+      water-vapour/aerosol transmission, (A94)-(A105) absorber-mass paths,
+      (A75)-(A78)/(A83)-(A86) planetary albedo and surface transmission, and
+      the (A69)-(A74) band/sky combination assembled by
+      ``shortwave_radiation()``. Two published-paper transcription errors
+      were found and corrected here (see the module docstring): a swapped
+      visible/IR band label on the water-vapour transmission (A87)/(A88),
+      and a sign error in the cloud-thickness exponent (A97);
+    - ``sesam_longwave.py``, Appendix A8 — the 15-level two-stream longwave
+      scheme: (A110)-(A112) water-vapour/CO2/ozone transmission, (A113)
+      cloud transmission, (A108)/(A109) combination, (A114)-(A116) absorber
+      mass paths, and the (A106)/(A107) flux-profile assembly by
+      ``longwave_flux_profile()``. The GMD paper leaves the absorber-mass
+      integral's discretization unworked; this module's closure is
+      independently verified against Petoukhov, Ganopolski & Claussen
+      (2003), PIK Report No. 81 (SESAM's direct scientific ancestor), not
+      just inferred from the reference Fortran.
+
+    All three reuse earlier stages directly rather than recomputing
+    anything: stage P1's ``saturation_specific_humidity``/exponential
+    pressure profile, stage P4's
+    ``surface_relative_humidity_star``/``t2m_diagnostic``, and stage P3's
+    ``synoptic_vertical_velocity``/``total_wind_magnitude``.
 
     This gate is off by default and is **not wired into the supported
-    climate path**: nothing in ``simulate.py`` calls ``sesam_radiation``, so
-    enabling it has zero default-path climate impact. It exists as the
-    documented hook for this same stage's remaining sub-deliverables (the
-    A69-A105 shortwave and A106-A117 longwave schemes that consume this
-    module's cloud fraction/height/thickness), and for stage P6 (the bounded
+    climate path**: nothing in ``simulate.py`` calls ``sesam_radiation``,
+    ``sesam_shortwave``, or ``sesam_longwave``, so enabling it has zero
+    default-path climate impact. It exists as the documented hook for this
+    same stage's remaining items (the (A10) tropopause radiative closure and
+    the ozone-climatology decision), and for stage P6 (the bounded
     calibration window) once the full radiation budget closes.
     """
 
