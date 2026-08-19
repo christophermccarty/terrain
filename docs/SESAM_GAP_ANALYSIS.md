@@ -665,12 +665,125 @@ so each is evaluable without the next.
     recorded here. What remains explicitly out of scope, unchanged from the
     prior verdict: wiring the branch into the supported climate path and any
     resulting climate-impact comparison, which is P6's job, not P3's.
-- **P4 — Column energy and water closure** (A3/A4): prognostic `QT`, `Qq` (reuse
-  `column_water.py` flux machinery), 95% RH + land turnover precipitation,
-  per-surface-type fluxes with `T2m`. This is the stage that **bypasses the
-  row-target allocator** inside the branch. *Exit*: water/energy conservation
-  residuals at the `column_water.py` standard; raw global P in [0.5, 5] mm/day
-  without any target.
+- **P4 — Column energy and water closure** (A3/A4) ✅ **exit gate passed
+  (2026-08-18)**: prognostic `QT`/`Ta` (A40), `Qq`/`qa` (A42, reusing
+  `column_water.py` flux machinery), the (A41)/(A43) `T2m`/`q2m` near-surface
+  diagnostics, and the (A44)/(A45) precipitation closure (moisture
+  convergence scaled by a continuous relative-humidity efficiency, plus a
+  land-only turnover term) as pure functions in `sesam_thermo.py`. This is
+  the stage that **bypasses the row-target allocator**: `P` in this branch
+  never touches `target_row_mm_day`, it is entirely a local moisture-budget
+  residual. Gated `enable_sesam_column_closure` (default False, **not wired
+  into the supported path**), guarded by `testing/test_sesam_thermo.py`
+  (29 tests: hand-computed values for every equation, planted-violation
+  tests for the shared diffusion primitive's face-averaging and CFL
+  sub-stepping, and conservation checks matching `column_water.py`'s own
+  contract). `scripts/diagnose_sesam_thermo.py` runs the full chain
+  (P1 vertical structure → P2 zonal-only SLP/wind → P3 local-steady-state
+  EKE → P4 column energy/water) diagnostically on the saved state for
+  DJF/JJA.
+  - **Equations verified against the article PDF directly** (2026-08-18,
+    same preprint mirror as the P2 §10 A38 finding, pages 44-47): this is
+    the first time A40-A45 were read from the source rather than
+    paraphrased. One real correction to this document's own earlier
+    shorthand: the gap-analysis dossier's §1/§7 paraphrase "moisture
+    convergence past 95% RH" undersold (A44)'s actual form — it is not a
+    hard threshold at `ra > ramax`, but a *continuous* efficiency `ra/ramax`
+    applied to the entire gross convergence-plus-evaporation term at every
+    `ra`, reaching 100% conversion only when `ra` reaches its ceiling. Full
+    verification log in `sesam_thermo.py`'s module docstring (8 numbered
+    notes) — cv/Le/Ls are confirmed genuinely unpublished (Table A3 prints
+    no parameter table beyond physical constants), so this module adopts
+    this project's own existing `cp=1004.0`/`Rd=287.0`/`Le=2.5e6` convention
+    (`land_surface.py`, `atmosphere.py`) rather than a fourth independent
+    set of constants.
+  - **(A46)-(A51) finding**: confirmed directly from the PDF that the
+    macroturbulent diffusivities `AT`/`Aq` used for Ta/qa transport are the
+    *literal same* `AT = c5syn·√K` / `Aq = c6syn·K` stage P3 already built
+    for K's own (A52) transport — not a new closure applied to a different
+    scalar by analogy, but the identical symbols. `sesam_thermo.py` imports
+    P3's `horizontal_diffusion_coefficient`/`moisture_diffusion_coefficient`
+    directly rather than recomputing them.
+  - **Polar zonal-diffusion stiffness recurs here, pre-empted rather than
+    re-discovered**: since AT/Aq inherit K's own magnitude (~1e6-1e7 range),
+    diffusing Ta/qa by them at the 512x1024 headline grid hits the identical
+    `x_len/area` polar divergence P3's 2026-08-18 entry found and fixed for
+    K's own diffusion. Rather than wait to hit it on a real run,
+    `sesam_thermo.py` ships a generic `_linear_diffusion_step_implicit_zonal`
+    from the start, reusing P3's already-validated `_cyclic_thomas_batch`
+    cyclic tridiagonal solve directly (not a second implementation of the
+    same algorithm). Simpler than P3's own implicit-zonal kernel in one
+    respect: because AT/Aq here are *externally supplied* (computed once
+    from K, not self-referential the way K's own AT is), the substep count
+    and zonal conductances are built once per call rather than adaptively
+    re-estimated — there is no nonlinear self-consistency loop to guard
+    against, only the ordinary CFL bound on the (never pole-stiff)
+    meridional half.
+  - **Two real bugs found and fixed during development** (both caught by
+    `testing/test_sesam_thermo.py` before this module ever touched the real
+    saved state, matching the "verify before use" discipline P3's own bug
+    hunts established): (1) the new diffusion primitive initially had no
+    substep-count safety cap, unlike `sesam_synoptic.eke_diffusion_step`'s
+    own `max_substeps=200_000` — a pathological-geometry test case hung the
+    test run indefinitely instead of raising `RuntimeError`; fixed by
+    porting the same cap to both the explicit and implicit-zonal variants.
+    (2) `evolve_column_water_vapor` passed the column-integrated water depth
+    `Qq` (mm) into (A45)'s `qa` slot, which needs near-surface *specific
+    humidity* (kg/kg) — a distinct physical quantity the function never
+    separately received. This inflated the slope-convergence term by
+    roughly the mm-to-kg/kg magnitude ratio (~1000x) and was caught by a
+    synthetic-field physical-bounds sanity test (global P computed at
+    2345 mm/day against an intended "generously above Earth's mean" ceiling
+    of 50). Fixed by adding an explicit, separate
+    `near_surface_specific_humidity_kg_kg` parameter; the diagnostic
+    script's own call site had the same conflation (passing raw specific
+    humidity into the *relative*-humidity `near_surface_rh` slot) and was
+    fixed alongside by diagnosing `ra = qa/qsat(Ta, p0)` explicitly.
+  - **Diagnostic placeholders** (documented, not fabricated physics,
+    following the same policy P2/P3's drivers already established): no
+    evaporation field is saved, so the script computes a standard bulk-
+    aerodynamic estimate `E = rho0·Ch·|wind|·max(qsat(Tskin)-qa, 0)`
+    (`Ch=1.3e-3`, the saved `wind_speed_avg` field) — not the project's
+    real evaporation code, which the script does not attempt to extract
+    from `simulate.py`/`atmosphere.py`. `Qq` is diagnosed from the saved
+    specific-humidity field via `qa · 2000 kg/m²`, the *same* lower-layer
+    water-mass scale `atmosphere.py`'s own gated `enable_prognostic_column_water`
+    path already uses (not a new, inconsistent conversion). EKE is P3's
+    local steady state, not the full prognostic-transport-to-equilibrium
+    loop (P3's own exit gate already closed that question separately).
+  - **Energy-closure scope, an honest limitation**: (A40)'s diabatic source
+    needs atmosphere-absorbed SW and net atmosphere LW, which do not exist
+    as separable fields until stage P5 (radiation) replaces the current
+    single-layer grey scheme. Rather than fabricate a SWa/LWa split from
+    fields the model does not track, the real-state measurement reports the
+    column-energy kernel's conservation contract under zero external
+    forcing only (pure advection + diffusion) — the same scope P3's own
+    "pure-transport conservation check" used for K. The nonzero-source
+    algebra (the actual point of A40) is fully covered by hand-computed
+    unit tests instead. Wiring a real SWa/LWa/SH assembly is P5's/P6's job,
+    not P4's.
+  - **Exit-gate measurement, full 512x1024 resolution, both seasons
+    (2026-08-18)**: global precipitation lands inside the target band with
+    no target ever supplied — **DJF 2.70 mm/day, JJA 3.00 mm/day** — both
+    close to the incumbent row-target allocator's own output on the same
+    state (DJF 2.80, JJA 2.91 mm/day), a reassuring cross-check that the
+    two very differently-derived mechanisms agree in aggregate even though
+    P4's `P` is a pure local residual with no prescribed profile anywhere in
+    its call chain. Conservation: water relative residual 5.4e-7 (DJF) /
+    6.1e-6 (JJA); energy (pure-transport) relative residual 2.2e-16 (DJF) /
+    0.0 (JJA) — both at or below `column_water.py`'s own established
+    precision standard. A coarse 64x128 screen (run first, to catch bugs
+    cheaply) gave consistent numbers (DJF 1.98, JJA 2.23 mm/day, exact
+    water conservation), confirming the result is not a resolution
+    artifact. Full test suite: no regressions (see below).
+  - **What remains explicitly out of scope**, unchanged in spirit from P2/P3's
+    own admission language: wiring this branch's `P`/`Ta` into the supported
+    climate path, per-surface-type flux sharing beyond the `T2m`/`q2m`
+    diagnostic formulas themselves (a real coupling question the SST-land
+    D3 precedent already flagged as its own separate effort), and the real
+    SWa/LWa energy-budget measurement that needs P5. All are P5/P6's job,
+    not P4's — P4's own stated exit gate (conservation + raw global P range,
+    no target) is unambiguously met.
 - **P5 — Radiation upgrade** (A7/A8): only after P1 gives it real profiles.
   Two-band SW + 15-level two-stream LW. *Exit*: TOA fluxes vs the paper's
   validation figures; ECS moves off the structural ~1.8 K floor.

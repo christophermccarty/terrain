@@ -650,6 +650,31 @@ class PlanetParams:
     remains False.
     """
 
+    enable_sesam_column_closure: bool = False
+    """Compute SESAM (CLIMBER-X) diagnostic column energy/water closure
+    (stage P4).
+
+    Pure diagnostic kernels in ``sesam_thermo.py``, Appendix A3/A4 of
+    Willeit et al. (2022), GMD 15, 5905-5948: the prognostic column-energy
+    budget solved for ``Ta`` (A40), the near-surface diagnostics ``T2m``
+    (A41) and ``q2m`` (A43), and the (A44)/(A45) precipitation closure
+    (moisture convergence scaled by relative-humidity efficiency, plus a
+    land-only turnover term) that replaces the supported path's
+    ``target_row_mm_day`` allocator inside the SESAM branch only. Column
+    water transport itself reuses the already-built ``column_water.py``
+    (gate ``enable_prognostic_column_water``); this gate adds the energy
+    side and the (A44) precipitation formula that closes it.
+
+    This gate is off by default and is **not wired into the supported
+    climate path**: nothing in ``simulate.py`` calls ``sesam_thermo``, so
+    enabling it has zero default-path climate impact. It exists as the
+    documented hook for stage P6 (the bounded calibration window) to couple
+    this closure into the SESAM branch once P5 (radiation) supplies real
+    ``SWa``/``LWa`` atmosphere-absorbed fluxes; until then
+    ``docs/SESAM_GAP_ANALYSIS.md``'s P4 diagnostic script exercises it
+    against a documented proxy heating field, not the real radiation code.
+    """
+
     enable_force_restore_atmospheric_heat_convergence: bool = False
     """Feed resolved atmospheric heat convergence to force-restore land.
 
