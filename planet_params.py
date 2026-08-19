@@ -675,6 +675,30 @@ class PlanetParams:
     against a documented proxy heating field, not the real radiation code.
     """
 
+    enable_sesam_radiation: bool = False
+    """Compute SESAM (CLIMBER-X) diagnostic cloud fraction/height/optical
+    thickness (stage P5, sub-deliverable 1: clouds).
+
+    Pure diagnostic kernels in ``sesam_radiation.py``, Appendix A6 of
+    Willeit et al. (2022), GMD 15, 5905-5948: the (A61)-(A62) combined
+    humidity/vertical-velocity cloud fraction, the (A63)-(A64) effective
+    cloud-level vertical velocity (mean 700 hPa + synoptic + orographic
+    terms), the (A65)-(A66) inversion/low-cloud fraction with its freeze-dry
+    factor, the (A67) cloud top height, and the (A68) cloud optical
+    thickness. Reuses stage P1's ``saturation_specific_humidity``, stage
+    P4's ``surface_relative_humidity_star``/``t2m_diagnostic``, and stage
+    P3's ``synoptic_vertical_velocity``/``total_wind_magnitude`` directly
+    rather than recomputing them.
+
+    This gate is off by default and is **not wired into the supported
+    climate path**: nothing in ``simulate.py`` calls ``sesam_radiation``, so
+    enabling it has zero default-path climate impact. It exists as the
+    documented hook for this same stage's remaining sub-deliverables (the
+    A69-A105 shortwave and A106-A117 longwave schemes that consume this
+    module's cloud fraction/height/thickness), and for stage P6 (the bounded
+    calibration window) once the full radiation budget closes.
+    """
+
     enable_force_restore_atmospheric_heat_convergence: bool = False
     """Feed resolved atmospheric heat convergence to force-restore land.
 

@@ -784,9 +784,32 @@ so each is evaluable without the next.
     SWa/LWa energy-budget measurement that needs P5. All are P5/P6's job,
     not P4's — P4's own stated exit gate (conservation + raw global P range,
     no target) is unambiguously met.
-- **P5 — Radiation upgrade** (A7/A8): only after P1 gives it real profiles.
-  Two-band SW + 15-level two-stream LW. *Exit*: TOA fluxes vs the paper's
-  validation figures; ECS moves off the structural ~1.8 K floor.
+- **P5 — Radiation upgrade** (A6/A7/A8): only after P1 gives it real profiles.
+  Cloud scheme, then two-band SW + 15-level two-stream LW. *Exit*: TOA fluxes
+  vs the paper's validation figures; ECS moves off the structural ~1.8 K floor.
+  - **First sub-deliverable complete (2026-08-19): the cloud scheme** (A61)-
+    (A68) as pure functions in `sesam_radiation.py` — (A62) humidity/vertical-
+    velocity cloud fraction, (A63)-(A64) effective cloud-level vertical
+    velocity (mean 700 hPa + synoptic + orographic terms), (A65)-(A66)
+    inversion/low-cloud fraction with freeze-dry factor, (A61) combination,
+    (A67) cloud top height, (A68) cloud optical thickness. Gated
+    `enable_sesam_radiation` (default False, **not wired into the supported
+    path**), guarded by `testing/test_sesam_radiation.py`. Equations verified
+    against the source PDF (500 dpi PyMuPDF render, poppler unavailable) and,
+    where the paper's notation was ambiguous, against the reference
+    implementation's `src/atm/clouds.f90`/`time_step.f90` (read-only, per
+    section 5). Two findings recorded in the module docstring: (A65)'s un-
+    numbered `r*` symbol is exactly stage P4's `surface_relative_humidity_star`
+    (no new physics needed), and (A65)'s "when r*>ra" phrasing describes a
+    continuous ramp in the reference implementation, not a hard branch —
+    the same "prose reads as a threshold, the real formula is continuous"
+    pattern already found once for (A44) at P4. Follows the published Table
+    A5 constants only; the live reference repo's namelist has since drifted
+    from them (e.g. `c_cld_5=0.75` there vs the paper's printed 0.5) and is
+    not a citable source under the section 6 calibration-window policy.
+    Remaining P5 sub-deliverables: (A69)-(A105) shortwave delta-Eddington,
+    (A106)-(A117) longwave two-stream, the (A10) tropopause radiative
+    closure, and the TOA-flux exit-gate measurement.
 - **P6 — The calibration window** (§6), then the standard 128×256 five-year
   promotion checkpoint.
 
