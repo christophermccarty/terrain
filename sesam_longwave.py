@@ -407,6 +407,172 @@ def sky_combine(
     return f * cld + (1.0 - f) * cs
 
 
+# ---------------------------------------------------------------------------
+# Full-column assembly (mirrors sesam_shortwave.shortwave_radiation's role:
+# wires the pure A108-A116 pieces above into one (N,N,H,W) transmission
+# matrix and calls longwave_flux_profile). Added alongside the P5 TOA
+# exit-gate work since nothing before this needed the whole scheme run
+# end-to-end -- each piece was unit-tested in isolation.
+# ---------------------------------------------------------------------------
+
+
+def _pairwise_transmission_matrix(
+    specific_humidity_profile_kg_kg: np.ndarray,
+    ozone_mixing_ratio_profile_kg_kg: np.ndarray,
+    pressure_profile_pa: np.ndarray,
+    air_density_profile_kg_m3: np.ndarray,
+    levels_m: np.ndarray,
+    surface_pressure_pa: np.ndarray,
+    co2_ppm: float,
+    gravity: float,
+    cloud_transmission: np.ndarray | float,
+    a8: dict[str, float] | None = None,
+) -> np.ndarray:
+    """Build the ``(N, N, H, W)`` combined transmission matrix (A108)/(A109)
+    by evaluating (A110)-(A112) mass paths for every level pair.  Symmetric
+    and unit-diagonal by construction (mass path between a level and itself
+    is zero, so every transmission factor is 1). ``cloud_transmission`` is
+    either the scalar ``1.0`` (clear-sky matrix) or a precomputed
+    ``(N, N, H, W)`` array (cloudy matrix, from :func:`cloud_lw_transmission`
+    evaluated per level pair).
+    """
+    params = a8 or _a8_defaults()
+    n = pressure_profile_pa.shape[0]
+    pressure_ratio = pressure_profile_pa / surface_pressure_pa[None, :, :]
+    hw_shape = pressure_profile_pa.shape[1:]
+    matrix = np.ones((n, n) + hw_shape, dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            mwv = water_vapor_mass_path_g_cm2(
+                specific_humidity_profile_kg_kg, pressure_profile_pa,
+                air_density_profile_kg_m3, levels_m, surface_pressure_pa, i, j, a8=params,
+            )
+            mo3 = ozone_mass_path_g_cm2(
+                ozone_mixing_ratio_profile_kg_kg, pressure_profile_pa,
+                air_density_profile_kg_m3, levels_m, surface_pressure_pa, i, j, a8=params,
+            )
+            mco2 = co2_mass_path_g_cm2(
+                co2_ppm, pressure_ratio[i], pressure_ratio[j], surface_pressure_pa, gravity, a8=params,
+            )
+            dwv = water_vapor_lw_transmission(mwv, a8=params)
+            do3 = ozone_lw_transmission(mo3, a8=params)
+            dco2 = co2_lw_transmission(mco2, a8=params)
+            cld = cloud_transmission if np.isscalar(cloud_transmission) else cloud_transmission[i, j]
+            d = combined_transmission(dwv, dco2, do3, cloud_transmission=cld)
+            matrix[i, j] = d
+            matrix[j, i] = d
+    return matrix
+
+
+def _cloud_transmission_matrix(
+    levels_m: np.ndarray,
+    cloud_base_height_m: np.ndarray,
+    cloud_top_height_m: np.ndarray,
+    cloud_optical_thickness: np.ndarray,
+) -> np.ndarray:
+    """``(N, N, H, W)`` array of (A113) cloud transmission for every level
+    pair, ``1.0`` unless both levels of the pair fall inside the cloud
+    layer (``cloud_base_height_m`` to ``cloud_top_height_m``)."""
+    n = levels_m.shape[0]
+    hw_shape = cloud_top_height_m.shape
+    thickness = np.maximum(cloud_top_height_m - cloud_base_height_m, 1.0)
+    inside_level = (levels_m[:, None, None] >= cloud_base_height_m[None, :, :]) & (
+        levels_m[:, None, None] <= cloud_top_height_m[None, :, :]
+    )
+    matrix = np.ones((n, n) + hw_shape, dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            inside = inside_level[i] & inside_level[j]
+            gap = np.full(hw_shape, abs(levels_m[j] - levels_m[i]))
+            d = cloud_lw_transmission(gap, thickness, cloud_optical_thickness, inside)
+            matrix[i, j] = d
+            matrix[j, i] = d
+    return matrix
+
+
+@dataclass(frozen=True)
+class LongwaveTOA:
+    """Full-column (A106)-(A117) result: sky-combined fluxes at every level
+    (``(N, H, W)``) plus the two scalar diagnostics the (A10) tropopause
+    closure and a TOA exit-gate measurement actually need."""
+
+    downward_w_m2: np.ndarray
+    upward_w_m2: np.ndarray
+    outgoing_longwave_w_m2: np.ndarray  # upward_w_m2 at the top level (OLR)
+
+
+def longwave_radiation(
+    temperature_profile_k: np.ndarray,
+    specific_humidity_profile_kg_kg: np.ndarray,
+    ozone_mixing_ratio_profile_kg_kg: np.ndarray,
+    pressure_profile_pa: np.ndarray,
+    air_density_profile_kg_m3: np.ndarray,
+    levels_m: np.ndarray,
+    surface_pressure_pa: np.ndarray,
+    surface_skin_temp_k: np.ndarray,
+    co2_ppm: float,
+    gravity: float,
+    cloud_fraction: np.ndarray,
+    cloud_base_height_m: np.ndarray,
+    cloud_top_height_m: np.ndarray,
+    cloud_optical_thickness: np.ndarray,
+    a8: dict[str, float] | None = None,
+) -> LongwaveTOA:
+    """Full (A106)-(A117) pipeline: assembles the clear-sky and cloudy
+    ``(N, N, H, W)`` transmission matrices, runs :func:`longwave_flux_profile`
+    for each, and sky-combines them via :func:`sky_combine` -- the same
+    two-pass clear/cloudy-then-combine structure
+    ``sesam_shortwave.shortwave_radiation`` already uses, rather than
+    combining transmission at the matrix level (the paper defines
+    (A108)/(A109) as two whole separate flux solutions, not a blended
+    transmission function).
+
+    Level 0 must be the surface, level ``N-1`` the model top (matching
+    :func:`longwave_flux_profile`'s convention). ``levels_m`` must extend
+    above the tropopause into the stratosphere for a genuine top-of-
+    atmosphere OLR -- a level grid that stops at the tropopause (as the
+    P1-P4 diagnostic scripts' reduced grids do) silently misidentifies the
+    tropopause as "space", one of docstring finding 7's two required
+    stratosphere levels below.
+    """
+    params = a8 or _a8_defaults()
+    t = _check_profile("temperature_profile_k", temperature_profile_k)
+    n = t.shape[0]
+    levels = np.asarray(levels_m, dtype=np.float64)
+    if levels.shape[0] != n:
+        raise ValueError("levels_m must match the profile's level axis")
+    ps = _check_2d("surface_pressure_pa", surface_pressure_pa)
+    b = blackbody_emission_w_m2(t)
+    bs = blackbody_emission_w_m2(_check_2d("surface_skin_temp_k", surface_skin_temp_k))
+
+    d_clear = _pairwise_transmission_matrix(
+        specific_humidity_profile_kg_kg, ozone_mixing_ratio_profile_kg_kg,
+        pressure_profile_pa, air_density_profile_kg_m3, levels, ps, co2_ppm, gravity,
+        cloud_transmission=1.0, a8=params,
+    )
+    d_cloud_only = _cloud_transmission_matrix(
+        levels, cloud_base_height_m, cloud_top_height_m, cloud_optical_thickness,
+    )
+    d_cloudy = _pairwise_transmission_matrix(
+        specific_humidity_profile_kg_kg, ozone_mixing_ratio_profile_kg_kg,
+        pressure_profile_pa, air_density_profile_kg_m3, levels, ps, co2_ppm, gravity,
+        cloud_transmission=d_cloud_only, a8=params,
+    )
+
+    clear = longwave_flux_profile(b, bs, d_clear)
+    cloudy = longwave_flux_profile(b, bs, d_cloudy)
+
+    fcld = _check_2d("cloud_fraction", cloud_fraction)
+    down = sky_combine(clear.downward_w_m2, cloudy.downward_w_m2, fcld)
+    up = sky_combine(clear.upward_w_m2, cloudy.upward_w_m2, fcld)
+
+    return LongwaveTOA(
+        downward_w_m2=down,
+        upward_w_m2=up,
+        outgoing_longwave_w_m2=up[n - 1],
+    )
+
+
 __all__ = [
     "blackbody_emission_w_m2",
     "water_vapor_lw_transmission",
@@ -420,4 +586,6 @@ __all__ = [
     "LongwaveRadiation",
     "longwave_flux_profile",
     "sky_combine",
+    "LongwaveTOA",
+    "longwave_radiation",
 ]

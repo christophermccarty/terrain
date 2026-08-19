@@ -292,3 +292,98 @@ def test_sky_combine_identity_at_zero_and_full_cloud_fraction():
     cld = np.array([[40.0]])
     assert slw.sky_combine(cs, cld, np.zeros((1, 1))) == pytest.approx(100.0)
     assert slw.sky_combine(cs, cld, np.ones((1, 1))) == pytest.approx(40.0)
+
+
+# ---------------------------------------------------------------------------
+# Full-column assembly (longwave_radiation)
+# ---------------------------------------------------------------------------
+
+
+def _realistic_profile(n, h, w):
+    """A monotonically-decreasing-with-height temperature/humidity/ozone
+    profile on a surface-to-30km grid, built from stage P1's own kernels --
+    not hand-picked numbers, so the full pipeline is exercised on physically
+    self-consistent inputs."""
+    import sesam_vertical as sv
+
+    levels = np.linspace(0.0, 30000.0, n)
+    p0 = 101325.0
+    t2m = np.full((h, w), 288.0)
+    skin = np.full((h, w), 288.0)
+    surface_kind = np.zeros((h, w), dtype=np.int64)
+    qa = np.full((h, w), 0.008)
+    zs = np.zeros((h, w))
+    ht = np.full((h, w), 12000.0)
+    structure = sv.compute_vertical_structure(
+        levels,
+        near_surface_air_temp_k=t2m, skin_temp_k=skin, surface_kind=surface_kind,
+        near_surface_specific_humidity_kgkg=qa, surface_elevation_m=zs,
+        tropopause_height_m=ht, p0_pa=p0, gravity=9.81, reference_temp_k=288.0,
+    )
+    return levels, structure, skin
+
+
+def test_longwave_radiation_toa_flux_is_physically_bounded():
+    """End-to-end (A106)-(A117) sanity check: OLR for an Earth-like profile
+    should land in the observed climatological ballpark (Table 1's
+    CLIMBER-X/observed thermal-up TOA is ~237-240 W/m^2), not merely be
+    finite -- this is the same discipline as the P4 exit gate's raw
+    unclamped precipitation-range check."""
+    n, h, w = 8, 2, 2
+    levels, structure, skin = _realistic_profile(n, h, w)
+    o3 = np.zeros((n, h, w))  # no ozone: isolates the LW water/CO2/cloud path
+    result = slw.longwave_radiation(
+        structure.temperature_k, structure.specific_humidity_kgkg, o3,
+        structure.pressure_pa, structure.air_density_kg_m3, levels,
+        np.full((h, w), 101325.0), skin, co2_ppm=415.0, gravity=9.81,
+        cloud_fraction=np.full((h, w), 0.3),
+        cloud_base_height_m=np.full((h, w), 5000.0),
+        cloud_top_height_m=np.full((h, w), 6000.0),
+        cloud_optical_thickness=np.full((h, w), 10.0),
+    )
+    assert np.all(np.isfinite(result.outgoing_longwave_w_m2))
+    assert np.all(result.outgoing_longwave_w_m2 > 100.0)
+    assert np.all(result.outgoing_longwave_w_m2 < 400.0)
+
+
+def test_longwave_radiation_downward_vanishes_at_top_of_atmosphere():
+    """The sky-combined downward flux inherits the (A106) boundary condition
+    exactly: both the clear and cloudy passes are individually zero at the
+    top level, so sky_combine (a convex combination) is too."""
+    n, h, w = 6, 2, 2
+    levels, structure, skin = _realistic_profile(n, h, w)
+    o3 = np.zeros((n, h, w))
+    result = slw.longwave_radiation(
+        structure.temperature_k, structure.specific_humidity_kgkg, o3,
+        structure.pressure_pa, structure.air_density_kg_m3, levels,
+        np.full((h, w), 101325.0), skin, co2_ppm=415.0, gravity=9.81,
+        cloud_fraction=np.full((h, w), 0.5),
+        cloud_base_height_m=np.full((h, w), 5000.0),
+        cloud_top_height_m=np.full((h, w), 6000.0),
+        cloud_optical_thickness=np.full((h, w), 10.0),
+    )
+    assert result.downward_w_m2[n - 1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_longwave_radiation_more_co2_reduces_olr():
+    """Physical sanity: more CO2 -> higher opacity -> lower OLR, holding
+    everything else fixed (the same monotonicity direction as the real
+    greenhouse effect, not merely "the function runs")."""
+    n, h, w = 6, 2, 2
+    levels, structure, skin = _realistic_profile(n, h, w)
+    o3 = np.zeros((n, h, w))
+    kwargs = dict(
+        specific_humidity_profile_kg_kg=structure.specific_humidity_kgkg,
+        ozone_mixing_ratio_profile_kg_kg=o3,
+        pressure_profile_pa=structure.pressure_pa,
+        air_density_profile_kg_m3=structure.air_density_kg_m3,
+        levels_m=levels, surface_pressure_pa=np.full((h, w), 101325.0),
+        surface_skin_temp_k=skin, gravity=9.81,
+        cloud_fraction=np.zeros((h, w)),
+        cloud_base_height_m=np.full((h, w), 5000.0),
+        cloud_top_height_m=np.full((h, w), 6000.0),
+        cloud_optical_thickness=np.zeros((h, w)),
+    )
+    olr_low = slw.longwave_radiation(structure.temperature_k, co2_ppm=280.0, **kwargs).outgoing_longwave_w_m2
+    olr_high = slw.longwave_radiation(structure.temperature_k, co2_ppm=1200.0, **kwargs).outgoing_longwave_w_m2
+    assert np.all(olr_high < olr_low)

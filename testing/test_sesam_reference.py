@@ -71,12 +71,13 @@ def test_provenance_is_complete():
 def test_flagged_transcriptions_are_explicit():
     flagged = sr.flagged_transcriptions()
     # c4Γ/c5Γ/c6Γ were resolved (linear, m^-1) from the paper PDF on
-    # 2026-08-16 and are no longer flagged. Only c1tp remains unresolved
-    # (per-day folding of the A10 tendency), pending the P5 radiation work.
+    # 2026-08-16, and c1tp was resolved (per-day folding, from the paper's
+    # own Conclusions text) on 2026-08-19 when P5 closed the A10 tropopause
+    # closure -- none are flagged any more.
     assert "c4_Gamma" not in flagged.get("A1_vertical_structure", [])
     assert "c5_Gamma" not in flagged.get("A1_vertical_structure", [])
     assert "c6_Gamma" not in flagged.get("A1_vertical_structure", [])
-    assert "c1tp" in flagged["A1_vertical_structure"]
+    assert "c1tp" not in flagged.get("A1_vertical_structure", [])
 
 
 def test_accessor_errors_name_available_keys():

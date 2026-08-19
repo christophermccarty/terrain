@@ -165,6 +165,23 @@ def pressure_profile(
     raise ValueError("p0_pa must be a scalar or a 2-D (H, W) field")
 
 
+def air_density_profile(
+    pressure_pa: np.ndarray,
+    reference_temp_k: float,
+    gas_constant: float = _DEFAULT_RD,
+) -> np.ndarray:
+    """(A3)/(A4) air density on the level grid: ``rho(z) = rho0*exp(-z/Ha)``,
+    ``rho0 = p0/(Rd*T0)``.  Since (A1)'s pressure profile shares the exact
+    same exponential (``p(z)/p0 = exp(-z/Ha) = rho(z)/rho0``), this reduces
+    to ``rho(z) = p(z)/(Rd*T0)`` exactly -- not a separate approximation,
+    just (A1)+(A3)+(A4) combined algebraically.  Added for stage P5 (the LW
+    absorber-mass integrals need a density profile that P1's original A1
+    kernels never had to materialise on their own).
+    """
+    p = np.asarray(pressure_pa, dtype=np.float64)
+    return p / (gas_constant * reference_temp_k)
+
+
 # ---------------------------------------------------------------------------
 # (A15) saturation specific humidity with ice/water partition
 # ---------------------------------------------------------------------------
@@ -578,6 +595,7 @@ class VerticalStructure:
     specific_humidity_kgkg: np.ndarray
     potential_temperature_k: np.ndarray
     pressure_pa: np.ndarray
+    air_density_kg_m3: np.ndarray
     near_surface_rh: np.ndarray
     tropopause_tendency: np.ndarray | None = None
     tropopause_shape_s: np.ndarray | None = None
@@ -690,6 +708,7 @@ def compute_vertical_structure(
         specific_humidity_kgkg=q_z,
         potential_temperature_k=theta_z,
         pressure_pa=p_z,
+        air_density_kg_m3=air_density_profile(p_z, reference_temp_k, gas_constant),
         near_surface_rh=ra_out,
         tropopause_tendency=trop_d,
         tropopause_shape_s=trop_s,
@@ -710,6 +729,7 @@ def _row_latitude_rad(h: int, w: int) -> np.ndarray:
 
 __all__ = [
     "VerticalStructure",
+    "air_density_profile",
     "compute_vertical_structure",
     "dry_adiabatic_lapse",
     "free_troposphere_lapse",

@@ -113,8 +113,13 @@ TABLE_A1_VERTICAL_STRUCTURE: dict[str, Any] = {
             note="uniform stratospheric relative humidity"),
         # --- tropopause (A10-A11) ---
         "c1tp": _p(100.0, "m^3 W^-1", "c1tp", ("A10",),
-            note="unit printed 'm3 W−1'; per-day vs per-second folding must be "
-            "checked against the PDF"),
+            documentation="per-day folding resolved 2026-08-19 (sesam_tropopause.py "
+            "module docstring): the paper's own Conclusions text states 'the use of "
+            "a daily time step for most processes' (page 5924), and no other "
+            "timestep convention appears anywhere in the SESAM description, so "
+            "c1tp*(Rstr,net+S) is read as metres of tropopause-height change per "
+            "simulated day -- scaled by dt_days like every other SESAM stage's own "
+            "substep convention, not per second."),
         "c2tp": _p(18.0, "W m^-2", "c2tp", ("A11",)),
         "c3tp": _p(1.0, "-", "c3tp", ("A11",)),
     },
@@ -293,12 +298,20 @@ TABLE_MAIN_ENERGY_BUDGET: dict[str, Any] = {
     "source_xlsx": "t01",
     "scope": "validation_reference",
     "note": "CLIMBER-X simulated vs observed global energy budget components "
-    "(W m^-2); Table-3-class validation data, not parameters.",
+    "(W m^-2); Table-3-class validation data, not parameters. The four "
+    "*_obs_mean TOA entries (added 2026-08-19 for the P5 TOA exit gate, "
+    "scripts/diagnose_sesam_toa.py) are Table 1's own 'observation mean' "
+    "column (Wild et al. 2013), a second, independent target alongside the "
+    "paper's own CLIMBER-X column.",
     "entries": {
         "toa_solar_down": _p(340.2, "W m^-2", "SW↓,TOA"),
+        "toa_solar_down_obs_mean": _p(340.0, "W m^-2", "SW↓,TOA (obs, Wild et al. 2013)"),
         "toa_solar_up": _p(102.2, "W m^-2", "SW↑,TOA"),
+        "toa_solar_up_obs_mean": _p(100.0, "W m^-2", "SW↑,TOA (obs, Wild et al. 2013)"),
         "toa_solar_net": _p(238.1, "W m^-2", "SWnet,TOA"),
+        "toa_solar_net_obs_mean": _p(240.0, "W m^-2", "SWnet,TOA (obs, Wild et al. 2013)"),
         "toa_thermal_up": _p(237.6, "W m^-2", "LW↑,TOA"),
+        "toa_thermal_up_obs_mean": _p(239.0, "W m^-2", "LW↑,TOA (obs, Wild et al. 2013)"),
         "atm_solar_net": _p(72.6, "W m^-2", "SWnet,atm"),
         "atm_thermal_net": _p(-177.1, "W m^-2", "LWnet,atm"),
         "sfc_solar_down": _p(192.0, "W m^-2", "SW↓,sfc"),
@@ -422,9 +435,9 @@ def flagged_transcriptions() -> dict[str, list[str]]:
     """Parameters whose units/forms carry a verify-against-the-PDF note.
 
     c4Γ/c5Γ/c6Γ were cleared 2026-08-16 when the A9 equation was read from
-    the paper PDF and confirmed linear; c1tp remains unresolved pending the
-    P5 radiation work that uses it (the per-day folding of its ``m^3 W^-1``
-    unit is not fixed by the A10 text alone).
+    the paper PDF and confirmed linear; c1tp was cleared 2026-08-19 when its
+    per-day folding was resolved from the paper's own Conclusions text (see
+    its ``note`` field, and ``sesam_tropopause.py``'s module docstring).
     """
     out: dict[str, list[str]] = {}
     for name, tab in SESAM_TABLES.items():

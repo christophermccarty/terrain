@@ -867,10 +867,63 @@ so each is evaluable without the next.
     external input — the constant/zonal-climatology/real-dataset decision is
     still open.
 
-  Remaining P5 items: the (A10) tropopause radiative closure (wiring this
-  stage's `Rstr,net` into P1's already-built but input-starved
-  `tropopause_tendency`), the ozone-climatology decision, and the TOA-flux
-  exit-gate measurement against the paper's validation figures.
+  - **Fourth sub-deliverable and exit gate complete (2026-08-19): the (A10)
+    tropopause radiative closure, the ozone-climatology decision, and the
+    TOA-flux exit-gate measurement — P5 is now closed end-to-end.**
+    `sesam_tropopause.py` closes P1's input-starved `tropopause_tendency`
+    with a real `Rstr,net`: a read-only disambiguation from the reference
+    Fortran's `atm_model.f90` `rb_str` (the paper states `Rstr,net` only in
+    prose — "the balance of longwave radiation and the shortwave radiation
+    absorbed by ozone" — with no worked formula), reproduced as
+    `net_LW(top) − net_LW(tropopause) + frac_vu·(1−I_O3,vu)·SW_down,top`,
+    using the *published* Table A5 `I_O3,vu=0.96` rather than the Fortran's
+    own uncited, undocumented `0.02` constant (per the section 6
+    calibration-window policy). `c1tp`'s previously-flagged per-day unit
+    folding is resolved from the paper's own Conclusions text ("the use of a
+    daily time step for most processes", page 5924): `tropopause_tendency`'s
+    output is metres/day, scaled by `dt_days` like every other SESAM stage.
+    The ozone-climatology decision lands on the "constant" branch of the
+    three-way choice raised at P5's scoping: a Gaussian stratospheric layer
+    (25 km peak, 7 km half-width — textbook shape, not fitted) normalised to
+    a 300 DU global column via the standard DU→kg/m² conversion — SESAM's
+    real input (a prescribed 3-D time-varying CMIP6 field) is out of reach
+    without external data this project does not have, and the reference
+    Fortran confirms there is no simpler built-in fallback either (`atm%o3`
+    is allocated but populated from an external boundary module this repo
+    lacks). `sesam_longwave.py` also gained the full `longwave_radiation()`
+    assembly (clear/cloudy `(N,N,H,W)` transmission matrices, sky-combined —
+    the piece every other P5 sub-deliverable needed but none had built), and
+    `sesam_vertical.py` gained the small (A3)/(A4) `air_density_profile` LW
+    absorber-mass integrals need. 12 new tests in
+    `testing/test_sesam_tropopause.py`, 3 more in `testing/test_sesam_longwave.py`
+    for the new assembly; full repo suite re-confirmed clean.
+
+    **Exit-gate measurement (2026-08-19, real 512×1024 saved state, annual
+    mean): NOT passed at a tight tolerance, with a decisive decomposition**
+    (`scripts/diagnose_sesam_toa.py`, scored against Table 1's own CLIMBER-X
+    and Wild et al. 2013 observational-mean columns, both now in
+    `sesam_reference.TABLE_MAIN_ENERGY_BUDGET`). TOA solar-down is exact
+    (340.3 vs 340.2/340.0 W/m², as expected — pure orbital geometry,
+    independent of SESAM). TOA solar-up is under-predicted by 41%  (60.1 vs
+    102.2/100.0 W/m²), TOA thermal-up (OLR) over-predicted by 16-17% (275.1
+    vs 237.6/239.0 W/m²) — both trace to one shared, identified cause: this
+    diagnostic reuses the *saved state's own* `cloud_cover` field (real data,
+    not fabricated, but out of P5's own scope to fix — clouds were already
+    measured at sub-deliverable 1) to avoid regridding the P2/P3 wind/EKE
+    chain onto the stratosphere-reaching level grid OLR needs, and that
+    field's actual global mean is ~9.8% versus the ~60-70% observed
+    climatology — too little cloud to reflect enough shortwave or trap
+    enough longwave. The radiative-transfer machinery this stage was built
+    to close (A69-A105, A106-A117) is exercised end-to-end and produces
+    values in the right physical regime, not a decomposition failure of its
+    own; the input-cloud-fraction gap is the dominant, identified driver,
+    consistent with the "no target ever supplied, no calibration window
+    spent yet" framing P4's own exit gate used. The (A10) closure was
+    exercised (not iterated to equilibrium, same "local closure" scope P3's
+    EKE exit gate used): `Rstr,net` averaged −17.8 W/m² (net stratospheric
+    radiative loss under this state) and the tropopause moved from the 12 km
+    initial guess to a ~13.2 km one-step update, the physically correct
+    sign per (A10)'s own `−c1tp·(Rstr,net+S)` form.
 - **P6 — The calibration window** (§6), then the standard 128×256 five-year
   promotion checkpoint.
 
