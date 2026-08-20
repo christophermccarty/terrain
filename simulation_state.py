@@ -99,3 +99,10 @@ class PlanetState(NamedTuple):
     lower_pressure_hydrometeors: np.ndarray | None = None
     midlevel_pressure_hydrometeors: np.ndarray | None = None
     upperlevel_pressure_hydrometeors: np.ndarray | None = None
+    # SESAM stage P6b (docs/SESAM_GAP_ANALYSIS.md Sec7): the (A42) prognostic
+    # column-integrated water depth Qq [mm], distinct from `humidity` (a
+    # near-surface relative-humidity fraction). Lazy-initialized on first use
+    # (see sesam_coupling.py); stays None while
+    # PlanetParams.enable_sesam_column_closure has never been active,
+    # matching every other gated field's old-save/gate-off convention here.
+    sesam_column_water_mm: np.ndarray | None = None

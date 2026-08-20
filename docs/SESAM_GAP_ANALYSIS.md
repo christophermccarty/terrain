@@ -231,7 +231,7 @@ than a knob, the promotion rules need one bounded exception:
 1. The SESAM branch develops behind `enable_sesam_atmosphere` (default False).
    The supported baseline and all its gates are untouched; no existing metric may
    regress on the default path.
-2. When the branch is feature-complete (§7 stage P4), it gets **one bounded
+2. When the branch is feature-complete (§7 stage P5), it gets **one bounded
    calibration window**: a documented sweep over only the SESAM paper's own
    constants (Table A values) — not legacy knobs — at 64×128. The judgement
    happens **after** the sweep, against the full standard gate set (Köppen
@@ -925,7 +925,181 @@ so each is evaluable without the next.
     initial guess to a ~13.2 km one-step update, the physically correct
     sign per (A10)'s own `−c1tp·(Rstr,net+S)` form.
 - **P6 — The calibration window** (§6), then the standard 128×256 five-year
-  promotion checkpoint.
+  promotion checkpoint. **Started 2026-08-19.** §6 point 2's trigger
+  ("when the branch is feature-complete, §7 stage P4") was itself stale --
+  written before P5 (radiation) existed as its own stage -- and is corrected
+  to stage P5 as part of starting this stage; P5's 2026-08-19 completion is
+  what actually unblocks P6.
+
+  Wiring five independent, unit-tested-but-never-live kernel stages (P1-P5)
+  into the single ~9000-line `simulate_step()` is itself comparable in size
+  to building them, so P6's own wiring is sub-staged the same way P1-P5 were,
+  rather than touched all at once:
+  - P6b: column energy/water closure (P4) first -- replaces the row-target
+    precipitation allocator, the mechanism-replacement §1/§4 identify as the
+    actual motivation for this whole adoption.
+  - P6c: SLP/wind (P2, zonal-only, matching P2's own admitted verdict) + EKE
+    transport (P3), replacing the bridge wind/EKE placeholders P6b uses.
+  - P6d: radiation (P5), replacing the bridge diabatic-source placeholder.
+  - P6e: full-chain sanity run, then the §6 bounded Table-A constant sweep
+    against the full standard gate set.
+
+  - **P6b sub-deliverable complete (2026-08-19): the column-closure branch is
+    now live-wired, gated, and verified inert on the default path -- not yet
+    verified as a climate improvement.** New `sesam_coupling.py` adapts
+    `PlanetState`'s live fields to `sesam_thermo.py`'s (stage P4) pure
+    kernels and is called from `simulate_step()` (`simulate.py`, immediately
+    before final state assembly) only when
+    `PlanetParams.enable_sesam_column_closure` is True; a new
+    `PlanetState.sesam_column_water_mm` field carries the (A42) prognostic
+    column-water depth `Qq`, defaulting to `None` (lazy-initialized on first
+    use, old saves unaffected, matching every other gated field's existing
+    convention). Verified byte-identical-in-effect on the default path
+    (`state.sesam_column_water_mm` stays `None`, `sesam_coupling.py` is never
+    called) by both a manual A/B smoke run and a new
+    `test_simulate_step_default_path_unaffected_by_sesam_gate` regression
+    test; full SESAM test suite 249 passed/1 skipped (`testing/ -k sesam`),
+    plus 7 new tests in `testing/test_sesam_coupling.py`.
+
+    **Three documented bridges** (module docstring, same "reuse a real field
+    from elsewhere, don't fabricate" discipline P4/P5's own diagnostic
+    scripts already used twice), each earmarked for replacement by its own
+    later P6 sub-stage: (1) wind -- the supported model's own already-computed
+    `wind_u`/`wind_v` drives SESAM's advection, not P2's own (not wired until
+    P6c); (2) EKE -- a spatially uniform placeholder at P3's own validated
+    global-mean local-steady-state value (240 m²/s², P3's 2026-08-18
+    measurement), not the real prognostic `K` field (not wired until P6c);
+    (3) diabatic source -- (A40) needs a real SWa/LWa split P5 hasn't
+    supplied to the live loop yet (only P5's *diagnostic* scripts have it),
+    so this stage instead drives Ta with a bulk sensible-heat-style relaxation
+    toward the legacy model's own already-computed skin temperature `T*`
+    (`(T* − Ta) / 1 day`) -- (A41)'s own `T2m=(Ta+T*)/2` relationship read as
+    a forcing, not an invented mechanism, but a real approximation nonetheless
+    (not wired to the real split until P6d).
+
+    **Real bug found and fixed (2026-08-19): multi-day outer steps applied
+    the diabatic bridge's 1-day relaxation *rate* for the whole span in one
+    Euler call, with no substepping.** A 10-day DAILY-mode smoke run at
+    32×64 stayed finite (no NaN/Inf) but showed a small, persistent number of
+    cells pinned at Ta's defensive ±[150, 350] K clip bounds near the equator
+    every day. Root-causing this (rather than papering over it with a damping
+    term, per this project's stop-condition discipline and the
+    `docs/VERTICAL_THERMODYNAMIC_CLOSURE.md` precedent) escalated fast once
+    tested at the actual §6 target resolution: a real 64×128/MONTHLY
+    (`days=30` per `simulate_step` call) `real_terrain_validation.py` run
+    showed `air_temperature` going **globally uniform at exactly the 350 K
+    clip bound one month, then exactly 150 K the next**, oscillating every
+    subsequent call -- and even the legacy skin temperature field
+    (`state.temperature`, which this branch never writes) collapsed to an
+    unphysical ~250 K global mean over the 1-year spinup, via the ice-albedo/
+    radiation feedback the corrupted air temperature drove in the untouched
+    downstream code. The cause: `sesam_coupling.sesam_column_closure_step`'s
+    diabatic bridge (module docstring bridge 3, `(T*-Ta)/1 day`) is a
+    K/day *rate*, but `simulate_step` was calling it once per outer step with
+    `dt_days=days` directly -- exactly the outer-step-vs-per-call-physics-
+    timescale mismatch `_PRECIP_SUBSTEP_DAYS` already exists to prevent for
+    precipitation (a 30-day call applies a 1-day-calibrated rate for 30 days
+    in one shot, overshooting by ~30x). **Fixed** by substepping the SESAM
+    call at 1-day cadence inside `simulate_step`
+    (`_SESAM_COLUMN_CLOSURE_SUBSTEP_DAYS`), mirroring the pre-existing
+    `_generate_precipitation_substepped`/`_evolve_wind_substepped` idiom
+    exactly rather than inventing a new one. New regression test
+    `test_simulate_step_multiday_call_does_not_saturate_clip_bounds`
+    (`testing/test_sesam_coupling.py`, 8 tests total now); full SESAM suite
+    250 passed/1 skipped after the fix.
+
+    **A second, smaller finding survives the fix, isolated but deferred to
+    P6c rather than chased further here.** Feeding `evolve_column_energy` the
+    real post-spinup legacy `wind_u`/`wind_v` with zero diabatic source
+    produced 264/2048 cells at the hot clip bound after 10 days; the same
+    wind field with only the diabatic term active (zero wind) produced *zero*
+    hot cells and stayed in a sane 230-303 K range throughout -- isolating
+    the cause to bridge 1 (the legacy, non-SESAM-native wind field), not
+    bridge 3 (the diabatic relaxation) or a substep/CFL discretization defect
+    (ruled out separately: sweeping the wind-only case's substep size from
+    1.0 down to 0.05 days did not resolve it, and if anything mildly
+    worsened it -- consistent with genuine concentration under a persistently
+    convergent velocity field, the same *real, not-a-bug* behaviour P2's
+    "azonal channel amplifying the saved state's sharp regional fields" and
+    P3's "pure advection can legitimately concentrate a field far above its
+    initial peak" findings already documented for their own bridge inputs).
+    This is exactly what P6c (replacing the legacy-wind bridge with SESAM's
+    own P2/P3-native wind/EKE) exists to fix, so it is not chased further
+    inside P6b.
+
+    **First real measurement, full 64×128/MONTHLY, 1yr spinup + 1yr eval
+    (`real_terrain_validation.py` defaults, post-fix):** global mean
+    temperature 289.96 K (gate off: 291.11 K) and ocean temperature 292.67 K
+    (gate off: 292.76 K) -- both close, confirming the catastrophic collapse
+    is gone and the branch is now numerically well-behaved at the target
+    resolution. But **Köppen group accuracy drops to 0.480 (κ 0.350) from the
+    gate-off baseline's 0.674 (κ 0.587)**, class accuracy 0.215 from 0.389,
+    and polar precipitation comes out 6x too high (2.29 vs the gate-off run's
+    0.38 mm/day, both vs the same reference). **This is not a surprising or
+    blocking result -- it is the expected state of a branch still running on
+    all three documented placeholder bridges** (legacy wind including the
+    just-isolated convergence-zone mismatch, P3's uniform-EKE placeholder,
+    and the crude skin-temperature diabatic relaxation), not yet SESAM's own
+    native wind/EKE/radiation. No promotion claim is made here; this is the
+    first honest baseline number for what P6c and P6d need to improve on, in
+    the same spirit as P2's "not passed, decisive decomposition" and P4's
+    "no target ever supplied" framings.
+
+  - **P6c sub-deliverable complete (2026-08-19): SESAM's own P2 (zonal-only
+    SLP/wind) and P3 (local-steady-state EKE) are now live-wired, replacing
+    P6b's bridges 1-2 -- numerically stable, but a real climate-impact
+    finding, not yet an improvement.** New `sesam_wind_coupling.py` mirrors
+    the already-validated `scripts/diagnose_sesam_wind.py`/
+    `scripts/diagnose_sesam_synoptic.py` chain exactly (P1 vertical structure
+    -> two-pass SLP<->wind closure -> zonal-only extraction -> local-
+    steady-state EKE via `sesam_synoptic.compute_synoptic`), sourced from
+    live `PlanetState` fields instead of a saved `.npz`. Gated on
+    `PlanetParams.enable_sesam_dynamics` *in addition to*
+    `enable_sesam_column_closure` -- column closure alone is unchanged and
+    still uses P6b's bridges. Recomputed once per outer `simulate_step` call
+    (not per column-closure inner substep), the same "hold the slower field
+    fixed across faster substeps" simplification the legacy precipitation
+    substep loop already makes. `sesam_coupling.sesam_column_closure_step`
+    gained an optional `eke_m2_s2` parameter (defaults to P6b's placeholder
+    when omitted, so P6b-only callers are unchanged) to accept the real P3
+    field. 6 new tests (`testing/test_sesam_wind_coupling.py`); full SESAM
+    suite 256 passed/1 skipped.
+
+    **Explicit scope narrowing, not the full P3 prognostic K transport.**
+    P3's own (A52) advection+diffusion transport of K needs a persistent
+    per-cell state field and a short coupling cadence to stay numerically
+    sane (Sec7 P3, 2026-08-18) -- real, validated machinery, but P3 itself
+    delivered it as a *second* sub-deliverable after first shipping the
+    local-steady-state closure alone. This live-coupling debut mirrors that
+    same staging; full prognostic K transport is a documented follow-up, not
+    attempted here.
+
+    **First real measurement, full 64×128/MONTHLY, 1yr spinup + 1yr eval,
+    both gates on:** global temperature 289.72 K (P6b-only: 289.96 K,
+    gate-off baseline: 291.11 K) -- close, confirms P6c stays numerically
+    well-behaved at the target resolution, same as P6b. Köppen group
+    accuracy is essentially unchanged from P6b-only (0.477 vs 0.480, both
+    well below the 0.674 baseline) but **precipitation collapses further**:
+    global mean 0.64 mm/day (P6b-only: 1.99, gate-off: 3.00 -- Earth's real
+    mean is ~2.7-3.0), tropical Köppen land coverage falls to 0.9% (P6b-only:
+    17.7%, gate-off: 20.3%) while arid coverage more than doubles to 56.1%
+    (P6b-only: 23.2%, gate-off: 30.2%). **The cause is not a new bug --
+    it is P2's own already-documented exit-gate finding surfacing as a
+    downstream climate effect**: the zonal-only SESAM wind's own validated
+    mean surface speed (~2.2-2.4 m/s, Sec7 P2 2026-08-16/17/18 entries) is
+    genuinely weaker than the legacy generator's (and NCEP's own ~3.9-4.0
+    m/s), so the (A44) moisture-convergence term this branch's precipitation
+    depends on has less advective convergence to work with -- P2's wind
+    speed shortfall was already known and documented as unresolved; this is
+    the first time it has been shown to propagate into the hydrological
+    cycle rather than just a wind-pattern-correlation score. **No promotion
+    claim is made; this is not chased further inside P6c** -- it is either a
+    genuine input for the §6 calibration window (SESAM's own Table A
+    convergence-efficiency/turnover constants may partly compensate for a
+    weaker but more physically-derived wind) or evidence that P2's zonal-only
+    wind itself needs revisiting before P6 can close, a judgement call for
+    the §6 sweep itself rather than a P6c-stage action per this project's own
+    staged discipline.
 
 **Stop conditions** (per operating rule 3): a stage that fails its exit gate after
 its *own* constants' bounded sweep is a conclusion about that mechanism, and the

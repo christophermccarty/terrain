@@ -26,6 +26,8 @@ from state_persistence import (
     load_state,
     save_state,
 )
+from sesam_coupling import sesam_column_closure_step
+from sesam_wind_coupling import sesam_wind_and_eke_step
 
 LOG = logging.getLogger("planetsim")
 
@@ -115,6 +117,14 @@ _RELAX_CACHE = {"key": None, "u": None, "v": None}
 # 1.554 to 0.148 mm/day. PlanetParams.precip_substep_days can still override
 # this threshold (for example 8.0 reproduces the former coarse cadence).
 _PRECIP_SUBSTEP_DAYS = 1.0
+
+# SESAM stage P6b (docs/SESAM_GAP_ANALYSIS.md Sec7): the diabatic bridge in
+# sesam_coupling.py is a 1-day relaxation *rate* (K/day); calling it once per
+# multi-day outer step (as MONTHLY mode's `days=30` does) applies that rate
+# for the whole span in one Euler step, overshooting massively -- the same
+# outer-step-vs-per-call-physics-timescale mismatch `_PRECIP_SUBSTEP_DAYS`
+# above already exists to prevent for precipitation. Mirrors that idiom.
+_SESAM_COLUMN_CLOSURE_SUBSTEP_DAYS = 1.0
 
 # Reference temperature for `PlanetParams.land_transport_deficit_k`'s gate. The
 # freezing point rather than a fitted constant: poleward eddy heat flux into a
@@ -4385,6 +4395,94 @@ def simulate_step(
         pfc_new = state.permafrost_carbon
         wind_speed_avg_new = state.wind_speed_avg
 
+    # SESAM stage P6b (docs/SESAM_GAP_ANALYSIS.md Sec7): replace the legacy
+    # air-temperature evolution and row-target precipitation allocator with
+    # the (A40)/(A42)/(A44) column-energy/water closure, gated and default
+    # off. Runs last, right before state assembly, so it overrides only
+    # T_air/humidity/precipitation/the new SESAM water reservoir -- every
+    # other quantity above (ocean, ice, land, biome, carbon, clouds, the
+    # legacy skin temperature T_full itself) is computed exactly as before
+    # and this branch only reads it. See sesam_coupling.py's module
+    # docstring for the three documented bridges (wind/EKE/diabatic source)
+    # this first live-coupling sub-stage relies on.
+    sesam_qq_next = state.sesam_column_water_mm
+    if (
+        pp.enable_sesam_column_closure
+        and T_air_full is not None
+        and T_full is not None
+        and humidity_next is not None
+        and u_full is not None
+        and v_full is not None
+        and float(days) > 0.0
+    ):
+        _sesam_sea_mask, _sesam_land_mask = get_masks(state.elevation, use_cache=True)
+        _sesam_elevation_m = np.clip(np.asarray(state.elevation, dtype=np.float64), 0.0, 1.0) * (
+            float(pp.max_elevation_km) * 1000.0
+        )
+        _sesam_ta = (
+            state.air_temperature if state.air_temperature is not None else T_air_full
+        )
+        _sesam_ra = state.humidity if state.humidity is not None else humidity_next
+        _sesam_qq = state.sesam_column_water_mm
+
+        # SESAM stage P6c: when the P2/P3 dynamics gate is also on, replace
+        # bridges 1-2 (legacy wind, uniform-EKE placeholder) with SESAM's own
+        # zonal-only SLP/wind (P2) and local-steady-state EKE (P3), computed
+        # once for the whole outer step -- see sesam_wind_coupling.py's
+        # module docstring for why this is recomputed per outer call rather
+        # than per inner substep (SLP/wind/EKE track the slowly-varying
+        # skin/air temperature, the same simplification the legacy
+        # precipitation substep loop already makes for its own inner loop).
+        _sesam_wind_u, _sesam_wind_v, _sesam_eke = u_full, v_full, None
+        if pp.enable_sesam_dynamics:
+            _sesam_ice_mask = (
+                np.asarray(state.ice_cover) > 0.5 if state.ice_cover is not None else None
+            )
+            _sesam_dynamics_step = sesam_wind_and_eke_step(
+                air_temperature_k=_sesam_ta,
+                skin_temperature_k=T_full,
+                relative_humidity=_sesam_ra,
+                elevation_m=_sesam_elevation_m,
+                land_mask=_sesam_land_mask,
+                ice_mask=_sesam_ice_mask,
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                radius_m=float(pp.radius_m),
+                gravity=float(pp.surface_gravity),
+                omega=float(pp.omega),
+            )
+            _sesam_wind_u = _sesam_dynamics_step.wind_u_m_s
+            _sesam_wind_v = _sesam_dynamics_step.wind_v_m_s
+            _sesam_eke = _sesam_dynamics_step.eke_m2_s2
+
+        _sesam_n_sub = max(1, int(round(float(days) / _SESAM_COLUMN_CLOSURE_SUBSTEP_DAYS)))
+        _sesam_sub_dt = float(days) / _sesam_n_sub
+        _sesam_p_accum = None
+        for _ in range(_sesam_n_sub):
+            _sesam_step = sesam_column_closure_step(
+                air_temperature_k=_sesam_ta,
+                skin_temperature_k=T_full,
+                relative_humidity=_sesam_ra,
+                column_water_mm=_sesam_qq,
+                wind_u_m_s=_sesam_wind_u, wind_v_m_s=_sesam_wind_v,
+                elevation_m=_sesam_elevation_m, land_mask=_sesam_land_mask,
+                surface_pressure_pa=float(pp.surface_pressure_pa),
+                radius_m=float(pp.radius_m),
+                dt_days=_sesam_sub_dt,
+                eke_m2_s2=_sesam_eke,
+            )
+            _sesam_ta = _sesam_step.air_temperature_k
+            _sesam_ra = _sesam_step.relative_humidity
+            _sesam_qq = _sesam_step.column_water_mm
+            _sesam_p_accum = (
+                _sesam_step.precipitation_mm_day.astype(np.float32)
+                if _sesam_p_accum is None
+                else _sesam_p_accum + _sesam_step.precipitation_mm_day
+            )
+        T_air_full = _sesam_ta
+        humidity_next = _sesam_ra
+        P_full = (_sesam_p_accum / _sesam_n_sub).astype(np.float32, copy=False)
+        sesam_qq_next = _sesam_qq
+
     new_state = PlanetState(
         day_of_year=new_day,
         total_days=new_total_days,
@@ -4395,6 +4493,7 @@ def simulate_step(
         wind_v=v_full,
         precipitation=P_full,
         humidity=humidity_next,
+        sesam_column_water_mm=sesam_qq_next,
         soil_moisture=soil_next,
         soil_moisture_deep=soil_deep_next,
         cloud_cover=cloud_full,
