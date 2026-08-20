@@ -41,7 +41,7 @@ def test_wind_and_eke_step_finite_and_shaped():
         radius_m=float(EARTH.radius_m), gravity=float(EARTH.surface_gravity),
         omega=float(EARTH.omega),
     )
-    for field in (result.wind_u_m_s, result.wind_v_m_s, result.eke_m2_s2):
+    for field in (result.wind_u_m_s, result.wind_v_m_s, result.eke_m2_s2, result.total_wind_m_s):
         assert field.shape == (h, w)
         assert np.all(np.isfinite(field))
     assert np.all(result.eke_m2_s2 >= 0.0)
@@ -52,6 +52,10 @@ def test_wind_and_eke_step_finite_and_shaped():
     speed = np.sqrt(result.wind_u_m_s ** 2 + result.wind_v_m_s ** 2)
     assert speed.mean() < 100.0
     assert result.eke_m2_s2.mean() < 1.0e5
+    # (A58) Us = sqrt(us^2+vs^2+Usyn^2) is the zonal magnitude plus a
+    # nonnegative synoptic-gustiness term added in quadrature -- it can
+    # never be smaller than the bare zonal speed it's built from.
+    assert np.all(result.total_wind_m_s >= speed - 1e-9)
 
 
 def test_wind_and_eke_step_with_ice_mask_does_not_crash():

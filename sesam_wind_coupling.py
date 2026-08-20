@@ -24,6 +24,11 @@ already run against saved states, adapted to read from live evolving
 3. P3 local-steady-state EKE (`sesam_synoptic.compute_synoptic`), driven by
    the zonal-only wind -- per P3's own documented finding that the full
    azonal-inflated wind would compound the same artefact into EKE.
+   `compute_synoptic` also returns (A58)'s `total_wind_m_s` (zonal wind
+   combined with the synoptic gustiness term `Usyn`), exposed here as
+   `SesamWindAndEke.total_wind_m_s` for callers that need a bulk-flux wind
+   speed rather than the mean advecting wind (docs/SESAM_GAP_ANALYSIS.md
+   Sec7 P2, 2026-08-20 follow-up).
 
 **Scope decision, not yet the full P3 prognostic K transport.** P3's own
 (A52) advection+diffusion transport of K needs a persistent per-cell state
@@ -93,6 +98,7 @@ class SesamWindAndEke(NamedTuple):
     wind_u_m_s: np.ndarray
     wind_v_m_s: np.ndarray
     eke_m2_s2: np.ndarray
+    total_wind_m_s: np.ndarray
     diagnostics: dict
 
 
@@ -229,6 +235,7 @@ def sesam_wind_and_eke_step(
         wind_u_m_s=wind_zonal.surface_u_m_s.astype(np.float32),
         wind_v_m_s=wind_zonal.surface_v_m_s.astype(np.float32),
         eke_m2_s2=syn.eddy_kinetic_energy_m2_s2.astype(np.float32),
+        total_wind_m_s=syn.total_wind_m_s.astype(np.float32),
         diagnostics=diagnostics,
     )
 

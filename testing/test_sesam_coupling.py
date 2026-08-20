@@ -175,6 +175,65 @@ def test_real_diabatic_source_path_finite_and_shaped():
     assert np.all(result.air_temperature_k >= 150.0) and np.all(result.air_temperature_k <= 350.0)
 
 
+def test_total_wind_speed_omitted_matches_zonal_magnitude():
+    """Passing total_wind_speed_m_s equal to sqrt(u^2+v^2) must reproduce the
+    omitted-argument result exactly -- both compute the same wind-speed
+    quantity for the bulk-flux terms when given the same magnitude."""
+    ta, tstar, ra, elev, land, u, v = _synthetic_fields()
+    default = sc.sesam_column_closure_step(
+        air_temperature_k=ta, skin_temperature_k=tstar, relative_humidity=ra,
+        column_water_mm=None, wind_u_m_s=u, wind_v_m_s=v,
+        elevation_m=elev * 3000.0, land_mask=land,
+        surface_pressure_pa=float(EARTH.surface_pressure_pa),
+        radius_m=float(EARTH.radius_m), dt_days=1.0,
+    )
+    explicit = sc.sesam_column_closure_step(
+        air_temperature_k=ta, skin_temperature_k=tstar, relative_humidity=ra,
+        column_water_mm=None, wind_u_m_s=u, wind_v_m_s=v,
+        elevation_m=elev * 3000.0, land_mask=land,
+        surface_pressure_pa=float(EARTH.surface_pressure_pa),
+        radius_m=float(EARTH.radius_m), dt_days=1.0,
+        total_wind_speed_m_s=np.sqrt(u ** 2 + v ** 2),
+    )
+    assert explicit.precipitation_mm_day == pytest.approx(default.precipitation_mm_day, rel=1e-9)
+    assert explicit.air_temperature_k == pytest.approx(default.air_temperature_k, rel=1e-9)
+
+
+def test_total_wind_speed_larger_than_zonal_increases_evaporation():
+    """(A58)'s total wind (zonal + synoptic gustiness) is always >= the bare
+    zonal magnitude it's built from; wiring a larger total_wind_speed_m_s
+    into the bulk-aerodynamic evaporation term must increase the moisture
+    source versus the zonal-only default -- the whole point of the P2,
+    2026-08-20 follow-up (docs/SESAM_GAP_ANALYSIS.md Sec7): the zonal-only
+    wind alone was found to understate the real wind-speed-driven flux."""
+    h, w = 6, 12
+    ta = np.full((h, w), 285.0)
+    tstar = np.full((h, w), 295.0)  # uniformly warmer skin -> positive vapor deficit
+    ra = np.full((h, w), 0.3)
+    elev = np.full((h, w), 200.0)
+    land = np.zeros((h, w), dtype=bool)
+    u = np.full((h, w), 2.0)
+    v = np.full((h, w), 0.5)
+    zonal_speed = np.sqrt(u ** 2 + v ** 2)
+
+    weak = sc.sesam_column_closure_step(
+        air_temperature_k=ta, skin_temperature_k=tstar, relative_humidity=ra,
+        column_water_mm=None, wind_u_m_s=u, wind_v_m_s=v,
+        elevation_m=elev, land_mask=land,
+        surface_pressure_pa=float(EARTH.surface_pressure_pa),
+        radius_m=float(EARTH.radius_m), dt_days=1.0,
+    )
+    strong = sc.sesam_column_closure_step(
+        air_temperature_k=ta, skin_temperature_k=tstar, relative_humidity=ra,
+        column_water_mm=None, wind_u_m_s=u, wind_v_m_s=v,
+        elevation_m=elev, land_mask=land,
+        surface_pressure_pa=float(EARTH.surface_pressure_pa),
+        radius_m=float(EARTH.radius_m), dt_days=1.0,
+        total_wind_speed_m_s=zonal_speed + 6.0,
+    )
+    assert np.mean(strong.precipitation_mm_day) > np.mean(weak.precipitation_mm_day)
+
+
 def test_real_diabatic_source_requires_both_fields():
     """Supplying only one of sw_absorbed_w_m2/lw_net_w_m2 falls back to
     bridge 3 (both-or-neither), not a partial/undefined source."""

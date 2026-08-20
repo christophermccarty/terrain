@@ -1216,6 +1216,182 @@ so each is evaluable without the next.
     rare, slow-drift edge case but the default outcome of the standard
     64x128/MONTHLY target config within one simulated month.
 
+  - **Follow-up investigation (2026-08-20), no code changed.** Two questions
+    raised by the P6e entry above are now resolved:
+
+    1. **Is (A9) actually a paper transcription bug, leaving a clamp as a
+       legitimate fix?** No. The published equation was read directly from
+       the CLIMBER-X GMD paper's Appendix A (`10.5194/gmd-15-5905-2022`,
+       page 5926): `near_surface_lapse`'s four branches and both upper-only
+       caps (7.5e-3 ocean / 10e-3 land+ice) match verbatim, and the paper's
+       own text states the unbounded cold-land inversion is intentional
+       ("Eq. (A9) allows SESAM to reproduce near-surface inversions which
+       are important for surface climate"). This removes "verify against
+       the paper and bound `near_surface_lapse`" from the P6d entry's list
+       of options with full confidence — it is now a confirmed paper
+       deviation, not an open question, and should not be revisited without
+       new information.
+    2. **Why does `Ta-T*` open a 24 K+ gap in the first place?** The
+       regression repro (`test_near_surface_lapse_large_cold_land_contrast_produces_unphysical_profile`)
+       uses `qa=0.0005 kg/kg` — a near-desert-dry column — which lines up
+       with this same stage's own P6c finding above: the zonal-only SESAM
+       wind's ~2.2-2.4 m/s mean (vs. the legacy generator's ~3.9-4.0 m/s)
+       starves (A44)'s moisture convergence, collapsing global mean
+       precipitation to 0.64 mm/day and expanding arid land coverage to
+       56.1%. A dry column has weak water-vapour greenhouse trapping, so its
+       near-surface air radiatively cools much faster than a moist column's
+       under clear skies — the same desert-nighttime-crash mechanism this
+       project has hit and fixed repeatedly in the legacy model (e.g. the
+       land-cap thermal-low and desert-evapotranspiration fixes, both
+       pre-SESAM). **This alone is not sufficient to blow up the profile**:
+       the P6e control run (P6b+P6c only, same dry land, same weak wind,
+       radiation gate off) completes all 12 spinup cycles cleanly. What
+       changes when P6d's gate is added is not the land's dryness but the
+       *coupling*: P6b/c's bulk `(T*-Ta)/1-day` bridge is a strong daily
+       pull of Ta back toward T*, which structurally caps how far the two
+       can separate regardless of how dry the column is. P6d's real SWa/LWa
+       assembly removes that artificial pull, so a dry column's genuinely
+       larger radiative swing is now free to open the gap (A9) was not
+       designed to tolerate. **Conclusion: the P6d/P6e divergence is
+       downstream of the already-documented, already-deferred P2 wind-speed
+       shortfall, not a defect newly introduced by P6d's own radiation
+       wiring.** This reframes the decision point: a fix aimed only at the
+       Ta/T* coupling (options (c)/the profile-handoff bound) would be
+       patching a symptom of P2's wind shortfall rather than addressing it,
+       whereas revisiting P2's zonal-only wind speed (already flagged in
+       the P6c entry as "a judgement call for the §6 sweep") might close
+       this gap at its actual source. No fix has been applied — this is
+       presented as a decision point, per this stage's own discipline
+       against silent physics changes.
+
+    3. **Follow-up (2026-08-20): why is the live wind ~2.2-2.4 m/s specifically,
+       vs NCEP's 3.9-4.0?** Traced to a concrete, narrow gap, not a deeper flaw
+       in P2's zonal-cell physics. This same stage's own P3 sub-deliverable
+       (2026-08-16 entry above) already documented that SESAM's Earth-realistic
+       "total surface wind" is `Us = sqrt(us^2 + vs^2 + Usyn^2)` (A58) — the
+       zonal-cell wind *plus* the synoptic/storm-track gustiness term `Usyn`
+       (A56, ≈7 m/s) — not the zonal-cell wind alone (that entry's own worked
+       total: "zonal-cell wind (2.2-2.4) + synoptic gustiness (≈7) ≈ 8 m/s").
+       `sesam_synoptic.compute_synoptic` already computes this exact quantity
+       and returns it as `SesamSynoptic.total_wind_m_s` — but
+       `sesam_wind_coupling.sesam_wind_and_eke_step` (P6c) discards it: its
+       `SesamWindAndEke` return only carries `wind_zonal.surface_u_m_s`/
+       `surface_v_m_s` (the pre-synoptic zonal components) plus
+       `eke_m2_s2`, never `total_wind_m_s`. Everything downstream that reads
+       `wind_u_m_s`/`wind_v_m_s` — (A44) moisture-convergence advection in
+       `sesam_coupling.py`, and the bulk-aerodynamic evaporation/sensible-heat
+       wind-speed terms in `sesam_coupling.py`/`sesam_radiation_coupling.py`
+       (`wind_speed = sqrt(wind_u**2+wind_v**2)`) — therefore only ever sees
+       the ~2.2-2.4 m/s zonal component, never the synoptic contribution.
+
+       **This likely conflates two physically distinct uses that should not
+       share one wind field.** Moisture *advection* should plausibly stay on
+       the mean (zonal) flow — that is the correct field for transporting a
+       tracer — but bulk-aerodynamic flux formulas (evaporation, sensible
+       heat) are standard nonlinear functions of *wind speed*, where
+       real-world/NCEP climatologies (themselves time-means of instantaneous
+       speed, which does not cancel eddies the way a time-mean vector wind
+       does) are physically closer to SESAM's own (A58) total than to its
+       zonal-only component. Using the zonal-only magnitude for those bulk
+       formulas would systematically understate evaporation and sensible
+       heat versus what SESAM's own equations intend.
+
+       **Resolved (2026-08-20): the "NCEP 3.9-4.0 m/s" figure used throughout
+       is a mean-*vector*-wind speed, not the true mean wind-speed
+       climatology, and comparing against the real product changes the
+       verdict substantially.** `scripts/build_ncep_wind_reference.py`/
+       `diagnose_sesam_wind.py` compute `sqrt(mean(u)^2 + mean(v)^2)` from
+       NOAA's `uwnd.sig995.mon.ltm`/`vwnd.sig995.mon.ltm` — the *speed of the
+       time-mean vector wind*, which is always ≤ the true mean of
+       instantaneous speed (transient/storm-track eddies largely cancel in a
+       component-wise time mean before the magnitude is taken). NOAA
+       separately publishes the actual scalar-speed climatology,
+       `wspd.sig995.mon.ltm` — its own metadata literally states "Long Term
+       Mean Monthly Mean Wind Speed... from daily wind speed (from daily
+       vector winds)," i.e. computed from daily |wind| before time-averaging,
+       not from time-averaged components. This project had never downloaded
+       it. Fetched and compared directly (area-weighted global mean, same
+       grid handling as the existing reference builder):
+
+       | | `sqrt(mean_u^2+mean_v^2)` (current comparison basis) | true `wspd` |
+       |---|---|---|
+       | DJF | 4.093 m/s | 6.536 m/s |
+       | JJA | 4.152 m/s | 6.578 m/s |
+       | ANN | 3.623 m/s | 6.513 m/s |
+
+       The true wind-speed climatology is **~1.6-1.8x** the vector-mean
+       figure this project had been treating as "NCEP wind speed." This
+       resolves the inconsistency cleanly, in favor of the P3 reading:
+       SESAM's zonal-only wind (2.2-2.4 m/s) is correctly compared against
+       the *vector-mean* NCEP figure (3.9-4.2 m/s) — that comparison stays
+       valid, and the ~40-45% shortfall there is real (a genuine, separate,
+       already-documented P2 calibration question). But SESAM's own (A58)
+       *total* wind (zonal + `Usyn`, ≈7.4-8 m/s per the P3 entry's worked
+       quadrature sum) should be judged against the *true* `wspd` climatology
+       (~6.5 m/s annual, ~6.5-6.6 seasonal) — and by that comparison, SESAM's
+       total wind is already in the right ballpark, if anything a bit strong
+       (~15-25% high), not "40% low." **This reframes the fix priority**: the
+       dominant lever on the P6c precipitation collapse / P6d Ta-T* blowup
+       chain is very likely wiring the already-computed but currently-discarded
+       `SesamSynoptic.total_wind_m_s` into the bulk-aerodynamic evaporation/
+       sensible-heat wind-speed terms (`sesam_coupling.py`,
+       `sesam_radiation_coupling.py`) — roughly a 3x increase in the wind
+       speed driving those formulas, now measurement-backed rather than
+       speculative. The zonal-only wind should stay driving moisture
+       *advection* (the correct field for transporting a tracer, and its own
+       remaining ~40% shortfall is a separate, smaller, already-tracked
+       question). (Raw file:
+       `testing/reference_data/ncep_ncar_raw/wspd.sig995.mon.ltm.1991-2020.nc`,
+       gitignored per this project's existing reference-data convention, not
+       committed.)
+
+    4. **Implemented (2026-08-20) and does NOT resolve the P6e blowup — a
+       real, tested fix kept in the codebase, but a negative result for this
+       specific chain.** `SesamSynoptic.total_wind_m_s` is now threaded
+       through: `sesam_wind_coupling.SesamWindAndEke` gained a
+       `total_wind_m_s` field (`sesam_wind_coupling.py`), and
+       `sesam_column_closure_step` gained an optional
+       `total_wind_speed_m_s` parameter (`sesam_coupling.py`) that drives
+       only the bulk-aerodynamic evaporation/sensible-heat wind-speed terms
+       when supplied, defaulting to the previous zonal-magnitude behaviour
+       when omitted (`simulate.py`'s P6c call site now passes it whenever
+       `enable_sesam_dynamics` is on). 2 new regression tests
+       (`testing/test_sesam_coupling.py`) plus 1 extended test
+       (`testing/test_sesam_wind_coupling.py`); full SESAM suite 268
+       passed/1 skipped, no regressions. Verified live on the real DEM: mean
+       total wind (6.37 m/s) is genuinely ~3.7x the zonal-only mean
+       (1.73 m/s) the bulk formulas previously saw — the wiring is real, not
+       a no-op.
+
+       **Re-ran the exact P6e full-chain sanity check (standard
+       64x128/MONTHLY, all three gates on) with this fix in place: it still
+       fails at essentially the same speed and severity.** Cycle 0 (the
+       first simulated MONTHLY cycle) already clips 63.6% of
+       `air_temperature` to the 150 K floor; cycle 2 trips the same
+       `sesam_dynamics.hadley_geometry` "Hadley-cell boundary is not
+       bracketed" guard as the original P6e finding. **This falsifies the
+       specific causal chain hypothesized in the 2026-08-20 part-1 follow-up
+       above** (P2 wind shortfall → starved evaporation → dry land → weak
+       greenhouse trapping → fast radiative Ta crash → (A9) blowup): if that
+       chain were the dominant driver, a ~3.7x increase in the wind-speed
+       term driving evaporation should have measurably slowed or prevented
+       the collapse within the first simulated month, and it did not. The
+       collapse happens too fast (within the first ~30 simulated days,
+       cold-start) for a precipitation/soil-moisture-mediated pathway to
+       have had time to act — pointing instead toward something in the
+       first-step transient itself (e.g. an initial Ta/T* mismatch at cold
+       start, before any climate has equilibrated) or a mechanism inside the
+       P6d coupling not explained by upstream wind/moisture starvation.
+       **The wind fix is kept** (it corrects a real, independently
+       measurement-backed physics gap, is fully tested, and is inert on
+       every path except the still-default-off `enable_sesam_dynamics`
+       gate) but does not by itself unblock P6e. The original P6d/P6e
+       decision point (verify/bound `near_surface_lapse`'s coupling
+       exposure, bound the Ta-T* drift, or bound the profile handoff — see
+       the P6d entry above) stays open; root-causing what actually happens
+       cycle-by-cycle within that first simulated month (day 1 through day
+       30) is the logical next diagnostic step, not yet done.
+
 **Stop conditions** (per operating rule 3): a stage that fails its exit gate after
 its *own* constants' bounded sweep is a conclusion about that mechanism, and the
 branch pauses — no widening into legacy-knob sweeps, no per-region patches.

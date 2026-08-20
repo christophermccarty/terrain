@@ -4436,6 +4436,7 @@ def simulate_step(
         # skin/air temperature, the same simplification the legacy
         # precipitation substep loop already makes for its own inner loop).
         _sesam_wind_u, _sesam_wind_v, _sesam_eke = u_full, v_full, None
+        _sesam_total_wind = None
         if pp.enable_sesam_dynamics:
             _sesam_ice_mask = (
                 np.asarray(state.ice_cover) > 0.5 if state.ice_cover is not None else None
@@ -4455,6 +4456,7 @@ def simulate_step(
             _sesam_wind_u = _sesam_dynamics_step.wind_u_m_s
             _sesam_wind_v = _sesam_dynamics_step.wind_v_m_s
             _sesam_eke = _sesam_dynamics_step.eke_m2_s2
+            _sesam_total_wind = _sesam_dynamics_step.total_wind_m_s
 
         # SESAM stage P6d: when the P5 radiation gate is also on, replace
         # bridge 3 (the (T*-Ta)/1-day bulk relaxation) with SESAM's own
@@ -4525,6 +4527,7 @@ def simulate_step(
                 sw_absorbed_w_m2=_sesam_swa,
                 lw_net_w_m2=_sesam_lwa,
                 gravity_m_s2=float(pp.surface_gravity),
+                total_wind_speed_m_s=_sesam_total_wind,
             )
             _sesam_ta = _sesam_step.air_temperature_k
             _sesam_ra = _sesam_step.relative_humidity

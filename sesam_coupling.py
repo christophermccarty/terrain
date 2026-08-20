@@ -154,6 +154,7 @@ def sesam_column_closure_step(
     sw_absorbed_w_m2: np.ndarray | None = None,
     lw_net_w_m2: np.ndarray | None = None,
     gravity_m_s2: float = _GRAVITY_DEFAULT_M_S2,
+    total_wind_speed_m_s: np.ndarray | None = None,
 ) -> SesamColumnClosureStep:
     """One SESAM (A40)/(A42)/(A44) column-closure step, live-state-shaped.
 
@@ -177,6 +178,24 @@ def sesam_column_closure_step(
     fallback for P6b/P6c-only callers. When supplied, the water step runs
     first (it does not depend on the energy step's output) so its own (A44)
     precipitation can feed (A40)'s Le*Pw+Ls*Ps terms.
+
+    ``total_wind_speed_m_s``: SESAM's own (A58) ``Us = sqrt(us^2+vs^2+Usyn^2)``
+    -- the zonal-cell wind combined with P3's synoptic/storm-track gustiness
+    term, computed by ``sesam_wind_coupling.sesam_wind_and_eke_step`` as
+    ``SesamWindAndEke.total_wind_m_s`` once ``enable_sesam_dynamics`` is on.
+    Drives only the bulk-aerodynamic evaporation and sensible-heat *wind
+    speed* terms below -- both are nonlinear functions of instantaneous wind
+    speed, for which (A58)'s total is the physically appropriate driver (see
+    docs/SESAM_GAP_ANALYSIS.md Sec7 P2, 2026-08-20 follow-up: NCEP's true
+    wspd climatology, fetched and measured directly, runs ~1.6-1.8x the
+    mean-*vector*-wind figure this project had been comparing SESAM's
+    zonal-only wind against, and SESAM's own (A58) total lines up with the
+    true climatology far better than the zonal component alone does).
+    ``wind_u_m_s``/``wind_v_m_s`` continue to drive advection unchanged --
+    the correct field for transporting a tracer, not the flux formulas'
+    wind-speed term. ``None`` (the default) falls back to
+    ``sqrt(wind_u_m_s^2+wind_v_m_s^2)``, reproducing this function's
+    previous behaviour exactly for P6b/P6c-only callers.
     """
     ta0 = np.asarray(air_temperature_k, dtype=np.float64)
     if ta0.ndim != 2:
@@ -209,8 +228,15 @@ def sesam_column_closure_step(
     # placeholder diagnose_sesam_thermo.py already uses -- this project's
     # live evaporation code lives inside generate_precipitation/atmosphere.py
     # and is not exposed as a standalone field this module can read.
-    wind_speed = np.sqrt(np.asarray(wind_u_m_s, dtype=np.float64) ** 2
-                          + np.asarray(wind_v_m_s, dtype=np.float64) ** 2)
+    # Wind speed driving the bulk formulas below is (A58)'s total (zonal +
+    # synoptic gustiness) when the caller supplies it, not the bare zonal
+    # magnitude -- see this function's own docstring, `total_wind_speed_m_s`.
+    wind_speed = (
+        np.sqrt(np.asarray(wind_u_m_s, dtype=np.float64) ** 2
+                + np.asarray(wind_v_m_s, dtype=np.float64) ** 2)
+        if total_wind_speed_m_s is None
+        else np.asarray(total_wind_speed_m_s, dtype=np.float64)
+    )
     qsat_skin = saturation_specific_humidity(tstar, p0_field)
     rho0 = p0 / (_RD_J_KG_K * _RHO0_REFERENCE_TEMP_K)
     evap_mm_day = np.maximum(qsat_skin - qa_kg_kg, 0.0) * wind_speed * _BULK_TRANSFER_COEFFICIENT * rho0 * 86400.0
