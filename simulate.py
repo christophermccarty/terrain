@@ -28,6 +28,7 @@ from state_persistence import (
 )
 from sesam_coupling import sesam_column_closure_step
 from sesam_wind_coupling import sesam_wind_and_eke_step
+from sesam_radiation_coupling import sesam_radiation_step
 
 LOG = logging.getLogger("planetsim")
 
@@ -4406,6 +4407,7 @@ def simulate_step(
     # docstring for the three documented bridges (wind/EKE/diabatic source)
     # this first live-coupling sub-stage relies on.
     sesam_qq_next = state.sesam_column_water_mm
+    sesam_ht_next = state.sesam_tropopause_height_m
     if (
         pp.enable_sesam_column_closure
         and T_air_full is not None
@@ -4454,10 +4456,61 @@ def simulate_step(
             _sesam_wind_v = _sesam_dynamics_step.wind_v_m_s
             _sesam_eke = _sesam_dynamics_step.eke_m2_s2
 
+        # SESAM stage P6d: when the P5 radiation gate is also on, replace
+        # bridge 3 (the (T*-Ta)/1-day bulk relaxation) with SESAM's own
+        # (A69)-(A117)/(A10) SWa/LWa split. Unlike P6c's wind/EKE, this is
+        # recomputed every 1-day substep, not once per outer step: a real
+        # instability was found and root-caused during this stage's own
+        # development (see sesam_radiation_coupling.py's module docstring) --
+        # holding SWa/LWa fixed across a multi-day MONTHLY call removes the
+        # Stefan-Boltzmann negative feedback (LW emission rising with Ta) that
+        # keeps a radiative source term self-limiting, so a stale forcing
+        # applied for many consecutive 1-day substeps overshoots exactly the
+        # way the pre-fix diabatic bridge did (docs/SESAM_GAP_ANALYSIS.md
+        # Sec7 P6b's own overshoot bug), just via a different mechanism.
+        _sesam_ice_mask_rad = None
+        if pp.enable_sesam_radiation:
+            _sesam_ice_mask_rad = (
+                np.asarray(state.ice_cover) > 0.5 if state.ice_cover is not None else None
+            )
+            _sesam_h, _sesam_w = _sesam_elevation_m.shape
+            _sesam_lat_deg = 90.0 - (np.arange(_sesam_h) + 0.5) * 180.0 / _sesam_h
+            _sesam_lat_rad = np.deg2rad(_sesam_lat_deg)[:, None] * np.ones((1, _sesam_w))
+
         _sesam_n_sub = max(1, int(round(float(days) / _SESAM_COLUMN_CLOSURE_SUBSTEP_DAYS)))
         _sesam_sub_dt = float(days) / _sesam_n_sub
         _sesam_p_accum = None
-        for _ in range(_sesam_n_sub):
+        _sesam_ht = state.sesam_tropopause_height_m
+        for _sesam_sub_i in range(_sesam_n_sub):
+            _sesam_swa, _sesam_lwa = None, None
+            if pp.enable_sesam_radiation:
+                _sesam_sub_day = float(state.day_of_year) + _sesam_sub_i * _sesam_sub_dt
+                _sesam_declination = pp.solar_declination(_sesam_sub_day)
+                _sesam_insolation = pp.daily_mean_insolation(_sesam_lat_rad, _sesam_sub_day)
+                _sesam_radiation = sesam_radiation_step(
+                    air_temperature_k=_sesam_ta,
+                    skin_temperature_k=T_full,
+                    relative_humidity=_sesam_ra,
+                    cloud_fraction=cloud_full if cloud_full is not None else np.zeros_like(_sesam_ta),
+                    column_water_mm=_sesam_qq,
+                    elevation_m=_sesam_elevation_m,
+                    land_mask=_sesam_land_mask,
+                    ice_mask=_sesam_ice_mask_rad,
+                    snow_depth=state.snow_depth,
+                    tropopause_height_m=_sesam_ht,
+                    surface_pressure_pa=float(pp.surface_pressure_pa),
+                    gravity=float(pp.surface_gravity),
+                    co2_ppm=float(co2_atm_new),
+                    day_of_year=_sesam_sub_day,
+                    itcz_seasonal_response=float(pp.itcz_seasonal_response),
+                    solar_declination_rad=float(_sesam_declination),
+                    daily_mean_insolation_w_m2=_sesam_insolation,
+                    dt_days=_sesam_sub_dt,
+                )
+                _sesam_swa = _sesam_radiation.sw_absorbed_w_m2
+                _sesam_lwa = _sesam_radiation.lw_net_w_m2
+                _sesam_ht = _sesam_radiation.tropopause_height_m
+
             _sesam_step = sesam_column_closure_step(
                 air_temperature_k=_sesam_ta,
                 skin_temperature_k=T_full,
@@ -4469,6 +4522,9 @@ def simulate_step(
                 radius_m=float(pp.radius_m),
                 dt_days=_sesam_sub_dt,
                 eke_m2_s2=_sesam_eke,
+                sw_absorbed_w_m2=_sesam_swa,
+                lw_net_w_m2=_sesam_lwa,
+                gravity_m_s2=float(pp.surface_gravity),
             )
             _sesam_ta = _sesam_step.air_temperature_k
             _sesam_ra = _sesam_step.relative_humidity
@@ -4482,6 +4538,7 @@ def simulate_step(
         humidity_next = _sesam_ra
         P_full = (_sesam_p_accum / _sesam_n_sub).astype(np.float32, copy=False)
         sesam_qq_next = _sesam_qq
+        sesam_ht_next = _sesam_ht
 
     new_state = PlanetState(
         day_of_year=new_day,
@@ -4494,6 +4551,7 @@ def simulate_step(
         precipitation=P_full,
         humidity=humidity_next,
         sesam_column_water_mm=sesam_qq_next,
+        sesam_tropopause_height_m=sesam_ht_next,
         soil_moisture=soil_next,
         soil_moisture_deep=soil_deep_next,
         cloud_cover=cloud_full,

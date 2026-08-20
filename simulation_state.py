@@ -106,3 +106,10 @@ class PlanetState(NamedTuple):
     # PlanetParams.enable_sesam_column_closure has never been active,
     # matching every other gated field's old-save/gate-off convention here.
     sesam_column_water_mm: np.ndarray | None = None
+    # SESAM stage P6d (docs/SESAM_GAP_ANALYSIS.md Sec7): the (A10) prognostic
+    # tropopause height HT [m]. Lazy-initialized to the 12 km guess every
+    # prior SESAM stage has used (see sesam_radiation_coupling.py); stays
+    # None while PlanetParams.enable_sesam_radiation has never been active
+    # alongside enable_sesam_column_closure, matching sesam_column_water_mm's
+    # own old-save/gate-off convention above.
+    sesam_tropopause_height_m: np.ndarray | None = None

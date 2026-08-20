@@ -27,15 +27,29 @@ replacement by its own later P6 sub-stage:
    m^2/s^2 DJF / 232.8 m^2/s^2 JJA at the real 512x1024 saved state,
    docs/SESAM_GAP_ANALYSIS.md Sec7 P3 2026-08-18 measurement), not the real
    prognostic K field (``sesam_synoptic.py``, not wired into the live loop).
-3. **Diabatic source** (stage P6d will replace this): (A40) needs SWa+LWa+
-   Le*Pw+Ls*Ps+SH, and SESAM's own (A69)-(A117) radiative split
-   (``sesam_shortwave.py``/``sesam_longwave.py``) is not wired into the live
-   loop. This module instead treats the legacy model's own newly-computed
-   skin temperature ``T*`` (already resolved by the supported ocean/land/
-   radiation code every step) as a bulk sensible-heat-style driver of Ta:
-   ``(T* - Ta) / relaxation_days``. This is not an invented mechanism -- it
-   is (A41)'s own T2m=(Ta+T*)/2 relationship read as a forcing, and (A40)'s
-   own SH term is proportional to T*-Ta in a standard bulk formulation.
+3. **Diabatic source** (stage P6d, ``sesam_radiation_coupling.py``, replaces
+   this when ``PlanetParams.enable_sesam_radiation`` is also on): (A40)
+   needs SWa+LWa+Le*Pw+Ls*Ps+SH. When the caller supplies real
+   ``sw_absorbed_w_m2``/``lw_net_w_m2`` fields (P6d's own
+   ``sesam_radiation_step``, SESAM's (A69)-(A117) radiative split), this
+   module assembles the full (A40) source via
+   ``sesam_thermo.diabatic_heating_rate_k_day``: Pw/Ps come from splitting
+   this step's own (A44) precipitation output by the same air-temperature
+   rain/snow ramp ``simulate.py``'s legacy snow-pack model already uses
+   (1 at <=-3 degC, 0 at >=2 degC), and SH reuses the exact bulk-aerodynamic
+   formula ``land_surface.py`` already computes for its own sensible-heat
+   term (``rho0 * cp_air * 1.3e-3 * |wind| * (T* - Ta)``), the same
+   1.3e-3 bulk transfer coefficient this module's own evaporation proxy
+   already uses below. When the caller omits those fields (P6d's gate off,
+   the default), this module falls back to treating the legacy model's own
+   newly-computed skin temperature ``T*`` (already resolved by the
+   supported ocean/land/radiation code every step) as a bulk sensible-
+   heat-style driver of Ta: ``(T* - Ta) / relaxation_days``. This fallback
+   is not an invented mechanism either -- it is (A41)'s own
+   T2m=(Ta+T*)/2 relationship read as a forcing, and (A40)'s own SH term is
+   proportional to T*-Ta in a standard bulk formulation; it is simply a
+   coarser stand-in for the real SW/LW/latent/SH split P6d now supplies
+   when its own gate is on.
 
 Grid geometry reuses ``sesam_synoptic.spherical_transport_geometry``/
 ``zonal_center_spacing_m`` directly (built fresh each call from H/W/radius,
@@ -49,7 +63,12 @@ from typing import NamedTuple
 import numpy as np
 
 from sesam_synoptic import spherical_transport_geometry, zonal_center_spacing_m
-from sesam_thermo import evolve_column_energy, evolve_column_water_vapor
+from sesam_thermo import (
+    column_heat_capacity_j_m2_k,
+    diabatic_heating_rate_k_day,
+    evolve_column_energy,
+    evolve_column_water_vapor,
+)
 from sesam_vertical import saturation_specific_humidity
 
 # Stage P3's own validated global-mean local-steady-state EKE
@@ -76,6 +95,26 @@ _QQ_SCALE_KG_M2_PER_KGKG = 2000.0
 # conventions -- a documented simplification, not a per-planet fit.
 _RHO0_REFERENCE_TEMP_K = 288.15
 _RD_J_KG_K = 287.0  # dry-air gas constant, this project's standing convention
+
+# Bulk-aerodynamic transfer coefficient -- the same 1.3e-3 constant this
+# module's own evaporation proxy already uses below and land_surface.py's
+# `ra = 1.0 / (1.3e-3 * wind)` sensible-heat resistance already uses.
+_BULK_TRANSFER_COEFFICIENT = 1.3e-3
+_CP_AIR_J_KG_K = 1004.0  # standing project convention, see sesam_thermo.py note 2
+
+# Reference gravity for the P6d diabatic source's column heat capacity when
+# a caller does not pass gravity_m_s2 explicitly -- standard-atmosphere
+# sea-level value, the same "documented scalar simplification" convention
+# as _RHO0_REFERENCE_TEMP_K above. Callers on non-Earth planets should pass
+# their own PlanetParams.surface_gravity.
+_GRAVITY_DEFAULT_M_S2 = 9.81
+
+# Legacy snow/rain-phase ramp, identical to simulate.py's own snow-pack
+# model (1 at <=-3 degC, 0 at >=2 degC) -- reused here for (A40)'s Pw/Ps
+# split rather than inventing a second convention.
+def _snow_fraction(air_temperature_k: np.ndarray) -> np.ndarray:
+    t_air_c = np.asarray(air_temperature_k, dtype=np.float64) - 273.15
+    return np.clip((-t_air_c + 2.0) / 5.0, 0.0, 1.0)
 
 
 class SesamColumnClosureStep(NamedTuple):
@@ -112,6 +151,9 @@ def sesam_column_closure_step(
     dt_days: float,
     eke_m2_s2: np.ndarray | None = None,
     implicit_zonal_diffusion: bool = False,
+    sw_absorbed_w_m2: np.ndarray | None = None,
+    lw_net_w_m2: np.ndarray | None = None,
+    gravity_m_s2: float = _GRAVITY_DEFAULT_M_S2,
 ) -> SesamColumnClosureStep:
     """One SESAM (A40)/(A42)/(A44) column-closure step, live-state-shaped.
 
@@ -127,6 +169,14 @@ def sesam_column_closure_step(
     P3 local-steady-state field here once ``PlanetParams.enable_sesam_dynamics``
     is also on; ``None`` (the default) keeps bridge 2's spatially uniform
     placeholder (``SESAM_EKE_PLACEHOLDER_M2_S2``) for P6b-only callers.
+
+    ``sw_absorbed_w_m2``/``lw_net_w_m2``: stage P6d (``sesam_radiation_coupling.py``)
+    supplies SESAM's own atmosphere-absorbed SWa/LWa fields here once
+    ``PlanetParams.enable_sesam_radiation`` is also on; ``None`` (the default,
+    both must be supplied together) keeps bridge 3's ``(T*-Ta)/relaxation_days``
+    fallback for P6b/P6c-only callers. When supplied, the water step runs
+    first (it does not depend on the energy step's output) so its own (A44)
+    precipitation can feed (A40)'s Le*Pw+Ls*Ps terms.
     """
     ta0 = np.asarray(air_temperature_k, dtype=np.float64)
     if ta0.ndim != 2:
@@ -155,16 +205,6 @@ def sesam_column_closure_step(
         else np.asarray(eke_m2_s2, dtype=np.float64)
     )
 
-    diabatic_k_day = (tstar - ta0) / SESAM_BRIDGE_RELAXATION_DAYS
-
-    energy = evolve_column_energy(
-        ta0, diabatic_k_day, wind_u_m_s, wind_v_m_s, eke,
-        dx_m=dx_m, dy_m=dy_m, dt_days=float(dt_days),
-        cell_area_m2=area, x_face_length_m=x_face, y_face_length_m=y_face,
-        implicit_zonal_diffusion=implicit_zonal_diffusion,
-    )
-    ta_next = np.clip(energy.temperature_k.astype(np.float64), 150.0, 350.0)
-
     # Evaporation proxy: bulk-aerodynamic estimate, the same documented
     # placeholder diagnose_sesam_thermo.py already uses -- this project's
     # live evaporation code lives inside generate_precipitation/atmosphere.py
@@ -173,10 +213,13 @@ def sesam_column_closure_step(
                           + np.asarray(wind_v_m_s, dtype=np.float64) ** 2)
     qsat_skin = saturation_specific_humidity(tstar, p0_field)
     rho0 = p0 / (_RD_J_KG_K * _RHO0_REFERENCE_TEMP_K)
-    evap_mm_day = np.maximum(qsat_skin - qa_kg_kg, 0.0) * wind_speed * 1.3e-3 * rho0 * 86400.0
+    evap_mm_day = np.maximum(qsat_skin - qa_kg_kg, 0.0) * wind_speed * _BULK_TRANSFER_COEFFICIENT * rho0 * 86400.0
 
     slope = _slope_magnitude(elev, dx_m, dy_m)
 
+    # Water step first: it depends only on ta0 (via qa_kg_kg/evap above), not
+    # on the energy step's output, so running it here lets its own (A44)
+    # precipitation feed the real diabatic source below when P6d supplies one.
     water = evolve_column_water_vapor(
         qq0, evap_mm_day, wind_u_m_s, wind_v_m_s, eke,
         ra, qa_kg_kg, slope, land,
@@ -184,6 +227,28 @@ def sesam_column_closure_step(
         cell_area_m2=area, x_face_length_m=x_face, y_face_length_m=y_face,
         rho0_kg_m3=rho0, implicit_zonal_diffusion=implicit_zonal_diffusion,
     )
+
+    if sw_absorbed_w_m2 is not None and lw_net_w_m2 is not None:
+        swa = np.asarray(sw_absorbed_w_m2, dtype=np.float64)
+        lwa = np.asarray(lw_net_w_m2, dtype=np.float64)
+        snow_frac = _snow_fraction(ta0)
+        rainfall_mm_day = water.precipitation_mm_day.astype(np.float64) * (1.0 - snow_frac)
+        snowfall_mm_day = water.precipitation_mm_day.astype(np.float64) * snow_frac
+        sensible_heat_w_m2 = rho0 * _CP_AIR_J_KG_K * _BULK_TRANSFER_COEFFICIENT * wind_speed * (tstar - ta0)
+        cv = column_heat_capacity_j_m2_k(p0, float(gravity_m_s2))
+        diabatic_k_day = diabatic_heating_rate_k_day(
+            swa, lwa, rainfall_mm_day, snowfall_mm_day, sensible_heat_w_m2, cv,
+        )
+    else:
+        diabatic_k_day = (tstar - ta0) / SESAM_BRIDGE_RELAXATION_DAYS
+
+    energy = evolve_column_energy(
+        ta0, diabatic_k_day, wind_u_m_s, wind_v_m_s, eke,
+        dx_m=dx_m, dy_m=dy_m, dt_days=float(dt_days),
+        cell_area_m2=area, x_face_length_m=x_face, y_face_length_m=y_face,
+        implicit_zonal_diffusion=implicit_zonal_diffusion,
+    )
+    ta_next = np.clip(energy.temperature_k.astype(np.float64), 150.0, 350.0)
 
     qa_next_kg_kg = water.water_mm.astype(np.float64) / _QQ_SCALE_KG_M2_PER_KGKG
     qsat_ta_next = saturation_specific_humidity(ta_next, p0_field)

@@ -64,6 +64,43 @@ def test_near_surface_lapse_branches_and_caps():
     assert g.max() <= 10.0e-3 + 1e-9
 
 
+def test_near_surface_lapse_large_cold_land_contrast_produces_unphysical_profile():
+    """Documents a real finding from SESAM stage P6d (docs/SESAM_GAP_ANALYSIS.md
+    Sec7, 2026-08-19): the (A9) cold-land branch's deliberately unbounded
+    inversion term (see `test_near_surface_lapse_branches_and_caps` above --
+    "not lower-capped" is intentional, paper-faithful behaviour, not a
+    transcription gap) means a large, sustained Ta-T* contrast produces a
+    near-surface lapse rate whose magnitude, integrated over even the ~1.5 km
+    near-surface layer (`H_Gamma_s`), swings the profile hundreds of Kelvin
+    away from the surface value. This was never exercised before P6d because
+    every prior SESAM stage either used smooth synthetic test fields or a
+    single diagnostic measurement against a saved state already near
+    radiative equilibrium (small Ta-T* gap); P6d's live day-by-day coupling
+    is the first caller that can let Ta drift far from the legacy T* between
+    steps, and does so when the diabatic-source bridge/radiation feedback
+    loop pushes a cell strongly out of balance (observed on a real 16x32
+    smoke run: a 24 K Ta-T* gap alone produces a >600 K profile point).
+    This is not asserted as a bug to fix here -- it is a live coupling
+    constraint on how far Ta may safely diverge from T* before feeding this
+    formula, deliberately left as an open finding for the P6 calibration
+    window rather than silently patched (this project's own stop-condition
+    discipline: a paper-faithful formula's own edge case is a finding about
+    the *coupling*, not license to alter already-tested P1 physics without
+    verifying the change against the source paper)."""
+    ta = np.array([[261.75]])
+    ts = np.array([[285.75]])  # a real 24 K gap observed during live P6d coupling
+    kind = np.array([[1]])  # land
+    qa = np.array([[0.0005]])
+    zs = np.array([[0.0]])
+    ht = np.array([[12000.0]])
+    t_z, gamma_z, _ = sv.temperature_profile(LEVELS, ta, ts, kind, qa, zs, ht, a1=A1)
+    assert np.any(t_z > 400.0), (
+        "expected the documented unbounded-inversion blowup to reproduce; if this "
+        "now fails, near_surface_lapse's cold-land branch behaviour has changed -- "
+        "update docs/SESAM_GAP_ANALYSIS.md's P6d entry accordingly"
+    )
+
+
 # ---------------------------------------------------------------------------
 # (A5) temperature profile
 # ---------------------------------------------------------------------------

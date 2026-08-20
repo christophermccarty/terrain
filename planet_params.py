@@ -641,13 +641,14 @@ class PlanetParams:
       turbulent diffusion coefficients, synoptic surface wind and 700 hPa
       vertical velocity, and wind stress.
 
-    This gate is off by default and is **not wired into the supported climate
-    path**: nothing in ``simulate.py`` calls these kernels, so enabling it has
-    zero default-path climate impact. It exists as the documented hook for
-    the SESAM stages P4 (transport) and P5 (radiation) to consume the
-    wind/SLP/EKE fields, and as the reservation that ``simulate_step`` is not
-    allowed to call ``sesam_dynamics`` or ``sesam_synoptic`` while this
-    remains False.
+    This gate is off by default. Since stage P6c (docs/SESAM_GAP_ANALYSIS.md
+    Sec7, 2026-08-19), ``simulate.py`` *does* call these kernels
+    (``sesam_wind_coupling.py``), but only when this gate *and*
+    ``enable_sesam_column_closure`` are both True; with either off, the
+    default climate path is unaffected. It supplies live SLP/wind/EKE fields
+    to stage P6d's own radiation coupling and stage P4's column closure when
+    enabled, replacing ``sesam_coupling.py``'s legacy-wind/uniform-EKE
+    bridges.
     """
 
     enable_sesam_column_closure: bool = False
@@ -665,14 +666,18 @@ class PlanetParams:
     (gate ``enable_prognostic_column_water``); this gate adds the energy
     side and the (A44) precipitation formula that closes it.
 
-    This gate is off by default and is **not wired into the supported
-    climate path**: nothing in ``simulate.py`` calls ``sesam_thermo``, so
-    enabling it has zero default-path climate impact. It exists as the
-    documented hook for stage P6 (the bounded calibration window) to couple
-    this closure into the SESAM branch once P5 (radiation) supplies real
-    ``SWa``/``LWa`` atmosphere-absorbed fluxes; until then
-    ``docs/SESAM_GAP_ANALYSIS.md``'s P4 diagnostic script exercises it
-    against a documented proxy heating field, not the real radiation code.
+    This gate is off by default. Since stage P6b (docs/SESAM_GAP_ANALYSIS.md
+    Sec7, 2026-08-19), ``simulate.py`` *does* call ``sesam_thermo`` (via
+    ``sesam_coupling.py``) when this gate is True, overriding the legacy
+    air-temperature evolution and row-target precipitation allocator; with
+    it off, the default climate path is unaffected. ``enable_sesam_dynamics``
+    (P6c) and ``enable_sesam_radiation`` (P6d) additionally replace this
+    closure's own legacy-wind/EKE/diabatic-source bridges when also enabled
+    -- see ``sesam_coupling.py``'s module docstring for the current bridge
+    status. P6d's live coupling found (2026-08-19) that a sustained large
+    Ta/skin-temperature gap can drive stage P1's cold-land lapse formula
+    into an unphysical regime (docs/SESAM_GAP_ANALYSIS.md Sec7 P6d), an open
+    issue for the P6 calibration window, not yet resolved.
     """
 
     enable_sesam_radiation: bool = False
@@ -713,13 +718,18 @@ class PlanetParams:
     ``surface_relative_humidity_star``/``t2m_diagnostic``, and stage P3's
     ``synoptic_vertical_velocity``/``total_wind_magnitude``.
 
-    This gate is off by default and is **not wired into the supported
-    climate path**: nothing in ``simulate.py`` calls ``sesam_radiation``,
-    ``sesam_shortwave``, or ``sesam_longwave``, so enabling it has zero
-    default-path climate impact. It exists as the documented hook for this
-    same stage's remaining items (the (A10) tropopause radiative closure and
-    the ozone-climatology decision), and for stage P6 (the bounded
-    calibration window) once the full radiation budget closes.
+    This gate is off by default. Since stage P6d (docs/SESAM_GAP_ANALYSIS.md
+    Sec7, 2026-08-19), ``simulate.py`` *does* call ``sesam_radiation``,
+    ``sesam_shortwave``, ``sesam_longwave`` and ``sesam_tropopause`` (via
+    ``sesam_radiation_coupling.py``) when this gate *and*
+    ``enable_sesam_column_closure`` are both True, replacing
+    ``sesam_coupling.py``'s bulk ``(T*-Ta)/1-day`` diabatic-source bridge
+    with the real (A69)-(A117)/(A10) SWa/LWa split; with either gate off,
+    the default climate path is unaffected. P6d's own first multi-day
+    exercise found this currently diverges under a sustained large Ta/skin-
+    temperature gap (stage P1's cold-land lapse formula, not a bug in this
+    module) -- see ``sesam_coupling.py``'s module docstring and
+    docs/SESAM_GAP_ANALYSIS.md Sec7 P6d for the open finding.
     """
 
     enable_force_restore_atmospheric_heat_convergence: bool = False

@@ -149,6 +149,80 @@ def test_simulate_step_gated_on_runs_without_nan():
         assert np.all(np.isfinite(arr)), f"{name} produced non-finite values"
 
 
+def test_real_diabatic_source_path_finite_and_shaped():
+    """P6d: when sw_absorbed_w_m2/lw_net_w_m2 are supplied, the real (A40)
+    assembly (sesam_thermo.diabatic_heating_rate_k_day) replaces bridge 3
+    instead of the (T*-Ta)/1-day fallback."""
+    ta, tstar, ra, elev, land, u, v = _synthetic_fields()
+    h, w = ta.shape
+    rng = np.random.default_rng(1)
+    swa = 60.0 + 20.0 * rng.uniform(-1, 1, size=(h, w))
+    lwa = -150.0 + 30.0 * rng.uniform(-1, 1, size=(h, w))
+    result = sc.sesam_column_closure_step(
+        air_temperature_k=ta, skin_temperature_k=tstar, relative_humidity=ra,
+        column_water_mm=None, wind_u_m_s=u, wind_v_m_s=v,
+        elevation_m=elev * 3000.0, land_mask=land,
+        surface_pressure_pa=float(EARTH.surface_pressure_pa),
+        radius_m=float(EARTH.radius_m), dt_days=1.0,
+        sw_absorbed_w_m2=swa, lw_net_w_m2=lwa, gravity_m_s2=float(EARTH.surface_gravity),
+    )
+    for field in (
+        result.air_temperature_k, result.relative_humidity,
+        result.precipitation_mm_day, result.column_water_mm,
+    ):
+        assert field.shape == (h, w)
+        assert np.all(np.isfinite(field))
+    assert np.all(result.air_temperature_k >= 150.0) and np.all(result.air_temperature_k <= 350.0)
+
+
+def test_real_diabatic_source_requires_both_fields():
+    """Supplying only one of sw_absorbed_w_m2/lw_net_w_m2 falls back to
+    bridge 3 (both-or-neither), not a partial/undefined source."""
+    ta, tstar, ra, elev, land, u, v = _synthetic_fields()
+    h, w = ta.shape
+    swa_only = sc.sesam_column_closure_step(
+        air_temperature_k=ta, skin_temperature_k=tstar, relative_humidity=ra,
+        column_water_mm=None, wind_u_m_s=u, wind_v_m_s=v,
+        elevation_m=elev * 3000.0, land_mask=land,
+        surface_pressure_pa=float(EARTH.surface_pressure_pa),
+        radius_m=float(EARTH.radius_m), dt_days=1.0,
+        sw_absorbed_w_m2=np.full((h, w), 60.0), lw_net_w_m2=None,
+    )
+    bridge_only = sc.sesam_column_closure_step(
+        air_temperature_k=ta, skin_temperature_k=tstar, relative_humidity=ra,
+        column_water_mm=None, wind_u_m_s=u, wind_v_m_s=v,
+        elevation_m=elev * 3000.0, land_mask=land,
+        surface_pressure_pa=float(EARTH.surface_pressure_pa),
+        radius_m=float(EARTH.radius_m), dt_days=1.0,
+    )
+    assert swa_only.air_temperature_k == pytest.approx(bridge_only.air_temperature_k, rel=1e-9)
+
+
+def test_simulate_step_gated_on_with_radiation_runs_without_nan_near_equilibrium():
+    """P6d gated on alongside P6b, single DAILY step from a fresh (near-
+    equilibrium) initial state -- see testing/test_sesam_vertical.py's
+    `test_near_surface_lapse_large_cold_land_contrast_produces_unphysical_profile`
+    for the documented open finding that a *sustained, large* Ta-T* contrast
+    (not exercised by a single step from a fresh state) currently makes P1's
+    cold-land lapse branch blow up; this test intentionally stays inside the
+    near-equilibrium regime that finding does not cover."""
+    from real_terrain_validation import load_bundled_earth_dem
+    from simulate import create_initial_state, simulate_step, TimeScaleMode
+
+    h, w = 16, 32
+    elevation = load_bundled_earth_dem(h, w)
+    pp = replace(EARTH, enable_sesam_column_closure=True, enable_sesam_radiation=True)
+
+    state = create_initial_state(elevation, day_of_year=80.0, planet_params=pp, block_size=1)
+    state, _ = simulate_step(state, days=1.0, planet_params=pp, block_size=1,
+                              time_scale=TimeScaleMode.DAILY)
+    for name in ("air_temperature", "precipitation", "humidity", "sesam_column_water_mm"):
+        arr = np.asarray(getattr(state, name))
+        assert np.all(np.isfinite(arr)), f"{name} produced non-finite values"
+    assert state.sesam_tropopause_height_m is not None
+    assert np.all(np.isfinite(state.sesam_tropopause_height_m))
+
+
 def test_simulate_step_multiday_call_does_not_saturate_clip_bounds():
     """Regression test for a real bug found and fixed 2026-08-19: the
     diabatic bridge in `sesam_coupling.py` is a 1-day relaxation *rate*

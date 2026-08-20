@@ -1101,6 +1101,84 @@ so each is evaluable without the next.
     the §6 sweep itself rather than a P6c-stage action per this project's own
     staged discipline.
 
+  - **P6d sub-deliverable built and wired (2026-08-19): SESAM's own (A69)-(A117)
+    shortwave/longwave radiation and (A10) tropopause closure now replace
+    P6b's bridge 3 (the ``(T*-Ta)/1-day`` bulk relaxation) -- but this stage's
+    own first real multi-day exercise surfaced a genuine, unresolved
+    numerical fragility that keeps it short of a clean pass, reported here
+    rather than papered over.** New ``sesam_radiation_coupling.py`` mirrors
+    ``scripts/diagnose_sesam_toa.py``'s already-validated chain (P1 vertical
+    structure on the stratosphere-reaching 10-level grid, (A6) cloud
+    geometry, (A69)-(A105) shortwave, (A106)-(A117) longwave, (A10)
+    tropopause), sourced from live ``PlanetState`` fields and the *current*
+    day of year rather than an annual mean. ``sesam_coupling.py``'s
+    ``sesam_column_closure_step`` gained optional
+    ``sw_absorbed_w_m2``/``lw_net_w_m2`` parameters: when both are supplied
+    it assembles the real (A40) source via
+    ``sesam_thermo.diabatic_heating_rate_k_day`` (Pw/Ps split from this
+    step's own (A44) precipitation by the same air-temperature rain/snow
+    ramp ``simulate.py``'s legacy snow-pack model already uses; SH reuses
+    ``land_surface.py``'s own bulk-aerodynamic sensible-heat formula), and
+    the water step now runs before the energy step (a pure reordering --
+    water never depended on the energy step's output -- needed so the real
+    source can consume this step's own precipitation). Gated on
+    ``PlanetParams.enable_sesam_radiation`` *in addition to*
+    ``enable_sesam_column_closure``; 15 new tests
+    (``testing/test_sesam_radiation_coupling.py``,
+    ``testing/test_sesam_coupling.py``); full SESAM suite 266 passed/1
+    skipped.
+
+    **A real cadence bug found and fixed during development, the same class
+    as P6b's own multi-day overshoot but via a different mechanism.** An
+    initial version held SWa/LWa fixed for the whole outer ``simulate_step``
+    call (mirroring P6c's own wind/EKE convention, justified there because
+    wind/EKE only scale advection/diffusion rather than acting as a source
+    term). This stayed numerically fine for single-day DAILY calls but drove
+    ``air_temperature`` to NaN within 2-3 MONTHLY (30-day) calls on a real
+    16x32 smoke run: holding a *diabatic source* fixed for many consecutive
+    1-day Euler substeps removes the Stefan-Boltzmann negative feedback (LW
+    emission rising with Ta) that keeps a radiative forcing self-limiting,
+    so a stale forcing overshoots the same way P6b's own un-substepped
+    bridge did. **Fixed** by recomputing the full radiation chain every
+    1-day column-closure substep instead of once per outer step -- expensive
+    (a full longwave transmission-matrix solve per simulated day, not per
+    outer call), left as a documented performance follow-up for P6e rather
+    than traded away silently.
+
+    **A second, deeper finding survives that fix, unresolved and not chased
+    further inside P6d per this project's own stop-condition discipline.**
+    Even with per-substep radiative recompute, a sustained multi-day
+    MONTHLY run still diverges (confirmed via a direct, isolated repro,
+    ``testing/test_sesam_vertical.py``'s
+    ``test_near_surface_lapse_large_cold_land_contrast_produces_unphysical_profile``):
+    stage P1's (A9) cold-land near-surface lapse rate
+    (``sesam_vertical.near_surface_lapse``) has a **deliberately unbounded**
+    inversion term (``c6_Gamma * (Ta - T*)``, already covered by
+    ``test_near_surface_lapse_branches_and_caps``'s own
+    "not lower-capped" assertion -- paper-faithful behaviour per that
+    branch's docstring, not a transcription gap). When the diabatic-source
+    bridge/radiation feedback loop lets Ta drift tens of Kelvin from the
+    legacy skin temperature T* (observed: a 24 K gap alone produces a
+    temperature-profile point above 600 K when integrated over the ~1.5 km
+    near-surface layer), this formula's own unbounded design -- never
+    exercised under live iteration before, since every prior SESAM stage
+    used either smooth synthetic test fields or a single diagnostic
+    measurement against an already-near-equilibrium saved state -- blows up
+    the whole vertical structure, cascading into the longwave scheme's
+    transmission matrix and producing LW fluxes many orders of magnitude
+    past anything physical. **This is not fixed here.** It is a paper-
+    faithful P1 formula's genuine edge case under a coupling architecture
+    that can (for now) let Ta wander further from T* than the formula was
+    evidently designed to tolerate -- altering already-tested P1 physics to
+    add a symmetric bound is a plausible fix but not one to make
+    unilaterally without verifying against the source paper text, per this
+    project's own section 5/6 discipline (read-only reference-repo policy,
+    no silent physics changes). Left as an explicit decision point for
+    whoever picks up P6e: verify against the paper and bound
+    ``near_surface_lapse`` symmetrically, add a coupling-side constraint
+    that keeps Ta closer to T*, or accept this as a bounded-scope limitation
+    the calibration window must design around.
+
 **Stop conditions** (per operating rule 3): a stage that fails its exit gate after
 its *own* constants' bounded sweep is a conclusion about that mechanism, and the
 branch pauses — no widening into legacy-knob sweeps, no per-region patches.
