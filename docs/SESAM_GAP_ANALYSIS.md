@@ -1179,6 +1179,43 @@ so each is evaluable without the next.
     that keeps Ta closer to T*, or accept this as a bounded-scope limitation
     the calibration window must design around.
 
+  - **P6e (full-chain sanity run) attempted 2026-08-19: NOT passed, and decisively
+    so -- the P6d finding above is confirmed to be far more severe than its own
+    write-up suggested, not a new root cause.** All three gates
+    (``enable_sesam_column_closure``/``enable_sesam_dynamics``/``enable_sesam_radiation``)
+    together at the standard ``real_terrain_validation.py`` config (64x128,
+    MONTHLY, 1yr spinup + 1yr eval): ``air_temperature`` collapses to the 150 K
+    clip floor almost everywhere (mean 153.3 K, vs a sane ``state.temperature``
+    skin mean of 281.4 K) within the **first simulated MONTHLY step (30 days)**,
+    not over "many days" as P6d's own smoke-run framing implied -- the smaller
+    16x32 test grid used there happened to collapse more gradually than the
+    real DEM's actual elevation/latitude distribution does at the target
+    resolution. By the third outer step (cycle 2 of the spinup), the now-
+    thoroughly-corrupted temperature field feeds into stage P2's own
+    ``sesam_dynamics.hadley_geometry`` (called every outer step by
+    ``sesam_wind_coupling.py`` when ``enable_sesam_dynamics`` is on) and raises
+    a hard ``ValueError`` ("the Hadley-cell boundary is not bracketed") --
+    P2's own deliberate guard for "a climate too distorted for the cell
+    decomposition" (its docstring's own words), tripped by exactly the
+    distortion P6d's ``near_surface_lapse`` finding produces. **This is the
+    same root cause as the P6d entry above, not a second bug**: confirmed by
+    an isolated control run (P6b+P6c only, radiation gate off, same config)
+    completing all 12 spinup cycles cleanly in 172.7s with no exception --
+    the divergence and the downstream Hadley-geometry crash both require
+    ``enable_sesam_radiation`` to be on.
+
+    **Consequence for this stage's own remaining scope**: the §6 bounded
+    Table-A constant sweep this stage exists to run cannot proceed on top of
+    a full chain that does not survive its first simulated month. Per this
+    project's own stop-condition discipline (below), this stage pauses here
+    rather than widening into a workaround; the P6d entry's own three listed
+    options (verify against the paper and bound ``near_surface_lapse``
+    symmetrically, add a coupling-side Ta-drift constraint, or design the
+    calibration window around this as a hard limitation) remain the explicit
+    decision point, now with the added information that the failure is not a
+    rare, slow-drift edge case but the default outcome of the standard
+    64x128/MONTHLY target config within one simulated month.
+
 **Stop conditions** (per operating rule 3): a stage that fails its exit gate after
 its *own* constants' bounded sweep is a conclusion about that mechanism, and the
 branch pauses — no widening into legacy-knob sweeps, no per-region patches.
