@@ -1551,6 +1551,57 @@ so each is evaluable without the next.
     **Next task: the §6 bounded Table-A constant sweep**, unblocked for the
     first time since P6 began (2026-08-19).
 
+  - **§6 bounded Table-A constant sweep run (2026-08-20) — no winning
+    configuration found; SESAM stays default-off, the window is spent.**
+    Per §6.2's own scope ("a documented sweep over only the SESAM paper's
+    own constants... at 64×128"), one-at-a-time sweep over three
+    paper-given constants motivated directly by the P6e baseline's own
+    gaps: `tau_p` (A4_hydrology, eq. A44, land moisture-turnover time,
+    default 50 d, tested 75/100 d), `ra_max` (A4_hydrology, eq. A44,
+    convergence-efficiency RH saturation threshold, default 0.95, tested
+    0.97/0.99), and `c7syn` (A5_synoptic, eq. A56, synoptic gustiness
+    coefficient driving `Usyn`, default 0.7, tested 0.5/0.35 — motivated by
+    this session's own finding that (A58)'s total wind runs ~15-25% high
+    against the true NCEP `wspd` climatology). Each scored against the full
+    standard gate set (Köppen group/class accuracy, CRU-referenced
+    temperature/precipitation, NCEP wind, regional target errors, and the
+    composite `reference_error_score`) at the standard 64×128/MONTHLY,
+    1yr spinup + 1yr eval config, baseline included:
+
+    | Config | precip mm/day | Köppen group | Köppen class | ref_error_score | global temp K |
+    |---|---|---|---|---|---|
+    | baseline | 5.00 | 0.582 | 0.282 | 6.02 | 282.8 |
+    | tau_p=75 | 4.96 | 0.573 | 0.277 | 5.89 | 282.8 |
+    | tau_p=100 | 4.94 | 0.569 | 0.274 | 5.69 | 282.7 |
+    | ra_max=0.97 | 4.97 | 0.583 | 0.281 | 6.00 | 282.8 |
+    | ra_max=0.99 | 4.94 | 0.582 | 0.280 | 6.02 | 282.7 |
+    | c7syn=0.5 | 4.52 | 0.571 | 0.273 | 5.30 | 279.2 |
+    | c7syn=0.35 | 4.15 | 0.563 | 0.271 | 4.88 | 274.5 |
+
+    **No configuration wins cleanly against the full gate set.** `tau_p`
+    and `ra_max` produce only weak, largely noise-level movement — global
+    precipitation barely shifts, and Köppen accuracy actually trends
+    *down* even as `reference_error_score` improves. `c7syn` moves
+    `reference_error_score` the most, but only by cooling the whole planet
+    substantially (up to 8.3 K global-mean drop at `c7syn=0.35`) — an
+    implausible magnitude of side effect for what should be a modest
+    synoptic-wind recalibration — while Köppen group/class accuracy falls
+    monotonically the whole way. That is the signature of a compensating
+    error improving one aggregate scalar, not a genuinely better climate;
+    per this project's own standing discipline, an aggregate-score
+    improvement bought by a physically implausible side effect and a worse
+    classification-accuracy score is not a promotion case.
+
+    **Per §6.3: the calibrated branch still loses and is rejected with
+    measurements like any other candidate. SESAM stays default-off. The
+    window is spent, not extended — a second window requires a new
+    decision record**, not a wider sweep run casually. This closes out the
+    P0-P6 staged SESAM adoption effort: every stage is built, tested, and
+    documented (P0-P5 complete, P6 unblocks a full-chain run for the first
+    time), but the adopted design does not beat the legacy incumbent on the
+    standard gate set even after its one allotted calibration window, and
+    is not promoted.
+
 **Stop conditions** (per operating rule 3): a stage that fails its exit gate after
 its *own* constants' bounded sweep is a conclusion about that mechanism, and the
 branch pauses — no widening into legacy-knob sweeps, no per-region patches.
