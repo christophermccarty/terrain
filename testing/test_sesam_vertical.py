@@ -291,6 +291,42 @@ def test_compute_vertical_structure_shapes_and_finite():
     assert res.pressure_pa.min() > 0.0
 
 
+def test_compute_vertical_structure_clips_profile_documented_p6d_blowup():
+    """docs/SESAM_GAP_ANALYSIS.md Sec7 P6d/P6e, 2026-08-20 follow-up: the
+    same 24 K Ta-T* cold-land contrast that
+    ``test_near_surface_lapse_large_cold_land_contrast_produces_unphysical_profile``
+    (above) shows blows ``temperature_profile`` past 400 K must come out of
+    ``compute_vertical_structure`` bounded to [150, 350] K -- the numerics
+    guard this stage added, not a change to (A9)/`temperature_profile`
+    itself (that lower-level function is deliberately left unclipped and
+    the other test's own assertion still passes unchanged). Also checks
+    that specific_humidity_kgkg/potential_temperature_k -- both derived
+    *from* the profile -- are finite, proving the clip runs before those
+    derivations, not after."""
+    ta = np.full((H, W), 261.75)
+    ts = np.full((H, W), 285.75)  # the same real 24 K gap observed during live P6d coupling
+    qa = np.full((H, W), 0.0005)
+    kind = np.ones((H, W), dtype=np.int64)  # land
+    zs = np.zeros((H, W))
+    ht = np.full((H, W), 12000.0)
+    res = sv.compute_vertical_structure(
+        LEVELS,
+        near_surface_air_temp_k=ta,
+        skin_temp_k=ts,
+        surface_kind=kind,
+        near_surface_specific_humidity_kgkg=qa,
+        surface_elevation_m=zs,
+        tropopause_height_m=ht,
+        p0_pa=101325.0,
+        gravity=9.81,
+        reference_temp_k=288.0,
+    )
+    assert res.temperature_k.min() >= 150.0
+    assert res.temperature_k.max() <= 350.0
+    assert np.isfinite(res.specific_humidity_kgkg).all()
+    assert np.isfinite(res.potential_temperature_k).all()
+
+
 def test_compute_with_tropopause_tendency_when_r_strat_given():
     ta, ts, qa, kind, zs, ht = _baseline()
     res = sv.compute_vertical_structure(

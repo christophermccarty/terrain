@@ -1392,6 +1392,165 @@ so each is evaluable without the next.
        cycle-by-cycle within that first simulated month (day 1 through day
        30) is the logical next diagnostic step, not yet done.
 
+    5. **Day-by-day trace (2026-08-20): root cause confirmed and sharpened,
+       no code changed.** Traced `Ta`/`T*` at `simulate_step`'s own
+       sub-step granularity (5×~6.08-day calls per MONTHLY cycle) through
+       the first two simulated months. Land `Ta-T*` starts sane (+2.1K mean
+       at t=0) and is already **-71K mean by day 6.1** (the very first
+       sub-step), **-125K and 62% floor-clipped by day 12.2**, then stays
+       parked there essentially unchanged through day 60.9 — a fast
+       collapse to a broken steady state within ~12 days, not a slow
+       ongoing runaway across the whole month. Checked whether day 1 alone
+       is a bug: it is not — `diabatic_heating_rate_k_day` on the fresh
+       initial state (sane inputs throughout) gives a physically reasonable
+       -0.59 K/day mean (range -2.06 to +0.38), nothing bug-sized.
+       **Conclusion: a fast, compounding feedback loop, not a one-time bad
+       calculation or a bad cold start.** Each day's modest cooling nudges
+       `Ta` slightly below `T*`; that nudges `near_surface_lapse`'s
+       (paper-correct, deliberately unbounded) cold-land inversion term;
+       that distorts the vertical profile fed into the next day's longwave
+       transmission-matrix solve; that produces a colder `LWa`; that cools
+       `Ta` further. ~5-6 daily iterations is enough to run completely away
+       from an unremarkable starting state. This confirms and sharpens the
+       original P6d finding rather than replacing it: the mechanism needs
+       **no precondition** (no dry land or weak wind required to get
+       started — consistent with why sub-item 4's wind fix didn't touch
+       it), and it is **fast** (single-digit days, not "many days"/gradual
+       over the whole month as earlier framings implied). This weights the
+       remaining decision point toward **bounding the profile handoff into
+       the longwave solve** over bounding the Ta-T* drift in the coupling:
+       the day-1-sane / fast-blowup evidence points at the profile handoff
+       itself turning a moderate gap into something numerically extreme,
+       not at a slowly-accumulating drift a coupling-side rate limiter
+       would naturally catch early. **Not implemented** — still an open
+       decision, per this whole investigation's standing discipline against
+       silently applying a coupling-architecture fix.
+
+    6. **Read CLIMBER-X's real Fortran source (2026-08-20), read-only per §5
+       licensing policy — a real architectural difference found and
+       partially validated.** Per the user's choice to investigate rather
+       than patch, fetched `github.com/cxesmc/climber-x`'s `src/atm/`
+       directly. `atm_model.f90`'s call sequence computes radiation and
+       vertical structure **once per outer atmosphere timestep**, but the
+       prognostic temperature update (`time_step.f90`) runs inside a "fast
+       time stepping loop" repeated `nstep_fast` times per outer step
+       (`nml/atm_par.nml`: `nstep_fast = 8`) — CLIMBER-X integrates the
+       temperature ODE in ~8 sub-steps per day, all against the same
+       held-fixed daily radiation. PlanetSim's SESAM coupling
+       (`_SESAM_COLUMN_CLOSURE_SUBSTEP_DAYS = 1.0`) does one single 1-day
+       Euler step per radiation recompute — 8x coarser. Also confirmed:
+       CLIMBER-X's `t2` (2m diagnostic, (A41)) is purely diagnostic
+       (`0.5*(tskin+tam_zs)`, never fed back), matching PlanetSim's own
+       `t2m_diagnostic` usage — not a discrepancy. Cross-checked `c_gam_6 =
+       10.e-3` (the paper's c6Γ, the exact constant driving the cold-land
+       inversion term) against `sesam_reference.py`'s `10.0e-3` — exact
+       match, not a transcription bug.
+
+       **Tested the sub-stepping hypothesis directly** (isolated diagnostic
+       script, no production code changed): replayed the real P6e initial
+       state, recomputing radiation once/day but integrating the SESAM
+       energy/water Euler step in 8 sub-steps of 1/8 day each (matching
+       `nstep_fast`), with `T*` deliberately **held fixed** to isolate just
+       the sub-stepping variable. **Result: substantially delays and
+       smooths the collapse but does not prevent it.** Land `Ta-T*` grows
+       gently through day 8 (-6.6K, vs. already -71K by day 6 in the
+       original 1-substep/day trace), then still runs away from ~day 9-10,
+       reaching the same clip-floor collapse by day 15. Finer time
+       discretization is a real, meaningful contributing factor (removes
+       artificial Euler overshoot, roughly doubles the runway) but is not
+       sufficient alone — once discretization error is mostly removed,
+       there is still a genuinely divergent trajectory in the coupled
+       system as built, not merely a numerical-integration artifact.
+       **Confound not yet resolved**: holding `T*` fixed removes the real,
+       already-on-by-default `land_surface.py` sensible-heat feedback
+       (`sensible_flux ∝ (T_sst - T_air)`, subtracted from `T*`'s own
+       budget) present in the actual production coupling. The next test —
+       not yet done — is combining 8x/day sub-stepping *with* that real
+       `T*` feedback active (i.e. actually adjusting `simulate.py`'s SESAM
+       substep cadence, not an isolated script) to see whether the two
+       together fully stabilize it. Not implemented in production code.
+
+    7. **Combined test (2026-08-20): real T* feedback + 8x sub-stepping —
+       decisive negative result, no production code changed.** Re-ran item
+       6's sub-stepping test through the real `simulate_step` path this
+       time (monkey-patched `simulate._SESAM_COLUMN_CLOSURE_SUBSTEP_DAYS =
+       1/8`, not a production edit), so `T*` evolves via its real,
+       already-on-by-default `land_surface.py` sensible-heat feedback
+       instead of being held fixed. **Result: sub-stepping provides no
+       benefit once T* is real** — land `Ta-T*` is already -126K and 58.8%
+       floor-clipped by day 6.1 (as bad as, arguably worse than, the
+       original un-substepped 1x/day trace at the same point), and by day
+       60.9 the field goes fully NaN. Investigated why: `T*` barely moves
+       at all across the whole 60 days (282→281K) even while `Ta` collapses
+       to the 150K floor — a huge, sustained mismatch its own sensible-heat
+       feedback should be reacting to. **Conclusion: `T*`'s real thermal
+       inertia (`land_surface_heat_capacity_j_m2_k`) is far too large
+       relative to how fast `Ta` collapses for that feedback to act as a
+       meaningful brake on any relevant timescale** — real, but far too
+       slow to matter here. **This closes off "it's a numerics/
+       discretization issue" as a viable path entirely** — item 6's
+       apparent partial fix was an artifact of that test's own
+       T*-held-fixed simplification, not a real effect. The underlying
+       instability is a genuine, robust divergence in the coupled system as
+       currently built, immune to both finer time-stepping and the
+       system's own existing (but too-slow) `T*` feedback.
+
+    **Summary of the 2026-08-20 investigation (items 1-7)**: three
+    independent "investigate before patching" avenues were pursued per the
+    user's explicit choice — the wind/dryness causal chain, numerical
+    time-discretization, and reading CLIMBER-X's own reference
+    architecture — and none resolve the P6d/P6e blowup standalone. What
+    remains established: (A9) is paper-faithful, not a bug; the reference
+    implementation's own constants and diagnostic-quantity conventions
+    match PlanetSim's; the blowup is a fast (~6-12 day), self-compounding
+    feedback between `near_surface_lapse` and the longwave transmission
+    solve that needs no special precondition and is not merely a
+    discretization artifact. The decision returns to the original P6d
+    menu — bound the `Ta-T*` drift in the coupling, bound the profile
+    handoff into the longwave solve, or stop here and leave documented —
+    now with substantially more confidence that this is a genuine
+    structural gap in the coupling, not a bug waiting to be found
+    elsewhere. Not implemented; still the user's decision.
+
+  - **Profile-handoff clip implemented (2026-08-20) — P6e now passes.**
+    Per the user's choice, `sesam_vertical.compute_vertical_structure` now
+    clips the assembled (A5) temperature profile to [150, 350] K
+    immediately after `temperature_profile` returns it, before `theta_z`/
+    `q_z` are derived from it — the same [150, 350] K sanity range
+    `sesam_coupling.py` already clips prognostic `Ta` to (an existing
+    project convention, not a new one). `temperature_profile`/(A9)
+    themselves are untouched — the existing
+    `test_near_surface_lapse_large_cold_land_contrast_produces_unphysical_profile`
+    regression still passes unchanged, confirming the paper-faithful
+    unbounded formula is preserved; a new
+    `test_compute_vertical_structure_clips_profile_documented_p6d_blowup`
+    guards the clip itself. Full SESAM suite 269 passed/1 skipped, no
+    regressions.
+
+    **Re-ran the full standard P6e config (64×128/MONTHLY, 1yr spinup + 1yr
+    eval, all three gates on) end to end: it now completes cleanly in
+    342.6s** — no crash, no NaN, no Hadley-geometry exception. Exit-gate
+    metrics: global temperature 282.82 K (vs. Earth's ~288 K — a few
+    degrees cold-biased, not collapsed), global precip 4.997 mm/day
+    (real Earth ~2.7-3.0 — now *over*-supplied, likely partly compounded by
+    this session's earlier (A58) total-wind fix, whose own total was
+    already measured ~15-25% high against the true NCEP `wspd` climatology),
+    Köppen group accuracy 0.582/kappa 0.481 (vs. gate-off baseline 0.674,
+    P6b-only 0.480, P6c-only 0.477 — **this is the best any SESAM-radiation
+    configuration has scored**, though still below the legacy baseline).
+    Per-region Köppen: classic deserts (Sahara/Kalahari/Atacama) score 0.0
+    (consistent with the precip over-supply erasing them), while several
+    other regions (Canadian Prairies, East China, S Japan, SE US) score
+    0.87-1.0.
+
+    **This is P6e's actual job done — not a finished climate.** The clip
+    only contains the numerical crash; it does not fix the underlying
+    `Ta-T*` coupling drift (option 1 from the decision menu, never
+    implemented) or the precip over-supply. Both are now exactly the kind
+    of bounded constant-calibration questions §6 exists for, not new bugs.
+    **Next task: the §6 bounded Table-A constant sweep**, unblocked for the
+    first time since P6 began (2026-08-19).
+
 **Stop conditions** (per operating rule 3): a stage that fails its exit gate after
 its *own* constants' bounded sweep is a conclusion about that mechanism, and the
 branch pauses — no widening into legacy-knob sweeps, no per-region patches.

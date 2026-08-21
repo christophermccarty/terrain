@@ -80,6 +80,33 @@ def _a1_defaults() -> dict[str, float]:
 _GAMMA_S_CAP_OCEAN = 7.5e-3
 _GAMMA_S_CAP_LAND_ICE = 10.0e-3
 
+# Numerics guard on the *integrated* (A5) temperature profile T(z), not on
+# (A9) itself -- see docs/SESAM_GAP_ANALYSIS.md Sec7 P6d/P6e, 2026-08-20
+# follow-up. (A9)'s cold-land inversion term is deliberately unbounded per
+# the published paper (verified against the source text directly, not a
+# transcription gap), so it stays untouched here. But under live coupling,
+# a live Ta can transiently drift far enough from T* that integrating that
+# unbounded slope over even the ~1.5 km near-surface layer produces a T(z)
+# point in the hundreds of Kelvin -- not a paper edge case, a downstream
+# numerics failure: `sesam_longwave.longwave_radiation`'s transmission
+# matrix and `saturation_specific_humidity`'s Clausius-Clapeyron form are
+# not designed to accept such values and produce physically meaningless
+# (and further destabilizing) output when they do. This clip bounds the
+# *result* T(z) is compared/fed downstream with, the same [150, 350] K
+# sanity range `sesam_coupling.py` already clips prognostic Ta to
+# (`ta_next = np.clip(..., 150.0, 350.0)`) -- an existing project
+# convention, not a new one. Investigated at length before adding this
+# (docs/SESAM_GAP_ANALYSIS.md Sec7 P6d/P6e 2026-08-20 entries): the
+# wind/dryness causal chain was falsified, finer time-sub-stepping was
+# tested and found insufficient even with the real T*-Ta feedback active,
+# and CLIMBER-X's own reference architecture was read directly and found to
+# match this project's constants and formulas -- the underlying Ta-T* drift
+# is a genuine, currently-unresolved coupling gap, not a bug elsewhere; this
+# clip only keeps the radiative-transfer numerics from amplifying it into a
+# harder crash while that gap stays open.
+_PROFILE_CLIP_MIN_K = 150.0
+_PROFILE_CLIP_MAX_K = 350.0
+
 # Magnus saturation-curve constants (specific-heat-consistent water term is
 # identical to land_surface.py; the ice term is the standard over-ice curve).
 _DEFAULT_RD = 287.0
@@ -661,6 +688,13 @@ def compute_vertical_structure(
     t_z, gamma_z, _ = temperature_profile(
         levels, ta, skin_temp_k, surface_kind, qa, zs, ht, a1=params
     )
+    # Numerics guard, not a physics change -- see _PROFILE_CLIP_MIN_K/MAX_K's
+    # own module-level docstring. Clipped here, before theta_z/q_z below are
+    # derived from t_z, so every downstream consumer (both this function's
+    # own potential-temperature/humidity outputs and every caller's use of
+    # temperature_k) sees a consistent, bounded profile -- not a t_z clipped
+    # after the fact while theta_z/q_z still reflect the unbounded value.
+    t_z = np.clip(t_z, _PROFILE_CLIP_MIN_K, _PROFILE_CLIP_MAX_K)
     theta_z = potential_temperature_profile(
         t_z, levels, gravity=gravity, specific_heat=specific_heat
     )
