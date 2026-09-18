@@ -5,7 +5,8 @@
 > next, roughly ordered by leverage within each theme. Nothing here is
 > committed work. `PLAN.md` is historical; use
 > `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md` for the supported scope and current
-> experimental decisions.
+> experimental decisions, and `docs/CLIMATE_ACCURACY_NEXT_STEPS.md` for the
+> current post-SESAM climate architecture decision.
 
 ---
 

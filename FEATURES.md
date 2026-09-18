@@ -1,5 +1,11 @@
 # PlanetSim — Feature Backlog (Part 2)
 
+> **Backlog, not current climate-accuracy priority.** Feature dispositions remain
+> useful, but the active accuracy direction is
+> `docs/CLIMATE_ACCURACY_NEXT_STEPS.md`. New Earth-system features may continue
+> against the frozen supported baseline; they should not be used to tune around
+> the atmosphere's structural ceiling.
+
 > Created: 2026-07-25
 > Companion to `ROADMAP.md` (long-horizon idea backlog) and the historical `PLAN.md`.
 >

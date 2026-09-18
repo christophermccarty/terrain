@@ -196,12 +196,14 @@ structural errors.
 ## Current validation status
 
 The fast and slow suites contain analytic operators, sign tests, wiring checks,
-golden-state regression, Earth benchmarks, conservation checks, and multi-year
-drift guards. The largest remaining validation gaps are:
+golden-state regression, Earth benchmarks, conservation checks, multi-year
+drift guards, automated real-terrain regional scoring, and gridded CRU/NCEP
+skill metrics. The largest remaining validation gaps are:
 
-- automated real-terrain regional scoring;
-- gridded ERA5/CRU spatial correlation and RMSE;
+- a broader reanalysis contract for clouds, radiation, pressure, humidity,
+  circulation, and column energy/water budgets (not only T/P and surface wind);
 - production-resolution fidelity/performance checks;
+- confidence-weighted Köppen scoring and explicit treatment of class boundaries;
 - GUI smoke and accessibility coverage;
 - an explicit guard against orbital-cycle phase slip.
 

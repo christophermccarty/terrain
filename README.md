@@ -45,10 +45,11 @@ the GUI falls back to deterministic procedural terrain.
 .\.venv\Scripts\python.exe -m pytest testing/test_generalize_time_orbit.py -q
 ```
 
-The suite currently collects 802 tests: 630 routine and 172 marked slow (verify
-with `--collect-only -q`, since this count changes frequently). Slow tests
-cover multi-year climate response, multi-decadal drift, conservation,
-circulation, seasonal behavior, and reanalysis anchors.
+The suite currently collects 1,188 tests (verify with `--collect-only -q`,
+since this count changes frequently). Use the pytest markers rather than a
+remembered test count to select routine or slow coverage. Slow tests cover
+multi-year climate response, multi-decadal drift, conservation, circulation,
+seasonal behavior, and reanalysis anchors.
 
 Pytest writes temporary files under `testing/.pytest-tmp/`, configured in
 `pytest.ini`, so routine runs do not depend on a user-profile temp directory.
@@ -97,7 +98,7 @@ before it can change a default.
 
 ## Architecture
 
-- `simulate.py` — state definition, time-step orchestration, persistence
+- `simulate.py` — numerical integration, physics coupling, and compatibility re-exports
 - `atmosphere.py` — wind, storms, humidity, and precipitation
 - `temperature.py` — insolation and radiative temperature baseline
 - `ocean.py` — ocean transport, currents, salinity, and sea ice
@@ -130,6 +131,7 @@ before it can change a default.
 
 - `docs/CURRENT_BASELINE.md` — generated compact current regression contract
 - `docs/MONTHLY_CLIMATOLOGY_REFERENCE.md` — optional gridded monthly T/P reference format
+- `docs/CLIMATE_ACCURACY_NEXT_STEPS.md` — current accuracy diagnosis and recommended architecture pivot
 
 ## Save-file security
 

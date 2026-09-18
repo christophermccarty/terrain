@@ -1,5 +1,10 @@
 # PlanetSim — Physics Depth Plan
 
+> **STATUS (2026-08-21): HISTORICAL.** This plan records completed and earlier
+> proposed work. Use `docs/CLIMATE_ACCURACY_NEXT_STEPS.md` for the current
+> climate-core decision and `docs/PRODUCT_SCOPE_AND_EXPERIMENTS.md` for supported
+> versus experimental behavior.
+
 > Created: 2026-06-20
 > **STATUS (2026-07-01): ARCHIVED — Effort 1 (1A-1D) and Effort 2 (2A-2D) are complete and
 > verified in code, with one caveat: 2 of Phase 1D's 4 quantitative predictions

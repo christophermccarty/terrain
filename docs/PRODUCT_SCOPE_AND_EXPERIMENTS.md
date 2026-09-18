@@ -1,5 +1,11 @@
 # Product scope and experiment policy
 
+> **Current status (2026-08-21).** The P0-P6 SESAM adoption experiment is
+> complete and rejected for default promotion after its bounded calibration
+> window. Its kernels and live gates remain useful research infrastructure,
+> but another scalar sweep is not authorized. The current accuracy diagnosis
+> and next architecture decision are in `CLIMATE_ACCURACY_NEXT_STEPS.md`.
+
 PlanetSim's supported product is an interactive, Earth-calibrated climate
 simulator with a deterministic CPU headless path for validation and bounded
 parameter searches. It is a climate-system exploration tool, not an
@@ -66,6 +72,12 @@ Each name below is a `PlanetParams` boolean that defaults to `False`. Nested
 gates require their parent path; enabling a child alone does not make a new
 default behavior.
 
+The six detailed SESAM rows preserve stage-completion evidence and contain
+then-current phrases such as "not wired" and "P5 in progress." Those phrases
+are historical snapshots, superseded by the 2026-08-21 status note above and
+the consolidated SESAM disposition below: P0-P6 is now fully wired behind
+default-off gates, its calibration window is spent, and it is not promoted.
+
 | Area | Gates | Status and promotion/retirement condition |
 |---|---|---|
 | Orbital experiments | `enable_milankovitch_cycles` | Keep experimental. The forcing is wired, but there is no dedicated multi-millennial experiment harness or calibrated ice-age response. Promote only with that harness plus stable long-run ice/ocean validation. |
@@ -105,6 +117,7 @@ research capability.
 | Conserved column water | **Redesign** | It replaces the empirical rainfall correction, so a local skill gain cannot validate it. The complete moisture closure must pass the normal real-terrain gate. |
 | Two-/three-level overturning | **Redesign** | The normal path lacks upper thermodynamic/radiative closure for a diagnosed overturning strength. The best three-level result also worsened whole-climate skill at roughly 47x cost. |
 | Land ice | **Redesign** | Flow, albedo, calving/freshwater, coastline feedback, and multi-century calibration are incomplete. |
+| SESAM atmosphere | **Retain research code; stop calibration** | P0-P6 is complete. The full chain reached 0.582/0.282 Köppen group/class accuracy, 5.00 mm/day precipitation, and 282.8 K global temperature at the compact gate, below the supported 0.674/0.388 baseline. The allotted Table-A sweep found no joint winner. Reuse kernels only inside a newly approved architecture; do not continue one-at-a-time constant tuning. |
 
 ## Inert numeric trials
 
@@ -136,13 +149,16 @@ than candidate Earth defaults.
 
 ## Working order
 
-No new experimental mechanism should be added while the supported baseline has
-an unresolved higher-priority accuracy issue. Work proceeds in this order:
+No new experimental mechanism should be added to tune around an unresolved
+higher-priority accuracy issue. Current climate-core work proceeds in this order:
 
-1. Regional precipitation/moisture budget.
-2. Jet placement and hemispheric circulation asymmetry.
-3. Land seasonal temperature bias and the temperature ceiling.
-4. A deliberate promote/redesign/retire decision for each experimental family.
+1. Freeze and version the supported Earth baseline; expand the validation contract.
+2. Build and admit a coarse conservative dynamical core on idealized tests.
+3. Add one coupled moist-column/cloud/radiation closure.
+4. Add Earth boundary conditions and evaluate against the long real-terrain gate.
+
+The earlier regional precipitation, jet-placement, land-temperature, and SESAM
+investigations are complete decision records. Do not resume their scalar tuning.
 
 This document is the concise current policy; `PLAN.md`,
 `IMPLEMENTATION_PLAN.md`, and `PLAN_PHYSICS.md` remain historical records.

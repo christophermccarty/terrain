@@ -110,13 +110,14 @@ legacy row multiplier, it:
   rainout at 85%;
 - reports capacity-limited rows and unmet target precipitation explicitly.
 
-On the compact two-year real-terrain gate, this reduced the composite reference
-error from 0.438 to 0.376. On a five-year spinup plus three-year evaluation it
-reduced error from 0.419 to 0.349. Tropical zonal rain moved from roughly
-3,700-3,800 mm/year to 1,969 mm/year, cloud fraction increased, and US Midwest
-rain improved. Sahara remains too wet, so the new mechanism removes the old
-multiplier-ceiling failure but does not claim to complete regional calibration.
-Set `moisture_budget_precip_rescale=False` only for legacy comparison runs.
+Historically, this mechanism reduced the compact and longer-run composite
+reference errors and repaired tropical zonal rain. The current generated
+contract is `CURRENT_BASELINE.md`: Sahara and Kalahari are now within their
+broad targets, while Atacama, Central Europe, SE US, East China, and S Japan
+remain outside at the compact gate. The mechanism removes the old
+multiplier-ceiling failure but does not make the rainfall field prognostic:
+the supported path still allocates toward a prescribed zonal target. Set
+`moisture_budget_precip_rescale=False` only for legacy comparison runs.
 
 Precipitation convergence and cloud ascent/subsidence now use spherical flux
 divergence by default. Their normalization is scale-invariant, so the physical

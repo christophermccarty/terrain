@@ -1,8 +1,16 @@
 # Remaining development plan
 
-This is the active implementation plan after the supported-baseline audit.
-It replaces open-ended parameter exploration with a sequence of bounded
-architecture and validation workstreams. `PRODUCT_SCOPE_AND_EXPERIMENTS.md`
+> **Status (2026-08-21): execution history through the Phase 2/3 experiments.**
+> The active-goal wording below records the work sequence that ended on
+> 2026-08-16; it is not the current recommendation. The subsequent P0-P6 SESAM
+> adoption also completed and failed its promotion gate. Current work starts
+> with Phase A in `CLIMATE_ACCURACY_NEXT_STEPS.md`: freeze the supported climate,
+> expand the validation contract, and construct a separate conservative moist
+> climate core. Do not resume the scalar or local-closure searches recorded here.
+
+This was the active implementation plan after the supported-baseline audit.
+It records the bounded architecture and validation workstreams that led to the
+current decision. `PRODUCT_SCOPE_AND_EXPERIMENTS.md`
 remains the authoritative list of supported and experimental controls; this
 document states the order in which their unresolved capabilities should be
 addressed.
@@ -916,7 +924,7 @@ decision: either invest in that shared operator redesign, or redefine the
 phase's acceptance target around what the supported single-layer atmosphere
 can conservatively provide.
 
-### Active goal (2026-08-16): diabatic-omega stability reformulation (shared Phase 2/3 dependency)
+### Superseded goal (2026-08-16): diabatic-omega stability reformulation (shared Phase 2/3 dependency)
 
 **Re-scoping decision:** invest in the shared operator redesign. Phase 3
 candidate construction is paused until the operator question is settled.
